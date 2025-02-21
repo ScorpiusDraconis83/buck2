@@ -20,31 +20,48 @@ use std::vec;
 
 use crate::typing::Ty;
 use crate::values::list::ListRef;
+use crate::values::list::ListType;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::UnpackValue;
 use crate::values::Value;
 
 /// Unpack a value of type `list<T>` into a vec.
-#[derive(Default, Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct UnpackList<T> {
     /// Unpacked items.
     pub items: Vec<T>,
 }
 
+impl<T> Default for UnpackList<T> {
+    fn default() -> Self {
+        UnpackList { items: Vec::new() }
+    }
+}
+
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for UnpackList<T> {
+    type Canonical = <ListType<T> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
-        Vec::<T>::starlark_type_repr()
+        ListType::<T>::starlark_type_repr()
     }
 }
 
 impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for UnpackList<T> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        let list = ListRef::from_value(value)?;
+    type Error = <T as UnpackValue<'v>>::Error;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        let Some(list) = <&ListRef>::unpack_value_opt(value) else {
+            return Ok(None);
+        };
+        // TODO(nga): should not allocate if the first element is of the wrong type.
         let mut items = Vec::with_capacity(list.len());
         for v in list.iter() {
-            items.push(T::unpack_value(v)?);
+            let Some(v) = T::unpack_value_impl(v)? else {
+                return Ok(None);
+            };
+            items.push(v);
         }
-        Some(UnpackList { items })
+        Ok(Some(UnpackList { items }))
     }
 }
 
@@ -87,9 +104,13 @@ mod tests {
         let v = heap.alloc(vec!["a", "b"]);
         assert_eq!(
             vec!["a", "b"],
-            UnpackList::<&str>::unpack_value(v).unwrap().items
+            UnpackList::<&str>::unpack_value(v).unwrap().unwrap().items
         );
-        assert!(UnpackList::<u32>::unpack_value(v).is_none());
-        assert!(UnpackList::<&str>::unpack_value(heap.alloc(1)).is_none());
+        assert!(UnpackList::<u32>::unpack_value(v).unwrap().is_none());
+        assert!(
+            UnpackList::<&str>::unpack_value(heap.alloc(1))
+                .unwrap()
+                .is_none()
+        );
     }
 }

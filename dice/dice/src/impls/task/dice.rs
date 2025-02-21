@@ -17,7 +17,9 @@ use std::task::Poll;
 
 use allocative::Allocative;
 use allocative::Visitor;
-use buck2_futures::cancellation::future::CancellationHandle;
+use buck2_futures::cancellation::CancellationHandle;
+use dice_error::result::CancellableResult;
+use dice_error::result::CancellationReason;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
 use futures::task::AtomicWaker;
@@ -34,8 +36,7 @@ use crate::impls::task::handle::TaskState;
 use crate::impls::task::promise::DicePromise;
 use crate::impls::task::state::AtomicDiceTaskState;
 use crate::impls::value::DiceComputedValue;
-use crate::result::CancellableResult;
-use crate::result::Cancelled;
+use crate::GlobalStats;
 
 ///
 /// 'DiceTask' is approximately a copy of Shared and Weak from std, but with some custom special
@@ -114,20 +115,6 @@ impl Allocative for DiceTaskInternalCritical {
     }
 }
 
-pub(crate) enum MaybeCancelled {
-    Ok(DicePromise),
-    Cancelled,
-}
-
-impl MaybeCancelled {
-    pub(crate) fn not_cancelled(self) -> Option<DicePromise> {
-        match self {
-            MaybeCancelled::Ok(promise) => Some(promise),
-            MaybeCancelled::Cancelled => None,
-        }
-    }
-}
-
 /// Future when resolves when task is finished or cancelled and terminated.
 pub(crate) enum TerminationObserver {
     Done,
@@ -157,33 +144,25 @@ impl Future for TerminationObserver {
 impl DiceTask {
     /// `k` depends on this task, returning a `DicePromise` that will complete when this task
     /// completes
-    pub(crate) fn depended_on_by(&self, k: ParentKey) -> MaybeCancelled {
+    pub(crate) fn depended_on_by(&self, k: ParentKey) -> CancellableResult<DicePromise> {
         if let Some(result) = self.internal.read_value() {
-            match result {
-                Ok(result) => MaybeCancelled::Ok(DicePromise::ready(result)),
-                Err(_err) => MaybeCancelled::Cancelled,
-            }
+            result.map(DicePromise::ready)
         } else {
             let mut critical = self.internal.critical.lock();
-            if self.cancellations.is_cancelled(&critical) {
-                return MaybeCancelled::Cancelled;
+            if let Some(reason) = self.cancellations.is_cancelled(&critical) {
+                return Err(reason);
             }
             match &mut critical.dependants {
-                None => {
-                    match self
-                        .internal
-                        .read_value()
-                        .expect("invalid state where deps are taken before state is ready")
-                    {
-                        Ok(result) => MaybeCancelled::Ok(DicePromise::ready(result)),
-                        Err(_err) => MaybeCancelled::Cancelled,
-                    }
-                }
+                None => self
+                    .internal
+                    .read_value()
+                    .expect("invalid state where deps are taken before state is ready")
+                    .map(DicePromise::ready),
                 Some(ref mut wakers) => {
                     let waker = Arc::new(AtomicWaker::new());
                     let id = wakers.insert((k, waker.dupe()));
 
-                    MaybeCancelled::Ok(DicePromise::pending(
+                    Ok(DicePromise::pending(
                         SlabId::Dependants(id),
                         self.internal.dupe(),
                         waker,
@@ -213,9 +192,9 @@ impl DiceTask {
             .map(|deps| deps.iter().map(|(_, (k, _))| *k).collect())
     }
 
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn cancel(&self, reason: CancellationReason) {
         let lock = self.internal.critical.lock();
-        self.cancellations.cancel(&lock);
+        self.cancellations.cancel(&lock, reason);
     }
 
     pub(crate) fn await_termination(&self) -> TerminationObserver {
@@ -260,7 +239,7 @@ impl DiceTaskInternal {
                 Some(ref mut deps) => {
                     deps.remove(*id);
                     if deps.is_empty() {
-                        cancellations.cancel(&critical);
+                        cancellations.cancel(&critical, CancellationReason::AllDependentsDropped);
                     }
                 }
             },
@@ -269,7 +248,7 @@ impl DiceTaskInternal {
                 Some(ref mut deps) => {
                     deps.remove(*id);
                     if deps.is_empty() {
-                        cancellations.cancel(&critical);
+                        cancellations.cancel(&critical, CancellationReason::AllObserversDropped);
                     }
                 }
             },
@@ -305,7 +284,7 @@ impl DiceTaskInternal {
         }
     }
 
-    pub(super) fn set_value(
+    pub(crate) fn set_value(
         &self,
         value: DiceComputedValue,
     ) -> CancellableResult<DiceComputedValue> {
@@ -353,7 +332,7 @@ impl DiceTaskInternal {
 
     /// report the task as terminated. This should only be called once. No effect if called affect
     /// task is already ready
-    pub(super) fn report_terminated(&self) {
+    pub(crate) fn report_terminated(&self, reason: CancellationReason) {
         match self.state.sync() {
             TaskState::Continue => {}
             TaskState::Finished => {
@@ -365,7 +344,7 @@ impl DiceTaskInternal {
             // SAFETY: no tasks read the value unless state is converted to `READY`
             &mut *self.maybe_value.get()
         }
-        .replace(Err(Cancelled))
+        .replace(Err(reason))
         .is_some();
         assert!(
             !prev_exist,
@@ -398,7 +377,7 @@ pub(super) struct Cancellations {
 
 enum CancellationsInternal {
     NotCancelled(CancellationHandle),
-    Cancelled,
+    Cancelled(CancellationReason),
 }
 
 impl Cancellations {
@@ -414,7 +393,12 @@ impl Cancellations {
         Self { internal: None }
     }
 
-    pub(super) fn cancel(&self, _lock: &MutexGuard<DiceTaskInternalCritical>) {
+    pub(super) fn cancel(
+        &self,
+        _lock: &MutexGuard<DiceTaskInternalCritical>,
+        reason: CancellationReason,
+    ) {
+        GlobalStats::record_cancellation();
         if let Some(internal) = self.internal.as_ref() {
             take_mut::take(
                 unsafe {
@@ -424,7 +408,7 @@ impl Cancellations {
                 |internal| match internal {
                     CancellationsInternal::NotCancelled(handle) => {
                         handle.cancel();
-                        CancellationsInternal::Cancelled
+                        CancellationsInternal::Cancelled(reason)
                     }
                     cancelled => cancelled,
                 },
@@ -432,14 +416,17 @@ impl Cancellations {
         };
     }
 
-    pub(super) fn is_cancelled(&self, _lock: &MutexGuard<DiceTaskInternalCritical>) -> bool {
-        self.internal.as_ref().map_or(false, |internal| {
+    pub(super) fn is_cancelled(
+        &self,
+        _lock: &MutexGuard<DiceTaskInternalCritical>,
+    ) -> Option<CancellationReason> {
+        self.internal.as_ref().and_then(|internal| {
             match unsafe {
                 // SAFETY: locked by the MutexGuard of Slab
                 &*internal.get()
             } {
-                CancellationsInternal::NotCancelled(_) => false,
-                CancellationsInternal::Cancelled => true,
+                CancellationsInternal::NotCancelled(_) => None,
+                CancellationsInternal::Cancelled(reason) => Some(*reason),
             }
         })
     }

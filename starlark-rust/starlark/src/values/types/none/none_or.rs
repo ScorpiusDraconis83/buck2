@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use allocative::Allocative;
 use dupe::Dupe;
 use either::Either;
 
@@ -32,7 +33,7 @@ use crate::values::Value;
 /// Equivalent of a Rust [`Option`], where `None`
 /// is encoded as [`NoneType`](crate::values::none::NoneType).
 /// Useful for its [`UnpackValue`] instance.
-#[derive(Debug, Eq, PartialEq, Copy, Clone, Dupe)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Dupe, Allocative)]
 pub enum NoneOr<T> {
     /// Starlark `None`.
     None,
@@ -50,6 +51,15 @@ impl<T> NoneOr<T> {
         }
     }
 
+    /// Convert a Rust [`Option`] to a [`NoneOr`].
+    #[inline]
+    pub fn from_option(option: Option<T>) -> Self {
+        match option {
+            None => NoneOr::None,
+            Some(x) => NoneOr::Other(x),
+        }
+    }
+
     /// Is the value a [`NoneOr::None`].
     pub fn is_none(&self) -> bool {
         matches!(self, NoneOr::None)
@@ -57,21 +67,21 @@ impl<T> NoneOr<T> {
 }
 
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for NoneOr<T> {
+    type Canonical = <Either<NoneType, T> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Either::<NoneType, T>::starlark_type_repr()
     }
 }
 
 impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for NoneOr<T> {
-    fn expected() -> String {
-        format!("None or {}", T::expected())
-    }
+    type Error = <T as UnpackValue<'v>>::Error;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
         if value.is_none() {
-            Some(NoneOr::None)
+            Ok(Some(NoneOr::None))
         } else {
-            T::unpack_value(value).map(NoneOr::Other)
+            Ok(T::unpack_value_impl(value)?.map(NoneOr::Other))
         }
     }
 }

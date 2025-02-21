@@ -7,7 +7,7 @@
 
 # Utility functions used by "fdb.bxl"
 
-load("@prelude//debugging/types.bzl", "TargetInfo")
+load("@prelude//debugging:types.bzl", "TargetInfo")
 
 def target_name(node: bxl.ConfiguredTargetNode) -> str:
     return "{}:{}".format(str(node.label.path), node.label.name)
@@ -19,6 +19,6 @@ def create_target_info(target: bxl.ConfiguredTargetNode) -> TargetInfo:
     attrs = target.attrs_lazy()
     return TargetInfo(
         target = target_name(target),
-        target_type = rule_type(target),
+        target_type = rule_type(target).removeprefix("prelude//rules.bzl:"),
         labels = attrs.get("labels").value() if attrs.get("labels") != None else [],
     )

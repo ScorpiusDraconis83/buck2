@@ -11,7 +11,6 @@ version = "0.1.0"
 
 [dependencies]
 allocative = { workspace = true }
-anyhow = { workspace = true }
 dupe = { workspace = true }
 futures = { workspace = true }
 starlark_map = { workspace = true }
@@ -19,9 +18,13 @@ sysinfo = { workspace = true }
 tracing = { workspace = true }
 triomphe = { workspace = true }
 
+buck2_error = { workspace = true }
 serde = { workspace = true }
 static_assertions = { workspace = true }
 tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -31,3 +34,8 @@ winapi = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+three_billion_instructions = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(debug)", "cfg(buck2_asan)"] }

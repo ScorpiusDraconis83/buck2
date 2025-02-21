@@ -40,11 +40,47 @@ message FileResponse {
   string name = 2;
   string path = 3;
   ErrorDetail error_detail = 4;
+  // Connected device metadata to be logged to scuba.
+  // Should be sent once per device per install command,
+  // not per FileReadyRequest.
+  // Returned here in case the installer needs information
+  // from received files in order to connect.
+  repeated DeviceMetadata device_metadata = 5;
+}
+
+// Metadata about a connected device for logging.
+// ex. device name, os version.
+message DeviceMetadata {
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+  repeated Entry entry = 1;
 }
 
 message ErrorDetail {
   // Error message
   string message = 1;
+  // High level error category.
+  // Determines error_category logged to buck2_builds.
+  ErrorCategory category = 2;
+  // List of short, stable error identifiers.
+  // Should be UPPER_SNAKE_CASE to match serialized buck2 tags.
+  repeated string tags = 3;
+}
+
+// Should be kept in sync with buck2_error::ErrorTier.
+enum ErrorCategory {
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  // Unexpected errors in installer. AKA Infra error.
+  TIER_0 = 1;
+  // Expected errors in inputs explicitly tracked by buck. AKA User error.
+  INPUT = 2;
+  // Errors that may be triggered by issues with the host,
+  // resource limits, non-explicit dependencies or potentially
+  // ambiguous input errors.
+  // These can be tracked but not eliminated.
+  ENVIRONMENT = 3;
 }
 
 message ShutdownRequest {

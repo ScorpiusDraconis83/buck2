@@ -7,54 +7,55 @@
  * of this source tree.
  */
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_audit::dep_files::AuditDepFilesCommand;
 use buck2_build_api::audit_dep_files::AUDIT_DEP_FILES;
 use buck2_cli_proto::ClientContext;
-use buck2_core::category::Category;
+use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
+use buck2_core::category::CategoryRef;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
+use buck2_error::BuckErrorContext;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
+use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::global_cfg_options_from_client_context;
-use buck2_server_ctx::pattern::parse_patterns_from_cli_args;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
 
 #[async_trait]
-impl AuditSubcommand for AuditDepFilesCommand {
+impl ServerAuditSubcommand for AuditDepFilesCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
-        client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx
-            .with_dice_ctx(async move |server_ctx, mut ctx| {
-                let global_cfg_options =
-                    global_cfg_options_from_client_context(&client_ctx, server_ctx, &mut ctx)
-                        .await?;
+        _client_ctx: ClientContext,
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|server_ctx, mut ctx| async move {
+                let global_cfg_options = global_cfg_options_from_client_context(
+                    &self.target_cfg.target_cfg(),
+                    server_ctx,
+                    &mut ctx,
+                )
+                .await?;
 
                 let label = parse_patterns_from_cli_args::<TargetPatternExtra>(
                     &mut ctx,
-                    &[buck2_data::TargetPattern {
-                        value: self.pattern.clone(),
-                    }],
+                    &[self.pattern.clone()],
                     server_ctx.working_dir(),
                 )
                 .await?
                 .into_iter()
                 .next()
-                .context("Parsing patterns returned nothing")?
+                .buck_error_context("Parsing patterns returned nothing")?
                 .as_target_label(&self.pattern)?;
 
                 let label = ctx
-                    .get_configured_target(&label, &global_cfg_options)
+                    .get_configured_target_post_transition(&label, &global_cfg_options)
                     .await?;
 
-                let category = Category::try_from(self.category.as_str())?;
+                let category = CategoryRef::new(self.category.as_str())?.to_owned();
 
                 (AUDIT_DEP_FILES.get()?)(
                     &ctx,
@@ -67,6 +68,6 @@ impl AuditSubcommand for AuditDepFilesCommand {
 
                 Ok(())
             })
-            .await
+            .await?)
     }
 }

@@ -15,7 +15,7 @@ use starlark::values::none::NoneType;
 use starlark::values::Value;
 
 #[starlark_module]
-pub fn register_load_symbols(builder: &mut GlobalsBuilder) {
+pub(crate) fn register_load_symbols(builder: &mut GlobalsBuilder) {
     /// Used in a `.bzl` file to set exported symbols. In most cases just defining
     /// the symbol as a top-level binding is sufficient, but sometimes the names
     /// might be programatically generated.
@@ -25,7 +25,7 @@ pub fn register_load_symbols(builder: &mut GlobalsBuilder) {
     /// This function should be used rarely.
     fn load_symbols<'v>(
         symbols: SmallMap<&'v str, Value<'v>>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<NoneType> {
         for (k, v) in symbols.into_iter() {
             eval.set_module_variable_at_some_point(k, v)?;

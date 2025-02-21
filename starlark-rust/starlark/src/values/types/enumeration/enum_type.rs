@@ -30,7 +30,6 @@ use starlark_derive::starlark_module;
 use starlark_derive::starlark_value;
 use starlark_derive::Coerce;
 use starlark_derive::NoSerialize;
-use starlark_derive::StarlarkDocs;
 use starlark_derive::Trace;
 use starlark_map::small_map::SmallMap;
 use starlark_map::Equivalent;
@@ -42,13 +41,13 @@ use crate::environment::MethodsBuilder;
 use crate::environment::MethodsStatic;
 use crate::eval::Arguments;
 use crate::eval::Evaluator;
+use crate::typing::callable::TyCallable;
 use crate::typing::starlark_value::TyStarlarkValue;
 use crate::typing::user::TyUser;
 use crate::typing::user::TyUserIndex;
 use crate::typing::user::TyUserParams;
-use crate::typing::Param;
+use crate::typing::ParamSpec;
 use crate::typing::Ty;
-use crate::typing::TyFunction;
 use crate::values::enumeration::matcher::EnumTypeMatcher;
 use crate::values::enumeration::ty_enum_type::TyEnumData;
 use crate::values::enumeration::value::EnumValueGen;
@@ -59,6 +58,7 @@ use crate::values::list::AllocList;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::typing::type_compiled::type_matcher_factory::TypeMatcherFactory;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenValue;
 use crate::values::Heap;
@@ -119,16 +119,7 @@ impl EnumCell for FrozenValue {
 }
 
 /// The type of an enumeration, created by `enum()`.
-#[derive(
-    Debug,
-    Trace,
-    Coerce,
-    NoSerialize,
-    ProvidesStaticType,
-    StarlarkDocs,
-    Allocative
-)]
-#[starlark_docs(builtin = "extension")]
+#[derive(Debug, Trace, Coerce, NoSerialize, ProvidesStaticType, Allocative)]
 #[repr(C)]
 // Deliberately store fully populated values
 // for each entry, so we can produce enum values with zero allocation.
@@ -147,7 +138,7 @@ pub struct EnumTypeGen<V: EnumCell> {
 impl<'v> Freeze for EnumTypeGen<Value<'v>> {
     type Frozen = EnumTypeGen<FrozenValue>;
 
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         let EnumTypeGen {
             id,
             ty_enum_data: ty_enum_type,
@@ -223,7 +214,7 @@ impl<V: EnumCell + Freeze> EnumTypeGen<V> {
 impl<'v, V> EnumTypeGen<V>
 where
     Value<'v>: Equivalent<V>,
-    V: ValueLike<'v> + 'v + EnumCell,
+    V: ValueLike<'v> + EnumCell,
 {
     pub(crate) fn ty_enum_data(&self) -> Option<&Arc<TyEnumData>> {
         V::get_ty(&self.ty_enum_data)
@@ -245,15 +236,17 @@ impl<'v, V> StarlarkValue<'v> for EnumTypeGen<V>
 where
     Self: ProvidesStaticType<'v>,
     Value<'v>: Equivalent<V>,
-    V: ValueLike<'v> + 'v + EnumCell,
+    V: ValueLike<'v> + EnumCell,
 {
     type Canonical = FrozenEnumType;
 
+    // TODO(nga): replace `Color("RED")` with `Color.RED`.
+    //   https://www.internalfb.com/tasks/?t=183515013
     fn invoke(
         &self,
         _me: Value<'v>,
         args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
         args.no_named_args()?;
         let val = args.positional1(eval.heap())?;
@@ -304,7 +297,11 @@ where
         self.ty_enum_data().map(|t| t.ty_enum_type.dupe())
     }
 
-    fn export_as(&self, variable_name: &str, _eval: &mut Evaluator<'v, '_>) -> crate::Result<()> {
+    fn export_as(
+        &self,
+        variable_name: &str,
+        _eval: &mut Evaluator<'v, '_, '_>,
+    ) -> crate::Result<()> {
         V::get_or_init_ty(&self.ty_enum_data, || {
             let ty_enum_value = Ty::custom(TyUser::new(
                 variable_name.to_owned(),
@@ -325,11 +322,14 @@ where
                         result: ty_enum_value.dupe(),
                     }),
                     iter_item: Some(ty_enum_value.dupe()),
-                    callable: Some(TyFunction::new(
-                        vec![Param::pos_only(
-                            // TODO(nga): we can do better parameter type.
-                            Ty::any(),
-                        )],
+                    callable: Some(TyCallable::new(
+                        ParamSpec::pos_only(
+                            [
+                                // TODO(nga): we can do better parameter type.
+                                Ty::any(),
+                            ],
+                            [],
+                        ),
                         ty_enum_value.dupe(),
                     )),
                     ..TyUserParams::default()
@@ -358,7 +358,7 @@ where
 #[starlark_module]
 fn enum_type_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
-    fn r#type<'v>(this: Value, heap: &Heap) -> anyhow::Result<Value<'v>> {
+    fn r#type<'v>(this: Value, heap: &Heap) -> starlark::Result<Value<'v>> {
         let this = EnumType::from_value(this).unwrap();
         let ty_enum_type = match this {
             Either::Left(x) => x.ty_enum_data(),

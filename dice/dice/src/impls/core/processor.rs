@@ -48,7 +48,7 @@ impl StateProcessor {
         debug!("Processor terminated");
     }
 
-    #[instrument(skip_all, fields(kind = %message.variant_name()))]
+    #[cfg_attr(debug_assertions, instrument(skip_all, fields(kind = %message.variant_name())))]
     fn iteration(&mut self, message: StateRequest) {
         match message {
             StateRequest::UpdateState { changes, resp } => {
@@ -77,6 +77,7 @@ impl StateProcessor {
                 storage,
                 value,
                 deps,
+                invalidation_paths,
                 resp,
                 ..
             } => {
@@ -88,6 +89,7 @@ impl StateProcessor {
                     value,
                     ValueReusable::EqualityBased,
                     deps,
+                    invalidation_paths,
                 )));
             }
             StateRequest::UpdateMismatchAsUnchanged {
@@ -95,6 +97,7 @@ impl StateProcessor {
                 epoch,
                 storage,
                 previous,
+                invalidation_paths,
                 resp,
                 ..
             } => {
@@ -104,8 +107,9 @@ impl StateProcessor {
                     epoch,
                     storage,
                     previous.entry,
-                    ValueReusable::VersionBased(previous.verified_versions),
+                    ValueReusable::VersionBased(previous.prev_verified_version),
                     previous.deps_to_validate,
+                    invalidation_paths,
                 )));
             }
             StateRequest::GetTasksPendingCancellation { resp } => {
@@ -117,6 +121,19 @@ impl StateProcessor {
             }
             StateRequest::Introspection { resp } => {
                 let _ignored = resp.send(self.state.introspection());
+            }
+            StateRequest::MakeAvailableForAllocative { resp } => {
+                use std::sync::Arc;
+
+                let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+                let state = std::mem::replace(&mut self.state, CoreState::new());
+                let arc_state = Arc::new(state);
+                drop(resp.send((Arc::clone(&arc_state), complete_tx)));
+                drop(complete_rx.blocking_recv());
+                // Correctness: Contract on `MakeAvailableForAllocative`
+                let state =
+                    Arc::into_inner(arc_state).expect("Other references to have been dropped");
+                self.state = state;
             }
         }
     }

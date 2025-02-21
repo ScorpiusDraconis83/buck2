@@ -12,7 +12,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use allocative::Allocative;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::name::TargetNameRef;
 use buck2_util::indent::indent;
 use dupe::Dupe;
@@ -23,7 +23,7 @@ use crate::nodes::unconfigured::TargetNode;
 use crate::nodes::unconfigured::TargetNodeRef;
 
 #[derive(Debug, buck2_error::Error)]
-#[buck2(user)]
+#[buck2(input)]
 pub enum TargetsMapRecordError {
     #[error(
         "Attempted to register target {0} twice, {}",

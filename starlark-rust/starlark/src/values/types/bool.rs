@@ -17,146 +17,16 @@
 
 //! The boolean type (`False` and `True`).
 //!
-//! Can be created with [`new_bool`](Value::new_bool) and unwrapped with [`unpack_bool`](Value::unpack_bool).
-//! Unlike most Starlark values, these aren't actually represented on the [`Heap`], but as special values.
+//! Can be created with [`Value::new_bool`](crate::values::Value::new_bool)
+//! and unwrapped with [`Value::unpack_bool`](crate::values::Value::unpack_bool).
+//! Unlike most Starlark values, these aren't actually allocated on the [`Heap`](crate::values::Heap),
+//! but as special values.
 
-use std::cmp::Ordering;
-use std::fmt;
-use std::fmt::Display;
-use std::hash::Hasher;
+mod alloc;
+pub(crate) mod globals;
+mod type_repr;
+mod unpack;
+pub(crate) mod value;
 
-use allocative::Allocative;
-use serde::Serialize;
-use starlark_derive::starlark_value;
-use starlark_derive::StarlarkDocs;
-
-use crate as starlark;
-use crate::any::ProvidesStaticType;
-use crate::collections::StarlarkHashValue;
-use crate::collections::StarlarkHasher;
-use crate::private::Private;
-use crate::typing::Ty;
-use crate::values::layout::avalue::alloc_static;
-use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Basic;
-use crate::values::layout::heap::repr::AValueRepr;
-use crate::values::type_repr::StarlarkTypeRepr;
-use crate::values::AllocFrozenValue;
-use crate::values::AllocValue;
-use crate::values::FrozenHeap;
-use crate::values::FrozenValue;
-use crate::values::Heap;
-use crate::values::StarlarkValue;
-use crate::values::UnpackValue;
-use crate::values::Value;
-use crate::values::ValueError;
-
-/// The result of calling `type()` on booleans.
-pub const BOOL_TYPE: &str = "bool";
-
-// We have to alias bool so we can have a Display that uses True/False.
-#[derive(ProvidesStaticType, Debug, Serialize, StarlarkDocs, Allocative)]
-#[starlark_docs(builtin = "standard")]
-#[serde(transparent)]
-pub(crate) struct StarlarkBool(pub(crate) bool);
-
-impl Display for StarlarkBool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 {
-            write!(f, "True")
-        } else {
-            write!(f, "False")
-        }
-    }
-}
-
-pub(crate) static VALUE_FALSE_TRUE: [AValueRepr<AValueImpl<Basic, StarlarkBool>>; 2] = [
-    alloc_static(Basic, StarlarkBool(false)),
-    alloc_static(Basic, StarlarkBool(true)),
-];
-
-impl<'v> AllocValue<'v> for bool {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
-        Value::new_bool(self)
-    }
-}
-
-impl AllocFrozenValue for bool {
-    fn alloc_frozen_value(self, _heap: &FrozenHeap) -> FrozenValue {
-        FrozenValue::new_bool(self)
-    }
-}
-
-impl StarlarkTypeRepr for bool {
-    fn starlark_type_repr() -> Ty {
-        StarlarkBool::get_type_starlark_repr()
-    }
-}
-
-impl UnpackValue<'_> for bool {
-    fn unpack_value(value: Value) -> Option<Self> {
-        value.unpack_bool()
-    }
-}
-
-/// Define the bool type
-#[starlark_value(type = BOOL_TYPE)]
-impl<'v> StarlarkValue<'v> for StarlarkBool {
-    fn is_special(_: Private) -> bool
-    where
-        Self: Sized,
-    {
-        true
-    }
-
-    fn collect_repr(&self, s: &mut String) {
-        // repr() for bool is quite hot, so optimise it
-        if self.0 {
-            s.push_str("True")
-        } else {
-            s.push_str("False")
-        }
-    }
-
-    fn to_bool(&self) -> bool {
-        self.0
-    }
-
-    fn write_hash(&self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
-        hasher.write_u8(if self.0 { 1 } else { 0 });
-        Ok(())
-    }
-
-    fn get_hash(&self, _private: Private) -> crate::Result<StarlarkHashValue> {
-        // These constants are just two random numbers.
-        Ok(StarlarkHashValue::new_unchecked(if self.0 {
-            0xa4acba08
-        } else {
-            0x71e8ba71
-        }))
-    }
-
-    fn equals(&self, other: Value) -> crate::Result<bool> {
-        // We always compare values for pointer equality before calling `equals`,
-        // and there are only two instances of `StarlarkBool`.
-        // So if we are here, values are definitely not equal.
-        debug_assert!(!matches!(other.unpack_bool(), Some(other) if other == self.0));
-        Ok(false)
-    }
-
-    fn compare(&self, other: Value) -> crate::Result<Ordering> {
-        if let Some(other) = other.unpack_bool() {
-            Ok(self.0.cmp(&other))
-        } else {
-            ValueError::unsupported_with(self, "<>", other)
-        }
-    }
-
-    fn typechecker_ty(&self) -> Option<Ty> {
-        Some(Ty::bool())
-    }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::bool()
-    }
-}
+pub use value::StarlarkBool;
+pub use value::BOOL_TYPE;

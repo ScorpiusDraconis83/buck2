@@ -12,10 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use async_trait::async_trait;
-use buck2_core;
 use buck2_core::fs::fs_util;
+use buck2_core::fs::fs_util::IoError;
 use buck2_core::fs::paths::abs_path::AbsPath;
 use buck2_core::fs::paths::abs_path::AbsPathBuf;
 use buck2_core::fs::paths::file_name::FileName;
@@ -23,6 +22,7 @@ use buck2_core::fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_error::BuckErrorContext;
 use compact_str::CompactString;
 use dupe::Dupe;
 use once_cell::sync::Lazy;
@@ -59,6 +59,7 @@ impl FsIoProvider {
 }
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum ReadSymlinkAtExactPathError {
     #[error("The path does not exist")]
     DoesNotExist,
@@ -74,7 +75,7 @@ impl FsIoProvider {
         &self,
         path: ProjectRelativePathBuf,
         options: ReadUncheckedOptions,
-    ) -> anyhow::Result<RawPathMetadata<ProjectRelativePathBuf>> {
+    ) -> buck2_error::Result<RawPathMetadata<ProjectRelativePathBuf>> {
         let fs = self.fs.dupe();
         let path = path.into_forward_relative_path_buf();
         let file_digest_config = FileDigestConfig::source(self.cas_digest_config);
@@ -89,7 +90,8 @@ impl FsIoProvider {
 }
 
 #[derive(Debug, buck2_error::Error)]
-enum ReadDirError {
+#[buck2(tag = Input)]
+enum FsIoError {
     #[error("File name `{0:?}` is not UTF-8")]
     NotUtf8(OsString),
 }
@@ -99,10 +101,10 @@ enum ReadDirError {
 /// edenfs, for example).
 #[async_trait]
 impl IoProvider for FsIoProvider {
-    async fn read_file_if_exists(
+    async fn read_file_if_exists_impl(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> buck2_error::Result<Option<String>> {
         let path = self.fs.resolve(&path);
 
         // Don't want to totally saturate the executor with these so that some other work can progress.
@@ -111,10 +113,15 @@ impl IoProvider for FsIoProvider {
         static SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(100));
         let _permit = SEMAPHORE.acquire().await.unwrap();
 
-        tokio::task::spawn_blocking(move || fs_util::read_to_string_if_exists(path)).await?
+        tokio::task::spawn_blocking(move || fs_util::read_to_string_if_exists(path))
+            .await?
+            .map_err(|e| IoError::categorize_for_source_file(e).into())
     }
 
-    async fn read_dir(&self, path: ProjectRelativePathBuf) -> anyhow::Result<Vec<RawDirEntry>> {
+    async fn read_dir_impl(
+        &self,
+        path: ProjectRelativePathBuf,
+    ) -> buck2_error::Result<Vec<RawDirEntry>> {
         // Don't want to totally saturate the executor with these so that some other work can progress.
         // For normal fs (or warm eden), something smaller would probably be fine, for eden couple hundred is probably
         // good (current plan in that impl is to allow multiple batches of 128 dirs at a time).
@@ -124,32 +131,33 @@ impl IoProvider for FsIoProvider {
         let path = self.fs.resolve(&path);
 
         tokio::task::spawn_blocking(move || {
-            let dir_entries = fs_util::read_dir(path)?;
+            let dir_entries =
+                fs_util::read_dir(path).map_err(IoError::categorize_for_source_file)?;
 
             let mut entries = Vec::new();
 
             for entry in dir_entries {
-                let e = entry.context("Error accessing directory entry")?;
+                let e = entry.buck_error_context("Error accessing directory entry")?;
                 let file_name = e.file_name();
                 let file_name = file_name
                     .to_str()
-                    .ok_or_else(|| ReadDirError::NotUtf8(file_name.clone()))?;
+                    .ok_or_else(|| FsIoError::NotUtf8(file_name.clone()))?;
                 entries.push(RawDirEntry {
                     file_type: e.file_type()?.into(),
                     file_name: CompactString::from(file_name),
                 });
             }
 
-            anyhow::Ok(entries)
+            buck2_error::Ok(entries)
         })
         .await?
-        .context("Error listing directory")
+        .buck_error_context("Error listing directory")
     }
 
-    async fn read_path_metadata_if_exists(
+    async fn read_path_metadata_if_exists_impl(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
+    ) -> buck2_error::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
         let fs = self.fs.dupe();
         let path = path.into_forward_relative_path_buf();
         let file_digest_config = FileDigestConfig::source(self.cas_digest_config);
@@ -164,7 +172,7 @@ impl IoProvider for FsIoProvider {
         .await?
     }
 
-    async fn settle(&self) -> anyhow::Result<()> {
+    async fn settle(&self) -> buck2_error::Result<()> {
         Ok(())
     }
 
@@ -172,7 +180,7 @@ impl IoProvider for FsIoProvider {
         "fs"
     }
 
-    async fn eden_version(&self) -> anyhow::Result<Option<String>> {
+    async fn eden_version(&self) -> buck2_error::Result<Option<String>> {
         Ok(None)
     }
 
@@ -202,7 +210,7 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
     root: P,
     relpath: &ForwardRelativePath,
     file_digest_config: FileDigestConfig,
-) -> anyhow::Result<Option<RawPathMetadata<ForwardRelativePathBuf>>> {
+) -> buck2_error::Result<Option<RawPathMetadata<ForwardRelativePathBuf>>> {
     let root = root.as_ref();
 
     let mut relpath_components = relpath.iter();
@@ -230,9 +238,8 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
         match ExactPathMetadata::from_exact_path(&curr)? {
             ExactPathMetadata::DoesNotExist => return Ok(None),
             ExactPathMetadata::Symlink(symlink) => {
-                return Ok(Some(
-                    symlink.to_raw_path_metadata(curr, relpath_components.collect())?,
-                ));
+                let rest: ForwardRelativePathBuf = relpath_components.collect();
+                return Ok(Some(symlink.to_raw_path_metadata(curr, rest)?));
             }
             ExactPathMetadata::FileOrDirectory(path_meta) => {
                 meta = Some(path_meta);
@@ -241,7 +248,7 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
     }
 
     // If we get here that means we never hit a symlink. So, the metadata we have
-    let meta = meta.context("Attempted to access empty path")?;
+    let meta = meta.buck_error_context("Attempted to access empty path")?;
     let meta = convert_metadata(&curr, meta, file_digest_config)?;
 
     if cfg!(test) {
@@ -256,12 +263,14 @@ fn convert_metadata(
     path: &PathAndAbsPath,
     meta: std::fs::Metadata,
     file_digest_config: FileDigestConfig,
-) -> anyhow::Result<RawPathMetadata<ForwardRelativePathBuf>> {
+) -> buck2_error::Result<RawPathMetadata<ForwardRelativePathBuf>> {
     let meta = if meta.is_dir() {
         RawPathMetadata::Directory
     } else {
         let digest = FileDigest::from_file(&path.abspath, file_digest_config)
-            .with_context(|| format!("Error collecting file digest for `{}`", path.path))?;
+            .with_buck_error_context(|| {
+                format!("Error collecting file digest for `{}`", path.path)
+            })?;
         let digest = TrackedFileDigest::new(digest, file_digest_config.as_cas_digest_config());
         RawPathMetadata::File(FileMetadata {
             digest,
@@ -279,32 +288,37 @@ enum ExactPathMetadata {
 }
 
 impl ExactPathMetadata {
-    fn from_exact_path(curr: &PathAndAbsPath) -> anyhow::Result<Self> {
-        Ok(match fs_util::symlink_metadata_if_exists(&curr.abspath)? {
-            Some(meta) if meta.file_type().is_symlink() => {
-                let dest = fs_util::read_link(&curr.abspath)?;
+    fn from_exact_path(curr: &PathAndAbsPath) -> buck2_error::Result<Self> {
+        Ok(
+            match fs_util::symlink_metadata_if_exists(&curr.abspath)
+                .map_err(IoError::categorize_for_source_file)?
+            {
+                Some(meta) if meta.file_type().is_symlink() => {
+                    let dest = fs_util::read_link(&curr.abspath)
+                        .map_err(IoError::categorize_for_source_file)?;
 
-                let out = if dest.is_absolute() {
-                    ExactPathSymlinkMetadata::ExternalSymlink(dest)
-                } else {
-                    // Remove the symlink name.
-                    let link_path = curr
-                        .path
-                        .parent()
-                        .expect("We pushed a component to this so it cannot be empty")
-                        .join_system(&dest)
-                        .with_context(|| {
-                            format!("Invalid symlink at `{}`: `{}`", curr.path, dest.display())
-                        })?;
+                    let out = if dest.is_absolute() {
+                        ExactPathSymlinkMetadata::ExternalSymlink(dest)
+                    } else {
+                        // Remove the symlink name.
+                        let link_path = curr
+                            .path
+                            .parent()
+                            .expect("We pushed a component to this so it cannot be empty")
+                            .join_system(&dest)
+                            .with_buck_error_context(|| {
+                                format!("Invalid symlink at `{}`: `{}`", curr.path, dest.display())
+                            })?;
 
-                    ExactPathSymlinkMetadata::InternalSymlink(link_path)
-                };
+                        ExactPathSymlinkMetadata::InternalSymlink(link_path)
+                    };
 
-                ExactPathMetadata::Symlink(out)
-            }
-            Some(meta) => ExactPathMetadata::FileOrDirectory(meta),
-            None => ExactPathMetadata::DoesNotExist,
-        })
+                    ExactPathMetadata::Symlink(out)
+                }
+                Some(meta) => ExactPathMetadata::FileOrDirectory(meta),
+                None => ExactPathMetadata::DoesNotExist,
+            },
+        )
     }
 }
 
@@ -317,17 +331,15 @@ impl ExactPathSymlinkMetadata {
     fn to_raw_path_metadata(
         self,
         curr: PathAndAbsPath,
-        rest: Option<ForwardRelativePathBuf>,
-    ) -> anyhow::Result<RawPathMetadata<ForwardRelativePathBuf>> {
+        rest: ForwardRelativePathBuf,
+    ) -> buck2_error::Result<RawPathMetadata<ForwardRelativePathBuf>> {
         Ok(match self {
             Self::ExternalSymlink(link_path) => RawPathMetadata::Symlink {
                 at: curr.path,
                 to: RawSymlink::External(Arc::new(ExternalSymlink::new(link_path, rest)?)),
             },
             Self::InternalSymlink(mut link_path) => {
-                if let Some(rest) = rest {
-                    link_path.push(&rest);
-                }
+                link_path.push(&rest);
                 RawPathMetadata::Symlink {
                     at: curr.path,
                     to: RawSymlink::Relative(link_path),
@@ -350,7 +362,7 @@ fn read_unchecked<P: AsRef<AbsPath>>(
     relpath: ForwardRelativePathBuf,
     file_digest_config: FileDigestConfig,
     options: ReadUncheckedOptions,
-) -> anyhow::Result<RawPathMetadata<ForwardRelativePathBuf>> {
+) -> buck2_error::Result<RawPathMetadata<ForwardRelativePathBuf>> {
     let abspath = root.as_ref().join(relpath.as_path());
 
     let curr = PathAndAbsPath {
@@ -364,12 +376,14 @@ fn read_unchecked<P: AsRef<AbsPath>>(
             ReadUncheckedOptions::Symlink => Err(ReadSymlinkAtExactPathError::NotASymlink.into()),
             ReadUncheckedOptions::Anything => convert_metadata(&curr, meta, file_digest_config),
         },
-        ExactPathMetadata::Symlink(link) => link.to_raw_path_metadata(curr, None),
+        ExactPathMetadata::Symlink(link) => {
+            link.to_raw_path_metadata(curr, ForwardRelativePathBuf::default())
+        }
     }
 }
 
 #[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
+pub fn is_executable(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     // We check 0o111 (user,group,other) instead of 0o100 (user) because even if the user
     // doesn't have permission, if ANYONE does we assume the file is an executable
@@ -377,7 +391,7 @@ fn is_executable(meta: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
+pub fn is_executable(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -386,13 +400,12 @@ mod tests {
     use std::os::unix;
 
     use assert_matches::assert_matches;
-    use buck2_core::fs::paths::abs_path::AbsPath;
     use tempfile::TempDir;
 
     use super::*;
 
     #[test]
-    fn test_read_not_symlink() -> anyhow::Result<()> {
+    fn test_read_not_symlink() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
         let root = AbsPath::new(t.path())?;
 
@@ -411,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_symlink() -> anyhow::Result<()> {
+    fn test_read_symlink() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
 
         unix::fs::symlink("y/z", t.path().join("x"))?;
@@ -427,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_symlink_in_dir() -> anyhow::Result<()> {
+    fn test_read_symlink_in_dir() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
         let t = AbsPath::new(t.path())?;
 
@@ -445,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_symlink_remaining_path() -> anyhow::Result<()> {
+    fn test_read_symlink_remaining_path() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
 
         unix::fs::symlink("y", t.path().join("x"))?;
@@ -461,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_symlink_out_of_project() -> anyhow::Result<()> {
+    fn test_read_symlink_out_of_project() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
 
         unix::fs::symlink("../y", t.path().join("x"))?;
@@ -475,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_unchecked_symlink() -> anyhow::Result<()> {
+    fn test_read_unchecked_symlink() -> buck2_error::Result<()> {
         let t = TempDir::new()?;
         let root = AbsPath::new(t.path())?;
         let digest_config = FileDigestConfig::source(CasDigestConfig::testing_default());

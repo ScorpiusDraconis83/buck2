@@ -7,21 +7,24 @@
  * of this source tree.
  */
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_cli_proto::protobuf_util::ProtobufSplitter;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::ui::ConsoleType;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
-use buck2_client_ctx::common::ConsoleType;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::events_ctx::PartialResultCtx;
 use buck2_client_ctx::events_ctx::PartialResultHandler;
 use buck2_client_ctx::exit_result::ExitCode;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::stream_util::reborrow_stream_for_static;
 use buck2_client_ctx::streaming::StreamingCommand;
+use buck2_error::BuckErrorContext;
 use buck2_subscription_proto::SubscriptionRequest;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -45,12 +48,6 @@ use tokio_util::codec::FramedRead;
 #[derive(Debug, clap::Parser)]
 #[clap(about = "Subscribe to updates from the Buck2 daemon")]
 pub struct SubscribeCommand {
-    #[clap(flatten)]
-    config_opts: CommonBuildConfigurationOptions,
-
-    #[clap(flatten)]
-    event_log_opts: CommonDaemonCommandOptions,
-
     /// Whether to request command snapshots.
     #[clap(long)]
     active_commands: bool,
@@ -59,6 +56,15 @@ pub struct SubscribeCommand {
     /// used for debugging.
     #[clap(long)]
     unstable_json: bool,
+
+    #[clap(flatten)]
+    config_opts: CommonBuildConfigurationOptions,
+
+    #[clap(flatten)]
+    starlark_opts: CommonStarlarkOptions,
+
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
 }
 
 #[async_trait]
@@ -68,8 +74,9 @@ impl StreamingCommand for SubscribeCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let client_context = ctx.client_context(matches, &self)?;
 
@@ -77,7 +84,7 @@ impl StreamingCommand for SubscribeCommand {
             .and_then(|bytes| {
                 futures::future::ready(
                     SubscriptionRequest::decode_length_delimited(bytes)
-                        .context("Error decoding SubscriptionRequest"),
+                        .buck_error_context("Error decoding SubscriptionRequest"),
                 )
             })
             .map(|res| match res {
@@ -123,7 +130,7 @@ impl StreamingCommand for SubscribeCommand {
                 |stream| async move {
                     buckd
                         .with_flushing()
-                        .subscription(client_context, stream, partial_result_handler)
+                        .subscription(client_context, stream, events_ctx, partial_result_handler)
                         .await
                 },
                 || {
@@ -163,12 +170,16 @@ impl StreamingCommand for SubscribeCommand {
         &SIMPLE_CONSOLE
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.starlark_opts
     }
 
     fn should_expect_spans(&self) -> bool {
@@ -191,12 +202,12 @@ impl PartialResultHandler for SubscriptionPartialResultHandler {
 
     async fn handle_partial_result(
         &mut self,
-        mut ctx: PartialResultCtx<'_, '_>,
+        mut ctx: PartialResultCtx<'_>,
         partial_res: Self::PartialResult,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let response = partial_res
             .response
-            .context("Empty `SubscriptionResponseWrapper`")?;
+            .buck_error_context("Empty `SubscriptionResponseWrapper`")?;
 
         if let Some(buck2_subscription_proto::subscription_response::Response::Goodbye(goodbye)) =
             &response.response
@@ -207,12 +218,13 @@ impl PartialResultHandler for SubscriptionPartialResultHandler {
         self.buffer.clear();
 
         if self.json {
-            serde_json::to_writer(&mut self.buffer, &response).context("JSON encoding failed")?;
+            serde_json::to_writer(&mut self.buffer, &response)
+                .buck_error_context("JSON encoding failed")?;
             self.buffer.push(b'\n');
         } else {
             response
                 .encode_length_delimited(&mut self.buffer)
-                .context("Encoding failed")?;
+                .buck_error_context("Encoding failed")?;
         }
 
         ctx.stdout(&self.buffer).await

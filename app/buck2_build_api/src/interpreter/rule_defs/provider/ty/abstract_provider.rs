@@ -10,6 +10,7 @@
 use std::sync::OnceLock;
 
 use allocative::Allocative;
+use buck2_interpreter::late_binding_ty::ProviderReprLate;
 use dupe::Dupe;
 use starlark::typing::Ty;
 use starlark::typing::TyStarlarkValue;
@@ -31,11 +32,11 @@ struct ProviderMatcher;
 
 impl TypeMatcher for ProviderMatcher {
     fn matches(&self, value: Value) -> bool {
-        value.as_provider().is_some()
+        ValueAsProviderLike::unpack(value).is_some()
     }
 }
 
-fn mk_ty_provider() -> anyhow::Result<Ty> {
+fn mk_ty_provider() -> buck2_error::Result<Ty> {
     Ok(Ty::custom(TyUser::new(
         UserProvider::TYPE.to_owned(),
         // Builtin providers behave like `UserProvider`.
@@ -50,11 +51,17 @@ fn mk_ty_provider() -> anyhow::Result<Ty> {
 }
 
 /// Type of any provider instance. In Starlark it is available as `Provider`.
-pub(crate) struct AbstractProvider;
+pub struct AbstractProvider;
 
 impl StarlarkTypeRepr for AbstractProvider {
+    type Canonical = Self;
+
     fn starlark_type_repr() -> Ty {
         static TY: OnceLock<Ty> = OnceLock::new();
         TY.get_or_init(|| mk_ty_provider().unwrap()).dupe()
     }
+}
+
+pub(crate) fn init_provider_ty() {
+    ProviderReprLate::init(AbstractProvider::starlark_type_repr())
 }

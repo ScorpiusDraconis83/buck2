@@ -21,44 +21,34 @@
 //!    ...
 //! }
 //! ```
-use std::path::Path;
-use std::str::FromStr;
 
-use buck2_cli_proto::common_build_options::ExecutionStrategy;
+pub mod build;
+pub mod target_cfg;
+pub mod timeout;
+pub mod ui;
+
+use std::path::Path;
+
 use buck2_cli_proto::config_override::ConfigType;
+use buck2_cli_proto::representative_config_flag::Source as RepresentativeConfigFlagSource;
 use buck2_cli_proto::ConfigOverride;
-use buck2_core::fs::fs_util;
-use clap::ArgGroup;
+use buck2_cli_proto::RepresentativeConfigFlag;
+use buck2_common::argv::ArgFileKind;
+use buck2_common::argv::ArgFilePath;
+use buck2_common::argv::ExpandedArgSource;
+use buck2_common::argv::ExpandedArgv;
+use buck2_common::argv::FlagfileArgSource;
+use buck2_core::fs::paths::abs_path::AbsPath;
+use buck2_core::fs::working_dir::AbsWorkingDir;
 use dupe::Dupe;
 use gazebo::prelude::*;
-use termwiz::istty::IsTty;
-use tracing::warn;
 
-use crate::final_console::FinalConsole;
+use crate::common::ui::CommonConsoleOptions;
+use crate::immediate_config::ImmediateConfigContext;
 use crate::path_arg::PathArg;
-use crate::subscribers::superconsole::SuperConsoleConfig;
 
-pub const EVENT_LOG: &str = "--event-log";
-pub const NO_EVENT_LOG: &str = "--no-event-log";
-
-#[derive(
-    Debug,
-    serde::Serialize,
-    serde::Deserialize,
-    Clone,
-    Dupe,
-    Copy,
-    clap::ArgEnum
-)]
-#[clap(rename_all = "lower")]
-pub enum ConsoleType {
-    Simple,
-    SimpleNoTty,
-    SimpleTty,
-    Super,
-    Auto,
-    None,
-}
+pub const EVENT_LOG: &str = "event-log";
+pub const NO_EVENT_LOG: &str = "no-event-log";
 
 #[derive(
     Debug,
@@ -67,26 +57,7 @@ pub enum ConsoleType {
     Clone,
     Dupe,
     Copy,
-    clap::ArgEnum
-)]
-#[clap(rename_all = "lower")]
-pub enum UiOptions {
-    Dice,
-    DebugEvents,
-    /// I/O panel.
-    Io,
-    /// RE panel.
-    Re,
-}
-
-#[derive(
-    Debug,
-    serde::Serialize,
-    serde::Deserialize,
-    Clone,
-    Dupe,
-    Copy,
-    clap::ArgEnum
+    clap::ValueEnum
 )]
 #[clap(rename_all = "lower")]
 pub enum HostPlatformOverride {
@@ -103,7 +74,31 @@ pub enum HostPlatformOverride {
     Clone,
     Dupe,
     Copy,
-    clap::ArgEnum
+    clap::ValueEnum,
+    Default
+)]
+#[clap(rename_all = "lower")]
+pub enum PreemptibleWhen {
+    /// (default) When another command starts that cannot run in parallel with this one, block that command.
+    #[default]
+    Never, // Read; "If I am Never, then never preempt me" (the default)
+    /// When another command starts, interrupt this command, *even if they could run in
+    /// parallel*. There is no good reason to use this other than that it provides slightly nicer
+    /// superconsole output.
+    Always,
+    /// When another command starts that cannot run in parallel with this one,
+    /// interrupt this command.
+    OnDifferentState, // Read; "if a command comes in, preempt me on different state"
+}
+
+#[derive(
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Dupe,
+    Copy,
+    clap::ValueEnum
 )]
 #[clap(rename_all = "lower")]
 pub enum HostArchOverride {
@@ -114,13 +109,14 @@ pub enum HostArchOverride {
 
 /// Defines options related to commands that involves a streaming daemon command.
 #[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize, Default)]
-pub struct CommonDaemonCommandOptions {
+#[clap(next_help_heading = "Event Log Options")]
+pub struct CommonEventLogOptions {
     /// Write events to this log file
     #[clap(value_name = "PATH", long = EVENT_LOG)]
     pub event_log: Option<PathArg>,
 
     /// Do not write any event logs. Overrides --event-log. Used from `replay` to avoid recursive logging
-    #[clap(long = NO_EVENT_LOG, hidden = true)]
+    #[clap(long = NO_EVENT_LOG, hide = true)]
     pub no_event_log: bool,
 
     /// Write command invocation id into this file.
@@ -131,22 +127,30 @@ pub struct CommonDaemonCommandOptions {
     /// regarding the stability of the format.
     #[clap(long, value_name = "PATH")]
     pub(crate) unstable_write_invocation_record: Option<PathArg>,
+
+    /// Write the command report to this path. A command report is always
+    /// written to `buck-out/v2/<uuid>/command_report` even without this flag.
+    #[clap(long, value_name = "PATH")]
+    pub(crate) command_report_path: Option<PathArg>,
 }
 
-impl CommonDaemonCommandOptions {
+impl CommonEventLogOptions {
     pub fn default_ref() -> &'static Self {
-        static DEFAULT: CommonDaemonCommandOptions = CommonDaemonCommandOptions {
+        static DEFAULT: CommonEventLogOptions = CommonEventLogOptions {
             event_log: None,
             no_event_log: false,
             write_build_id: None,
+            command_report_path: None,
             unstable_write_invocation_record: None,
         };
         &DEFAULT
     }
 }
 
-/// Defines options for config and configuration related things. Any command that involves the build graph should include these options.
+/// Defines options for config and configuration related things. Any command that involves the build
+/// graph should include these options.
 #[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize, Default)]
+#[clap(next_help_heading = "Buckconfig Options")]
 pub struct CommonBuildConfigurationOptions {
     #[clap(
         value_name = "SECTION.OPTION=VALUE",
@@ -155,7 +159,7 @@ pub struct CommonBuildConfigurationOptions {
         help = "List of config options",
         // Needs to be explicitly set, otherwise will treat `-c a b c` -> [a, b, c]
         // rather than [a] and other positional arguments `b c`.
-        number_of_values = 1
+        num_args = 1
     )]
     pub config_values: Vec<String>,
 
@@ -163,66 +167,19 @@ pub struct CommonBuildConfigurationOptions {
         value_name = "PATH",
         long = "config-file",
         help = "List of config file paths",
-        number_of_values = 1
+        num_args = 1
     )]
     pub config_files: Vec<String>,
 
-    #[clap(
-        long = "target-platforms",
-        help = "Configuration target (one) to use to configure targets",
-        number_of_values = 1,
-        value_name = "PLATFORM"
-    )]
-    pub target_platforms: Option<String>,
+    #[clap(long, ignore_case = true, value_name = "HOST", value_enum)]
+    pub fake_host: Option<HostPlatformOverride>,
 
-    #[clap(
-        value_name = "VALUE",
-        long = "modifier",
-        use_value_delimiter = true,
-        value_delimiter=',',
-        short = 'm',
-        help = "A configuration modifier to configure all targets on the command line. This may be a constraint value target.",
-        // Needs to be explicitly set, otherwise will treat `-c a b c` -> [a, b, c]
-        // rather than [a] and other positional arguments `b c`.
-        number_of_values = 1
-    )]
-    pub cli_modifiers: Vec<String>,
-
-    #[clap(long, ignore_case = true, value_name = "HOST", arg_enum)]
-    fake_host: Option<HostPlatformOverride>,
-
-    #[clap(long, ignore_case = true, value_name = "ARCH", arg_enum)]
-    fake_arch: Option<HostArchOverride>,
+    #[clap(long, ignore_case = true, value_name = "ARCH", value_enum)]
+    pub fake_arch: Option<HostArchOverride>,
 
     /// Value must be formatted as: version-build (e.g., 14.3.0-14C18 or 14.1-14B47b)
     #[clap(long, value_name = "VERSION-BUILD")]
-    fake_xcode_version: Option<String>,
-
-    /// Disable runtime type checking in Starlark interpreter.
-    ///
-    /// This option is not stable, and can be used only locally
-    /// to diagnose evaluation performance problems.
-    #[clap(long)]
-    pub disable_starlark_types: bool,
-
-    /// Typecheck bzl and bxl files during evaluation.
-    #[clap(long, hidden(true))]
-    pub unstable_typecheck: bool,
-
-    /// Record or show target call stacks.
-    ///
-    /// Starlark call stacks will be included in duplicate targets error.
-    ///
-    /// If a command outputs targets (like `targets` command),
-    /// starlark call stacks will be printed after the targets.
-    #[clap(long = "stack")]
-    pub target_call_stacks: bool,
-
-    /// If there are targets with duplicate names in `BUCK` file,
-    /// skip all the duplicates but the first one.
-    /// This is a hack for TD. Do not use this option.
-    #[clap(long)]
-    pub(crate) skip_targets_with_duplicate_names: bool,
+    pub fake_xcode_version: Option<String>,
 
     /// Re-uses any `--config` values (inline or via modefiles) if there's
     /// a previous command, otherwise the flag is ignored.
@@ -238,6 +195,16 @@ pub struct CommonBuildConfigurationOptions {
     /// Used for exiting a concurrent command when a different state is detected.
     #[clap(long)]
     pub exit_when_different_state: bool,
+
+    /// Used to configure when this command could be preempted by another command for the same isolation dir.
+    ///
+    /// Normally, when you run two commands - from different terminals, say - buck2 will attempt
+    /// to run them in parallel. However, if the two commands are based on different state, that
+    /// is they either have different configs or different filesystem states, buck2 cannot run them
+    /// in parallel. The default behavior in this case is to block the second command until the
+    /// first completes.
+    #[clap(long, ignore_case = true, value_enum)]
+    pub preemptible: Option<PreemptibleWhen>,
 }
 
 impl CommonBuildConfigurationOptions {
@@ -247,14 +214,16 @@ impl CommonBuildConfigurationOptions {
     /// hence they're merged into a single list.
     pub fn config_overrides(
         &self,
-        matches: &clap::ArgMatches,
-    ) -> anyhow::Result<Vec<ConfigOverride>> {
+        matches: BuckArgMatches<'_>,
+        immediate_ctx: &ImmediateConfigContext<'_>,
+        cwd: &AbsWorkingDir,
+    ) -> buck2_error::Result<Vec<ConfigOverride>> {
         fn with_indices<'a, T>(
             collection: &'a [T],
             name: &str,
-            matches: &'a clap::ArgMatches,
+            matches: BuckArgMatches<'a>,
         ) -> impl Iterator<Item = (usize, &'a T)> + 'a {
-            let indices = matches.indices_of(name);
+            let indices = matches.inner.indices_of(name);
             let indices = indices.unwrap_or_default();
             assert_eq!(
                 indices.len(),
@@ -265,47 +234,57 @@ impl CommonBuildConfigurationOptions {
             indices.into_iter().zip(collection)
         }
 
-        // Relative paths passed on the command line are relative to the cwd
-        // of the client, not the daemon, so perform path canonicalisation here.
-        fn resolve_config_file_argument(arg: &str) -> anyhow::Result<String> {
-            if arg.contains("//") {
-                // Cell-relative path resolution would be performed by the daemon
-                return Ok(arg.to_owned());
-            }
+        let config_values_args = with_indices(&self.config_values, "config_values", matches)
+            .map(|(index, config_value)| {
+                let (cell, raw_arg) = match config_value.split_once("//") {
+                    Some((cell, val)) if !cell.contains('=') => {
+                        let cell = immediate_ctx
+                            .resolve_alias_to_path_in_cwd(cell)?
+                            .to_string();
+                        (Some(cell), val)
+                    }
+                    _ => (None, config_value.as_str()),
+                };
 
-            let path = Path::new(arg);
-            if path.is_absolute() {
-                return Ok(arg.to_owned());
-            }
-
-            let abs_path = fs_util::canonicalize(path)?;
-            Ok(abs_path.to_string_lossy().into_owned())
-        }
-
-        let config_values_args = with_indices(&self.config_values, "config-values", matches).map(
-            |(index, config_value)| {
-                (
+                buck2_error::Ok((
                     index,
                     ConfigOverride {
-                        config_override: config_value.clone(),
+                        cell,
+                        config_override: raw_arg.to_owned(),
                         config_type: ConfigType::Value as i32,
                     },
-                )
-            },
-        );
+                ))
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
 
-        let config_file_args = with_indices(&self.config_files, "config-files", matches)
-            .map(|(index, unresolved_file)| {
-                let resolved_file = resolve_config_file_argument(unresolved_file)?;
+        let config_file_args = with_indices(&self.config_files, "config_files", matches)
+            .map(|(index, file)| {
+                let (cell, path) = match file.split_once("//") {
+                    Some((cell, val)) => {
+                        // This should also reject =?
+                        let cell = immediate_ctx
+                            .resolve_alias_to_path_in_cwd(cell)?
+                            .to_string();
+                        (Some(cell), val.to_owned())
+                    }
+                    None => {
+                        let abs_path = match AbsPath::new(file) {
+                            Ok(p) => p.to_owned(),
+                            Err(_) => cwd.resolve(Path::new(file)),
+                        };
+                        (None, abs_path.to_string())
+                    }
+                };
                 Ok((
                     index,
                     ConfigOverride {
-                        config_override: resolved_file,
+                        cell,
+                        config_override: path,
                         config_type: ConfigType::File as i32,
                     },
                 ))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<buck2_error::Result<Vec<_>>>()?;
 
         let mut ordered_merged_configs: Vec<(usize, ConfigOverride)> = config_file_args;
         ordered_merged_configs.extend(config_values_args);
@@ -334,313 +313,70 @@ impl CommonBuildConfigurationOptions {
         static DEFAULT: CommonBuildConfigurationOptions = CommonBuildConfigurationOptions {
             config_values: vec![],
             config_files: vec![],
-            cli_modifiers: vec![],
-            target_platforms: None,
             fake_host: None,
             fake_arch: None,
             fake_xcode_version: None,
+            reuse_current_config: false,
+            exit_when_different_state: false,
+            preemptible: Some(PreemptibleWhen::Never),
+        };
+        &DEFAULT
+    }
+
+    pub fn reuse_current_config_ref() -> &'static Self {
+        static OPTS: CommonBuildConfigurationOptions = CommonBuildConfigurationOptions {
+            config_values: vec![],
+            config_files: vec![],
+            fake_host: None,
+            fake_arch: None,
+            fake_xcode_version: None,
+            reuse_current_config: true,
+            exit_when_different_state: false,
+            preemptible: Some(PreemptibleWhen::Never),
+        };
+        &OPTS
+    }
+}
+
+#[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize, Default)]
+#[clap(next_help_heading = "Starlark Options")]
+pub struct CommonStarlarkOptions {
+    /// Disable runtime type checking in Starlark interpreter.
+    ///
+    /// This option is not stable, and can be used only locally
+    /// to diagnose evaluation performance problems.
+    #[clap(long)]
+    pub disable_starlark_types: bool,
+
+    /// Typecheck bzl and bxl files during evaluation.
+    #[clap(long, hide = true)]
+    pub unstable_typecheck: bool,
+
+    /// Record or show target call stacks.
+    ///
+    /// Starlark call stacks will be included in duplicate targets error.
+    ///
+    /// If a command outputs targets (like `targets` command),
+    /// starlark call stacks will be printed after the targets.
+    #[clap(long = "stack")]
+    pub target_call_stacks: bool,
+
+    /// If there are targets with duplicate names in `BUCK` file,
+    /// skip all the duplicates but the first one.
+    /// This is a hack for TD. Do not use this option.
+    #[clap(long, hide = true)]
+    pub(crate) skip_targets_with_duplicate_names: bool,
+}
+
+impl CommonStarlarkOptions {
+    pub fn default_ref() -> &'static Self {
+        static DEFAULT: CommonStarlarkOptions = CommonStarlarkOptions {
             disable_starlark_types: false,
             unstable_typecheck: false,
             target_call_stacks: false,
             skip_targets_with_duplicate_names: false,
-            reuse_current_config: false,
-            exit_when_different_state: false,
         };
         &DEFAULT
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct BuildReportOption {
-    /// Fill out the failures in build report as it was done by default in buck1.
-    fill_out_failures: bool,
-}
-
-impl FromStr for BuildReportOption {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut fill_out_failures = false;
-        if s.to_lowercase() == "fill-out-failures" {
-            fill_out_failures = true;
-        } else {
-            warn!(
-                "Incorrect syntax for build report option. Got: `{}` but expected `fill-out-failures`",
-                s.to_owned()
-            )
-        }
-        Ok(BuildReportOption { fill_out_failures })
-    }
-}
-
-/// Defines common options for build-like commands (build, test, install).
-#[allow(rustdoc::invalid_html_tags)]
-#[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize)]
-pub struct CommonBuildOptions {
-    /// Print a build report
-    ///
-    /// --build-report=- will print the build report to stdout
-    /// --build-report=<filepath> will write the build report to the file
-    #[clap(long = "build-report", value_name = "PATH")]
-    build_report: Option<String>,
-
-    #[clap(
-        long = "build-report-options",
-        requires = "build-report",
-        value_delimiter = ',',
-        help = "Comma separated list of build report options (currently only supports a single option: fill-out-failures)."
-    )]
-    build_report_options: Vec<BuildReportOption>,
-
-    /// Deprecated. Use --build-report=-
-    // TODO(cjhopman): this is probably only used by the e2e framework. remove it from there
-    #[clap(long = "print-build-report", hidden = true)]
-    print_build_report: bool,
-
-    /// Number of threads to use during execution (default is # cores)
-    // TODO(cjhopman): This only limits the threads used for action execution and it doesn't work correctly with concurrent commands.
-    #[clap(short = 'j', long = "num-threads", value_name = "THREADS")]
-    pub num_threads: Option<u32>,
-
-    /// Enable only local execution. Will reject actions that cannot execute locally.
-    #[clap(long, group = "build_strategy", env = "BUCK_OFFLINE_BUILD")]
-    local_only: bool,
-
-    /// Enable only remote execution. Will reject actions that cannot execute remotely.
-    #[clap(long, group = "build_strategy")]
-    remote_only: bool,
-
-    /// Enable hybrid execution. Will prefer executing actions that can execute locally on the
-    /// local host.
-    #[clap(long, group = "build_strategy")]
-    prefer_local: bool,
-
-    /// Enable hybrid execution. Will prefer executing actions that can execute remotely on RE and will avoid racing local and remote execution.
-    #[clap(long, group = "build_strategy")]
-    prefer_remote: bool,
-
-    /// Experimental: Disable all execution.
-    #[clap(long, group = "build_strategy")]
-    unstable_no_execution: bool,
-
-    /// Do not perform remote cache queries or cache writes. If remote execution is enabled, the RE
-    /// service might still deduplicate actions, so for e.g. benchmarking, using a random isolation
-    /// dir is preferred.
-    #[clap(long, env = "BUCK_OFFLINE_BUILD")]
-    no_remote_cache: bool,
-
-    /// Could be used to enable the action cache writes on the RE worker when no_remote_cache is specified
-    #[clap(long, requires("no-remote-cache"))]
-    write_to_cache_anyway: bool,
-
-    /// Process dep files when they are generated (i.e. after running a command that produces dep
-    /// files), rather than when they are used (i.e. before re-running a command that previously
-    /// produced dep files). Use this when debugging commands that produce dep files. Note that
-    /// commands that previously produced dep files will not re-run: only dep files produced during
-    /// this command will be eagerly loaded.
-    #[clap(long)]
-    eager_dep_files: bool,
-
-    /// Uploads every action to the RE service, regardless of whether the action needs to execute on RE.
-    ///
-    /// This is useful when debugging builds and trying to inspect actions which executed remotely.
-    /// It's possible that the action result is cached but the action itself has expired. In this case,
-    /// downloading the action itself would fail. Enabling this option would unconditionally upload
-    /// all actions, thus you will not hit any expiration issues.
-    #[clap(long)]
-    upload_all_actions: bool,
-
-    /// If Buck hits an error, do as little work as possible before exiting.
-    ///
-    /// To illustrate the effect of this flag, consider an invocation of `build :foo :bar`. The
-    /// default behavior of buck is to do enough work to get a result for the builds of each of
-    /// `:foo` and `:bar`, and no more. This means that buck will continue to complete the build of
-    /// `:bar` after the build of `:foo` has failed; however, once one dependency of `:foo` has
-    /// failed, other dependencies will be cancelled unless they are needed by `:bar`.
-    ///
-    /// This flag changes the behavior of buck to not wait on `:bar` to complete once `:foo` has
-    /// failed. Generally, this flag only has an effect on builds that specify multiple targets.
-    ///
-    /// `--keep-going` changes the behavior of buck to not only wait on `:bar` once one dependency
-    /// of `:foo` has failed, but to additionally attempt to build other dependencies of `:foo` if
-    /// possible.
-    #[clap(long, group = "fail-when")]
-    fail_fast: bool,
-
-    /// If Buck hits an error, continue doing as much work as possible before exiting.
-    ///
-    /// See `--fail-fast` for more details.
-    #[clap(long, group = "fail-when")]
-    keep_going: bool,
-
-    /// If target is missing, then skip building instead of throwing error.
-    #[clap(long)]
-    skip_missing_targets: bool,
-
-    /// If target is incompatible with the specified configuration, skip building instead of throwing error.
-    /// This does not apply to targets specified with glob patterns `/...` or `:`
-    /// which are skipped unconditionally.
-    #[clap(long)]
-    skip_incompatible_targets: bool,
-
-    /// Materializes inputs for failed actions which ran on RE
-    #[clap(long)]
-    materialize_failed_inputs: bool,
-}
-
-impl CommonBuildOptions {
-    fn build_report(&self) -> (bool, String) {
-        match (self.print_build_report, &self.build_report) {
-            (false, None) => (false, "".to_owned()),
-            (_, Some(path)) if path != "-" => (true, path.to_owned()),
-            _ => (true, "".to_owned()),
-        }
-    }
-
-    pub fn to_proto(&self) -> buck2_cli_proto::CommonBuildOptions {
-        let (unstable_print_build_report, unstable_build_report_filename) = self.build_report();
-        let unstable_include_failures_build_report = self
-            .build_report_options
-            .iter()
-            .any(|option| option.fill_out_failures);
-        let concurrency = self
-            .num_threads
-            .map(|num| buck2_cli_proto::Concurrency { concurrency: num });
-
-        buck2_cli_proto::CommonBuildOptions {
-            concurrency,
-            execution_strategy: if self.local_only {
-                ExecutionStrategy::LocalOnly as i32
-            } else if self.remote_only {
-                ExecutionStrategy::RemoteOnly as i32
-            } else if self.prefer_local {
-                ExecutionStrategy::HybridPreferLocal as i32
-            } else if self.prefer_remote {
-                ExecutionStrategy::HybridPreferRemote as i32
-            } else if self.unstable_no_execution {
-                ExecutionStrategy::NoExecution as i32
-            } else {
-                ExecutionStrategy::Default as i32
-            },
-            unstable_print_build_report,
-            unstable_build_report_filename,
-            eager_dep_files: self.eager_dep_files,
-            upload_all_actions: self.upload_all_actions,
-            skip_cache_read: self.no_remote_cache,
-            skip_cache_write: self.no_remote_cache && !self.write_to_cache_anyway,
-            fail_fast: self.fail_fast,
-            keep_going: self.keep_going,
-            skip_missing_targets: self.skip_missing_targets,
-            skip_incompatible_targets: self.skip_incompatible_targets,
-            materialize_failed_inputs: self.materialize_failed_inputs,
-            unstable_include_failures_build_report,
-        }
-    }
-}
-
-/// Defines common console options for commands.
-#[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize)]
-pub struct CommonConsoleOptions {
-    #[clap(
-        long = "console",
-        help = "Which console to use for this command",
-        default_value = "auto",
-        ignore_case = true,
-        env = "BUCK_CONSOLE",
-        value_name = "super|simple|...",
-        arg_enum
-    )]
-    pub console_type: ConsoleType,
-
-    /// Configure additional superconsole ui components.
-    ///
-    /// Accepts a comma-separated list of superconsole components to add. Possible values are:
-    ///
-    ///   dice - shows information about evaluated dice nodes
-    ///   debugevents - shows information about the flow of events from buckd
-    ///
-    /// These components can be turned on/off interactively.
-    /// Press 'h' for help when superconsole is active.
-    #[clap(
-        long = "ui",
-        ignore_case = true,
-        multiple = true,
-        number_of_values = 1,
-        arg_enum
-    )]
-    pub ui: Vec<UiOptions>,
-
-    #[clap(
-        long,
-        help = "Disable console interactions",
-        env = "BUCK_NO_INTERACTIVE_CONSOLE"
-    )]
-    pub no_interactive_console: bool,
-}
-
-impl Default for CommonConsoleOptions {
-    fn default() -> Self {
-        Self {
-            console_type: ConsoleType::Auto,
-            ui: Vec::new(),
-            no_interactive_console: false,
-        }
-    }
-}
-
-impl CommonConsoleOptions {
-    pub fn default_ref() -> &'static Self {
-        static OPTS: CommonConsoleOptions = CommonConsoleOptions {
-            console_type: ConsoleType::Auto,
-            ui: vec![],
-            no_interactive_console: false,
-        };
-        &OPTS
-    }
-
-    pub fn simple_ref() -> &'static Self {
-        static OPTS: CommonConsoleOptions = CommonConsoleOptions {
-            console_type: ConsoleType::Simple,
-            ui: vec![],
-            no_interactive_console: false,
-        };
-        &OPTS
-    }
-
-    pub fn none_ref() -> &'static Self {
-        static OPTS: CommonConsoleOptions = CommonConsoleOptions {
-            console_type: ConsoleType::None,
-            ui: vec![],
-            no_interactive_console: false,
-        };
-        &OPTS
-    }
-
-    pub fn final_console(&self) -> FinalConsole {
-        let is_tty = match self.console_type {
-            ConsoleType::Auto | ConsoleType::Simple => std::io::stderr().is_tty(),
-            ConsoleType::Super => true,
-            ConsoleType::SimpleNoTty => false,
-            ConsoleType::SimpleTty => true,
-            ConsoleType::None => false,
-        };
-        if is_tty {
-            FinalConsole::new_with_tty()
-        } else {
-            FinalConsole::new_without_tty()
-        }
-    }
-
-    pub fn superconsole_config(&self) -> SuperConsoleConfig {
-        let mut config = SuperConsoleConfig::default();
-        for option in &self.ui {
-            match option {
-                UiOptions::Dice => config.enable_dice = true,
-                UiOptions::DebugEvents => config.enable_debug_events = true,
-                UiOptions::Io => config.enable_io = true,
-                UiOptions::Re => config.enable_detailed_re = true,
-            }
-        }
-        config
     }
 }
 
@@ -652,53 +388,17 @@ pub struct CommonCommandOptions {
     #[clap(flatten)]
     pub config_opts: CommonBuildConfigurationOptions,
 
+    /// Starlark options.
+    #[clap(flatten)]
+    pub starlark_opts: CommonStarlarkOptions,
+
     /// UI options.
     #[clap(flatten)]
     pub console_opts: CommonConsoleOptions,
 
     /// Event-log options.
     #[clap(flatten)]
-    pub event_log_opts: CommonDaemonCommandOptions,
-}
-
-/// Show-output options shared by `build` and `targets`.
-#[derive(Debug, clap::Parser)]
-#[clap(group(
-    // Make mutually exclusive. A command may have at most one of the flags in
-    // the following group.
-    ArgGroup::default().args(&[
-        "show-output",
-        "show-full-output",
-        "show-simple-output",
-        "show-full-simple-output",
-        "show-json-output",
-        "show-full-json-output",
-    ])
-))]
-pub struct CommonOutputOptions {
-    /// Print the path to the output for each of the rules relative to the project root
-    #[clap(long)]
-    pub show_output: bool,
-
-    /// Print the absolute path to the output for each of the rules
-    #[clap(long)]
-    pub show_full_output: bool,
-
-    /// Print only the path to the output for each of the rules relative to the project root
-    #[clap(long)]
-    pub show_simple_output: bool,
-
-    /// Print only the absolute path to the output for each of the rules
-    #[clap(long)]
-    pub show_full_simple_output: bool,
-
-    /// Print the output paths relative to the project root, in JSON format
-    #[clap(long)]
-    pub show_json_output: bool,
-
-    /// Print the output absolute paths, in JSON format
-    #[clap(long)]
-    pub show_full_json_output: bool,
+    pub event_log_opts: CommonEventLogOptions,
 }
 
 #[derive(Debug, PartialEq)]
@@ -708,85 +408,255 @@ pub enum PrintOutputsFormat {
     Json,
 }
 
-impl CommonOutputOptions {
-    pub fn format(&self) -> Option<PrintOutputsFormat> {
-        if self.show_output || self.show_full_output {
-            Some(PrintOutputsFormat::Plain)
-        } else if self.show_simple_output || self.show_full_simple_output {
-            Some(PrintOutputsFormat::Simple)
-        } else if self.show_json_output || self.show_full_json_output {
-            Some(PrintOutputsFormat::Json)
-        } else {
-            None
+#[derive(Clone, Copy)]
+pub struct BuckArgMatches<'a> {
+    inner: &'a clap::ArgMatches,
+    expanded_argv: &'a ExpandedArgv,
+}
+
+impl<'a> BuckArgMatches<'a> {
+    pub fn from_clap(inner: &'a clap::ArgMatches, expanded_argv: &'a ExpandedArgv) -> Self {
+        Self {
+            inner,
+            expanded_argv,
         }
     }
 
-    pub fn is_full(&self) -> bool {
-        self.show_full_output || self.show_full_simple_output || self.show_full_json_output
+    pub fn unwrap_subcommand(&self) -> Self {
+        match self.inner.subcommand().map(|s| s.1) {
+            Some(submatches) => Self {
+                inner: submatches,
+                expanded_argv: self.expanded_argv,
+            },
+            None => panic!("Parsed a subcommand but couldn't extract subcommand argument matches"),
+        }
+    }
+
+    /// A subset of the expanded argv containing config flags. When a config flag is from an argfile in the project,
+    /// it will be represented with the argfile rather than the raw config flag. This gives a compact, stable, and
+    /// recognizable form of the flags.
+    pub fn get_representative_config_flags(&self) -> buck2_error::Result<Vec<String>> {
+        self.get_representative_config_flags_by_source()
+            .map(|flags| {
+                flags
+                    .into_iter()
+                    .map(|flag| match flag.source {
+                        Some(RepresentativeConfigFlagSource::ConfigFlag(v)) => format!("-c {}", v),
+                        Some(RepresentativeConfigFlagSource::ConfigFile(v)) => {
+                            format!("--config-file {}", v)
+                        }
+                        Some(RepresentativeConfigFlagSource::ModeFile(v)) => v,
+                        None => unreachable!("impossible flag"),
+                    })
+                    .collect()
+            })
+    }
+
+    pub fn get_representative_config_flags_by_source(
+        &self,
+    ) -> buck2_error::Result<Vec<RepresentativeConfigFlag>> {
+        fn get_flagfile_for_logging<'a>(
+            flagfile: &'a FlagfileArgSource,
+        ) -> Option<&'a FlagfileArgSource> {
+            if let Some(parent) = &flagfile.parent {
+                if let Some(v) = get_flagfile_for_logging(parent) {
+                    return Some(v);
+                }
+            }
+            match &flagfile.kind {
+                ArgFileKind::Path(ArgFilePath::External(_))
+                | ArgFileKind::PythonExecutable(ArgFilePath::External(_), _)
+                | ArgFileKind::Stdin => None,
+                _ => Some(flagfile),
+            }
+        }
+        // FIXME: Ideally we'd be able to recover this from the clap ArgMatches, but that only
+        // tracks clap's index concept which doesn't map directly to argv index.
+        enum State {
+            None,
+            Matched(&'static str),
+        }
+        let mut state = State::None;
+        let config_args = self
+            .expanded_argv
+            .iter()
+            .filter_map(move |(value, source)| {
+                match state {
+                    State::None => match value {
+                        "-c" => {
+                            state = State::Matched("-c");
+                            None
+                        }
+                        "--config" => {
+                            state = State::Matched("-c");
+                            None
+                        }
+                        "--config-file" => {
+                            state = State::Matched("--config-file");
+                            None
+                        }
+                        v if v.starts_with("--config=") || v.starts_with("-c=") => {
+                            Some(RepresentativeConfigFlagSource::ConfigFlag(
+                                v.split_once("=").unwrap().1.to_owned(),
+                            ))
+                        }
+                        v if v.starts_with("--config-file=") => {
+                            Some(RepresentativeConfigFlagSource::ConfigFile(
+                                v.split_at("--config-file=".len()).1.to_owned(),
+                            ))
+                        }
+                        _ => None,
+                    },
+                    State::Matched(flag) => {
+                        state = State::None;
+                        match flag {
+                            "-c" => {
+                                Some(RepresentativeConfigFlagSource::ConfigFlag(value.to_owned()))
+                            }
+                            "--config-file" => {
+                                Some(RepresentativeConfigFlagSource::ConfigFile(value.to_owned()))
+                            }
+                            _ => unreachable!("impossible flag"),
+                        }
+                    }
+                }
+                .map(|flag_value| (flag_value, source))
+            });
+
+        let mut args: Vec<RepresentativeConfigFlag> = Vec::new();
+        let mut last_flagfile = None;
+
+        for (flag_value, source) in config_args {
+            let flagfile = match source {
+                ExpandedArgSource::Inline => None,
+                ExpandedArgSource::Flagfile(file) => get_flagfile_for_logging(&file),
+            };
+
+            match flagfile {
+                Some(flagfile) => {
+                    if Some(flagfile) != last_flagfile {
+                        args.push(RepresentativeConfigFlag {
+                            source: Some(RepresentativeConfigFlagSource::ModeFile(
+                                flagfile.kind.to_string(),
+                            )),
+                        });
+                    }
+                }
+                None => {
+                    args.push(RepresentativeConfigFlag {
+                        source: Some(flag_value),
+                    });
+                }
+            }
+            last_flagfile = flagfile;
+        }
+
+        Ok(args)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
-    use clap::Parser;
+    use buck2_common::argv::ExpandedArgvBuilder;
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
+    use buck2_core::fs::project::ProjectRootTemp;
 
     use super::*;
 
-    fn parse(args: &[&str]) -> anyhow::Result<CommonBuildConfigurationOptions> {
-        Ok(CommonBuildConfigurationOptions::from_iter_safe(
-            std::iter::once("program").chain(args.iter().copied()),
-        )?)
-    }
-
     #[test]
-    fn short_opt_multiple() -> anyhow::Result<()> {
-        let opts = parse(&["-m", "value1", "-m", "value2"])?;
+    fn test_get_representative_config_flags() -> anyhow::Result<()> {
+        let mut argv = ExpandedArgvBuilder::new();
 
-        assert_eq!(opts.cli_modifiers, vec!["value1", "value2"]);
+        argv.push("-c".to_owned());
+        argv.push("section.option=value".to_owned());
+
+        argv.push("--other-flag".to_owned());
+        argv.push("value".to_owned());
+        argv.push("--other-flag2".to_owned());
+        argv.push("value".to_owned());
+
+        argv.push("--config".to_owned());
+        argv.push("section.option2=value".to_owned());
+
+        argv.push("--config=section.option3=value".to_owned());
+        argv.push("-c=section.option4=value".to_owned());
+
+        argv.push("--config-file=//1.bcfg".to_owned());
+        argv.push("--config-file".to_owned());
+        argv.push("//2.bcfg".to_owned());
+
+        let argv = argv.build();
+
+        let clap = clap::ArgMatches::default(); // we don't actually inspect this right now so just use an empty one.
+        let matches = BuckArgMatches::from_clap(&clap, &argv);
+
+        let flags = matches.get_representative_config_flags()?;
+
+        assert_eq!(
+            flags,
+            vec![
+                "-c section.option=value",
+                "-c section.option2=value",
+                "-c section.option3=value",
+                "-c section.option4=value",
+                "--config-file //1.bcfg",
+                "--config-file //2.bcfg",
+            ]
+        );
 
         Ok(())
     }
 
     #[test]
-    fn short_opt_comma_separated() -> anyhow::Result<()> {
-        let opts = parse(&["-m", "value1,value2"])?;
+    fn test_get_representative_config_flags_for_flagfiles() -> anyhow::Result<()> {
+        let project_argfile = |path: &str| ArgFilePath::Project(CellPath::testing_new(path));
 
-        assert_eq!(opts.cli_modifiers, vec!["value1", "value2"]);
+        let external_root = ProjectRootTemp::new().unwrap();
+        let external_root = external_root.path();
+        let external_argfile = |path: &str| {
+            ArgFilePath::External(
+                external_root
+                    .root()
+                    .join(ForwardRelativePathBuf::new(path.to_owned()).unwrap()),
+            )
+        };
 
-        Ok(())
-    }
+        let mut argv = ExpandedArgvBuilder::new();
 
-    #[test]
-    fn long_opt_multiple() -> anyhow::Result<()> {
-        let opts = parse(&["--modifier", "value1", "--modifier", "value2"])?;
+        argv.argfile_scope(ArgFileKind::Path(project_argfile("root//mode/1")), |argv| {
+            argv.push("-c=a.b=c".to_owned());
+            argv.push("-c=a.b2=c".to_owned());
+            argv.push("-c=a.b3=c".to_owned());
+        });
 
-        assert_eq!(opts.cli_modifiers, vec!["value1", "value2"]);
+        argv.argfile_scope(ArgFileKind::Path(external_argfile("mode/1")), |argv| {
+            argv.argfile_scope(ArgFileKind::Path(external_argfile("mode/2")), |argv| {
+                argv.argfile_scope(ArgFileKind::Path(project_argfile("root//mode/2")), |argv| {
+                    argv.push("-c=a.b4=c".to_owned());
+                });
 
-        Ok(())
-    }
+                argv.push("-c=a.b5=c".to_owned());
+            });
+            argv.push("-c=a.b6=c".to_owned());
+        });
 
-    #[test]
-    fn long_opt_comma_separated() -> anyhow::Result<()> {
-        let opts = parse(&["--modifier", "value1,value2"])?;
+        // Ignored because other-flag is not a config flag
+        argv.argfile_scope(ArgFileKind::Path(project_argfile("root//mode/3")), |argv| {
+            argv.push("--other-flag".to_owned());
+        });
 
-        assert_eq!(opts.cli_modifiers, vec!["value1", "value2"]);
+        let argv = argv.build();
 
-        Ok(())
-    }
+        let clap = clap::ArgMatches::default(); // we don't actually inspect this right now so just use an empty one.
+        let matches = BuckArgMatches::from_clap(&clap, &argv);
 
-    #[test]
-    fn comma_separated_and_multiple() -> anyhow::Result<()> {
-        let opts = parse(&["--modifier", "value1,value2", "--modifier", "value3"])?;
+        let flags = matches.get_representative_config_flags()?;
 
-        assert_eq!(opts.cli_modifiers, vec!["value1", "value2", "value3"]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn space_separated_fails() -> anyhow::Result<()> {
-        assert_matches!(parse(&["-m", "value1", "value2"]), Err(..));
+        assert_eq!(
+            flags,
+            vec!["@root//mode/1", "@root//mode/2", "-c a.b5=c", "-c a.b6=c"]
+        );
 
         Ok(())
     }

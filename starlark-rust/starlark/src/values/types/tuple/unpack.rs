@@ -25,26 +25,42 @@ use crate::values::UnpackValue;
 use crate::values::Value;
 
 /// Unpack a value of type `tuple[T, ...]` into a vec.
-#[derive(Default, Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct UnpackTuple<T> {
     /// Unpacked items.
     pub items: Vec<T>,
 }
 
+impl<T: Default> Default for UnpackTuple<T> {
+    fn default() -> Self {
+        UnpackTuple { items: Vec::new() }
+    }
+}
+
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for UnpackTuple<T> {
+    type Canonical = UnpackTuple<T::Canonical>;
+
     fn starlark_type_repr() -> Ty {
         Ty::tuple_of(T::starlark_type_repr())
     }
 }
 
 impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for UnpackTuple<T> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        let tuple = TupleRef::from_value(value)?;
+    type Error = <T as UnpackValue<'v>>::Error;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        let Some(tuple) = TupleRef::from_value(value) else {
+            return Ok(None);
+        };
+        // TODO(nga): should not allocate if the first element is of the wrong type.
         let mut items = Vec::with_capacity(tuple.len());
         for v in tuple.iter() {
-            items.push(T::unpack_value(v)?);
+            let Some(v) = T::unpack_value_impl(v)? else {
+                return Ok(None);
+            };
+            items.push(v);
         }
-        Some(UnpackTuple { items })
+        Ok(Some(UnpackTuple { items }))
     }
 }
 
@@ -87,9 +103,13 @@ mod tests {
         let v = heap.alloc(("a", "b"));
         assert_eq!(
             vec!["a", "b"],
-            UnpackTuple::<&str>::unpack_value(v).unwrap().items
+            UnpackTuple::<&str>::unpack_value(v).unwrap().unwrap().items
         );
-        assert!(UnpackTuple::<u32>::unpack_value(v).is_none());
-        assert!(UnpackTuple::<&str>::unpack_value(heap.alloc(1)).is_none());
+        assert!(UnpackTuple::<u32>::unpack_value(v).unwrap().is_none());
+        assert!(
+            UnpackTuple::<&str>::unpack_value(heap.alloc(1))
+                .unwrap()
+                .is_none()
+        );
     }
 }

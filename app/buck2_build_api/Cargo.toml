@@ -15,13 +15,12 @@ dashmap = { workspace = true }
 derivative = { workspace = true }
 derive_more = { workspace = true }
 either = { workspace = true }
-fnv = { workspace = true }
 futures = { workspace = true }
-higher-order-closure = { workspace = true }
 indexmap = { workspace = true }
 internment = { workspace = true }
 inventory = { workspace = true }
 itertools = { workspace = true }
+linkme = { workspace = true }
 once_cell = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
@@ -37,7 +36,6 @@ dice = { workspace = true }
 display_container = { workspace = true }
 dupe = { workspace = true }
 gazebo = { workspace = true }
-provider = { workspace = true }
 remote_execution = { workspace = true }
 sorted_vector_map = { workspace = true }
 starlark = { workspace = true }
@@ -51,6 +49,7 @@ buck2_cli_proto = { workspace = true }
 buck2_common = { workspace = true }
 buck2_core = { workspace = true }
 buck2_data = { workspace = true }
+buck2_directory = { workspace = true }
 buck2_error = { workspace = true }
 buck2_event_observer = { workspace = true }
 buck2_events = { workspace = true }
@@ -63,6 +62,7 @@ buck2_node = { workspace = true }
 buck2_query = { workspace = true }
 buck2_test_api = { workspace = true }
 buck2_util = { workspace = true }
+buck2_wrapper_common = { workspace = true }
 
 [dev-dependencies]
 buck2_wrapper_common = { workspace = true }

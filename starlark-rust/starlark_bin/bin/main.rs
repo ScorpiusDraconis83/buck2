@@ -25,24 +25,22 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context as _;
+use clap::builder::StringValueParser;
+use clap::builder::TypedValueParser;
 use clap::Parser;
 use clap::ValueEnum;
 use dupe::Dupe;
 use eval::Context;
 use itertools::Either;
-use itertools::Itertools;
 use starlark::analysis::LintMessage;
-use starlark::docs::get_registered_starlark_docs;
-use starlark::docs::render_docs_as_code;
-use starlark::docs::Doc;
+use starlark::docs::markdown::render_doc_item_no_link;
 use starlark::docs::DocItem;
-use starlark::docs::MarkdownFlavor;
-use starlark::docs::RenderMarkdown;
 use starlark::environment::Globals;
 use starlark::errors::EvalMessage;
 use starlark::errors::EvalSeverity;
 use starlark::read_line::ReadLine;
+use starlark::syntax::Dialect;
+use suppression::GlobLintSuppression;
 use walkdir::WalkDir;
 
 use crate::eval::ContextMode;
@@ -50,6 +48,7 @@ use crate::eval::ContextMode;
 mod bazel;
 mod dap;
 mod eval;
+mod suppression;
 
 #[derive(Debug, Parser)]
 #[command(name = "starlark", about = "Evaluate Starlark code", version)]
@@ -127,6 +126,13 @@ struct Args {
     evaluate: Vec<String>,
 
     #[arg(
+        long = "dialect",
+        help = "Dialect to use for features and globals.",
+        default_value = "extended"
+    )]
+    dialect: ArgsDialect,
+
+    #[arg(
         id = "files",
         value_name = "FILE",
         help = "Files to evaluate.",
@@ -139,6 +145,15 @@ struct Args {
         help = "Run in Bazel mode (temporary, will be removed)"
     )]
     bazel: bool,
+
+    #[arg(
+        long = "suppression",
+        help = "Specify lint rules to suppress. You may specify an optional glob pattern to \
+suppress rules for files matching the pattern, in the format of `[<glob>:]<rule>[,<rule>]*`.",
+        requires = "check",
+        value_parser = StringValueParser::new().try_map(GlobLintSuppression::try_parse)
+    )]
+    suppression: Vec<GlobLintSuppression>,
 }
 
 #[derive(ValueEnum, Copy, Clone, Dupe, Debug, PartialEq, Eq)]
@@ -146,6 +161,12 @@ enum ArgsDoc {
     Lsp,
     Markdown,
     Code,
+}
+
+#[derive(ValueEnum, Copy, Clone, Dupe, Debug, PartialEq, Eq)]
+enum ArgsDialect {
+    Standard,
+    Extended,
 }
 
 // Treat directories as things to recursively walk for .<extension> files,
@@ -212,7 +233,8 @@ fn drain(
         if json {
             println!(
                 "{}",
-                serde_json::to_string(&LintMessage::new(x)).context("serializing lint to JSON")?
+                serde_json::to_string(&LintMessage::new(x))
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize lint to JSON: {e}"))?
             );
         } else if let Some(error) = x.full_error_with_span {
             let mut error = error.to_owned();
@@ -256,8 +278,14 @@ fn main() -> anyhow::Result<()> {
 
     let args = argfile::expand_args(argfile::parse_fromfile, argfile::PREFIX)?;
     let args: Args = Args::parse_from(args);
+
+    let (dialect, globals) = match args.dialect {
+        ArgsDialect::Standard => (Dialect::Standard, Globals::standard()),
+        ArgsDialect::Extended => (Dialect::Extended, Globals::extended_internal()),
+    };
+
     if args.dap {
-        dap::server();
+        dap::server(dialect, globals);
     } else {
         let is_interactive = args.evaluate.is_empty() && args.files.is_empty();
 
@@ -271,7 +299,14 @@ fn main() -> anyhow::Result<()> {
         // TODO: Remove this when extracting the Bazel binary to its own
         // repository, after the LspContext interface stabilizes.
         if args.bazel {
-            bazel::main(args.lsp, print_non_none, is_interactive, &prelude)?;
+            bazel::main(
+                args.lsp,
+                print_non_none,
+                is_interactive,
+                &prelude,
+                dialect,
+                globals,
+            )?;
             return Ok(());
         }
 
@@ -284,31 +319,29 @@ fn main() -> anyhow::Result<()> {
             print_non_none,
             &prelude,
             is_interactive,
+            dialect,
+            globals,
+            args.suppression,
         )?;
 
         if args.lsp {
             ctx.mode = ContextMode::Check;
             starlark_lsp::server::stdio_server(ctx)?;
         } else if let Some(docs) = args.docs {
-            let mut builtin = get_registered_starlark_docs();
-            builtin.push(Doc::named_item(
-                "globals".to_owned(),
-                DocItem::Module(Globals::extended_internal().documentation()),
-            ));
+            let global_module = DocItem::Module(Globals::extended_internal().documentation());
 
             match docs {
                 ArgsDoc::Markdown | ArgsDoc::Lsp => {
-                    let mode = if docs == ArgsDoc::Markdown {
-                        MarkdownFlavor::DocFile
-                    } else {
-                        MarkdownFlavor::LspSummary
-                    };
                     println!(
                         "{}",
-                        builtin.iter().map(|x| x.render_markdown(mode)).join("\n\n")
+                        if docs == ArgsDoc::Markdown {
+                            render_doc_item_no_link("globals", &global_module)
+                        } else {
+                            String::new()
+                        }
                     )
                 }
-                ArgsDoc::Code => println!("{}", render_docs_as_code(&builtin)),
+                ArgsDoc::Code => println!("{}", global_module.render_as_code("globals")),
             };
         } else if is_interactive {
             interactive(&ctx)?;

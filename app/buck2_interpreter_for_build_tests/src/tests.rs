@@ -7,12 +7,12 @@
  * of this source tree.
  */
 
-use buck2_build_api::interpreter::rule_defs::register_rule_defs;
+use std::sync::Arc;
+
 use buck2_common::dice::cells::SetCellResolver;
 use buck2_common::dice::data::testing::SetTestingIoProvider;
+use buck2_common::legacy_configs::cells::ExternalBuckconfigData;
 use buck2_common::legacy_configs::dice::SetLegacyConfigs;
-use buck2_common::legacy_configs::LegacyBuckConfig;
-use buck2_common::legacy_configs::LegacyBuckConfigs;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::cells::name::CellName;
@@ -20,21 +20,17 @@ use buck2_core::cells::CellResolver;
 use buck2_core::fs::project::ProjectRootTemp;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::package::PackageLabel;
+use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
-use buck2_interpreter::dice::starlark_profiler::SetStarlarkProfilerInstrumentation;
-use buck2_interpreter::dice::starlark_profiler::StarlarkProfilerConfiguration;
 use buck2_interpreter::dice::starlark_types::SetStarlarkTypes;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::load_module::InterpreterCalculation;
-use buck2_interpreter_for_build::attrs::attrs_global::register_attrs;
+use buck2_interpreter::starlark_profiler::config::SetStarlarkProfilerInstrumentation;
+use buck2_interpreter::starlark_profiler::config::StarlarkProfilerConfiguration;
 use buck2_interpreter_for_build::interpreter::configuror::BuildInterpreterConfiguror;
 use buck2_interpreter_for_build::interpreter::context::SetInterpreterContext;
-use buck2_interpreter_for_build::rule::register_rule_function;
-use buck2_interpreter_for_build::super_package::defs::register_package_natives;
-use buck2_interpreter_for_build::super_package::package_value::register_read_package_value;
-use buck2_interpreter_for_build::super_package::package_value::register_write_package_value;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use dice::DetectCycles;
 use dice::Dice;
@@ -42,15 +38,6 @@ use dice::DiceTransaction;
 use dice::UserComputationData;
 use dupe::Dupe;
 use indoc::indoc;
-
-fn empty_configs(resolver: &CellResolver) -> LegacyBuckConfigs {
-    let config = resolver
-        .cells()
-        .map(|(name, _)| (name, LegacyBuckConfig::empty()))
-        .collect();
-
-    LegacyBuckConfigs::new(config)
-}
 
 pub(crate) fn root_cell() -> CellName {
     CellName::testing_new("root")
@@ -71,7 +58,6 @@ pub(crate) async fn calculation(fs: &ProjectRootTemp) -> DiceTransaction {
         CellName::testing_new("root"),
         CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("".to_owned())),
     );
-    let cell_configs = empty_configs(&resolver);
 
     ctx.set_cell_resolver(resolver.dupe()).unwrap();
     ctx.set_interpreter_context(
@@ -82,26 +68,15 @@ pub(crate) async fn calculation(fs: &ProjectRootTemp) -> DiceTransaction {
             None,
             false,
             false,
-            register_read_package_value,
-            |globals| {
-                register_package_natives(globals);
-                register_read_package_value(globals);
-            },
-            |globals| {
-                register_rule_defs(globals);
-                register_rule_function(globals);
-                register_attrs(globals);
-                register_read_package_value(globals);
-                register_write_package_value(globals);
-            },
-            |_| {},
             None,
+            Arc::new(ConcurrentTargetLabelInterner::default()),
         )
         .unwrap(),
     )
     .unwrap();
-    ctx.set_legacy_configs(cell_configs).unwrap();
-    ctx.set_starlark_profiler_instrumentation_override(StarlarkProfilerConfiguration::default())
+    ctx.set_legacy_config_external_data(Arc::new(ExternalBuckconfigData::testing_default()))
+        .unwrap();
+    ctx.set_starlark_profiler_configuration(StarlarkProfilerConfiguration::default())
         .unwrap();
     ctx.set_starlark_types(false, false).unwrap();
     ctx.commit().await
@@ -119,7 +94,7 @@ async fn test_eval_import() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
 
     let env = ctx
         .get_loaded_module_from_import_path(&ImportPath::testing_new("root//pkg:two.bzl"))
@@ -158,7 +133,7 @@ async fn test_eval_import_with_load() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
     let env = ctx
         .get_loaded_module_from_import_path(&ImportPath::testing_new("root//pkg:two.bzl"))
         .await
@@ -233,7 +208,7 @@ async fn test_eval_build_file() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
 
     let package = PackageLabel::testing_parse("root//pkg");
     let eval_result = ctx.get_interpreter_results(package.dupe()).await.unwrap();

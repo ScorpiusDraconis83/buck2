@@ -9,6 +9,10 @@
 
 #![cfg(test)]
 
+mod general;
+mod invalidation_tracking;
 mod legacy;
+mod linear_recompute;
+mod multiversion;
 mod opaque;
 mod projection;

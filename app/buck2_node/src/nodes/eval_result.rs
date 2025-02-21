@@ -13,12 +13,13 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use allocative::Allocative;
+use buck2_common::starlark_profiler::StarlarkProfileDataAndStatsDyn;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::PackageSpec;
 use buck2_core::pattern::pattern_type::PatternType;
-use buck2_core::pattern::PackageSpec;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::name::TargetName;
 use buck2_core::target::name::TargetNameRef;
 use dupe::Dupe;
@@ -38,7 +39,7 @@ use crate::super_package::SuperPackage;
     "Unknown target `{target}` from package `{package}`.\n\
 Did you mean one of the {num_targets} targets in {buildfile_path}?{similar_targets}"
 )]
-#[buck2(user)]
+#[buck2(input)]
 pub struct MissingTargetError {
     pub target: TargetName,
     pub package: PackageLabel,
@@ -125,6 +126,7 @@ pub struct EvaluationResult {
     imports: Vec<ImportPath>,
     super_package: SuperPackage,
     targets: TargetsMap,
+    pub starlark_profile: Option<Arc<dyn StarlarkProfileDataAndStatsDyn>>,
 }
 
 impl EvaluationResult {
@@ -139,6 +141,8 @@ impl EvaluationResult {
             imports,
             super_package,
             targets,
+            // This is populated later when `Evaluator` is finalized.
+            starlark_profile: None,
         }
     }
 
@@ -166,7 +170,10 @@ impl EvaluationResult {
         self.targets.get(name)
     }
 
-    pub fn resolve_target<'a>(&'a self, path: &TargetNameRef) -> anyhow::Result<TargetNodeRef<'a>> {
+    pub fn resolve_target<'a>(
+        &'a self,
+        path: &TargetNameRef,
+    ) -> buck2_error::Result<TargetNodeRef<'a>> {
         self.get_target(path).ok_or_else(|| {
             MissingTargetError {
                 target: path.to_owned(),
@@ -236,6 +243,8 @@ pub struct EvaluationResultWithStats {
     pub result: EvaluationResult,
     // Peak allocated memory in starlark mutable heap during evaluation of BUCK file
     pub starlark_peak_allocated_bytes: u64,
+    /// Instruction count during evaluation of `BUCK` file.
+    pub cpu_instruction_count: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -288,7 +297,7 @@ impl Display for SuggestedSimilarTargets {
 
 #[cfg(test)]
 mod tests {
-    use buck2_core::target::label::TargetLabel;
+    use buck2_core::target::label::label::TargetLabel;
 
     use crate::nodes::eval_result::MissingTargets;
 

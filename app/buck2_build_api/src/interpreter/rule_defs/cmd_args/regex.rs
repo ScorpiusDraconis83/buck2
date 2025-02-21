@@ -8,13 +8,15 @@
  */
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_interpreter::types::regex::BuckStarlarkRegex;
 use dupe::Dupe;
+use regex::Regex;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::Freeze;
+use starlark::values::FreezeError;
+use starlark::values::FreezeResult;
 use starlark::values::Freezer;
 use starlark::values::FrozenStringValue;
 use starlark::values::FrozenValueTyped;
@@ -41,6 +43,19 @@ pub(crate) enum CmdArgsRegex<'v> {
     Regex(ValueTyped<'v, BuckStarlarkRegex>),
 }
 
+impl<'v> CmdArgsRegex<'v> {
+    pub(crate) fn validate(&self) -> buck2_error::Result<()> {
+        match self {
+            CmdArgsRegex::Str(pattern) => {
+                // Validate that regex is valid
+                Regex::new(pattern.as_str())?;
+            }
+            CmdArgsRegex::Regex(_) => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Dupe, Copy, Allocative)]
 pub(crate) enum FrozenCmdArgsRegex {
     Str(FrozenStringValue),
@@ -59,12 +74,14 @@ impl<'v> CmdArgsRegex<'v> {
 impl<'v> Freeze for CmdArgsRegex<'v> {
     type Frozen = FrozenCmdArgsRegex;
 
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         Ok(match self {
             Self::Str(s) => FrozenCmdArgsRegex::Str(s.freeze(freezer)?),
             Self::Regex(r) => FrozenCmdArgsRegex::Regex(
-                FrozenValueTyped::new(r.to_value().freeze(freezer)?)
-                    .context("frozen to the wrong type (internal error)")?,
+                match FrozenValueTyped::new_err(r.to_value().freeze(freezer)?) {
+                    Ok(r) => r,
+                    Err(e) => return Err(FreezeError::new(e.to_string())),
+                },
             ),
         })
     }

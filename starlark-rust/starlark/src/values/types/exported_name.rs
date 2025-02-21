@@ -30,6 +30,7 @@ use either::Either;
 use crate as starlark;
 use crate::any::ProvidesStaticType;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::Trace;
 
@@ -77,7 +78,7 @@ impl<'a> Eq for BorrowedExportedName<'a> {}
 ///     Allocative,
 ///     derive_more::Display
 /// )]
-/// #[display(fmt = "{:?}", "self")]
+/// #[display("{:?}", self)]
 /// struct MyStruct<T: ExportedName + 'static> {
 ///     name: T,
 /// }
@@ -89,7 +90,7 @@ impl<'a> Eq for BorrowedExportedName<'a> {}
 ///     fn export_as(
 ///         &self,
 ///         variable_name: &str,
-///         _eval: &mut Evaluator<'v, '_>,
+///         _eval: &mut Evaluator<'v, '_, '_>,
 ///     ) -> starlark::Result<()> {
 ///         self.name.try_export_as(variable_name);
 ///         Ok(())
@@ -132,7 +133,7 @@ pub struct FrozenExportedName {
 impl Freeze for MutableExportedName {
     type Frozen = FrozenExportedName;
 
-    fn freeze(self, _freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, _freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         Ok(FrozenExportedName {
             name: self.name.into_inner(),
         })

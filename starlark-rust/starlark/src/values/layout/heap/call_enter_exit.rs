@@ -18,7 +18,6 @@
 //! Marker objects to track allocations.
 
 use std::fmt::Debug;
-use std::time::Instant;
 
 use allocative::Allocative;
 use starlark_derive::starlark_value;
@@ -26,6 +25,7 @@ use starlark_derive::NoSerialize;
 
 use crate as starlark;
 use crate::any::ProvidesStaticType;
+use crate::eval::runtime::profile::instant::ProfilerInstant;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::Value;
@@ -59,10 +59,10 @@ impl MaybeDrop for NoDrop {}
     NoSerialize,
     Allocative
 )]
-#[display(fmt = "CallEnter")]
+#[display("CallEnter")]
 pub(crate) struct CallEnter<'v, D: MaybeDrop + 'static> {
     pub(crate) function: Value<'v>,
-    pub(crate) time: Instant,
+    pub(crate) time: ProfilerInstant,
     pub(crate) maybe_drop: D,
 }
 
@@ -78,9 +78,9 @@ impl<'v, D: MaybeDrop + Trace<'v> + 'v> StarlarkValue<'v> for CallEnter<'v, D> {
     NoSerialize,
     Allocative
 )]
-#[display(fmt = "CallExit")]
+#[display("CallExit")]
 pub(crate) struct CallExit<D: MaybeDrop + 'static> {
-    pub(crate) time: Instant,
+    pub(crate) time: ProfilerInstant,
     pub(crate) maybe_drop: D,
 }
 

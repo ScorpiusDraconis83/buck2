@@ -7,19 +7,118 @@
  * of this source tree.
  */
 
-use std::ops::Deref;
+use std::any::Any;
+use std::fmt::Debug;
+use std::fmt::Display;
+use std::hash::Hash;
+use std::hash::Hasher;
+use std::ops::DerefMut;
+use std::sync::Arc;
 
+use allocative::Allocative;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
-use buck2_common::legacy_configs::view::LegacyBuckConfigView;
+use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+use buck2_core::configuration::transition::id::TransitionId;
+use buck2_core::package::PackageLabel;
+use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
+use buck2_util::arc_str::ThinArcStr;
 use dice::DiceComputations;
-use starlark::environment::FrozenModule;
+use dupe::Dupe;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 
 use crate::dice::starlark_debug::HasStarlarkDebugger;
 use crate::factory::StarlarkEvaluatorProvider;
+use crate::paths::module::OwnedStarlarkModulePath;
 use crate::starlark_debug::StarlarkDebugController;
-use crate::starlark_profiler::StarlarkProfilerOrInstrumentation;
+use crate::starlark_profiler::data::ProfileTarget;
+use crate::starlark_profiler::profiler::StarlarkProfilerOpt;
+
+pub trait DynEvalKindKey: Display + Send + Sync + Debug + Allocative + 'static {
+    fn hash(&self, state: &mut dyn Hasher);
+    fn eq(&self, other: &dyn DynEvalKindKey) -> bool;
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Display + Send + Sync + Debug + Allocative + Hash + Eq + PartialEq + Any + 'static>
+    DynEvalKindKey for T
+{
+    fn hash(&self, mut state: &mut dyn Hasher) {
+        Hash::hash(self, &mut state)
+    }
+
+    fn eq(&self, other: &dyn DynEvalKindKey) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            None => false,
+            Some(v) => v == self,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Hash for dyn DynEvalKindKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        DynEvalKindKey::hash(self, state)
+    }
+}
+
+impl PartialEq for dyn DynEvalKindKey {
+    fn eq(&self, other: &Self) -> bool {
+        DynEvalKindKey::eq(self, other)
+    }
+}
+
+impl Eq for dyn DynEvalKindKey {}
+
+/// StarlarkEvalKind is used as an identifier for a particular starlark evaluation.
+///
+/// It's used to selectively enable profiling and provides an identifier for the debugger.
+#[derive(Debug, Clone, Dupe, Hash, Eq, PartialEq, Allocative)]
+pub enum StarlarkEvalKind {
+    Analysis(ConfiguredTargetLabel),
+    Load(Arc<OwnedStarlarkModulePath>),
+    LoadPackageFile(PackageLabel),
+    LoadBuildFile(PackageLabel),
+    Transition(Arc<TransitionId>),
+    // These types are defined in higher crates, so we just accept dyn DynEvalKindKey here.
+    AnonTarget(Arc<dyn DynEvalKindKey>),
+    Bxl(Arc<dyn DynEvalKindKey>),
+    BxlDynamic(Arc<dyn DynEvalKindKey>),
+    Unknown(ThinArcStr),
+}
+
+impl StarlarkEvalKind {
+    pub fn to_profile_target(&self) -> buck2_error::Result<ProfileTarget> {
+        match self {
+            StarlarkEvalKind::Analysis(label) => Ok(ProfileTarget::Analysis(label.dupe())),
+            StarlarkEvalKind::LoadBuildFile(package) => Ok(ProfileTarget::Loading(package.dupe())),
+            StarlarkEvalKind::Bxl(_) => Ok(ProfileTarget::Bxl),
+            StarlarkEvalKind::BxlDynamic(_) => Ok(ProfileTarget::Bxl),
+            v => Err(internal_error!("no profiletarget type for {}", v)),
+        }
+    }
+}
+
+impl std::fmt::Display for StarlarkEvalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StarlarkEvalKind::Analysis(target) => write!(f, "analysis:{}", target),
+            StarlarkEvalKind::Load(module) => write!(f, "load:{}", module),
+            StarlarkEvalKind::LoadPackageFile(package) => write!(f, "load_packagefile:{}", package),
+            StarlarkEvalKind::LoadBuildFile(package) => write!(f, "load_buildfile:{}", package),
+            StarlarkEvalKind::AnonTarget(key) => write!(f, "anon_analysis:{}", key),
+            StarlarkEvalKind::Transition(id) => write!(f, "transition:{}", id),
+            StarlarkEvalKind::Bxl(key) => write!(f, "bxl:{}", key),
+            StarlarkEvalKind::BxlDynamic(key) => write!(f, "bxl_dynamic:{}", key),
+            StarlarkEvalKind::Unknown(key) => write!(f, "generic_starlark:{}", key),
+        }
+    }
+}
 
 /// This constructs an appropriate StarlarkEvaluatorProvider to set up
 /// profiling/instrumentation/debugging in a starlark Evaluator for buck.
@@ -28,53 +127,58 @@ use crate::starlark_profiler::StarlarkProfilerOrInstrumentation;
 /// async context and allows us to do things like the block_in_place required
 /// when debugging.
 ///
-/// The description is used for the thread name when debugging.
+/// The kind is used for the thread name when debugging.
 ///
 /// The provided closure will be invoked and passed an appropriate
 /// StarlarkEvaluatorProvider.
-pub async fn with_starlark_eval_provider<D: Deref<Target = DiceComputations>, R>(
-    ctx: D,
-    profiler_instrumentation: &mut StarlarkProfilerOrInstrumentation<'_>,
-    description: String,
-    closure: impl FnOnce(&mut dyn StarlarkEvaluatorProvider, D) -> anyhow::Result<R>,
-) -> anyhow::Result<R> {
+pub async fn with_starlark_eval_provider<'a, D: DerefMut<Target = DiceComputations<'a>>, R>(
+    mut ctx: D,
+    profiler_instrumentation: &mut StarlarkProfilerOpt<'_>,
+    kind: &StarlarkEvalKind,
+    closure: impl FnOnce(&mut dyn StarlarkEvaluatorProvider, D) -> buck2_error::Result<R>,
+) -> buck2_error::Result<R> {
     let root_buckconfig = ctx.get_legacy_root_config_on_dice().await?;
-    let root_buckconfig_view: &dyn LegacyBuckConfigView = &root_buckconfig;
+
     let starlark_max_callstack_size =
-        root_buckconfig_view.parse::<usize>("buck2", "starlark_max_callstack_size")?;
+        root_buckconfig
+            .view(&mut ctx)
+            .parse::<usize>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "starlark_max_callstack_size",
+            })?;
 
     let debugger_handle = ctx.get_starlark_debugger_handle();
     let debugger = match debugger_handle {
-        Some(v) => Some(v.start_eval(&description).await?),
+        Some(v) => Some(v.start_eval(&kind.to_string()).await?),
         None => None,
     };
 
     struct EvalProvider<'a, 'b> {
-        profiler: &'a mut StarlarkProfilerOrInstrumentation<'b>,
+        profiler: &'a mut StarlarkProfilerOpt<'b>,
         debugger: Option<Box<dyn StarlarkDebugController>>,
         starlark_max_callstack_size: Option<usize>,
     }
 
     impl StarlarkEvaluatorProvider for EvalProvider<'_, '_> {
-        fn make<'v, 'a>(&mut self, module: &'v Module) -> anyhow::Result<Evaluator<'v, 'a>> {
+        fn make<'v, 'a, 'e>(
+            &mut self,
+            module: &'v Module,
+        ) -> buck2_error::Result<(Evaluator<'v, 'a, 'e>, bool)> {
             let mut eval = Evaluator::new(module);
             if let Some(stack_size) = self.starlark_max_callstack_size {
-                eval.set_max_callstack_size(stack_size)?;
+                eval.set_max_callstack_size(stack_size)
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
             }
 
-            self.profiler.initialize(&mut eval)?;
+            let is_profiling_enabled = self.profiler.initialize(&mut eval)?;
             if let Some(v) = &mut self.debugger {
                 v.initialize(&mut eval)?;
             }
-            Ok(eval)
+            Ok((eval, is_profiling_enabled))
         }
 
-        fn evaluation_complete(&mut self, eval: &mut Evaluator) -> anyhow::Result<()> {
+        fn evaluation_complete(&mut self, eval: &mut Evaluator) -> buck2_error::Result<()> {
             self.profiler.evaluation_complete(eval)
-        }
-
-        fn visit_frozen_module(&mut self, module: Option<&FrozenModule>) -> anyhow::Result<()> {
-            self.profiler.visit_frozen_module(module)
         }
     }
 

@@ -8,7 +8,6 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
 #![feature(try_blocks)]
 
 use std::sync::Once;
@@ -30,6 +29,7 @@ pub fn init_late_bindings() {
         aquery::find_matching_action::init_find_matching_action();
         description::init_query_environment_description_by_type();
         frontend::init_query_frontend();
+        frontend::init_universe_from_literals();
         cquery::bxl::init_new_bxl_cquery_functions();
         aquery::bxl::init_new_bxl_aquery_functions();
         uquery::bxl::init_new_bxl_uquery_functions();

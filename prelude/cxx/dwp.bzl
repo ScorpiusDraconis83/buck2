@@ -24,17 +24,14 @@ def run_dwp_action(
         referenced_objects: [ArgLike, list[Artifact]],
         dwp_output: Artifact,
         local_only: bool):
-    args = cmd_args()
     dwp = toolchain.binary_utilities_info.dwp
 
-    # llvm trunk now supports 64-bit debug cu indedx, add --continue-on-cu-index-overflow by default
-    # to suppress dwp file overflow warning
-    args.add("/bin/sh", "-c", '"$1" --continue-on-cu-index-overflow -o "$2" -e "$3" && touch "$2"', "")
-    args.add(dwp, dwp_output.as_output(), obj)
-
-    # All object/dwo files referenced in the library/executable are implicitly
-    # processed by dwp.
-    args.hidden(referenced_objects)
+    args = cmd_args(
+        [dwp, "-o", dwp_output.as_output(), "-e", obj],
+        # All object/dwo files referenced in the library/executable are implicitly
+        # processed by dwp.
+        hidden = referenced_objects,
+    )
 
     category = "dwp"
     if category_suffix != None:
@@ -62,9 +59,10 @@ def dwp(
         # but currently we don't track them properly.  So, we just pass in the full
         # link line and extract all inputs from that, which is a bit of an
         # overspecification.
-        referenced_objects: [ArgLike, list[Artifact]]) -> Artifact:
+        referenced_objects: [ArgLike, list[Artifact]],
+        name_suffix: str = "") -> Artifact:
     # gdb/lldb expect to find a file named $file.dwp next to $file.
-    output = ctx.actions.declare_output(obj.short_path + ".dwp")
+    output = ctx.actions.declare_output(obj.short_path + name_suffix + ".dwp")
     run_dwp_action(
         ctx,
         toolchain,

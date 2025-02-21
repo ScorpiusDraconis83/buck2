@@ -57,7 +57,7 @@ static GLOBALS: Lazy<Globals> = Lazy::new(|| mk_environment().build());
 
 static ASSERTS_STAR: Lazy<FrozenModule> = Lazy::new(|| {
     let g = GlobalsBuilder::new()
-        .with_struct("asserts", asserts_star)
+        .with_namespace("asserts", asserts_star)
         .build();
     let m = Module::new();
     m.frozen_heap().add_reference(g.heap());
@@ -139,7 +139,7 @@ fn asserts_star(builder: &mut crate::environment::GlobalsBuilder) {
     fn fails<'v>(
         f: Value<'v>,
         msg: &str,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<NoneType> {
         let _ = msg;
         match f.invoke_pos(&[], eval) {
@@ -157,11 +157,6 @@ pub(crate) fn test_functions(builder: &mut GlobalsBuilder) {
     // Approximate version of a method used by the Go test suite
     fn hasfields<'v>() -> anyhow::Result<impl AllocValue<'v>> {
         Ok(AllocStruct::EMPTY)
-    }
-
-    // Approximate version of a method used by the Go test suite
-    fn set<'v>(xs: Value<'v>) -> anyhow::Result<Value<'v>> {
-        Ok(xs)
     }
 
     fn assert_eq<'v>(a: Value<'v>, b: Value<'v>) -> starlark::Result<NoneType> {
@@ -198,7 +193,7 @@ pub(crate) fn test_functions(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    fn assert_type<'v>(v: Value<'v>, ty: Value<'v>, heap: &'v Heap) -> anyhow::Result<NoneType> {
+    fn assert_type<'v>(v: Value<'v>, ty: Value<'v>, heap: &'v Heap) -> starlark::Result<NoneType> {
         TypeCompiled::new(ty, heap)?.check_type(v, Some("v"))?;
         Ok(NoneType)
     }
@@ -231,13 +226,13 @@ pub struct Assert<'a> {
 /// Construction and state management.
 impl<'a> Assert<'a> {
     /// Create a new assert object, which will by default use
-    /// [`Dialect::Extended`] and all library extensions,
+    /// extended dialect and all library extensions,
     /// plus some additional global functions like `assert_eq`.
     /// The usual pattern is to create a `mut` `Assert`, modify some properties
     /// and then execute some tests.
     pub fn new() -> Self {
         Self {
-            dialect: Dialect::Extended,
+            dialect: Dialect::AllOptionsInternal,
             modules: hashmap!["asserts.star".to_owned() => Lazy::force(&ASSERTS_STAR).dupe()],
             globals: Lazy::force(&GLOBALS).dupe(),
             gc_strategy: None,
@@ -596,6 +591,15 @@ pub fn eq(lhs: &str, rhs: &str) {
 /// See [`Assert::fail`].
 pub fn fail(program: &str, msg: &str) -> crate::Error {
     Assert::new().fail(program, msg)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_golden(path: &str, program: &str) -> crate::Error {
+    let program = program.trim();
+    let e = fails(program, &[]);
+    let output = format!("Program:\n\n{program}\n\nError:\n\n{e:?}\n");
+    starlark_syntax::golden_test_template::golden_test_template(path, &output);
+    e
 }
 
 #[cfg(test)]

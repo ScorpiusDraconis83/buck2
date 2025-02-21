@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use buck2_common::events::HasEvents;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationResult;
 use buck2_query::query::syntax::simple::functions::DefaultQueryFunctionsModule;
-use dice::DiceComputations;
+use dice::LinearRecomputeDiceComputations;
 use dupe::Dupe;
 
 use crate::analysis::evaluator::eval_query;
@@ -25,17 +25,17 @@ use crate::dice::DiceQueryDelegate;
 use crate::uquery::environment::PreresolvedQueryLiterals;
 use crate::uquery::environment::UqueryEnvironment;
 
-pub(crate) struct UqueryEvaluator<'c> {
-    dice_query_delegate: DiceQueryDelegate<'c>,
+pub(crate) struct UqueryEvaluator<'c, 'd> {
+    dice_query_delegate: DiceQueryDelegate<'c, 'd>,
     functions: DefaultQueryFunctionsModule<UqueryEnvironment<'c>>,
 }
 
-impl UqueryEvaluator<'_> {
+impl UqueryEvaluator<'_, '_> {
     pub(crate) async fn eval_query(
         &self,
         query: &str,
         query_args: &[String],
-    ) -> anyhow::Result<QueryEvaluationResult<TargetNode>> {
+    ) -> buck2_error::Result<QueryEvaluationResult<TargetNode>> {
         eval_query(
             self.dice_query_delegate
                 .ctx()
@@ -45,11 +45,11 @@ impl UqueryEvaluator<'_> {
             &self.functions,
             query,
             query_args,
-            async move |literals| {
+            |literals| async move {
                 let resolved_literals = PreresolvedQueryLiterals::pre_resolve(
                     &**self.dice_query_delegate.query_data(),
                     &literals,
-                    self.dice_query_delegate.ctx(),
+                    &mut self.dice_query_delegate.ctx(),
                 )
                 .await;
                 Ok(UqueryEnvironment::new(
@@ -64,12 +64,12 @@ impl UqueryEvaluator<'_> {
 
 /// Evaluates some query expression. TargetNodes are resolved via the interpreter from
 /// the provided DiceCtx.
-pub(crate) async fn get_uquery_evaluator<'a, 'c: 'a>(
-    ctx: &'c DiceComputations,
+pub(crate) async fn get_uquery_evaluator<'a, 'c: 'a, 'd>(
+    ctx: &'c LinearRecomputeDiceComputations<'d>,
     working_dir: &'a ProjectRelativePath,
-    global_cfg_options: GlobalCfgOptions,
-) -> anyhow::Result<UqueryEvaluator<'c>> {
-    let dice_query_delegate = get_dice_query_delegate(ctx, working_dir, global_cfg_options).await?;
+) -> buck2_error::Result<UqueryEvaluator<'c, 'd>> {
+    let dice_query_delegate =
+        get_dice_query_delegate(ctx, working_dir, GlobalCfgOptions::default()).await?;
     let functions = DefaultQueryFunctionsModule::new();
 
     Ok(UqueryEvaluator {

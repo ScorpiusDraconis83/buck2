@@ -23,6 +23,7 @@ gazebo = { workspace = true }
 humantime = { workspace = true }
 indexmap = { workspace = true }
 libc = { workspace = true }
+linked-hash-map = { workspace = true }
 lsp-server = { workspace = true }
 maplit = { workspace = true }
 multimap = { workspace = true }
@@ -35,8 +36,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 superconsole = { version = "0.2.0", path = "../../superconsole" }
-termwiz = { workspace = true }
-thiserror = { workspace = true }
 threadpool = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

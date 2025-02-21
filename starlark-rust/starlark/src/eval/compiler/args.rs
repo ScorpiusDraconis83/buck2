@@ -18,12 +18,14 @@
 use starlark_derive::VisitSpanMut;
 use starlark_syntax::slice_vec_ext::SliceExt;
 use starlark_syntax::syntax::ast::ArgumentP;
+use starlark_syntax::syntax::ast::CallArgsP;
 
 use crate::coerce::coerce;
-use crate::collections::symbol_map::Symbol;
+use crate::collections::symbol::symbol::Symbol;
+use crate::eval::compiler::error::CompilerInternalError;
 use crate::eval::compiler::expr::ExprCompiled;
 use crate::eval::compiler::opt_ctx::OptCtx;
-use crate::eval::compiler::scope::payload::CstArgument;
+use crate::eval::compiler::scope::payload::CstPayload;
 use crate::eval::compiler::span::IrSpanned;
 use crate::eval::compiler::Compiler;
 use crate::eval::runtime::arguments::ArgNames;
@@ -120,7 +122,7 @@ impl ArgsCompiledValue {
         Some(handler(&Arguments(ArgumentsFull {
             pos: &pos,
             named: &named,
-            names: ArgNames::new(coerce(&self.names)),
+            names: ArgNames::new_unique(coerce(&self.names)),
             args,
             kwargs,
         })))
@@ -163,25 +165,28 @@ impl ArgsCompiledValue {
     }
 }
 
-impl Compiler<'_, '_, '_> {
-    pub(crate) fn args(&mut self, args: &[CstArgument]) -> ArgsCompiledValue {
+impl Compiler<'_, '_, '_, '_> {
+    pub(crate) fn args(
+        &mut self,
+        args: &CallArgsP<CstPayload>,
+    ) -> Result<ArgsCompiledValue, CompilerInternalError> {
         let mut res = ArgsCompiledValue::default();
-        for x in args {
+        for x in &args.args {
             match &x.node {
-                ArgumentP::Positional(x) => res.pos_named.push(self.expr(x)),
+                ArgumentP::Positional(x) => res.pos_named.push(self.expr(x)?),
                 ArgumentP::Named(name, value) => {
                     let fv = self
                         .eval
                         .module_env
                         .frozen_heap()
-                        .alloc_str(name.node.as_str());
+                        .alloc_str_intern(name.node.as_str());
                     res.names.push((Symbol::new(&name.node), fv));
-                    res.pos_named.push(self.expr(value));
+                    res.pos_named.push(self.expr(value)?);
                 }
-                ArgumentP::Args(x) => res.args = Some(self.expr(x)),
-                ArgumentP::KwArgs(x) => res.kwargs = Some(self.expr(x)),
+                ArgumentP::Args(x) => res.args = Some(self.expr(x)?),
+                ArgumentP::KwArgs(x) => res.kwargs = Some(self.expr(x)?),
             }
         }
-        res
+        Ok(res)
     }
 }

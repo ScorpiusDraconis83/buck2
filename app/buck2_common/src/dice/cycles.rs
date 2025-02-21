@@ -7,8 +7,8 @@
  * of this source tree.
  */
 
-use std::any::Any;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
@@ -18,6 +18,7 @@ use buck2_util::cycle_detector::LazyCycleDetector;
 use buck2_util::cycle_detector::LazyCycleDetectorGuard;
 use derive_more::Display;
 use dice::DiceComputations;
+use dice::DynKey;
 use dice::Key;
 use dice::UserCycleDetector;
 use dice::UserCycleDetectorGuard;
@@ -27,8 +28,8 @@ use tracing::debug;
 /// Additional requirement for a CycleDescriptor to be used for defining a Dice UserCycleDetector through
 /// the CycleDetectorAdapter. Simply requires converting the Dice Key to the CycleDescriptor::Key type.
 pub trait CycleAdapterDescriptor: CycleDescriptor {
-    /// Will be provided a &dyn Any for a Dice Key implementation.
-    fn to_key(key: &dyn Any) -> Option<Self::Key>;
+    /// Will be provided a &DynKey for a Dice Key implementation.
+    fn to_key(key: &DynKey) -> Option<Self::Key>;
 }
 
 /// This allows using the LazyCycleDetector as a Dice UserCycleDetector. All it needs is an implementation of the normal
@@ -38,17 +39,39 @@ pub struct CycleDetectorAdapter<D: CycleAdapterDescriptor> {
     inner: LazyCycleDetector<D>,
 }
 
-#[async_trait]
-pub trait CycleGuard<E> {
-    async fn guard_this<R: Send, Fut: Future<Output = R> + Send>(
-        ctx: &DiceComputations,
-        fut: Fut,
-    ) -> anyhow::Result<Result<R, E>>;
+pub struct CycleGuardResult<R, E>(buck2_error::Result<Result<R, E>>);
+
+impl<R, E> CycleGuardResult<R, E> {
+    /// Converts the result from GuardThis into an buck2_error::Result.
+    ///
+    /// This is a separate function to get the borrowing of the &mut DiceComputations, (which in
+    /// guard_this will have been borrowed by the passed in future).
+    pub async fn into_result(
+        self,
+        ctx: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<Result<R, E>> {
+        match &self.0 {
+            Ok(Ok(_)) => {}
+            _ => {
+                // The cycle detector either hit an error or it detected a cycle. In either case, we
+                // want to make sure that dice doesn't cache this node. To do that, we add a dep on our
+                // PoisonedDueToDetectedCycle key. We shouldn't hit a dice error, but we know we're already
+                // returning an error so just ignore it.
+                let _unused = ctx.compute(&PoisonedDueToDetectedCycleKey).await;
+            }
+        }
+        self.0
+    }
 }
 
-#[async_trait]
-impl<D: CycleAdapterDescriptor> CycleGuard<D::Error> for D {
-    /// Use this to wrap futures waiting on dependencies where you want to detect cycles. All dice keys involved
+pub struct CycleGuard<D: CycleAdapterDescriptor>(Option<Arc<CycleAdapterGuard<D>>>);
+
+impl<D: CycleAdapterDescriptor> CycleGuard<D> {
+    pub fn new(ctx: &DiceComputations<'_>) -> buck2_error::Result<Self> {
+        Ok(Self(ctx.cycle_guard()?))
+    }
+
+    /// Use this to wrap a computation waiting on dependencies where you want to detect cycles. All dice keys involved
     /// in the cycle must be supported by the CycleAdapterDescriptor implementation. If the cycle is FooKey(1) ->
     /// BarKey(a) -> FooKey(1) and the descriptor only support FooKey, the cycle won't be detected.
     ///
@@ -59,24 +82,19 @@ impl<D: CycleAdapterDescriptor> CycleGuard<D::Error> for D {
     ///
     /// It's probably the case that the keys in the cycle should treat the cycle error case as invalid (in the sense
     /// of Dice Key::validity()).
-    async fn guard_this<R: Send, Fut: Future<Output = R> + Send>(
-        ctx: &DiceComputations,
+    pub async fn guard_this<R: Send, Fut: Future<Output = R> + Send>(
+        &self,
         fut: Fut,
-    ) -> anyhow::Result<Result<R, D::Error>> {
-        match ctx.cycle_guard::<CycleAdapterGuard<D>>()? {
-            Some(v) => match v.guard.guard_this(fut).await {
-                Ok(Ok(v)) => Ok(Ok(v)),
-                v => {
-                    // The cycle detector either hit an error or it detected a cycle. In either case, we
-                    // want to make sure that dice doesn't cache this node. To do that, we add a dep on our
-                    // PoisonedDueToDetectedCycle key. We shouldn't hit a dice error, but we know we're already
-                    // returning an error so just ignore it.
-                    let _unused = ctx.compute(&PoisonedDueToDetectedCycleKey).await;
-                    v
-                }
-            },
-            None => Ok(Ok(fut.await)),
-        }
+    ) -> CycleGuardResult<R, D::Error> {
+        #[allow(clippy::redundant_closure_call)]
+        let res: buck2_error::Result<Result<R, D::Error>> = (|| async move {
+            match &self.0 {
+                Some(v) => v.guard.guard_this(fut).await,
+                None => Ok(Ok(fut.await)),
+            }
+        })()
+        .await;
+        CycleGuardResult(res)
     }
 }
 
@@ -85,7 +103,7 @@ impl<D: CycleAdapterDescriptor> CycleGuard<D::Error> for D {
 /// flow of data that is potentially not tracked by dice, and while we may be able to identify those
 /// and fix them it'll still be fragile and its best to just make sure they aren't cached).
 #[derive(Allocative, Debug, Display, Clone, PartialEq, Eq, Hash)]
-#[display(fmt = "poisoned_due_to_detected_cycle")]
+#[display("poisoned_due_to_detected_cycle")]
 struct PoisonedDueToDetectedCycleKey;
 
 #[async_trait]
@@ -126,16 +144,16 @@ impl<D: CycleAdapterDescriptor> CycleDescriptor for CycleDetectorAdapter<D> {
 }
 
 impl<D: CycleAdapterDescriptor> UserCycleDetector for CycleDetectorAdapter<D> {
-    fn start_computing_key(&self, key: &dyn Any) -> Option<Box<dyn UserCycleDetectorGuard>> {
+    fn start_computing_key(&self, key: &DynKey) -> Option<Arc<dyn UserCycleDetectorGuard>> {
         match D::to_key(key) {
             None => None,
-            Some(v) => Some(Box::new(CycleAdapterGuard {
+            Some(v) => Some(Arc::new(CycleAdapterGuard {
                 guard: self.inner.start(v),
             })),
         }
     }
 
-    fn finished_computing_key(&self, key: &dyn Any) {
+    fn finished_computing_key(&self, key: &DynKey) {
         if let Some(v) = D::to_key(key) {
             debug!("finish computing key {}", v);
             self.inner.finish(v);
@@ -148,14 +166,10 @@ pub struct CycleAdapterGuard<D: CycleAdapterDescriptor> {
 }
 
 impl<D: CycleAdapterDescriptor> UserCycleDetectorGuard for CycleAdapterGuard<D> {
-    fn add_edge(&self, key: &dyn Any) {
+    fn add_edge(&self, key: &DynKey) {
         if let Some(k) = D::to_key(key) {
             self.guard.add_edge(k);
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn type_name(&self) -> &'static str {
@@ -167,7 +181,7 @@ impl<D: CycleAdapterDescriptor> UserCycleDetectorGuard for CycleAdapterGuard<D> 
 pub struct PairDiceCycleDetector<A: UserCycleDetector, B: UserCycleDetector>(pub A, pub B);
 
 impl<A: UserCycleDetector, B: UserCycleDetector> UserCycleDetector for PairDiceCycleDetector<A, B> {
-    fn start_computing_key(&self, key: &dyn Any) -> Option<Box<dyn UserCycleDetectorGuard>> {
+    fn start_computing_key(&self, key: &DynKey) -> Option<Arc<dyn UserCycleDetectorGuard>> {
         // Right now, only one of the inner detectors is allowed to claim a key. We could feasibly change that, but it's a bit trickier.
         if let Some(v) = self.0.start_computing_key(key) {
             return Some(v);
@@ -178,7 +192,7 @@ impl<A: UserCycleDetector, B: UserCycleDetector> UserCycleDetector for PairDiceC
         None
     }
 
-    fn finished_computing_key(&self, key: &dyn Any) {
+    fn finished_computing_key(&self, key: &DynKey) {
         self.0.finished_computing_key(key);
         self.1.finished_computing_key(key);
     }
@@ -186,11 +200,17 @@ impl<A: UserCycleDetector, B: UserCycleDetector> UserCycleDetector for PairDiceC
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::fmt::Debug;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
+    use allocative::Allocative;
+    use async_trait::async_trait;
+    use dice::CancellationContext;
+    use dice::DiceComputations;
+    use dice::DynKey;
+    use dice::Key;
     use dice::UserCycleDetector;
     use dice::UserCycleDetectorGuard;
 
@@ -198,14 +218,29 @@ mod tests {
 
     #[test]
     fn pair_cycle_detector() {
+        #[derive(Allocative, Debug, derive_more::Display, Clone, PartialEq, Eq, Hash)]
+        struct K;
+        #[async_trait]
+        impl Key for K {
+            type Value = ();
+
+            async fn compute(
+                &self,
+                _ctx: &mut DiceComputations,
+                _cancellations: &CancellationContext,
+            ) -> Self::Value {
+                unreachable!()
+            }
+
+            fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
+                false
+            }
+        }
+
         struct TestingGuard;
 
         impl UserCycleDetectorGuard for TestingGuard {
-            fn add_edge(&self, _key: &dyn Any) {
-                unreachable!("testing")
-            }
-
-            fn as_any(&self) -> &dyn Any {
+            fn add_edge(&self, _key: &DynKey) {
                 unreachable!("testing")
             }
 
@@ -223,13 +258,13 @@ mod tests {
         impl UserCycleDetector for ReceivesStartAndFinish {
             fn start_computing_key(
                 &self,
-                _key: &dyn Any,
-            ) -> Option<Box<dyn UserCycleDetectorGuard>> {
+                _key: &DynKey,
+            ) -> Option<Arc<dyn UserCycleDetectorGuard>> {
                 self.got_start.store(true, Ordering::SeqCst);
-                Some(Box::new(TestingGuard))
+                Some(Arc::new(TestingGuard))
             }
 
-            fn finished_computing_key(&self, _key: &dyn Any) {
+            fn finished_computing_key(&self, _key: &DynKey) {
                 assert!(self.got_start.load(Ordering::SeqCst));
                 self.got_finish.store(true, Ordering::SeqCst);
             }
@@ -243,12 +278,12 @@ mod tests {
         impl UserCycleDetector for ReceivesOnlyFinish {
             fn start_computing_key(
                 &self,
-                _key: &dyn Any,
-            ) -> Option<Box<dyn UserCycleDetectorGuard>> {
+                _key: &DynKey,
+            ) -> Option<Arc<dyn UserCycleDetectorGuard>> {
                 panic!("shouldn't be called")
             }
 
-            fn finished_computing_key(&self, _key: &dyn Any) {
+            fn finished_computing_key(&self, _key: &DynKey) {
                 self.got_finish.store(true, Ordering::SeqCst);
             }
         }
@@ -258,9 +293,9 @@ mod tests {
             ReceivesOnlyFinish::default(),
         );
 
-        assert!(detector.start_computing_key(&()).is_some());
+        assert!(detector.start_computing_key(&DynKey::from_key(K)).is_some());
 
-        detector.finished_computing_key(&());
+        detector.finished_computing_key(&DynKey::from_key(K));
 
         assert!(detector.0.got_start.load(Ordering::SeqCst));
         assert!(detector.0.got_finish.load(Ordering::SeqCst));

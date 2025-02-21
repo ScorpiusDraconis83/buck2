@@ -5,8 +5,10 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
 load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:go.bzl", "system_go_bootstrap_toolchain", "system_go_toolchain")
 load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
 load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
@@ -25,6 +27,16 @@ def system_demo_toolchains():
 
     system_genrule_toolchain(
         name = "genrule",
+        visibility = ["PUBLIC"],
+    )
+
+    system_go_toolchain(
+        name = "go",
+        visibility = ["PUBLIC"],
+    )
+
+    system_go_bootstrap_toolchain(
+        name = "go_bootstrap",
         visibility = ["PUBLIC"],
     )
 
@@ -56,5 +68,10 @@ def system_demo_toolchains():
 
     remote_test_execution_toolchain(
         name = "remote_test_execution",
+        visibility = ["PUBLIC"],
+    )
+
+    noop_test_toolchain(
+        name = "test",
         visibility = ["PUBLIC"],
     )

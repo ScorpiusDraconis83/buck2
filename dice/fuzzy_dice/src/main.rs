@@ -7,12 +7,6 @@
  * of this source tree.
  */
 
-#![feature(exclusive_range_pattern)]
-#![feature(async_closure)]
-
-#[macro_use]
-extern crate higher_order_closure;
-
 use std::fs;
 use std::fs::File;
 use std::path::Path;

@@ -11,12 +11,16 @@ use async_trait::async_trait;
 use buck2_cli_proto::AqueryRequest;
 use buck2_cli_proto::AqueryResponse;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::StdoutPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_core::if_else_opensource;
@@ -68,10 +72,13 @@ return incorrect results or otherwise behave unexpectedly.
 )]
 pub struct AqueryCommand {
     #[clap(flatten)]
-    common_opts: CommonCommandOptions,
+    query_common: CommonQueryOptions,
 
     #[clap(flatten)]
-    query_common: CommonQueryOptions,
+    target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 #[async_trait]
@@ -81,8 +88,9 @@ impl StreamingCommand for AqueryCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let (query, query_args) = self.query_common.get_query();
         let unstable_output_format = self.query_common.output_format() as i32;
@@ -95,12 +103,13 @@ impl StreamingCommand for AqueryCommand {
                 AqueryRequest {
                     query,
                     query_args,
+                    target_cfg: Some(self.target_cfg.target_cfg()),
                     context: Some(context),
                     output_attributes,
                     unstable_output_format,
                 },
-                ctx.stdin()
-                    .console_interaction_stream(&self.common_opts.console_opts),
+                events_ctx,
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 &mut StdoutPartialResultHandler,
             )
             .await??;
@@ -112,11 +121,15 @@ impl StreamingCommand for AqueryCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }

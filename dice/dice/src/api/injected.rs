@@ -19,6 +19,7 @@ use dupe::Dupe;
 use crate::api::computations::DiceComputations;
 use crate::api::key::Key;
 use crate::api::storage_type::StorageType;
+use crate::InvalidationSourcePriority;
 
 /// Specialized version of `Key` above. This type of Key is never computed. It
 /// should always be injected onto the graph before being requested via
@@ -35,6 +36,10 @@ pub trait InjectedKey:
     type Value: Allocative + Dupe + Send + Sync + 'static;
 
     fn equality(x: &Self::Value, y: &Self::Value) -> bool;
+
+    fn invalidation_source_priority() -> InvalidationSourcePriority {
+        InvalidationSourcePriority::Normal
+    }
 }
 
 #[async_trait]
@@ -61,7 +66,10 @@ where
     }
 
     fn storage_type() -> StorageType {
-        // if we store more than usize max value, we are in trouble.
-        StorageType::LastN(usize::max_value())
+        StorageType::Injected
+    }
+
+    fn invalidation_source_priority() -> InvalidationSourcePriority {
+        K::invalidation_source_priority()
     }
 }

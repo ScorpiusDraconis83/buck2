@@ -8,36 +8,37 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(fs_try_exists)]
+#![feature(decl_macro)]
 #![feature(never_type)]
 #![feature(pattern)]
 #![feature(box_patterns)]
 #![feature(impl_trait_in_assoc_type)]
+#![feature(io_error_more)]
 #![feature(once_cell_try)]
 #![feature(try_blocks)]
-#![cfg_attr(windows, feature(absolute_path))]
 #![feature(used_with_arg)]
-
-#[cfg(test)]
-#[macro_use]
-extern crate maplit;
+#![feature(let_chains)]
 
 #[macro_use]
 pub mod error;
 
 mod ascii_char_set;
 pub mod async_once_cell;
-pub mod base_deferred_key;
-pub mod buck_path;
 pub mod build_file_path;
+pub mod bxl;
 pub mod bzl;
 pub mod category;
 pub mod cells;
+pub mod ci;
+pub mod client_only;
 pub mod configuration;
-pub mod directory;
+pub mod deferred;
+pub mod directory_digest;
 pub mod env;
+pub mod event;
 pub mod execution_types;
 pub mod fs;
+pub mod global_cfg_options;
 pub mod io_counters;
 pub mod logging;
 pub mod package;
@@ -45,10 +46,12 @@ pub mod pattern;
 pub mod plugins;
 pub mod provider;
 pub mod rollout_percentage;
-pub mod sandcastle;
 pub mod target;
 pub mod target_aliases;
 pub mod unsafe_send_future;
+
+pub use env::__macro_refs::buck2_env;
+pub use env::__macro_refs::buck2_env_name;
 
 /// Marker for things that are only sensible to use inside Facebook,
 /// not intended to be complete, but intended to be useful to audit
@@ -68,10 +71,4 @@ macro_rules! if_else_opensource {
 #[inline]
 pub fn is_open_source() -> bool {
     if_else_opensource!(true, false)
-}
-
-/// Internal build with `buck2`.
-#[inline]
-pub fn is_fbcode_build() -> bool {
-    cfg!(fbcode_build)
 }

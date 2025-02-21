@@ -13,8 +13,8 @@ load(":apple_bundle_types.bzl", "AppleBundleLinkerMapInfo", "AppleMinDeploymentV
 load(":apple_bundle_utility.bzl", "get_default_binary_dep", "get_flattened_binary_deps", "merge_bundle_linker_maps_info")
 load(":apple_code_signing_types.bzl", "AppleEntitlementsInfo")
 load(":apple_dsym.bzl", "DSYM_SUBTARGET", "get_apple_dsym_ext")
-load(":apple_universal_binaries.bzl", "create_universal_binary")
-load(":debug.bzl", "AppleDebuggableInfo")
+load(":apple_universal_binaries.bzl", "create_universal_binary", "get_universal_binary_name")
+load(":debug.bzl", "AppleDebuggableInfo", "DEBUGINFO_SUBTARGET")
 load(":resource_groups.bzl", "ResourceGraphInfo")
 
 _FORWARDED_PROVIDER_TYPES = [
@@ -28,27 +28,19 @@ _MERGED_PROVIDER_TYPES = [
     AppleBundleLinkerMapInfo,
 ]
 
-def _get_universal_binary_name(ctx: AnalysisContext) -> str:
-    if ctx.attrs.executable_name:
-        return ctx.attrs.executable_name
-    binary_deps = ctx.attrs.executable
-
-    # Because `binary_deps` is a split transition of the same target,
-    # the filenames would be identical, so we just pick the first one.
-    first_binary_dep = binary_deps.values()[0]
-    first_binary_artifact = first_binary_dep[DefaultInfo].default_outputs[0]
-
-    # The universal executable should have the same name as the base/thin ones
-    return first_binary_artifact.short_path
-
 def apple_universal_executable_impl(ctx: AnalysisContext) -> list[Provider]:
     dsym_name = ctx.attrs.name + ".dSYM"
     binary_outputs = create_universal_binary(
         ctx = ctx,
         binary_deps = ctx.attrs.executable,
-        binary_name = _get_universal_binary_name(ctx),
+        binary_name = get_universal_binary_name(ctx),
         dsym_bundle_name = dsym_name,
         split_arch_dsym = ctx.attrs.split_arch_dsym,
+    )
+
+    debug_info = project_artifacts(
+        actions = ctx.actions,
+        tsets = [binary_outputs.debuggable_info.debug_info_tset],
     )
 
     sub_targets = {}
@@ -58,14 +50,18 @@ def apple_universal_executable_impl(ctx: AnalysisContext) -> list[Provider]:
         dsyms = [get_apple_dsym_ext(
             ctx = ctx,
             executable = binary_outputs.binary,
-            debug_info = project_artifacts(
-                actions = ctx.actions,
-                tsets = [binary_outputs.debuggable_info.debug_info_tset],
-            ),
+            debug_info = debug_info,
             action_identifier = ctx.attrs.name + "_dsym",
             output_path = dsym_name,
         )]
     sub_targets[DSYM_SUBTARGET] = [DefaultInfo(default_outputs = dsyms)]
+
+    debug_info_artifacts_manifest = ctx.actions.write(
+        "debuginfo.artifacts",
+        debug_info,
+        with_inputs = True,
+    )
+    sub_targets[DEBUGINFO_SUBTARGET] = [DefaultInfo(default_output = debug_info_artifacts_manifest)]
 
     default_binary = get_default_binary_dep(ctx.attrs.executable)
     forwarded_providers = []

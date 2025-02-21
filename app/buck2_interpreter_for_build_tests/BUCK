@@ -1,15 +1,14 @@
-load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
+load("@fbcode_macros//build_defs:rust_unittest.bzl", "rust_unittest")
 
 oncall("build_infra")
 
-rust_library(
+rust_unittest(
     name = "buck2_interpreter_for_build_tests",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
-    test_deps = [
-        "fbsource//third-party/rust:anyhow",
+    deps = [
         "fbsource//third-party/rust:ctor",
+        "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:indoc",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tokio",
@@ -21,6 +20,7 @@ rust_library(
         "//buck2/app/buck2_interpreter:buck2_interpreter",
         "//buck2/app/buck2_interpreter_for_build:buck2_interpreter_for_build",
         "//buck2/app/buck2_node:buck2_node",
+        "//buck2/app/buck2_transition:buck2_transition",
         "//buck2/dice/dice:dice",
         "//buck2/gazebo/dupe:dupe",
         "//buck2/gazebo/gazebo:gazebo",

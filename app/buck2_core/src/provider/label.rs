@@ -8,23 +8,30 @@
  */
 
 use std::fmt;
-use std::fmt::Display;
 use std::fmt::Formatter;
 use std::iter;
 
 use allocative::Allocative;
+use buck2_util::arc_str::ArcSlice;
+use buck2_util::arc_str::ArcStr;
 use derive_more::Display;
 use dupe::Dupe;
 use serde::Serialize;
 use serde::Serializer;
 use static_assertions::assert_eq_size;
+use triomphe::Arc;
 
 use crate::ascii_char_set::AsciiCharSet;
+use crate::cells::name::CellName;
+use crate::cells::CellAliasResolver;
+use crate::cells::CellResolver;
 use crate::configuration::data::ConfigurationData;
 use crate::configuration::pair::Configuration;
 use crate::configuration::pair::ConfigurationNoExec;
+use crate::pattern::pattern::ParsedPattern;
+use crate::pattern::pattern_type::ProvidersPatternExtra;
 use crate::target::configured_target_label::ConfiguredTargetLabel;
-use crate::target::label::TargetLabel;
+use crate::target::label::label::TargetLabel;
 
 #[derive(
     Display, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
@@ -33,9 +40,10 @@ pub struct ProviderName(String);
 
 #[derive(buck2_error::Error, Debug)]
 #[error(
-    "Invalid provider name `{}`. Inner providers names can only contain non-empty alpha numeric characters, and symbols `,`, '=', `-`, `/`, `+` and `_`. No other characters are allowed.",
+    "Invalid provider name `{}`. Inner providers names can only contain non-empty alpha numeric characters, and symbols `,`, `=`, `-`, `/`, `+` and `_`. No other characters are allowed.",
     _0
 )]
+#[buck2(tag = Input)]
 struct InvalidProviderName(String);
 
 impl ProviderName {
@@ -47,12 +55,12 @@ impl ProviderName {
         ProviderName(name)
     }
 
-    pub fn new(name: String) -> anyhow::Result<ProviderName> {
+    pub fn new(name: String) -> buck2_error::Result<ProviderName> {
         Self::verify(&name)?;
         Ok(ProviderName(name))
     }
 
-    fn verify(name: &str) -> anyhow::Result<()> {
+    fn verify(name: &str) -> buck2_error::Result<()> {
         const VALID_CHARS: &str =
             r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_\\/.=,+-";
         const SET: AsciiCharSet = AsciiCharSet::new(VALID_CHARS);
@@ -65,14 +73,14 @@ impl ProviderName {
     }
 }
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative)]
+#[derive(Clone, Dupe, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative)]
 pub enum NonDefaultProvidersName {
-    Named(Box<[ProviderName]>),
+    Named(ArcSlice<ProviderName>),
     // For some flavors from buck1, we can translate them to ProvidersName::Named
     // as we know that we can implement them as a subtarget. For many flavored targets,
     // we can't do that. For those cases, we parse them to this "UnrecognizedFlavor" so
     // that we can defer any errors related to us not supporting it.
-    UnrecognizedFlavor(Box<str>),
+    UnrecognizedFlavor(ArcStr),
     // TODO(cjhopman): We should add an InferredNamed for flavors where we infer a name
     // so that we can display them in their original form.
 }
@@ -86,10 +94,12 @@ pub enum NonDefaultProvidersName {
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative)]
 pub enum ProvidersName {
     Default,
-    NonDefault(Box<NonDefaultProvidersName>),
+    NonDefault(Arc<NonDefaultProvidersName>),
 }
 
 assert_eq_size!(ProvidersName, [usize; 1]);
+
+impl Dupe for ProvidersName {}
 
 impl Default for ProvidersName {
     fn default() -> Self {
@@ -103,15 +113,17 @@ impl Display for ProvidersName {
             ProvidersName::Default => {
                 write!(f, "")
             }
-            ProvidersName::NonDefault(box NonDefaultProvidersName::Named(names)) => {
-                for name in &**names {
-                    write!(f, "[{}]", name)?;
+            ProvidersName::NonDefault(flavor) => match flavor.as_ref() {
+                NonDefaultProvidersName::Named(names) => {
+                    for name in &**names {
+                        write!(f, "[{}]", name)?;
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            ProvidersName::NonDefault(box NonDefaultProvidersName::UnrecognizedFlavor(s)) => {
-                write!(f, "#{}", s)
-            }
+                NonDefaultProvidersName::UnrecognizedFlavor(s) => {
+                    write!(f, "#{}", s)
+                }
+            },
         }
     }
 }
@@ -124,11 +136,11 @@ impl ProvidersName {
                 NonDefaultProvidersName::Named(xs) => {
                     xs.iter().cloned().chain(iter::once(name)).collect()
                 }
-                NonDefaultProvidersName::UnrecognizedFlavor(_) => return self.clone(),
+                NonDefaultProvidersName::UnrecognizedFlavor(_) => return self.dupe(),
             },
         };
-        ProvidersName::NonDefault(Box::new(NonDefaultProvidersName::Named(
-            items.into_boxed_slice(),
+        ProvidersName::NonDefault(Arc::new(NonDefaultProvidersName::Named(
+            ArcSlice::from_iter(items),
         )))
     }
 }
@@ -138,9 +150,9 @@ impl ProvidersName {
 /// the 'ProvidersName' referring to the specific set of inner providers of a
 /// rule.
 #[derive(
-    Clone, Debug, Display, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
+    Clone, Dupe, Debug, Display, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
 )]
-#[display(fmt = "{}{}", target, name)]
+#[display("{}{}", target, name)]
 pub struct ProvidersLabel {
     target: TargetLabel,
     name: ProvidersName,
@@ -169,12 +181,28 @@ impl ProvidersLabel {
         &self.name
     }
 
+    pub fn parse(
+        label: &str,
+        cell_name: CellName,
+        cell_resolver: &CellResolver,
+        cell_alias_resolver: &CellAliasResolver,
+    ) -> buck2_error::Result<ProvidersLabel> {
+        let providers_label = ParsedPattern::<ProvidersPatternExtra>::parse_precise(
+            label,
+            cell_name,
+            cell_resolver,
+            cell_alias_resolver,
+        )?
+        .as_providers_label(label)?;
+        Ok(providers_label)
+    }
+
     /// Creates a 'ConfiguredProvidersLabel' from ['Self'] based on the provided
     /// configuration.
     pub fn configure(&self, cfg: ConfigurationData) -> ConfiguredProvidersLabel {
         ConfiguredProvidersLabel {
             target: self.target.configure(cfg),
-            name: self.name.clone(),
+            name: self.name.dupe(),
         }
     }
 
@@ -186,7 +214,7 @@ impl ProvidersLabel {
     ) -> ConfiguredProvidersLabel {
         ConfiguredProvidersLabel {
             target: self.target.configure_with_exec(cfg, exec_cfg),
-            name: self.name.clone(),
+            name: self.name.dupe(),
         }
     }
 
@@ -194,7 +222,7 @@ impl ProvidersLabel {
     pub fn configure_pair(&self, cfg_pair: Configuration) -> ConfiguredProvidersLabel {
         ConfiguredProvidersLabel {
             target: self.target.configure_pair(cfg_pair),
-            name: self.name.clone(),
+            name: self.name.dupe(),
         }
     }
 
@@ -223,9 +251,9 @@ impl Serialize for ProvidersLabel {
 ///
 /// A configured 'ProvidersLabel'.
 #[derive(
-    Clone, Debug, Display, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
+    Clone, Dupe, Debug, Display, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
 )]
-#[display(fmt = "{}{} ({})", "target.unconfigured()", "name", "target.cfg()")]
+#[display("{}{} ({})", target.unconfigured(), name, target.cfg())]
 pub struct ConfiguredProvidersLabel {
     target: ConfiguredTargetLabel,
     name: ProvidersName,
@@ -253,7 +281,7 @@ impl ConfiguredProvidersLabel {
     }
 
     pub fn unconfigured(&self) -> ProvidersLabel {
-        ProvidersLabel::new(self.target.unconfigured().dupe(), self.name.clone())
+        ProvidersLabel::new(self.target.unconfigured().dupe(), self.name.dupe())
     }
 
     pub fn name(&self) -> &ProvidersName {
@@ -281,7 +309,6 @@ pub mod testing {
 
     use super::*;
     use crate::package::PackageLabel;
-    use crate::target::label::TargetLabel;
     use crate::target::name::TargetNameRef;
 
     pub trait ProvidersLabelTestExt {
@@ -306,9 +333,8 @@ pub mod testing {
                     TargetNameRef::new(target).unwrap(),
                 ),
                 match name {
-                    Some(n) => ProvidersName::NonDefault(Box::new(NonDefaultProvidersName::Named(
-                        n.map(|s| ProviderName::new((*s).to_owned()).unwrap())
-                            .into_boxed_slice(),
+                    Some(n) => ProvidersName::NonDefault(Arc::new(NonDefaultProvidersName::Named(
+                        ArcSlice::from_iter(n.map(|s| ProviderName::new((*s).to_owned()).unwrap())),
                     ))),
                     _ => ProvidersName::Default,
                 },

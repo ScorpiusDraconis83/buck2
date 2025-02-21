@@ -8,8 +8,8 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
 #![feature(try_blocks)]
+#![allow(clippy::comparison_to_empty)]
 
 use std::sync::Once;
 
@@ -22,6 +22,7 @@ use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 mod analysis_queries;
 mod cell;
 mod classpath;
+mod common;
 mod config;
 mod configurations;
 pub mod deferred_materializer;
@@ -32,7 +33,7 @@ pub mod output;
 mod package_values;
 mod prelude;
 mod providers;
-pub mod server;
+mod server;
 mod starlark;
 mod subtargets;
 mod visibility;
@@ -46,13 +47,13 @@ mod visibility;
 /// Audit subcommands implement this trait so that we can handle the entire client side
 /// logic here and to support that serialization to the daemon.
 #[async_trait]
-pub trait AuditSubcommand: Send + Sync + 'static {
+pub trait ServerAuditSubcommand: Send + Sync + 'static {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         client_server_ctx: ClientContext,
-    ) -> anyhow::Result<()>;
+    ) -> buck2_error::Result<()>;
 }
 
 #[async_trait]
@@ -62,8 +63,8 @@ pub trait AuditCommandExt {
         server_ctx: &dyn ServerCommandContextTrait,
         stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         client_server_ctx: ClientContext,
-    ) -> anyhow::Result<()>;
-    fn as_subcommand(&self) -> &dyn AuditSubcommand;
+    ) -> buck2_error::Result<()>;
+    fn as_subcommand(&self) -> &dyn ServerAuditSubcommand;
 }
 
 #[async_trait]
@@ -73,12 +74,12 @@ impl AuditCommandExt for AuditCommand {
         server_ctx: &dyn ServerCommandContextTrait,
         stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         client_server_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         self.as_subcommand()
             .server_execute(server_ctx, stdout, client_server_ctx)
             .await
     }
-    fn as_subcommand(&self) -> &dyn AuditSubcommand {
+    fn as_subcommand(&self) -> &dyn ServerAuditSubcommand {
         match self {
             AuditCommand::Cell(cmd) => cmd,
             AuditCommand::Classpath(cmd) => cmd,
@@ -106,5 +107,6 @@ pub fn init_late_bindings() {
     ONCE.call_once(|| {
         output::command::init_audit_output();
         cell::init_audit_cell();
+        server::init_audit_server_command();
     })
 }

@@ -13,17 +13,18 @@
 use std::sync::Once;
 
 pub mod attrs;
+pub mod call_stack;
 pub mod interpreter;
 pub mod label;
 pub mod nodes;
-pub mod plugins;
+pub(crate) mod plugins;
 pub mod rule;
 pub mod super_package;
 
 pub fn init_late_bindings() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        attrs::attrs_global::init_coerce_target_label();
+        attrs::attrs_global::init_coerce_target_label_for_bzl();
         interpreter::calculation::init_interpreter_calculation_impl();
         interpreter::calculation::init_target_graph_calculation_impl();
         interpreter::build_context::init_starlark_path_from_build_context();

@@ -14,7 +14,6 @@ use regex::RegexSet;
 use crate::provider::label::NonDefaultProvidersName;
 use crate::provider::label::ProviderName;
 use crate::provider::label::ProvidersName;
-use crate::soft_error;
 
 static PLATFORM_REGEX_SET: OnceLock<RegexSet> = OnceLock::new();
 
@@ -45,7 +44,7 @@ fn is_platform_flavor(flavor: &str) -> bool {
 /// via subtargets.
 ///
 /// This mapping is a hardcoded map of flavors that we know can be handled simply as subtargets.
-pub fn map_flavors(flavors: &str, full_target: &str) -> anyhow::Result<ProvidersName> {
+pub fn map_flavors(flavors: &str, full_target: &str) -> buck2_error::Result<ProvidersName> {
     let mut flavors_parts: Vec<&str> = flavors.split(',').collect();
     assert!(!flavors_parts.is_empty());
 
@@ -56,7 +55,8 @@ pub fn map_flavors(flavors: &str, full_target: &str) -> anyhow::Result<Providers
             // rely on the wrapping span in order to find
             soft_error!(
                 "platform_flavor",
-                anyhow::anyhow!("Platform flavor found in target: {}", full_target),
+                buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "Platform flavor found in target: {}", full_target).into(),
+                deprecation: true,
                 quiet: true
             )?;
             flavors_parts.remove(index);
@@ -66,113 +66,75 @@ pub fn map_flavors(flavors: &str, full_target: &str) -> anyhow::Result<Providers
 
     // sort a flavors list to have a deterministic order.
     flavors_parts.sort_unstable();
-    Ok(ProvidersName::NonDefault(Box::new(
-        NonDefaultProvidersName::Named(Box::new([ProviderName::new_unchecked(
-            match flavors_parts.len() {
+    Ok(ProvidersName::NonDefault(triomphe::Arc::new(
+        NonDefaultProvidersName::Named(buck2_util::arc_str::ArcSlice::new([
+            ProviderName::new_unchecked(match *flavors_parts {
                 // If we only had one flavor that represents some specific platform then return a default provider name.
-                0 => {
+                [] => {
                     // Some targets specifically ask for a given platform, we just ignore them
                     return Ok(ProvidersName::Default);
                 }
 
-                1 => match flavors_parts[0] {
-                    // android_binary intermediate/secondary outputs. See https://fburl.com/diffusion/jd3cmnfw
-                    "package_string_assets" => "package_string_assets".to_owned(),
-                    "aapt2_link" => "aapt2_link".to_owned(),
-                    "unstripped_native_libraries" => "unstripped_native_libraries".to_owned(),
-                    "proguard_text_output" => "proguard_text_output".to_owned(),
-                    "generate_string_resources" => "generate_string_resources".to_owned(),
-                    "generate_voltron_string_resources" => {
-                        "generate_voltron_string_resources".to_owned()
-                    }
-                    "exo_symlink_tree" => "exo_symlink_tree".to_owned(),
+                // android_binary intermediate/secondary outputs. See https://fburl.com/diffusion/jd3cmnfw
+                ["package_string_assets"] => "package_string_assets".to_owned(),
+                ["aapt2_link"] => "aapt2_link".to_owned(),
+                ["unstripped_native_libraries"] => "unstripped_native_libraries".to_owned(),
+                ["proguard_text_output"] => "proguard_text_output".to_owned(),
+                ["generate_string_resources"] => "generate_string_resources".to_owned(),
+                ["generate_voltron_string_resources"] => {
+                    "generate_voltron_string_resources".to_owned()
+                }
+                ["exo_symlink_tree"] => "exo_symlink_tree".to_owned(),
 
-                    // android_library secondary outputs
-                    "dummy_r_dot_java" => "dummy_r_dot_java".to_owned(),
+                // android_library secondary outputs
+                ["dummy_r_dot_java"] => "dummy_r_dot_java".to_owned(),
 
-                    // Rules depend on `#headers` flavor of C++ libraries to use a
-                    // dep's headers without linking against it.
-                    "headers" => "headers".to_owned(),
+                // Rules depend on `#headers` flavor of C++ libraries to use a
+                // dep's headers without linking against it.
+                ["headers"] => "headers".to_owned(),
 
-                    // This is used by Rust quite a bit
-                    "check" => "check".to_owned(),
+                // This is used by Rust quite a bit
+                ["check"] => "check".to_owned(),
 
-                    // FIXME(ndmitchell): Most users shouldn't be using strip-debug.
-                    // We currently can't handle strip-debug, and it's a dependency of Eden,
-                    // so just ignore it for now. D27984137 aims to add it back properly.
-                    "strip-debug" => return Ok(ProvidersName::Default),
+                // FIXME(ndmitchell): Most users shouldn't be using strip-debug.
+                // We currently can't handle strip-debug, and it's a dependency of Eden,
+                // so just ignore it for now. D27984137 aims to add it back properly.
+                ["strip-debug"] => return Ok(ProvidersName::Default),
 
-                    // Used in JEX builder script (https://fburl.com/code/2w2gjkey)
-                    "shared" => "shared".to_owned(),
+                // Used in JEX builder script (https://fburl.com/code/2w2gjkey)
+                ["shared"] => "shared".to_owned(),
 
-                    // Used by Nullsafe for (android|java)_libraries
-                    "nullsafex-json" => "nullsafex-json".to_owned(),
+                // Used by Nullsafe for (android|java)_libraries
+                ["nullsafex-json"] => "nullsafex-json".to_owned(),
 
-                    // This is for js_bundle. We strip it and let the configuration handle it instead.
-                    "android" => return Ok(ProvidersName::Default),
+                // Java/Kotlin sub-targets
+                ["class-abi"] => "class-abi".to_owned(),
+                ["source-abi"] => "source-abi".to_owned(),
+                ["source-only-abi"] => "source-only-abi".to_owned(),
 
-                    // Java/Kotlin sub-targets
-                    "class-abi" => "class-abi".to_owned(),
-                    "source-abi" => "source-abi".to_owned(),
-                    "source-only-abi" => "source-only-abi".to_owned(),
-
-                    "compilation-database" => "compilation-database".to_owned(),
-
-                    _ => {
-                        return Ok(ProvidersName::NonDefault(Box::new(
-                            NonDefaultProvidersName::UnrecognizedFlavor(flavors.into()),
-                        )));
-                    }
-                },
+                ["compilation-database"] => "compilation-database".to_owned(),
 
                 // For js_bundle rules. The platform and optimization ("release") flavors are stripped
                 // and handled by the configuration. The other flavors are mapped to named outputs.
-                2 => match (flavors_parts[0], flavors_parts[1]) {
-                    ("android", "dependencies") => "dependencies".to_owned(),
-                    ("android", "misc") => "misc".to_owned(),
-                    ("android", "source_map") => "source_map".to_owned(),
-                    ("android", "release") => return Ok(ProvidersName::Default),
-                    _ => {
-                        return Ok(ProvidersName::NonDefault(Box::new(
-                            NonDefaultProvidersName::UnrecognizedFlavor(flavors.into()),
-                        )));
-                    }
-                },
-
-                3 => match (flavors_parts[0], flavors_parts[1], flavors_parts[2]) {
-                    ("android", "dependencies", "release") => "dependencies".to_owned(),
-                    ("android", "misc", "release") => "misc".to_owned(),
-                    ("android", "release", "source_map") => "source_map".to_owned(),
-                    _ => {
-                        return Ok(ProvidersName::NonDefault(Box::new(
-                            NonDefaultProvidersName::UnrecognizedFlavor(flavors.into()),
-                        )));
-                    }
-                },
-
-                4 => match (
-                    flavors_parts[0],
-                    flavors_parts[1],
-                    flavors_parts[2],
-                    flavors_parts[3],
-                ) {
-                    ("android", "misc", "rambundle-indexed", "release") => {
-                        "rambundle-indexed-misc".to_owned()
-                    }
-                    _ => {
-                        return Ok(ProvidersName::NonDefault(Box::new(
-                            NonDefaultProvidersName::UnrecognizedFlavor(flavors.into()),
-                        )));
-                    }
-                },
+                ["android"] | ["android", "release"] => return Ok(ProvidersName::Default),
+                ["android", "dependencies"] | ["android", "dependencies", "release"] => {
+                    "dependencies".to_owned()
+                }
+                ["android", "misc"] | ["android", "misc", "release"] => "misc".to_owned(),
+                ["android", "source_map"] | ["android", "release", "source_map"] => {
+                    "source_map".to_owned()
+                }
+                ["android", "misc", "rambundle-indexed", "release"] => {
+                    "rambundle-indexed-misc".to_owned()
+                }
 
                 // This allows us to pass parsing for this thing.
                 _ => {
-                    return Ok(ProvidersName::NonDefault(Box::new(
+                    return Ok(ProvidersName::NonDefault(triomphe::Arc::new(
                         NonDefaultProvidersName::UnrecognizedFlavor(flavors.into()),
                     )));
                 }
-            },
-        )])),
+            }),
+        ])),
     )))
 }

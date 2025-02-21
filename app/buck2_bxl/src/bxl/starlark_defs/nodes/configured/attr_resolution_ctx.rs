@@ -20,6 +20,7 @@ use buck2_analysis::analysis::env::resolve_unkeyed_placeholder;
 use buck2_analysis::attrs::resolve::ctx::AnalysisQueryResult;
 use buck2_analysis::attrs::resolve::ctx::AttrResolutionContext;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::FrozenCommandLineArg;
+use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
@@ -27,6 +28,7 @@ use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use futures::FutureExt;
 use starlark::environment::Module;
+use starlark::values::FrozenValueTyped;
 
 use crate::bxl::starlark_defs::context::BxlContext;
 
@@ -36,15 +38,18 @@ pub(crate) struct LazyAttrResolutionContext<'v> {
     pub(crate) module: &'v Module,
     pub(crate) configured_node: &'v ConfiguredTargetNode,
     pub(crate) ctx: &'v BxlContext<'v>,
-    pub(crate) dep_analysis_results:
-        OnceLock<anyhow::Result<HashMap<&'v ConfiguredTargetLabel, FrozenProviderCollectionValue>>>,
-    pub(crate) query_results: OnceLock<anyhow::Result<HashMap<String, Arc<AnalysisQueryResult>>>>,
+    pub(crate) dep_analysis_results: OnceLock<
+        buck2_error::Result<HashMap<&'v ConfiguredTargetLabel, FrozenProviderCollectionValue>>,
+    >,
+    pub(crate) query_results:
+        OnceLock<buck2_error::Result<HashMap<String, Arc<AnalysisQueryResult>>>>,
 }
 
 impl<'v> LazyAttrResolutionContext<'v> {
     pub(crate) fn dep_analysis_results(
         &self,
-    ) -> &anyhow::Result<HashMap<&'v ConfiguredTargetLabel, FrozenProviderCollectionValue>> {
+    ) -> &buck2_error::Result<HashMap<&'v ConfiguredTargetLabel, FrozenProviderCollectionValue>>
+    {
         self.dep_analysis_results.get_or_init(|| {
             get_deps_from_analysis_results(self.ctx.async_ctx.borrow_mut().via(|dice_ctx| {
                 get_dep_analysis(self.configured_node.as_ref(), dice_ctx).boxed_local()
@@ -54,7 +59,7 @@ impl<'v> LazyAttrResolutionContext<'v> {
 
     pub(crate) fn query_results(
         &self,
-    ) -> &anyhow::Result<HashMap<String, Arc<AnalysisQueryResult>>> {
+    ) -> &buck2_error::Result<HashMap<String, Arc<AnalysisQueryResult>>> {
         self.query_results.get_or_init(|| {
             self.ctx.async_ctx.borrow_mut().via(|dice_ctx| {
                 resolve_queries(dice_ctx, self.configured_node.as_ref()).boxed_local()
@@ -71,20 +76,25 @@ impl<'v> AttrResolutionContext<'v> for LazyAttrResolutionContext<'v> {
     fn get_dep(
         &self,
         target: &ConfiguredProvidersLabel,
-    ) -> anyhow::Result<FrozenProviderCollectionValue> {
+    ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>> {
         match self.dep_analysis_results() {
-            Ok(deps) => get_dep(deps, target, self.module),
-            Err(e) => Err(anyhow::anyhow!("Error getting deps from analysis: `{}`", e)),
+            Ok(deps) => Ok(get_dep(deps, target, self.module)?),
+            Err(e) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Error getting deps from analysis: `{}`",
+                e
+            )),
         }
     }
 
     fn resolve_unkeyed_placeholder(
         &self,
         name: &str,
-    ) -> anyhow::Result<Option<FrozenCommandLineArg>> {
+    ) -> buck2_error::Result<Option<FrozenCommandLineArg>> {
         match self.dep_analysis_results() {
             Ok(deps) => Ok(resolve_unkeyed_placeholder(deps, name, self.module)),
-            Err(e) => Err(anyhow::anyhow!(
+            Err(e) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
                 "Error resolving unkeyed placeholder: `{}`",
                 e
             )),
@@ -94,8 +104,12 @@ impl<'v> AttrResolutionContext<'v> for LazyAttrResolutionContext<'v> {
     fn resolve_query(&self, query: &str) -> buck2_error::Result<Arc<AnalysisQueryResult>> {
         match self.query_results() {
             Ok(res) => resolve_query(res, query, self.module),
-            Err(e) => Err(anyhow::anyhow!("Error resolving query: `{}`", e))
-                .map_err(buck2_error::Error::from),
+            Err(e) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Error resolving query: `{}`",
+                e
+            ))
+            .map_err(buck2_error::Error::from),
         }
     }
 

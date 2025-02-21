@@ -15,7 +15,7 @@
 
 -module(test).
 
--include_lib("common/include/tpx_records.hrl").
+-include_lib("common/include/buck_ct_records.hrl").
 
 %% Public API
 -export([
@@ -24,7 +24,8 @@
     list/0, list/1,
     rerun/1,
     run/0, run/1,
-    reset/0
+    reset/0,
+    logs/0
 ]).
 
 %% init
@@ -34,10 +35,17 @@
     start_shell/0
 ]).
 
--type test_id() :: string() | non_neg_integer().
+%% Test functions
+-export([
+    list_impl/1
+]).
+
+-type test_id() :: string() | non_neg_integer() | atom().
 -type test_info() :: #{name := string(), suite := atom()}.
 -type run_spec() :: test_id() | [test_info()].
 -type run_result() :: {non_neg_integer(), non_neg_integer()}.
+
+-type provided_test_info() :: test_info:test_info().
 
 -spec start() -> ok.
 start() ->
@@ -71,7 +79,7 @@ help() ->
     [
         print_help(F, A)
      || {F, A} <- ?MODULE:module_info(exports),
-        not lists:member(F, [module_info, ensure_initialized, start, start_shell])
+        not lists:member(F, [module_info, ensure_initialized, start, start_shell, list_impl])
     ],
     io:format("~n"),
     io:format("For more information, use the built in help, e.g. h(test, help)~n"),
@@ -128,6 +136,8 @@ command_description(run, 1) ->
     };
 command_description(reset, 0) ->
     #{args => [], desc => ["restarts the test node, enabling a clean test state"]};
+command_description(logs, 0) ->
+    #{args => [], desc => ["print log files of the currently running test suites"]};
 command_description(F, A) ->
     error({help_is_missing, {F, A}}).
 
@@ -143,10 +153,9 @@ list() ->
 %% tests from that module instead
 -spec list(RegExOrModule :: module() | string()) -> ok | {error, term()}.
 list(RegEx) when is_list(RegEx) ->
-    ensure_initialized(),
-    case ct_daemon:list(RegEx) of
-        {invalid_regex, _} = Err -> {error, Err};
-        Tests -> print_tests(Tests)
+    case list_impl(RegEx) of
+        {ok, TestsString} -> io:format("~s", [TestsString]);
+        Error -> Error
     end.
 
 %% @doc Run a test given by either the test id from the last list() command, or
@@ -187,7 +196,7 @@ run(RegExOrId) ->
                         ChangedCount ->
                             io:format("reloaded ~p modules ~P~n", [ChangedCount, Loaded, 10]),
                             % There were some changes, so list the tests again, then run but without recompiling changes
-                            % Note that if called with the RegEx insted of ToRun test list like above, do_plain_test_run/1 will list the tests again
+                            % Note that if called with the RegEx instead of ToRun test list like above, do_plain_test_run/1 will list the tests again
                             do_plain_test_run(RegExOrId)
                     end;
                 Error ->
@@ -196,7 +205,7 @@ run(RegExOrId) ->
     end.
 
 %% @doc restarts the test node, enabling a clean test state
--spec reset() -> ok | {error, debugger_mode}.
+-spec reset() -> ok | {error, term()}.
 reset() ->
     case is_debug_session() of
         true ->
@@ -204,12 +213,33 @@ reset() ->
         false ->
             Type = ct_daemon_node:get_domain_type(),
             NodeName = ct_daemon_node:stop(),
-            ct_daemon:start(#{
+            #test_info{erl_cmd = ErlCmd} = get_provided_test_info(),
+            ct_daemon:start(ErlCmd, #{
                 type => Type, name => NodeName, cookie => erlang:get_cookie(), options => []
             })
     end.
 
+%% @doc Print all the logs of the currently running test suites
+-spec logs() -> ok.
+logs() ->
+    ensure_initialized(),
+    case logs_impl() of
+        {ok, Logs} ->
+            lists:foreach(fun(LogPath) -> io:format("~s~n", [LogPath]) end, Logs),
+            io:format("~n");
+        {error, not_found} ->
+            io:format("no logs found~n")
+    end.
+
 %% internal
+-spec list_impl(RegEx :: string()) -> {ok, string()} | {error, term()}.
+list_impl(RegEx) ->
+    ensure_initialized(),
+    case ct_daemon:list(RegEx) of
+        {invalid_regex, _} = Err -> {error, Err};
+        Tests -> {ok, print_tests(Tests)}
+    end.
+
 ensure_initialized() ->
     PrintInit = lists:foldl(
         fun(Fun, Acc) -> Fun() orelse Acc end,
@@ -229,21 +259,28 @@ ensure_initialized() ->
 
 -spec init_utility_apps() -> boolean().
 init_utility_apps() ->
+    _ = application:load(test_cli_lib),
+    UtilityApps = application:get_env(test_cli_lib, utility_applications, []),
     RunningApps = proplists:get_value(running, application:info()),
-    case proplists:is_defined(test_cli_lib, RunningApps) of
+    StartResults = [init_utility_app(RunningApps, UtilityApp) || UtilityApp <- UtilityApps],
+    lists:any(fun(B) when is_boolean(B) -> B end, StartResults).
+
+-spec init_utility_app(RunningApps :: [atom()], UtilityApp :: atom()) -> boolean().
+init_utility_app(RunningApps, UtilityApp) ->
+    case proplists:is_defined(UtilityApp, RunningApps) of
         true ->
             false;
         false ->
-            io:format("starting utility applications...~n", []),
-            case application:ensure_all_started(test_cli_lib) of
+            io:format("starting utility application ~s...~n", [UtilityApp]),
+            case application:ensure_all_started(UtilityApp) of
                 {ok, _} ->
                     true;
                 Error ->
-                    io:format("ERROR: could not start utility applications:~n~p~n", [Error]),
-                    io:format("exiting...~n"),
-                    erlang:halt(-1)
+                    abort("could not start utility applications:~n~p", [Error])
             end
     end.
+
+-define(TYPE_IS_OK(Type), (Type =:= shortnames orelse Type =:= longnames)).
 
 -spec init_node() -> boolean().
 init_node() ->
@@ -252,16 +289,20 @@ init_node() ->
             false;
         false ->
             io:format("starting test node...~n", []),
+            #test_info{erl_cmd = ErlCmd} = get_provided_test_info(),
             case application:get_env(test_cli_lib, node_config) of
                 undefined ->
-                    ct_daemon:start();
-                {ok, {Type, NodeName, Cookie}} ->
-                    ct_daemon:start(#{
-                        name => NodeName,
-                        type => Type,
-                        cookie => Cookie,
-                        options => [{multiply_timetraps, infinity} || is_debug_session()]
-                    })
+                    ct_daemon:start(ErlCmd);
+                {ok, {Type, NodeName, Cookie}} when ?TYPE_IS_OK(Type), is_atom(NodeName), is_atom(Cookie) ->
+                    ct_daemon:start(
+                        ErlCmd,
+                        #{
+                            name => NodeName,
+                            type => Type,
+                            cookie => Cookie,
+                            options => [{multiply_timetraps, infinity} || is_debug_session()]
+                        }
+                    )
             end,
             case is_debug_session() of
                 true ->
@@ -271,6 +312,25 @@ init_node() ->
             end,
             true
     end.
+
+-spec get_provided_test_info() -> provided_test_info().
+get_provided_test_info() ->
+    case application:get_env(test_cli_lib, test_info_file, undefined) of
+        undefined ->
+            abort("test_info_file not provided.");
+        TestInfoFile when is_binary(TestInfoFile) ->
+            test_info:load_from_file(TestInfoFile)
+    end.
+
+-spec abort(Message :: string()) -> no_return().
+abort(Message) ->
+    abort(Message, []).
+
+-spec abort(Format :: string(), Args :: [term()]) -> no_return().
+abort(Format, Args) ->
+    io:format(standard_error, "ERROR: " ++ Format ++ "~n", Args),
+    io:format(standard_error, "exiting...~n", []),
+    erlang:halt(1).
 
 -spec watchdog() -> no_return().
 watchdog() ->
@@ -294,19 +354,20 @@ init_group_leader() ->
     ct_daemon:set_gl(),
     false.
 
--spec print_tests([{module(), [{non_neg_integer(), string()}]}]) -> ok.
+-spec print_tests([{module(), [{non_neg_integer(), string()}]}]) -> string().
 print_tests([]) ->
-    io:format("no tests found~n");
+    lists:flatten(io_lib:format("no tests found~n"));
 print_tests(Tests) ->
-    print_tests_impl(lists:reverse(Tests)).
+    lists:flatten(print_tests_impl(lists:reverse(Tests))).
 
--spec print_tests_impl([{module(), [{non_neg_integer(), string()}]}]) -> ok.
+-spec print_tests_impl([{module(), [{non_neg_integer(), string()}]}]) -> io_lib:chars().
 print_tests_impl([]) ->
-    ok;
+    "";
 print_tests_impl([{Suite, SuiteTests} | Rest]) ->
-    io:format("~s:~n", [Suite]),
-    [io:format("\t~b - ~s~n", [Id, Test]) || {Id, Test} <- SuiteTests],
-    print_tests_impl(Rest).
+    SuiteString = io_lib:format("~s:~n", [Suite]),
+    TestsString = [io_lib:format("\t~b - ~s~n", [Id, Test]) || {Id, Test} <- SuiteTests],
+    RestString = print_tests_impl(Rest),
+    SuiteString ++ TestsString ++ RestString.
 
 -spec is_debug_session() -> boolean().
 is_debug_session() ->
@@ -350,9 +411,15 @@ ensure_per_suite_encapsulation(Suite) ->
             end
     end.
 
--spec discover(string() | non_neg_integer()) -> [test_info()].
+-spec discover(string() | non_neg_integer() | atom()) -> [test_info()].
 discover(RegExOrId) ->
-    case ct_daemon:discover(RegExOrId) of
+    StringOrId = case is_atom(RegExOrId) of
+        true ->
+            atom_to_list(RegExOrId);
+        false ->
+            RegExOrId
+    end,
+    case ct_daemon:discover(StringOrId) of
         {error, not_listed_yet} ->
             ct_daemon:list(""),
             discover(RegExOrId);
@@ -403,4 +470,18 @@ start_shell() ->
         _ ->
             user_drv:start(),
             ok
+    end.
+
+-spec logs_impl() -> {ok, [file:filename_all()]} | {error, not_found}.
+logs_impl() ->
+    case ct_daemon:priv_dir() of
+        undefined ->
+            {error, not_found};
+        PrivDir ->
+            PatternLog = filename:join(PrivDir, "*.log"),
+            LogPaths = filelib:wildcard(PatternLog),
+            PatternLogJson = filename:join(PrivDir, "*.log.json"),
+            LogJsonPaths = filelib:wildcard(PatternLogJson),
+            AllLogs = lists:sort(LogPaths ++ LogJsonPaths),
+            {ok, AllLogs}
     end.

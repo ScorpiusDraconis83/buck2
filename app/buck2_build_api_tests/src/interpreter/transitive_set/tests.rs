@@ -181,44 +181,10 @@ fn test_transitive_set_display() -> anyhow::Result<()> {
             assert_eq("FooSet(value=2, 1 children)", repr(f2))
             assert_eq("FooSet(1 children)", repr(f3))
 
-            assert_eq("FooSet(\n  value=1,\n  0 children\n)", pprint_str(f1))
-            assert_eq("FooSet( 1 children )", pprint_str(f3))
+            assert_eq("FooSet(\n  value=1,\n  0 children\n)", prepr(f1))
+            assert_eq("FooSet( 1 children )", prepr(f3))
         "#
     ))?;
-
-    Ok(())
-}
-
-#[test]
-fn test_transitive_sets_validation() -> anyhow::Result<()> {
-    let mut tester = transitive_set_tester();
-
-    let contents = indoc!(
-        r#"
-        def test():
-            FooSet = transitive_set()
-            make_tset(FooSet, value = None)
-        "#
-    );
-
-    expect_error(
-        tester.run_starlark_bzl_test(contents),
-        contents,
-        "used before being assigned",
-    );
-
-    let contents = indoc!(
-        r#"
-        def test():
-            make_tset(123, value = None)
-        "#
-    );
-
-    expect_error(
-        tester.run_starlark_bzl_test(contents),
-        contents,
-        "not the output of transitive_set",
-    );
 
     Ok(())
 }
@@ -721,7 +687,23 @@ fn test_accessors() -> anyhow::Result<()> {
 
             s2 = make_tset(FooSet, value = 1)
             assert_eq(s2.value,  1)
-        "#
+
+            f4 = make_tset(FooSet, value = "baz")
+            assert_eq([], f4.children)
+            assert_eq([], [x.value for x in f4.children])
+
+            f3 = make_tset(FooSet, value = "bar", children = [f4])
+            assert_eq([f4], f3.children)
+            assert_eq(["baz"], [x.value for x in f3.children])
+
+            f2 = make_tset(FooSet, children = [f4, f3])
+            assert_eq([f4, f3], f2.children)
+            assert_eq(["baz", "bar"], [x.value for x in f2.children])
+
+            f1 = make_tset(FooSet, children = [f4, f3, f2])
+            assert_eq([f4, f3, f2], f1.children)
+            assert_eq(["baz", "bar"], filter(None, [x.value for x in f1.children])) 
+            "#
     ))?;
 
     Ok(())

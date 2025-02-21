@@ -7,27 +7,26 @@
  * of this source tree.
  */
 
+use buck2_artifact::actions::key::ActionIndex;
 use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
-use buck2_artifact::deferred::id::DeferredId;
 use buck2_build_api::actions::registry::ActionsRegistry;
 use buck2_build_api::analysis::registry::AnalysisRegistry;
 use buck2_build_api::artifact_groups::ArtifactGroup;
-use buck2_build_api::deferred::types::BaseKey;
-use buck2_build_api::deferred::types::DeferredRegistry;
 use buck2_build_api::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use buck2_build_api::interpreter::rule_defs::artifact::output_artifact_like::OutputArtifactArg;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkDeclaredArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::unpack_artifact::UnpackArtifactOrDeclaredArtifact;
 use buck2_build_api::interpreter::rule_defs::cmd_args::DefaultCommandLineContext;
-use buck2_core::base_deferred_key::BaseDeferredKey;
-use buck2_core::buck_path::path::BuckPath;
-use buck2_core::category::Category;
+use buck2_core::category::CategoryRef;
 use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::configuration::data::ConfigurationData;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::deferred::key::DeferredHolderKey;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
@@ -36,16 +35,18 @@ use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_core::package::package_relative_path::PackageRelativePathBuf;
+use buck2_core::package::package_relative_path::PackageRelativePath;
+use buck2_core::package::source_path::SourcePath;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::request::OutputType;
 use buck2_interpreter_for_build::interpreter::build_context::BuildContext;
 use buck2_interpreter_for_build::interpreter::testing::cells;
+use buck2_util::arc_str::ArcS;
 use dupe::Dupe;
 use indexmap::indexset;
 use indexmap::IndexSet;
@@ -63,6 +64,7 @@ fn get_label(eval: &Evaluator, target: &str) -> anyhow::Result<ConfiguredTargetL
         target,
         ctx.build_file_cell().name(),
         ctx.cell_resolver(),
+        ctx.cell_info.cell_alias_resolver(),
     ) {
         Ok(ParsedPattern::Target(package, target_name, TargetPatternExtra)) => {
             Ok(TargetLabel::new(package, target_name.as_ref())
@@ -84,10 +86,7 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
             ctx.build_file_cell().name(),
             CellRelativePath::from_path(package).unwrap(),
         );
-        let path = BuckPath::testing_new(
-            package,
-            PackageRelativePathBuf::try_from(path.to_owned()).unwrap(),
-        );
+        let path = SourcePath::new(package, ArcS::from(PackageRelativePath::new(path)?));
         Ok(StarlarkArtifact::new(SourceArtifact::new(path).into()))
     }
 
@@ -97,12 +96,8 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator,
     ) -> anyhow::Result<StarlarkArtifact> {
         let target_label = get_label(eval, target)?;
-        let id = DeferredId::testing_new(0);
-        let artifact = Artifact::from(BuildArtifact::testing_new(
-            target_label,
-            ForwardRelativePathBuf::try_from(path.to_owned()).unwrap(),
-            id,
-        ));
+        let id = ActionIndex::new(0);
+        let artifact = Artifact::from(BuildArtifact::testing_new(target_label, path, id));
         Ok(StarlarkArtifact::new(artifact))
     }
 
@@ -112,7 +107,7 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
     ) -> anyhow::Result<StarlarkDeclaredArtifact> {
         let target_label = get_label(eval, "//foo:bar")?;
         let mut registry = ActionsRegistry::new(
-            BaseDeferredKey::TargetLabel(target_label),
+            DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target_label)),
             ExecutionPlatformResolution::unspecified(),
         );
         let artifact = registry.declare_artifact(
@@ -134,11 +129,8 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator,
     ) -> anyhow::Result<StarlarkDeclaredArtifact> {
         let target_label = get_label(eval, target)?;
-        let mut deferred = DeferredRegistry::new(BaseKey::Base(BaseDeferredKey::TargetLabel(
-            target_label.dupe(),
-        )));
         let mut registry = ActionsRegistry::new(
-            BaseDeferredKey::TargetLabel(target_label),
+            DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target_label.dupe())),
             ExecutionPlatformResolution::unspecified(),
         );
         let artifact = registry.declare_artifact(
@@ -149,10 +141,14 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
         )?;
         let outputs = indexset![artifact.as_output()];
         registry.register(
-            &mut deferred,
+            &DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target_label.dupe())),
             IndexSet::new(),
             outputs,
-            SimpleUnregisteredAction::new(vec![], Category::try_from("fake_action").unwrap(), None),
+            SimpleUnregisteredAction::new(
+                vec![],
+                CategoryRef::new("fake_action").unwrap().to_owned(),
+                None,
+            ),
         )?;
         Ok(StarlarkDeclaredArtifact::new(
             None,
@@ -187,12 +183,11 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
 
     // Mainly tests get_or_declare_output function that can transfer associated artifacts
     // artifact parameter can be either string or artifact
-    #[allow(clippy::from_iter_instead_of_collect)]
     fn declared_bound_artifact_with_associated_artifacts<'v>(
         // TODO(nga): parameters should be either positional or named, not both.
         artifact: OutputArtifactArg<'v>,
-        associated_artifacts: UnpackListOrTuple<StarlarkArtifact>,
-        eval: &mut Evaluator<'v, '_>,
+        associated_artifacts: UnpackListOrTuple<UnpackArtifactOrDeclaredArtifact<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<Value<'v>> {
         let target_label = get_label(eval, "//foo:bar")?;
         let mut analysis_registry = AnalysisRegistry::new_from_owner(
@@ -200,27 +195,28 @@ pub(crate) fn artifactory(builder: &mut GlobalsBuilder) {
             ExecutionPlatformResolution::unspecified(),
         )?;
         let mut actions_registry = ActionsRegistry::new(
-            BaseDeferredKey::TargetLabel(target_label.dupe()),
+            DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target_label.dupe())),
             ExecutionPlatformResolution::unspecified(),
         );
-        let mut deferred = DeferredRegistry::new(BaseKey::Base(BaseDeferredKey::TargetLabel(
-            target_label.dupe(),
-        )));
 
         let associated_artifacts = AssociatedArtifacts::from(
             associated_artifacts
                 .items
                 .iter()
-                .map(|a| ArtifactGroup::Artifact(a.artifact())),
+                .map(|a| ArtifactGroup::Artifact(a.artifact().unwrap())),
         );
         let (declaration, output_artifact) =
             analysis_registry.get_or_declare_output(eval, artifact, OutputType::File)?;
 
         actions_registry.register(
-            &mut deferred,
+            &DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target_label.dupe())),
             IndexSet::new(),
             indexset![output_artifact],
-            SimpleUnregisteredAction::new(vec![], Category::try_from("fake_action").unwrap(), None),
+            SimpleUnregisteredAction::new(
+                vec![],
+                CategoryRef::new("fake_action").unwrap().to_owned(),
+                None,
+            ),
         )?;
 
         let value = declaration

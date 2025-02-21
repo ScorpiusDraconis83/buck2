@@ -13,24 +13,29 @@ use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::execution_types::execution::ExecutionPlatform;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Trace;
-use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
+use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOfUncheckedGeneric;
+use starlark::values::ValueTyped;
+use starlark::values::ValueTypedComplex;
 
 use crate::interpreter::rule_defs::command_executor_config::StarlarkCommandExecutorConfig;
 use crate::interpreter::rule_defs::provider::builtin::configuration_info::ConfigurationInfo;
+use crate::interpreter::rule_defs::provider::builtin::configuration_info::FrozenConfigurationInfo;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum ExecutionPlatformProviderErrors {
-    #[error("expected a label, got `{0}` (type `{1}`)")]
-    ExpectedLabel(String, String),
     #[error("expected a ConfigurationInfo, got `{0}` (type `{1}`)")]
     ExpectedConfigurationInfo(String, String),
     #[error("expected a CommandExecutorConfig, got `{0}` (type `{1}`)")]
@@ -41,63 +46,56 @@ enum ExecutionPlatformProviderErrors {
 #[internal_provider(info_creator)]
 #[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
 #[repr(C)]
-pub struct ExecutionPlatformInfoGen<V> {
+pub struct ExecutionPlatformInfoGen<V: ValueLifetimeless> {
     /// label of the defining rule, used in informative messages
-    #[provider(field_type = StarlarkTargetLabel)]
-    label: V,
+    label: ValueOfUncheckedGeneric<V, StarlarkTargetLabel>,
     /// The configuration of the execution platform
-    #[provider(field_type = ConfigurationInfo<'v>)]
-    configuration: V,
+    configuration: ValueOfUncheckedGeneric<V, FrozenConfigurationInfo>,
     /// The executor config
-    #[provider(field_type = StarlarkCommandExecutorConfig)]
-    executor_config: V,
+    executor_config: ValueOfUncheckedGeneric<V, StarlarkCommandExecutorConfig>,
 }
 
 impl<'v, V: ValueLike<'v>> ExecutionPlatformInfoGen<V> {
-    pub fn to_execution_platform(&self) -> anyhow::Result<ExecutionPlatform> {
-        let target = StarlarkTargetLabel::from_value(self.label.to_value())
-            .ok_or_else(|| {
-                ExecutionPlatformProviderErrors::ExpectedLabel(
-                    self.label.to_value().to_repr(),
-                    self.label.to_value().get_type().to_owned(),
-                )
-            })?
-            .label()
-            .dupe();
-        let cfg = ConfigurationInfo::from_value(self.configuration.to_value())
+    pub fn to_execution_platform(&self) -> buck2_error::Result<ExecutionPlatform> {
+        let target = self.label.cast::<&StarlarkTargetLabel>().unpack()?.label();
+        let cfg = ConfigurationInfo::from_value(self.configuration.get().to_value())
             .ok_or_else(|| {
                 ExecutionPlatformProviderErrors::ExpectedConfigurationInfo(
-                    self.configuration.to_value().to_repr(),
-                    self.configuration.to_value().get_type().to_owned(),
+                    self.configuration.to_value().get().to_repr(),
+                    self.configuration.to_value().get().get_type().to_owned(),
                 )
             })?
             .to_configuration_data()?;
-        let cfg = ConfigurationData::from_platform(TargetLabel::to_string(&target), cfg)?;
+        let cfg = ConfigurationData::from_platform(TargetLabel::to_string(target), cfg)?;
         let executor_config =
-            StarlarkCommandExecutorConfig::from_value(self.executor_config.to_value())
+            StarlarkCommandExecutorConfig::from_value(self.executor_config.get().to_value())
                 .ok_or_else(|| {
                     ExecutionPlatformProviderErrors::ExpectedCommandExecutorConfig(
-                        self.configuration.to_value().to_repr(),
-                        self.configuration.to_value().get_type().to_owned(),
+                        self.configuration.get().to_value().to_repr(),
+                        self.configuration.get().to_value().get_type().to_owned(),
                     )
                 })?
                 .0
                 .dupe();
-        Ok(ExecutionPlatform::platform(target, cfg, executor_config))
+        Ok(ExecutionPlatform::platform(
+            target.dupe(),
+            cfg,
+            executor_config,
+        ))
     }
 }
 
 #[starlark_module]
 fn info_creator(globals: &mut GlobalsBuilder) {
     fn ExecutionPlatformInfo<'v>(
-        #[starlark(require = named)] label: Value<'v>,
-        #[starlark(require = named)] configuration: Value<'v>,
-        #[starlark(require = named)] executor_config: Value<'v>,
-    ) -> anyhow::Result<ExecutionPlatformInfo<'v>> {
+        #[starlark(require = named)] label: ValueTyped<'v, StarlarkTargetLabel>,
+        #[starlark(require = named)] configuration: ValueTypedComplex<'v, ConfigurationInfo<'v>>,
+        #[starlark(require = named)] executor_config: ValueTyped<'v, StarlarkCommandExecutorConfig>,
+    ) -> starlark::Result<ExecutionPlatformInfo<'v>> {
         let info = ExecutionPlatformInfo {
-            label,
-            configuration,
-            executor_config,
+            label: label.to_value_of_unchecked(),
+            configuration: ValueOfUnchecked::new(configuration.to_value()),
+            executor_config: executor_config.to_value_of_unchecked(),
         };
         // This checks that the values are valid.
         info.to_execution_platform()?;

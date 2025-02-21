@@ -20,53 +20,42 @@ use starlark_derive::starlark_module;
 
 use crate as starlark;
 use crate::codemap::Span;
-use crate::codemap::Spanned;
 use crate::environment::GlobalsBuilder;
+use crate::typing::call_args::TyCallArgs;
+use crate::typing::callable::TyCallable;
 use crate::typing::error::TypingOrInternalError;
 use crate::typing::function::TyCustomFunctionImpl;
-use crate::typing::Arg;
+use crate::typing::ParamSpec;
 use crate::typing::Ty;
 use crate::typing::TypingOracleCtx;
 use crate::values::tuple::UnpackTuple;
+use crate::values::typing::StarlarkIter;
+use crate::values::FrozenValue;
 use crate::values::Heap;
 use crate::values::Value;
+use crate::values::ValueOfUnchecked;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Allocative)]
 struct ZipType;
 
 impl TyCustomFunctionImpl for ZipType {
+    fn as_callable(&self) -> TyCallable {
+        // TODO(nga): this should be obtained from function signature from function definition.
+        TyCallable::new(ParamSpec::args(Ty::iter(Ty::any())), Ty::list(Ty::any()))
+    }
+
     fn validate_call(
         &self,
         _span: Span,
-        args: &[Spanned<Arg>],
+        args: &TyCallArgs,
         oracle: TypingOracleCtx,
     ) -> Result<Ty, TypingOrInternalError> {
         let mut iter_item_types: Vec<Ty> = Vec::new();
-        let mut seen_star_args = false;
-        for arg in args {
-            match &arg.node {
-                Arg::Pos(pos) => {
-                    let item_ty = oracle.iter_item(Spanned {
-                        span: arg.span,
-                        node: pos,
-                    })?;
-                    iter_item_types.push(item_ty);
-                }
-                Arg::Name(_, _) => {
-                    return Err(
-                        oracle.msg_error(arg.span, "zip() does not accept keyword arguments")
-                    );
-                }
-                Arg::Args(_) => {
-                    seen_star_args = true;
-                }
-                Arg::Kwargs(_) => {
-                    // `zip()` does not accept keyword args,
-                    // but if `**kwargs` is empty, the call is valid.
-                }
-            }
+        for pos in &args.pos {
+            let item_ty = oracle.iter_item(pos.as_ref())?;
+            iter_item_types.push(item_ty);
         }
-        if seen_star_args {
+        if args.args.is_some() {
             Ok(Ty::list(Ty::any()))
         } else {
             Ok(Ty::list(Ty::tuple(iter_item_types)))
@@ -96,14 +85,14 @@ pub(crate) fn register_zip(globals: &mut GlobalsBuilder) {
     /// ```
     #[starlark(speculative_exec_safe, ty_custom_function = ZipType)]
     fn zip<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(args)] args: UnpackTuple<ValueOfUnchecked<'v, StarlarkIter<FrozenValue>>>,
         heap: &'v Heap,
     ) -> starlark::Result<Vec<Value<'v>>> {
         let mut v = Vec::new();
         let mut first = true;
         for arg in args.items {
             let mut idx = 0;
-            for e in arg.iterate(heap)? {
+            for e in arg.get().iterate(heap)? {
                 if first {
                     v.push(heap.alloc((e,)));
                     idx += 1;

@@ -8,11 +8,12 @@
  */
 
 use std::borrow::Cow;
+use std::convert::Infallible;
 use std::path::Path;
 
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_core::cells::cell_path::CellPath;
@@ -21,7 +22,7 @@ use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::fs::paths::abs_path::AbsPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
-use buck2_core::pattern::maybe_split_cell_alias_and_relative_path;
+use buck2_core::pattern::pattern::maybe_split_cell_alias_and_relative_path;
 use derive_more::Display;
 use dice::DiceComputations;
 use dupe::Dupe;
@@ -38,17 +39,27 @@ pub(crate) struct SourceArtifactUnpack {
 }
 
 impl StarlarkTypeRepr for SourceArtifactUnpack {
+    type Canonical = <StarlarkArtifact as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         StarlarkArtifact::starlark_type_repr()
     }
 }
 
 impl<'v> UnpackValue<'v> for SourceArtifactUnpack {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        let v = ValueAsArtifactLike::unpack_value(value)?;
-        Some(SourceArtifactUnpack {
-            artifact: v.0.get_bound_artifact().ok()?.get_source()?,
-        })
+    type Error = Infallible;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        let Some(v) = ValueAsArtifactLike::unpack_value_opt(value) else {
+            return Ok(None);
+        };
+        let Some(bound_artifact) = v.0.get_bound_artifact().ok() else {
+            return Ok(None);
+        };
+        let Some(artifact) = bound_artifact.get_source() else {
+            return Ok(None);
+        };
+        Ok(Some(SourceArtifactUnpack { artifact }))
     }
 }
 
@@ -66,7 +77,7 @@ pub(crate) enum FileExpr<'v> {
 fn parse_cell_path_as_file_expr_literal(
     val: &str,
     cell_alias_resolver: &CellAliasResolver,
-) -> anyhow::Result<Option<CellPath>> {
+) -> buck2_error::Result<Option<CellPath>> {
     Ok(match maybe_split_cell_alias_and_relative_path(val)? {
         Some((alias, path)) => {
             let cell_name = cell_alias_resolver.resolve(alias.as_str())?;
@@ -82,15 +93,14 @@ fn parse_cell_path_as_file_expr_literal(
 impl<'a> FileExpr<'a> {
     pub(crate) async fn get(
         self,
-        dice: &mut DiceComputations,
+        dice: &mut DiceComputations<'_>,
         cell_instance: &CellInstance,
-    ) -> anyhow::Result<CellPath> {
+    ) -> buck2_error::Result<CellPath> {
         match self {
             FileExpr::Literal(val) => {
-                match parse_cell_path_as_file_expr_literal(
-                    val,
-                    cell_instance.cell_alias_resolver(),
-                )? {
+                let cell_alias_resolver =
+                    dice.get_cell_alias_resolver(cell_instance.name()).await?;
+                match parse_cell_path_as_file_expr_literal(val, &cell_alias_resolver)? {
                     Some(cell_path) => Ok(cell_path),
                     None => {
                         let fs = dice.global_data().get_io_provider().project_root().dupe();
@@ -100,7 +110,7 @@ impl<'a> FileExpr<'a> {
                         } else {
                             Cow::Borrowed(<&ProjectRelativePath>::try_from(val)?)
                         };
-                        dice.get_cell_resolver().await?.get_cell_path(&rel)
+                        Ok(dice.get_cell_resolver().await?.get_cell_path(&rel)?)
                     }
                 }
             }
@@ -115,13 +125,12 @@ mod tests {
 
     use buck2_core::cells::alias::NonEmptyCellAlias;
     use buck2_core::cells::name::CellName;
-    use buck2_core::cells::CellAliasResolver;
     use maplit::hashmap;
 
     use super::*;
 
     #[test]
-    fn test_parse_cell_path_as_file_expr_literal() -> anyhow::Result<()> {
+    fn test_parse_cell_path_as_file_expr_literal() -> buck2_error::Result<()> {
         let cell1 = CellName::testing_new("cell1");
 
         let map = hashmap![

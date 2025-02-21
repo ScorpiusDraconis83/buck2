@@ -22,24 +22,156 @@ use dupe::Dupe;
 
 use crate::eval::runtime::profile::data::ProfileData;
 use crate::eval::runtime::profile::data::ProfileDataImpl;
+use crate::eval::runtime::profile::profiler_type::ProfilerType;
 use crate::eval::ProfileMode;
 use crate::values::layout::heap::profile::aggregated::AggregateHeapProfileInfo;
 use crate::values::Heap;
 use crate::values::Value;
 
+pub(crate) struct HeapAllocatedProfilerType;
+pub(crate) struct HeapRetainedProfilerType;
+pub(crate) struct HeapSummaryAllocatedProfilerType;
+pub(crate) struct HeapFlameAllocatedProfilerType;
+pub(crate) struct HeapSummaryRetainedProfilerType;
+pub(crate) struct HeapFlameRetainedProfilerType;
+
+impl ProfilerType for HeapAllocatedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapAllocated;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapAllocated(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapAllocated(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for HeapSummaryAllocatedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapSummaryAllocated;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapSummaryAllocated(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapSummaryAllocated(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for HeapFlameAllocatedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapFlameAllocated;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapFlameAllocated(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapFlameAllocated(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for HeapRetainedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapRetained;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapRetained(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapRetained(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for HeapSummaryRetainedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapSummaryRetained;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapSummaryRetained(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapSummaryRetained(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for HeapFlameRetainedProfilerType {
+    type Data = Box<AggregateHeapProfileInfo>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::HeapFlameRetained;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::HeapFlameRetained(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::HeapFlameRetained(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(AggregateHeapProfileInfo::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
 #[derive(Copy, Clone, Dupe, Debug, Allocative)]
 pub(crate) enum RetainedHeapProfileMode {
     Flame,
     Summary,
-}
-
-impl RetainedHeapProfileMode {
-    pub(crate) fn to_profile_mode(self) -> ProfileMode {
-        match self {
-            RetainedHeapProfileMode::Flame => ProfileMode::HeapFlameRetained,
-            RetainedHeapProfileMode::Summary => ProfileMode::HeapSummaryRetained,
-        }
-    }
+    FlameAndSummary,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,8 +182,9 @@ enum HeapProfileError {
 
 #[derive(Copy, Clone, Dupe, Debug)]
 pub(crate) enum HeapProfileFormat {
-    Summary,
     FlameGraph,
+    Summary,
+    FlameGraphAndSummary,
 }
 
 pub(crate) struct HeapProfile {
@@ -84,19 +217,18 @@ impl HeapProfile {
     }
 
     // We could expose profile on the Heap, but it's an implementation detail that it works here.
-    pub(crate) fn gen(
-        &self,
-        heap: &Heap,
-        format: HeapProfileFormat,
-    ) -> anyhow::Result<ProfileData> {
+    pub(crate) fn gen(&self, heap: &Heap, format: HeapProfileFormat) -> crate::Result<ProfileData> {
         if !self.enabled {
-            return Err(HeapProfileError::NotEnabled.into());
+            return Err(crate::Error::new_other(HeapProfileError::NotEnabled));
         }
         Ok(Self::gen_enabled(heap, format))
     }
 
     pub(crate) fn gen_enabled(heap: &Heap, format: HeapProfileFormat) -> ProfileData {
         match format {
+            HeapProfileFormat::FlameGraphAndSummary => {
+                Self::write_flame_and_summarized_heap_profile(heap)
+            }
             HeapProfileFormat::Summary => Self::write_summarized_heap_profile(heap),
             HeapProfileFormat::FlameGraph => Self::write_flame_heap_profile(heap),
         }
@@ -105,27 +237,32 @@ impl HeapProfile {
     fn write_flame_heap_profile(heap: &Heap) -> ProfileData {
         let stacks = AggregateHeapProfileInfo::collect(heap, None);
         ProfileData {
-            profile_mode: ProfileMode::HeapFlameAllocated,
-            profile: ProfileDataImpl::AggregateHeapProfileInfo(Box::new(stacks)),
+            profile: ProfileDataImpl::HeapFlameAllocated(Box::new(stacks)),
         }
     }
 
     fn write_summarized_heap_profile(heap: &Heap) -> ProfileData {
         let stacks = AggregateHeapProfileInfo::collect(heap, None);
         ProfileData {
-            profile_mode: ProfileMode::HeapSummaryAllocated,
-            profile: ProfileDataImpl::AggregateHeapProfileInfo(Box::new(stacks)),
+            profile: ProfileDataImpl::HeapSummaryAllocated(Box::new(stacks)),
+        }
+    }
+
+    fn write_flame_and_summarized_heap_profile(heap: &Heap) -> ProfileData {
+        let stacks = AggregateHeapProfileInfo::collect(heap, None);
+        ProfileData {
+            profile: ProfileDataImpl::HeapAllocated(Box::new(stacks)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::environment::Globals;
     use crate::environment::Module;
+    use crate::eval::runtime::profile::heap::HeapProfile;
+    use crate::eval::runtime::profile::mode::ProfileMode;
     use crate::eval::Evaluator;
-    use crate::eval::ProfileMode;
     use crate::syntax::AstModule;
     use crate::syntax::Dialect;
     use crate::values::Value;
@@ -142,7 +279,7 @@ y = 8 * 9 + 2
 f
 "#
             .to_owned(),
-            &Dialect::Extended,
+            &Dialect::AllOptionsInternal,
         )?;
         let globals = Globals::standard();
         let module = Module::new();

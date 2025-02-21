@@ -14,8 +14,9 @@ use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use dashmap::DashMap;
+use dice_error::result::CancellationReason;
 use dupe::Dupe;
-use fnv::FnvBuildHasher;
+use fxhash::FxBuildHasher;
 use lock_free_hashtable::sharded::ShardedLockFreeRawTable;
 
 use crate::arc::Arc;
@@ -27,7 +28,7 @@ use crate::impls::value::DiceComputedValue;
 struct Data {
     completed: ShardedLockFreeRawTable<Arc<DiceCompletedTask>, 64>,
     /// Completed tasks lazily moved into `completed` from this map.
-    storage: DashMap<DiceKey, DiceTask, FnvBuildHasher>,
+    storage: DashMap<DiceKey, DiceTask, FxBuildHasher>,
     is_cancelled: AtomicBool,
 }
 
@@ -45,8 +46,8 @@ struct DiceCompletedTask {
 /// Reference to the task in the cache.
 pub(crate) enum DiceTaskRef<'a> {
     Computed(DiceComputedValue),
-    Occupied(dashmap::mapref::entry::OccupiedEntry<'a, DiceKey, DiceTask, FnvBuildHasher>),
-    Vacant(dashmap::mapref::entry::VacantEntry<'a, DiceKey, DiceTask, FnvBuildHasher>),
+    Occupied(dashmap::mapref::entry::OccupiedEntry<'a, DiceKey, DiceTask, FxBuildHasher>),
+    Vacant(dashmap::mapref::entry::VacantEntry<'a, DiceKey, DiceTask, FxBuildHasher>),
     TransactionCancelled,
 }
 
@@ -146,7 +147,7 @@ impl SharedCache {
             .iter()
             .filter_map(|entry| {
                 if entry.value().is_pending() {
-                    entry.value().cancel();
+                    entry.value().cancel(CancellationReason::TransactionDropped);
                     Some(entry.value().clone())
                 } else {
                     None
@@ -189,6 +190,7 @@ mod tests {
     use buck2_futures::cancellation::CancellationContext;
     use buck2_futures::spawner::TokioSpawner;
     use derive_more::Display;
+    use dice_error::result::CancellationReason;
     use dupe::Dupe;
     use futures::FutureExt;
 
@@ -197,7 +199,6 @@ mod tests {
     use crate::arc::Arc;
     use crate::impls::cache::DiceTaskRef;
     use crate::impls::cache::SharedCache;
-    use crate::impls::core::graph::history::CellHistory;
     use crate::impls::key::DiceKey;
     use crate::impls::key::ParentKey;
     use crate::impls::task::dice::DiceTask;
@@ -206,6 +207,8 @@ mod tests {
     use crate::impls::value::DiceKeyValue;
     use crate::impls::value::DiceValidValue;
     use crate::impls::value::MaybeValidDiceValue;
+    use crate::impls::value::TrackedInvalidationPaths;
+    use crate::versions::VersionRanges;
 
     #[derive(Allocative, Clone, Debug, Display, Eq, PartialEq, Hash)]
     struct K;
@@ -234,7 +237,8 @@ mod tests {
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(val),
                     )),
-                    Arc::new(CellHistory::empty()),
+                    Arc::new(VersionRanges::new()),
+                    TrackedInvalidationPaths::clean(),
                 ));
 
                 Box::new(()) as Box<dyn Any + Send>
@@ -242,11 +246,7 @@ mod tests {
             .boxed()
         });
 
-        task.depended_on_by(ParentKey::None)
-            .not_cancelled()
-            .unwrap()
-            .await
-            .unwrap();
+        task.depended_on_by(ParentKey::None).unwrap().await.unwrap();
 
         task
     }
@@ -259,7 +259,7 @@ mod tests {
             }
             .boxed()
         });
-        finished_cancelling_tasks.cancel();
+        finished_cancelling_tasks.cancel(CancellationReason::ByTest);
 
         finished_cancelling_tasks.await_termination().await;
 

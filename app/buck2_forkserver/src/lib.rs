@@ -8,9 +8,9 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(offset_of)]
+#![cfg_attr(windows, feature(windows_process_extensions_main_thread_handle))]
 pub mod client;
-pub mod convert;
+pub(crate) mod convert;
 pub mod run;
 
 #[cfg(unix)]

@@ -25,10 +25,10 @@ impl AttrTypeCoerce for IntAttrType {
         _configurable: AttrIsConfigurable,
         _ctx: &dyn AttrCoercionContext,
         value: Value,
-    ) -> anyhow::Result<CoercedAttr> {
-        match i64::unpack_value(value) {
+    ) -> buck2_error::Result<CoercedAttr> {
+        match i64::unpack_value(value)? {
             Some(x) => Ok(CoercedAttr::Int(x)),
-            None => Err(anyhow::anyhow!(CoercionError::type_error("int", value))),
+            None => Err(CoercionError::type_error("int", value).into()),
         }
     }
 

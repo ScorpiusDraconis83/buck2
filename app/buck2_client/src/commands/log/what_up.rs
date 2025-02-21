@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use std::time::SystemTimeError;
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::subscribers::superconsole::session_info::SessionInfoComponent;
 use buck2_client_ctx::subscribers::superconsole::timed_list::TimedList;
@@ -20,6 +21,7 @@ use buck2_client_ctx::subscribers::superconsole::StatefulSuperConsole;
 use buck2_client_ctx::subscribers::superconsole::SuperConsoleConfig;
 use buck2_client_ctx::subscribers::superconsole::SuperConsoleState;
 use buck2_client_ctx::subscribers::superconsole::CUTOFFS;
+use buck2_error::conversion::from_any_with_tag;
 use buck2_event_log::stream_value::StreamValue;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_events::BuckEvent;
@@ -48,19 +50,23 @@ pub struct WhatUpCommand {
 }
 
 impl WhatUpCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self { event_log, after } = self;
         let cutoff_time = after.map(Duration::from_millis);
 
-        ctx.with_runtime(async move |ctx| {
+        ctx.instant_command_no_log("log-what-up", |ctx| async move {
             let log_path = event_log.get(&ctx).await?;
 
             // Get events
             let (invocation, mut events) = log_path.unpack_stream().await?;
 
             let mut super_console = StatefulSuperConsole::console_builder()
-                .build_forced(StatefulSuperConsole::FALLBACK_SIZE)?;
+                .build_forced(StatefulSuperConsole::FALLBACK_SIZE)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
 
+            let build_count_dir = ctx
+                .maybe_paths()?
+                .map(|p| p.roots.project_root.root().to_owned());
             let mut super_console_state = SuperConsoleState::new(
                 None,
                 invocation.trace_id,
@@ -70,6 +76,7 @@ impl WhatUpCommand {
                     max_lines: 1000000,
                     ..Default::default()
                 },
+                build_count_dir,
             )?;
             let mut first_timestamp = None;
             // Ignore any events that are truncated, hence unreadable
@@ -90,13 +97,17 @@ impl WhatUpCommand {
                             _ => (),
                         }
 
-                        super_console_state.update_event_observer(&Arc::new(e))?;
+                        super_console_state
+                            .update_event_observer(&Arc::new(e))
+                            .await?;
                     }
                     StreamValue::PartialResult(..) => {}
                     StreamValue::Result(result) => {
                         let result = StatefulSuperConsole::render_result_errors(&result);
                         super_console.emit(result);
-                        super_console.finalize(&Self::component(&super_console_state))?;
+                        super_console
+                            .finalize(&Self::component(&super_console_state))
+                            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
                         buck2_client_ctx::eprintln!("No open spans to render when log ended")?;
                         return Ok(());
                     }
@@ -104,8 +115,9 @@ impl WhatUpCommand {
             }
 
             super_console
-                .finalize_with_mode(&Self::component(&super_console_state), DrawMode::Normal)?;
-            anyhow::Ok(())
+                .finalize_with_mode(&Self::component(&super_console_state), DrawMode::Normal)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
+            buck2_error::Ok(())
         })?;
 
         ExitResult::success()
@@ -129,7 +141,7 @@ impl WhatUpCommand {
                     },
                     mode,
                 )?;
-                draw.draw(&TimedList::new(&CUTOFFS, "", self.state), mode)?;
+                draw.draw(&TimedList::new(&CUTOFFS, self.state), mode)?;
                 Ok(draw.finish())
             }
         }

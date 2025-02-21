@@ -8,29 +8,33 @@
  */
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api_derive::internal_provider;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
+use buck2_error::BuckErrorContext;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::dict::DictRef;
-use starlark::values::type_repr::DictType;
+use starlark::values::dict::DictType;
 use starlark::values::Coerce;
 use starlark::values::Freeze;
+use starlark::values::FreezeError;
+use starlark::values::FreezeResult;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
-use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
 use starlark::values::ValueOf;
+use starlark::values::ValueOfUncheckedGeneric;
 
-use crate::interpreter::rule_defs::artifact::StarlarkArtifact;
-use crate::interpreter::rule_defs::artifact::ValueAsArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
+
 // Provider that signals a rule is installable (ex. android_binary)
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum InstallInfoProviderErrors {
     #[error("expected a label, got `{0}` (type `{1}`)")]
     ExpectedLabel(String, String),
@@ -46,22 +50,20 @@ enum InstallInfoProviderErrors {
 #[derive(Clone, Coerce, Debug, Freeze, Trace, ProvidesStaticType, Allocative)]
 #[repr(C)]
 #[freeze(validator = validate_install_info, bounds = "V: ValueLike<'freeze>")]
-pub struct InstallInfoGen<V> {
+pub struct InstallInfoGen<V: ValueLifetimeless> {
     // Label for the installer
-    #[provider(field_type = StarlarkConfiguredProvidersLabel)]
-    installer: V,
+    installer: ValueOfUncheckedGeneric<V, StarlarkConfiguredProvidersLabel>,
     // list of files that need to be installed
-    #[provider(field_type = DictType<String, StarlarkArtifact>)]
-    files: V,
+    files: ValueOfUncheckedGeneric<V, DictType<String, ValueAsArtifactLike<'static>>>,
 }
 
 impl<'v, V: ValueLike<'v>> InstallInfoGen<V> {
-    pub fn get_installer(&self) -> anyhow::Result<ConfiguredProvidersLabel> {
-        let label = StarlarkConfiguredProvidersLabel::from_value(self.installer.to_value())
+    pub fn get_installer(&self) -> buck2_error::Result<ConfiguredProvidersLabel> {
+        let label = StarlarkConfiguredProvidersLabel::from_value(self.installer.get().to_value())
             .ok_or_else(|| {
                 InstallInfoProviderErrors::ExpectedLabel(
-                    self.installer.to_value().to_repr(),
-                    self.installer.to_value().get_type().to_owned(),
+                    self.installer.get().to_value().to_repr(),
+                    self.installer.get().to_value().get_type().to_owned(),
                 )
             })?
             .label()
@@ -70,19 +72,19 @@ impl<'v, V: ValueLike<'v>> InstallInfoGen<V> {
     }
 
     fn get_files_dict(&self) -> DictRef<'v> {
-        DictRef::from_value(self.files.to_value()).expect("Value is a Dict")
+        DictRef::from_value(self.files.get().to_value()).expect("Value is a Dict")
     }
 
     fn get_files_iter<'a>(
         files: &'a DictRef<'v>,
-    ) -> impl Iterator<Item = anyhow::Result<(&'v str, ValueAsArtifactLike<'v>)>> + 'a {
+    ) -> impl Iterator<Item = buck2_error::Result<(&'v str, ValueAsArtifactLike<'v>)>> + 'a {
         files.iter().map(|(k, v)| {
             let k = k
                 .unpack_str()
                 .ok_or_else(|| InstallInfoProviderErrors::ExpectedStringKey(k.to_string()))?;
             Ok((
                 k,
-                ValueAsArtifactLike::unpack_value(v).ok_or_else(|| {
+                ValueAsArtifactLike::unpack_value(v)?.ok_or_else(|| {
                     InstallInfoProviderErrors::ExpectedArtifact {
                         key: k.to_owned(),
                         got: v.get_type().to_owned(),
@@ -92,14 +94,14 @@ impl<'v, V: ValueLike<'v>> InstallInfoGen<V> {
         })
     }
 
-    pub fn get_files(&self) -> anyhow::Result<SmallMap<&'v str, Artifact>> {
+    pub fn get_files(&self) -> buck2_error::Result<SmallMap<&'v str, Artifact>> {
         Self::get_files_iter(&self.get_files_dict())
             .map(|x| {
                 let (k, v) = x?;
                 Ok((
                     k,
                     v.0.get_bound_artifact()
-                        .with_context(|| format!("For key `{k}`"))?,
+                        .with_buck_error_context(|| format!("For key `{k}`"))?,
                 ))
             })
             .collect()
@@ -110,18 +112,18 @@ impl<'v, V: ValueLike<'v>> InstallInfoGen<V> {
 fn install_info_creator(globals: &mut GlobalsBuilder) {
     fn InstallInfo<'v>(
         installer: ValueOf<'v, &'v StarlarkConfiguredProvidersLabel>,
-        files: ValueOf<'v, SmallMap<&'v str, Value<'v>>>,
-    ) -> anyhow::Result<InstallInfo<'v>> {
+        files: ValueOf<'v, DictType<&'v str, ValueAsArtifactLike<'v>>>,
+    ) -> starlark::Result<InstallInfo<'v>> {
         let info = InstallInfo {
-            installer: *installer,
-            files: files.value,
+            installer: installer.as_unchecked().cast(),
+            files: files.as_unchecked().cast(),
         };
         validate_install_info(&info)?;
         Ok(info)
     }
 }
 
-fn validate_install_info<'v, V>(info: &InstallInfoGen<V>) -> anyhow::Result<()>
+fn validate_install_info<'v, V>(info: &InstallInfoGen<V>) -> buck2_error::Result<()>
 where
     V: ValueLike<'v>,
 {

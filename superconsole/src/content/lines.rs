@@ -19,12 +19,14 @@ use crossterm::style::Attribute;
 use crossterm::style::Attributes;
 use crossterm::style::Color;
 use itertools::Itertools;
+use termwiz::cell::Hyperlink;
 use termwiz::cell::Intensity;
 use termwiz::color::ColorSpec;
 use termwiz::color::RgbColor;
 use termwiz::escape::csi::Sgr;
 use termwiz::escape::csi::CSI;
 use termwiz::escape::Action;
+use termwiz::escape::OperatingSystemCommand;
 
 use crate::style::ContentStyle;
 use crate::style::StyledContent;
@@ -43,6 +45,7 @@ struct ColoredStringParser {
     underline_color: Option<Color>,
     attributes: Attributes,
     line_buffer: String,
+    hyperlink: Option<Hyperlink>,
     spans: Vec<Span>,
 }
 
@@ -57,7 +60,11 @@ impl ColoredStringParser {
             },
             std::mem::take(&mut self.line_buffer),
         );
-        self.spans.push(Span::new_styled_lossy(sc));
+        let mut span = Span::new_styled_lossy(sc);
+        if self.hyperlink.is_some() {
+            span = span.with_hyperlink(self.hyperlink.clone());
+        }
+        self.spans.push(span);
     }
 
     fn spec_to_color(spec: ColorSpec) -> Option<Color> {
@@ -101,6 +108,13 @@ impl ColoredStringParser {
                 self.push_current();
                 self.background_color = Self::spec_to_color(spec);
             }
+            Action::OperatingSystemCommand(cmd) => match *cmd {
+                OperatingSystemCommand::SetHyperlink(hy) => {
+                    self.push_current();
+                    self.hyperlink = hy;
+                }
+                _ => {}
+            },
             _ => {}
         });
         self.push_current();
@@ -152,6 +166,10 @@ impl Lines {
 
     pub fn push(&mut self, line: Line) {
         self.0.push(line);
+    }
+
+    pub fn extend(&mut self, lines: impl IntoIterator<Item = Line>) {
+        self.0.extend(lines);
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Line> {
@@ -227,8 +245,8 @@ impl Lines {
 
     /// Extends the Lines list by the given length, adding empty lines at the bottom
     pub fn pad_lines_bottom(&mut self, amount: usize) {
-        let mut extender = iter::repeat(Line::default()).take(amount);
-        self.0.extend(&mut extender);
+        let extender = iter::repeat(Line::default()).take(amount);
+        self.extend(extender);
     }
 
     /// Same functionality as `pad_lines_bottom` but on the top.
@@ -263,12 +281,11 @@ impl Lines {
         self.truncate_lines_bottom(dimensions.height);
     }
 
-    /// Formats and renders all lines to `stdout`.
-    /// Notably, this *queues* the lines for rendering.  You must flush the buffer.
+    /// Like `render`, but with a limit.
     /// If a limit is specified, no more than that amount will be drained.
     /// The limit is on the number of *lines*, **NOT** the number of *bytes*.
     /// Care should be taken with calling a limit of 0 - this will cause no lines to render and the buffer to never be drained.
-    pub(crate) fn render(
+    pub(crate) fn render_with_limit(
         &mut self,
         writer: &mut Vec<u8>,
         limit: Option<usize>,
@@ -278,8 +295,28 @@ impl Lines {
         for line in self.0.drain(..amt) {
             line.render_with_clear_and_nl(writer)?;
         }
-
         Ok(())
+    }
+
+    /// Formats and renders all lines to `stdout`.
+    /// Notably, this *queues* the lines for rendering.  You must flush the buffer.
+    pub(crate) fn render_from_line(
+        &self,
+        writer: &mut Vec<u8>,
+        start: usize,
+    ) -> anyhow::Result<()> {
+        for line in self.0.iter().skip(start) {
+            line.render_with_clear_and_nl(writer)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lines_equal(&self, other: &Self) -> usize {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .take_while(|(l1, l2)| l1 == l2)
+            .count()
     }
 
     /// Returns the maximum line width and the number of lines.
@@ -356,9 +393,6 @@ impl IntoIterator for Lines {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::style::Attribute;
-    use crossterm::style::Color;
-
     use super::*;
 
     #[test]
@@ -531,7 +565,6 @@ mod tests {
         assert_eq!(test, expected);
     }
 
-    #[allow(clippy::from_iter_instead_of_collect)] // More readable this way.
     #[test]
     fn test_colored_from_multiline_string() {
         // Lots of little things we check in here, including that we persist state
@@ -644,6 +677,26 @@ strips out {bs}invalid control sequences",
 
         let lines = Lines::from_colored_multiline_string(&test_string);
 
+        assert_eq!(expected, lines);
+    }
+
+    #[test]
+    fn test_hyperlink() {
+        let input = format!(
+            "This is a {link}https://example.com{endlink}hyper{link}{endlink}{link}https://example.com{endlink}link{link}{endlink}.",
+            link = "\x1b]8;;",
+            endlink = "\x1b\\"
+        );
+        let lines = Lines::from_colored_multiline_string(&input);
+        let expected: Lines = vec![Line::from_iter([
+            Span::new_unstyled("This is a ").unwrap(),
+            Span::new_unstyled("hyperlink")
+                .unwrap()
+                .with_hyperlink(Some(Hyperlink::new("https://example.com"))),
+            Span::new_unstyled(".").unwrap(),
+        ])]
+        .into_iter()
+        .collect();
         assert_eq!(expected, lines);
     }
 

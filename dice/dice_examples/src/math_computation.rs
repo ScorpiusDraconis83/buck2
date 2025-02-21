@@ -21,7 +21,6 @@ use async_trait::async_trait;
 use buck2_futures::cancellation::CancellationContext;
 use derive_more::Display;
 use dice::DiceComputations;
-use dice::DiceComputationsParallel;
 use dice::DiceTransactionUpdater;
 use dice::InjectedKey;
 use dice::Key;
@@ -29,10 +28,9 @@ use dupe::Dupe;
 use futures::future;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use gazebo::prelude::*;
 
 #[derive(Clone, Dupe, PartialEq, Eq, Hash, Display, Debug, Allocative)]
-#[display(fmt = "Var({})", _0)]
+#[display("Var({})", _0)]
 pub struct Var(pub Arc<String>);
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Allocative)]
@@ -87,7 +85,9 @@ pub fn parse_math_equations<'a>(
 }
 
 pub fn parse_math_equation(math: &str) -> anyhow::Result<(Var, Equation)> {
-    let (l, r) = math.split1("=");
+    let Some((l, r)) = math.split_once("=") else {
+        return Err(anyhow::anyhow!("= must have left and right"));
+    };
     if l.is_empty() || r.is_empty() {
         return Err(anyhow::anyhow!("= must have left and right"));
     }
@@ -126,7 +126,7 @@ impl MathEquations for DiceTransactionUpdater {
 }
 
 #[derive(Clone, Display, Debug, Dupe, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "Eval({})", _0)]
+#[display("Eval({})", _0)]
 pub struct EvalVar(pub Var);
 #[async_trait]
 impl Key for EvalVar {
@@ -153,7 +153,7 @@ impl Key for EvalVar {
 }
 
 #[async_trait]
-impl Math for DiceComputations {
+impl Math for DiceComputations<'_> {
     async fn eval(&mut self, var: Var) -> Result<i64, Arc<anyhow::Error>> {
         Ok(self
             .compute(&EvalVar(var))
@@ -162,20 +162,20 @@ impl Math for DiceComputations {
     }
 }
 
-async fn resolve_units(
-    ctx: &DiceComputations,
+async fn resolve_units<'a>(
+    ctx: &mut DiceComputations<'a>,
     units: &[Unit],
 ) -> Result<Vec<i64>, Arc<anyhow::Error>> {
-    let futs = ctx.compute_many(units.iter().map(|unit|
-        higher_order_closure! {
-            for<'x> move |ctx: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, Result<i64, Arc<anyhow::Error>>> {
+    let futs = ctx.compute_many(units.iter().map(|unit| {
+        DiceComputations::declare_closure(
+            move |ctx: &mut DiceComputations| -> BoxFuture<Result<i64, Arc<anyhow::Error>>> {
                 match unit {
                     Unit::Var(var) => ctx.eval(var.clone()).boxed(),
                     Unit::Literal(lit) => futures::future::ready(Ok(*lit)).boxed(),
                 }
-            }
-        }
-    ));
+            },
+        )
+    }));
 
     future::join_all(futs)
         .await
@@ -183,12 +183,12 @@ async fn resolve_units(
         .collect::<Result<_, _>>()
 }
 
-async fn lookup_unit(ctx: &DiceComputations, var: &Var) -> anyhow::Result<Arc<Equation>> {
+async fn lookup_unit(ctx: &mut DiceComputations<'_>, var: &Var) -> anyhow::Result<Arc<Equation>> {
     Ok(ctx.compute(&LookupVar(var.clone())).await?)
 }
 
 #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "Lookup({})", _0)]
+#[display("Lookup({})", _0)]
 struct LookupVar(Var);
 impl InjectedKey for LookupVar {
     type Value = Arc<Equation>;

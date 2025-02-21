@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use buck2_audit::visibility::AuditVisibilityCommand;
 use buck2_cli_proto::ClientContext;
+use buck2_common::pattern::parse_from_cli::parse_patterns_from_cli_args;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_node::load_patterns::load_patterns;
 use buck2_node::load_patterns::MissingTargetBehavior;
@@ -22,14 +23,13 @@ use buck2_query::query::traversal::async_depth_first_postorder_traversal;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::parse_patterns_from_cli_args;
 use dice::DiceTransaction;
 use dupe::Dupe;
-use gazebo::prelude::SliceExt;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Tier0)]
 enum VisibilityCommandError {
     #[error(
         "Internal Error: The dependency `{0}` of the target `{1}` was not found during the traversal."
@@ -38,9 +38,9 @@ enum VisibilityCommandError {
 }
 
 async fn verify_visibility(
-    ctx: DiceTransaction,
+    mut ctx: DiceTransaction,
     targets: TargetSet<TargetNode>,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let mut new_targets: TargetSet<TargetNode> = TargetSet::new();
 
     let visit = |target| {
@@ -48,14 +48,17 @@ async fn verify_visibility(
         Ok(())
     };
 
-    let lookup = TargetNodeLookup(&ctx);
+    ctx.with_linear_recompute(|ctx| async move {
+        let lookup = TargetNodeLookup(&ctx);
 
-    async_depth_first_postorder_traversal(
-        &lookup,
-        targets.iter_names(),
-        QueryTargetDepsSuccessors,
-        visit,
-    )
+        async_depth_first_postorder_traversal(
+            &lookup,
+            targets.iter_names(),
+            QueryTargetDepsSuccessors,
+            visit,
+        )
+        .await
+    })
     .await?;
 
     let mut visibility_errors = Vec::new();
@@ -72,7 +75,7 @@ async fn verify_visibility(
                     }
                 }
                 None => {
-                    return Err(anyhow::Error::from(
+                    return Err(buck2_error::Error::from(
                         VisibilityCommandError::DepNodeNotFound(
                             dep.to_string(),
                             target.label().name().to_string(),
@@ -88,7 +91,11 @@ async fn verify_visibility(
     }
 
     if !visibility_errors.is_empty() {
-        return Err(anyhow::anyhow!("{}", 1));
+        return Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "{}",
+            1
+        ));
     }
 
     buck2_client_ctx::eprintln!("audit visibility succeeded")?;
@@ -96,26 +103,24 @@ async fn verify_visibility(
 }
 
 #[async_trait]
-impl AuditSubcommand for AuditVisibilityCommand {
+impl ServerAuditSubcommand for AuditVisibilityCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         _stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         _client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx
-            .with_dice_ctx(async move |server_ctx, mut ctx| {
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|server_ctx, mut ctx| async move {
                 let parsed_patterns = parse_patterns_from_cli_args::<TargetPatternExtra>(
                     &mut ctx,
-                    &self
-                        .patterns
-                        .map(|pat| buck2_data::TargetPattern { value: pat.clone() }),
+                    &self.patterns,
                     server_ctx.working_dir(),
                 )
                 .await?;
 
                 let parsed_target_patterns =
-                    load_patterns(&ctx, parsed_patterns, MissingTargetBehavior::Fail).await?;
+                    load_patterns(&mut ctx, parsed_patterns, MissingTargetBehavior::Fail).await?;
 
                 let mut nodes = TargetSet::<TargetNode>::new();
                 for (_package, result) in parsed_target_patterns.iter() {
@@ -126,6 +131,6 @@ impl AuditSubcommand for AuditVisibilityCommand {
                 verify_visibility(ctx, nodes).await?;
                 Ok(())
             })
-            .await
+            .await?)
     }
 }

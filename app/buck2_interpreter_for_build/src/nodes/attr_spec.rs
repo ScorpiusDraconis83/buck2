@@ -9,13 +9,16 @@
 
 use std::collections::HashMap;
 
-use anyhow::Context;
-use buck2_core::target::label::TargetLabelRef;
-use buck2_core::target::name::TargetName;
+use buck2_core::target::label::label::TargetLabelRef;
+use buck2_core::target::name::TargetNameRef;
+use buck2_error::internal_error;
+use buck2_error::BuckErrorContext;
+use buck2_node::attrs::attr::Attribute;
 use buck2_node::attrs::attr::CoercedValue;
 use buck2_node::attrs::attr_type::string::StringLiteral;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::configurable::AttrIsConfigurable;
+use buck2_node::attrs::id::AttributeId;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::attrs::internal::attr_is_configurable;
 use buck2_node::attrs::internal::NAME_ATTRIBUTE_FIELD;
@@ -28,7 +31,9 @@ use dupe::Dupe;
 use starlark::docs::DocString;
 use starlark::eval::ParametersParser;
 use starlark::eval::ParametersSpec;
-use starlark::typing::Param;
+use starlark::eval::ParametersSpecParam;
+use starlark::typing::ParamIsRequired;
+use starlark::typing::ParamSpec;
 use starlark::typing::Ty;
 use starlark::typing::TyFunction;
 use starlark::values::Value;
@@ -37,19 +42,26 @@ use crate::attrs::AttributeCoerceExt;
 use crate::interpreter::module_internals::ModuleInternals;
 use crate::nodes::check_within_view::check_within_view;
 
-#[derive(Debug, buck2_error::Error)]
-enum AttributeSpecError {
-    #[error("`within_view` coerced incorrectly (internal error)")]
-    WithinViewCoercedIncorrectly,
-}
-
 pub trait AttributeSpecExt {
+    fn start_parse<'a, 'v>(
+        &'a self,
+        param_parser: &mut ParametersParser<'v, '_>,
+        size_hint: usize,
+    ) -> buck2_error::Result<(
+        // "name" attribute value.
+        &'v TargetNameRef,
+        // Remaining attributes.
+        impl ExactSizeIterator<Item = (&'a str, AttributeId, &'a Attribute)> + 'a,
+        // Populated with name.
+        AttrValues,
+    )>;
+
     fn parse_params<'v>(
         &self,
-        param_parser: ParametersParser<'v, '_>,
+        param_parser: &mut ParametersParser<'v, '_>,
         arg_count: usize,
         internals: &ModuleInternals,
-    ) -> anyhow::Result<(TargetName, AttrValues)>;
+    ) -> buck2_error::Result<(&'v TargetNameRef, AttrValues)>;
 
     /// Returns a starlark Parameters for the rule callable.
     fn signature(&self, rule_name: String) -> ParametersSpec<Value<'_>>;
@@ -57,45 +69,56 @@ pub trait AttributeSpecExt {
     fn ty_function(&self) -> TyFunction;
 
     fn starlark_types(&self) -> Vec<Ty>;
-
     fn docstrings(&self) -> HashMap<String, Option<DocString>>;
 }
 
 impl AttributeSpecExt for AttributeSpec {
-    /// Parses params extracting the TargetName and the attribute values to store in the TargetNode.
-    fn parse_params<'v>(
-        &self,
-        mut param_parser: ParametersParser<'v, '_>,
-        arg_count: usize,
-        internals: &ModuleInternals,
-    ) -> anyhow::Result<(TargetName, AttrValues)> {
-        let mut attr_values = AttrValues::with_capacity(arg_count);
+    fn start_parse<'a, 'v>(
+        &'a self,
+        param_parser: &mut ParametersParser<'v, '_>,
+        size_hint: usize,
+    ) -> buck2_error::Result<(
+        &'v TargetNameRef,
+        impl ExactSizeIterator<Item = (&'a str, AttributeId, &'a Attribute)> + 'a,
+        AttrValues,
+    )> {
+        let mut attr_values = AttrValues::with_capacity(size_hint);
 
         let mut indices = self.attr_specs();
         let name = match indices.next() {
-            Some((name_name, attr_idx, _attr))
-                if name_name == NAME_ATTRIBUTE_FIELD && attr_idx.index_in_attribute_spec == 0 =>
-            {
-                let name: &str = param_parser.next(NAME_ATTRIBUTE_FIELD)?;
-
+            Some((name_name, attr_idx, _attr)) if name_name == NAME_ATTRIBUTE_FIELD => {
+                let name = param_parser.next()?;
                 attr_values.push_sorted(
                     attr_idx,
                     CoercedAttr::String(StringLiteral(ArcStr::from(name))),
                 );
-
-                TargetName::new(name)?
+                name
             }
-            _ => panic!("First attribute is `name`, it is known"),
+            _ => {
+                return Err(internal_error!("First attribute is `name`, it is known"));
+            }
         };
+        let name = TargetNameRef::new(name)?;
+        Ok((name, indices, attr_values))
+    }
 
-        let target_label = TargetLabelRef::new(internals.buildfile_path().package(), name.as_ref());
+    /// Parses params extracting the TargetName and the attribute values to store in the TargetNode.
+    fn parse_params<'v>(
+        &self,
+        param_parser: &mut ParametersParser<'v, '_>,
+        arg_count: usize,
+        internals: &ModuleInternals,
+    ) -> buck2_error::Result<(&'v TargetNameRef, AttrValues)> {
+        let (name, indices, mut attr_values) = self.start_parse(param_parser, arg_count)?;
+
+        let target_label = TargetLabelRef::new(internals.buildfile_path().package(), name);
 
         for (attr_name, attr_idx, attribute) in indices {
             let configurable = attr_is_configurable(attr_name);
 
             let user_value: Option<Value> = match attribute.default() {
-                Some(_) => param_parser.next_opt(attr_name)?,
-                None => Some(param_parser.next(attr_name)?),
+                Some(_) => param_parser.next_opt()?,
+                None => Some(param_parser.next()?),
             };
 
             let attr_is_visibility = attr_name == VISIBILITY_ATTRIBUTE_FIELD;
@@ -108,7 +131,7 @@ impl AttributeSpecExt for AttributeSpec {
                         internals.attr_coercion_context(),
                         v,
                     )
-                    .with_context(|| {
+                    .with_buck_error_context(|| {
                         format!(
                             "Error coercing attribute `{}` of `{}`",
                             attr_name, target_label,
@@ -154,7 +177,7 @@ impl AttributeSpecExt for AttributeSpec {
         if let Some(within_view) = attr_values.get(AttributeSpec::within_view_attr_id()) {
             let within_view = match within_view {
                 CoercedAttr::WithinView(within_view) => within_view,
-                _ => return Err(AttributeSpecError::WithinViewCoercedIncorrectly.into()),
+                _ => return Err(internal_error!("`within_view` coerced incorrectly")),
             };
             for a in self.attrs(&attr_values, AttrInspectOptions::DefinedOnly) {
                 check_within_view(
@@ -163,7 +186,7 @@ impl AttributeSpecExt for AttributeSpec {
                     a.attr.coercer(),
                     within_view,
                 )
-                .with_context(|| {
+                .with_buck_error_context(|| {
                     format!(
                         "checking `within_view` for attribute `{}` of `{}`",
                         a.name, target_label,
@@ -177,15 +200,19 @@ impl AttributeSpecExt for AttributeSpec {
 
     /// Returns a starlark Parameters for the rule callable.
     fn signature(&self, rule_name: String) -> ParametersSpec<Value<'_>> {
-        let mut signature = ParametersSpec::with_capacity(rule_name, self.len());
-        signature.no_more_positional_args();
-        for (name, _idx, attribute) in self.attr_specs() {
-            match attribute.default() {
-                Some(_) => signature.optional(name),
-                None => signature.required(name),
-            };
-        }
-        signature.finish()
+        ParametersSpec::new_named_only(
+            &rule_name,
+            self.attr_specs().map(|(name, _idx, attribute)| {
+                let default = attribute.default();
+                (
+                    name,
+                    match default {
+                        Some(_) => ParametersSpecParam::Optional,
+                        None => ParametersSpecParam::Required,
+                    },
+                )
+            }),
+        )
     }
 
     fn ty_function(&self) -> TyFunction {
@@ -195,13 +222,13 @@ impl AttributeSpecExt for AttributeSpec {
                 AttrIsConfigurable::Yes => attribute.starlark_type().to_ty_with_select(),
                 AttrIsConfigurable::No => attribute.starlark_type().to_ty(),
             };
-            let param = Param::name_only(name, ty);
-            let param = match attribute.default() {
-                Some(_) => param.optional(),
-                None => param,
+            let required = match attribute.default() {
+                Some(_) => ParamIsRequired::No,
+                None => ParamIsRequired::Yes,
             };
-            params.push(param);
+            params.push((starlark::util::ArcStr::from(name), required, ty));
         }
+        let params = ParamSpec::new_named_only(params).unwrap();
         TyFunction::new(params, Ty::none())
     }
 

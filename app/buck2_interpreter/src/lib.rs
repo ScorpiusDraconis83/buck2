@@ -16,22 +16,17 @@
 #![feature(never_type)]
 #![feature(box_patterns)]
 
-#[macro_use]
-extern crate starlark;
-
-pub mod anon_targets;
 pub mod build_context;
-pub mod bxl;
-pub mod cfg_constructor;
 pub mod coerce;
 pub mod dice;
-pub mod error;
+pub mod downstream_crate_starlark_defs;
 pub mod extra;
 pub mod factory;
 pub mod file_loader;
 pub mod file_type;
-pub mod functions;
+pub mod from_freeze;
 pub mod import_paths;
+pub mod late_binding_ty;
 pub mod load_module;
 pub mod package_imports;
 pub mod parse_import;
@@ -39,6 +34,7 @@ pub mod paths;
 pub mod plugins;
 pub mod prelude_path;
 pub mod print_handler;
+pub mod soft_error;
 pub mod starlark_debug;
 pub mod starlark_profiler;
 pub mod starlark_promise;

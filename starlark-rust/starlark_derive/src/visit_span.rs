@@ -22,10 +22,11 @@ use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::DeriveInput;
 
-use crate::for_each_field::for_each_field;
+use crate::util::DeriveInputUtil;
 
-fn derive_body(input: &DeriveInput) -> syn::Result<TokenStream> {
-    for_each_field(&input.data, |field_name, field| {
+fn derive_body(input: &DeriveInput) -> syn::Result<syn::Expr> {
+    let derive_input = DeriveInputUtil::new(input)?;
+    derive_input.for_each_field(|field_name, field| {
         Ok(quote_spanned! {
             field.span() =>
             crate::eval::runtime::visit_span::VisitSpanMut::visit_spans(#field_name, visitor);
@@ -34,6 +35,7 @@ fn derive_body(input: &DeriveInput) -> syn::Result<TokenStream> {
 }
 
 fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
+    let input = DeriveInputUtil::new(&input)?;
     let (_impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
     let name = &input.ident;
     let body = derive_body(&input)?;
@@ -42,22 +44,16 @@ fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
         quote! {}
     } else {
         let params = input
-            .generics
-            .params
-            .iter()
-            .map(|p| match p {
-                syn::GenericParam::Type(t) => {
-                    let t = &t.ident;
-                    Ok(quote! {
-                        #t: crate::eval::runtime::visit_span::VisitSpanMut
-                    })
+            .generics()
+            .assert_only_type_params()?
+            .into_iter()
+            .map(|t| {
+                let t = &t.ident;
+                quote! {
+                    #t: crate::eval::runtime::visit_span::VisitSpanMut
                 }
-                _ => Err(syn::Error::new_spanned(
-                    p,
-                    "VisitSpanMut cannot be derived for generics with non-type params",
-                )),
             })
-            .collect::<syn::Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         quote! {
             < #(#params,)* >
         }

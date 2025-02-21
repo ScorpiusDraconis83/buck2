@@ -38,7 +38,7 @@ impl DiceEventListener for Tracker {
 }
 
 #[derive(Clone, Dupe, Debug, Display, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct Injected;
 
 #[async_trait]
@@ -51,7 +51,7 @@ impl InjectedKey for Injected {
 }
 
 #[derive(Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct Stage0;
 
 #[async_trait]
@@ -72,7 +72,7 @@ impl Key for Stage0 {
 }
 
 #[derive(Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct Stage1;
 
 #[async_trait]
@@ -106,15 +106,19 @@ async fn test_events_impl(builder: DiceDataBuilder) -> anyhow::Result<()> {
         let mut updater = dice.updater_with_data(data);
         updater.changed_to(vec![(Injected, 123)])?;
 
-        let transaction = updater.commit().await;
+        let mut transaction = updater.commit().await;
         transaction.compute(&Stage1).await?;
 
         assert_eq!(
             &*tracker.state.lock().unwrap(),
             &[
                 DiceEvent::Started { key_type: "Stage1" },
+                DiceEvent::ComputeStarted { key_type: "Stage1" },
                 DiceEvent::Started { key_type: "Stage0" },
+                DiceEvent::ComputeStarted { key_type: "Stage0" },
+                DiceEvent::ComputeFinished { key_type: "Stage0" },
                 DiceEvent::Finished { key_type: "Stage0" },
+                DiceEvent::ComputeFinished { key_type: "Stage1" },
                 DiceEvent::Finished { key_type: "Stage1" },
             ]
         );
@@ -132,18 +136,22 @@ async fn test_events_impl(builder: DiceDataBuilder) -> anyhow::Result<()> {
         let mut updater = dice.updater_with_data(data);
         updater.changed_to(vec![(Injected, 456)])?;
 
-        let transaction = updater.commit().await;
+        let mut transaction = updater.commit().await;
         transaction.compute(&Stage1).await?;
 
         assert_eq!(
             &*tracker.state.lock().unwrap(),
             &[
+                DiceEvent::Started { key_type: "Stage1" },
                 DiceEvent::CheckDepsStarted { key_type: "Stage1" },
+                DiceEvent::Started { key_type: "Stage0" },
                 DiceEvent::CheckDepsStarted { key_type: "Stage0" },
                 DiceEvent::CheckDepsFinished { key_type: "Stage0" },
-                DiceEvent::Started { key_type: "Stage0" },
+                DiceEvent::ComputeStarted { key_type: "Stage0" },
+                DiceEvent::ComputeFinished { key_type: "Stage0" },
                 DiceEvent::Finished { key_type: "Stage0" },
-                DiceEvent::CheckDepsFinished { key_type: "Stage1" }
+                DiceEvent::CheckDepsFinished { key_type: "Stage1" },
+                DiceEvent::Finished { key_type: "Stage1" },
             ]
         );
     }

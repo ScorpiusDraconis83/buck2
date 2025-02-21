@@ -16,6 +16,7 @@
  */
 
 /// Fixed length byte vector API.
+#[allow(dead_code)] // FIXME: Investigate if this is really needed, fails on Mac
 pub(crate) trait Vector: Copy {
     /// Fill the vector with given byte value.
     unsafe fn splat(byte: u8) -> Self;
@@ -42,6 +43,7 @@ where
     /// This function is called when SIMD is not available.
     fn no_simd(self) -> R;
     /// This function is called when SIMD is available.
+    #[allow(dead_code)] // FIXME: Investigate if this is really needed, fails on Mac
     fn simd<V: Vector>(self) -> R;
 
     /// Call either `simd` or `no_simd` function.
@@ -54,12 +56,12 @@ where
             #[cfg(target_arch = "x86_64")]
             use std::arch::x86_64::*;
 
-            self.simd::<__m128i>()
+            if true {
+                return self.simd::<__m128i>();
+            }
         }
-        #[cfg(not(target_feature = "sse2"))]
-        {
-            self.no_simd()
-        }
+
+        self.no_simd()
     }
 }
 

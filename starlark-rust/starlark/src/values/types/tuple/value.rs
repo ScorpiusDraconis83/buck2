@@ -27,7 +27,6 @@ use display_container::fmt_container;
 use serde::ser::SerializeTuple;
 use serde::Serialize;
 use starlark_derive::starlark_value;
-use starlark_derive::StarlarkDocs;
 
 use crate as starlark;
 use crate::any::ProvidesStaticType;
@@ -41,8 +40,8 @@ use crate::values::comparison::equals_slice;
 use crate::values::index::apply_slice;
 use crate::values::index::convert_index;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueFrozenTuple;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Direct;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::FrozenValue;
 use crate::values::Heap;
@@ -50,13 +49,13 @@ use crate::values::StarlarkValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
 use crate::values::ValueError;
+use crate::values::ValueLifetimeless;
 use crate::values::ValueLike;
 
 /// Define the tuple type. See [`Tuple`] and [`FrozenTuple`] as the two aliases.
 #[repr(C)]
-#[derive(ProvidesStaticType, StarlarkDocs, Allocative)]
-#[starlark_docs(builtin = "standard")]
-pub(crate) struct TupleGen<V> {
+#[derive(ProvidesStaticType, Allocative)]
+pub(crate) struct TupleGen<V: ValueLifetimeless> {
     len: usize,
     /// The data stored by the tuple.
     content: [V; 0],
@@ -85,7 +84,7 @@ impl<'v, V: ValueLike<'v>> Debug for TupleGen<V> {
     }
 }
 
-impl<V> TupleGen<V> {
+impl<V: ValueLifetimeless> TupleGen<V> {
     /// `type(())`.
     pub(crate) const TYPE: &'static str = "tuple";
 
@@ -98,8 +97,8 @@ impl<V> TupleGen<V> {
     }
 }
 
-pub(crate) static VALUE_EMPTY_TUPLE: AValueRepr<AValueImpl<Direct, FrozenTuple>> =
-    alloc_static(Direct, unsafe { FrozenTuple::new(0) });
+pub(crate) static VALUE_EMPTY_TUPLE: AValueRepr<AValueImpl<'static, AValueFrozenTuple>> =
+    alloc_static(unsafe { FrozenTuple::new(0) });
 
 /// Runtime type of unfrozen tuple.
 pub(crate) type Tuple<'v> = TupleGen<Value<'v>>;
@@ -144,7 +143,7 @@ impl<'v, V: ValueLike<'v>> TupleGen<V> {
 }
 
 #[starlark_value(type = Tuple::TYPE)]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for TupleGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TupleGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -240,7 +239,11 @@ where
     }
 
     fn mul(&self, other: Value, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
-        let l = i32::unpack_value(other)?;
+        let l = match i32::unpack_value(other) {
+            Ok(Some(l)) => l,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
         let mut result = Vec::new();
         for _i in 0..l {
             result.extend(self.content().iter().map(|e| e.to_value()));

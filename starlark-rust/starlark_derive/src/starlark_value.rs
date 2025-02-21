@@ -18,6 +18,8 @@
 use quote::quote_spanned;
 use syn::spanned::Spanned;
 
+use crate::util::GenericsUtil;
+use crate::v_lifetime::find_v_lifetime;
 use crate::vtable::vtable_has_field_name;
 
 pub(crate) fn derive_starlark_value(
@@ -99,18 +101,8 @@ fn is_impl_starlark_value(
     if last.ident != "StarlarkValue" {
         return Err(syn::Error::new_spanned(&last.ident, err));
     }
-    let mut lifetime_param = None;
-    for lt in input.generics.lifetimes() {
-        if lifetime_param.is_some() {
-            return Err(syn::Error::new_spanned(
-                lt,
-                "multiple lifetime parameters are not supported",
-            ));
-        }
-        lifetime_param = Some(lt);
-    }
-    let lifetime_param = match lifetime_param {
-        Some(lt) => lt.lifetime.clone(),
+    let lifetime_param = match find_v_lifetime(&input.generics)? {
+        Some(lt) => lt.clone(),
         None => {
             return Err(syn::Error::new_spanned(
                 input,
@@ -143,20 +135,12 @@ impl ImplStarlarkValue {
             ));
         }
 
-        for param in &self.input.generics.params {
-            match param {
-                syn::GenericParam::Lifetime(_) => {}
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        param,
-                        "only lifetime parameters are supported to implement `UnpackValue` or `StarlarkTypeRepr`",
-                    ));
-                }
-            }
-        }
+        GenericsUtil::new(&self.input.generics).assert_only_lifetime_params()?;
 
         let lt = &self.lifetime_param;
         let params = &self.input.generics.params;
+        // TODO(nga): where clause is incorrect:
+        //   if there's something `Self: Xxx` constraint, it should be `*Self: Xxx`.
         let where_clause = &self.input.generics.where_clause;
         let self_ty = &self.input.self_ty;
         Ok(quote_spanned! {
@@ -165,6 +149,8 @@ impl ImplStarlarkValue {
             impl<#params> starlark::values::type_repr::StarlarkTypeRepr for &#lt #self_ty
             #where_clause
             {
+                type Canonical = #self_ty;
+
                 fn starlark_type_repr() -> starlark::typing::Ty {
                     <#self_ty as starlark::values::type_repr::StarlarkTypeRepr>::starlark_type_repr()
                 }
@@ -173,8 +159,10 @@ impl ImplStarlarkValue {
             impl<#params> starlark::values::UnpackValue<#lt> for &#lt #self_ty
             #where_clause
             {
-                fn unpack_value(value: starlark::values::Value<#lt>) -> Option<&#lt #self_ty> {
-                    starlark::values::ValueLike::downcast_ref(value)
+                type Error = std::convert::Infallible;
+
+                fn unpack_value_impl(value: starlark::values::Value<#lt>) -> Result<Option<&#lt #self_ty>, Self::Error> {
+                    std::result::Result::Ok(starlark::values::ValueLike::downcast_ref(value))
                 }
             }
         })

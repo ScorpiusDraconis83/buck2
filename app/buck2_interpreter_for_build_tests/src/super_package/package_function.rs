@@ -8,7 +8,7 @@
  */
 
 use buck2_core::fs::project::ProjectRootTemp;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::visibility::VisibilitySpecification;
 
@@ -44,7 +44,7 @@ simple(name = "a")
 "#,
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
 
     let a = ctx
         .get_target_node(&TargetLabel::testing_parse("root//juxtaposition:a"))
@@ -87,7 +87,7 @@ simple(name = "a")
 "#,
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
 
     let a = ctx
         .get_target_node(&TargetLabel::testing_parse("root//juxtaposition:a"))
@@ -129,7 +129,7 @@ simple(name = "a")
 "#,
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
 
     let a = ctx
         .get_target_node(&TargetLabel::testing_parse("root//juxtaposition:a"))

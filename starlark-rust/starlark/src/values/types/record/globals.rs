@@ -23,10 +23,10 @@ use starlark_derive::starlark_module;
 use crate as starlark;
 use crate::collections::SmallMap;
 use crate::environment::GlobalsBuilder;
+use crate::eval::Evaluator;
 use crate::values::record::field::Field;
 use crate::values::record::record_type::RecordType;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
-use crate::values::Heap;
 use crate::values::Value;
 
 #[starlark_module]
@@ -60,13 +60,13 @@ pub(crate) fn register_record(builder: &mut GlobalsBuilder) {
     /// Records are stored deduplicating their field names, making them more memory efficient than dictionaries.
     fn record<'v>(
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
-        heap: &'v Heap,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<RecordType<'v>> {
         // Every Value must either be a field or a value (the type)
         let mut mp = SmallMap::with_capacity(kwargs.len());
         for (k, v) in kwargs.into_iter_hashed() {
             let field = match Field::from_value(v) {
-                None => Field::new(TypeCompiled::new(v, heap)?, None),
+                None => Field::new(TypeCompiled::new(v, eval.heap())?, None),
                 Some(v) => v.dupe(),
             };
             mp.insert_hashed(k, field);
@@ -87,10 +87,10 @@ pub(crate) fn register_record(builder: &mut GlobalsBuilder) {
     fn field<'v>(
         #[starlark(require = pos)] typ: Value<'v>,
         default: Option<Value<'v>>,
-        heap: &'v Heap,
-    ) -> anyhow::Result<Field<'v>> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Field<'v>> {
         // We compile the type even if we don't have a default to raise the error sooner
-        let compiled = TypeCompiled::new(typ, heap)?;
+        let compiled = TypeCompiled::new(typ, eval.heap())?;
         if let Some(d) = default {
             compiled.check_type(d, Some("default"))?;
         }
@@ -104,10 +104,10 @@ mod tests {
     use crate::assert::Assert;
 
     #[test]
-    fn test_record() {
+    fn test_record_pass() {
         assert::pass(
             r#"
-rec_type = record(host=str.type, port=int.type)
+rec_type = record(host=str, port=int)
 rec1 = rec_type(host = "test", port=80)
 rec2 = rec_type(host = "test", port=90)
 assert_eq(rec1, rec1)
@@ -117,55 +117,79 @@ assert_eq(rec1.port, 80)
 assert_eq(dir(rec1), ["host", "port"])
 "#,
         );
+    }
+
+    #[test]
+    fn test_record_fail_0() {
         assert::fails(
             r#"
-rec_type = record(host=str.type, port=int.type)
+rec_type = record(host=str, port=int)
 rec_type(host=1, port=80)
 "#,
             &[
                 "Value `1` of type `int` does not match the type annotation `str` for argument `host`",
             ],
         );
+    }
+
+    #[test]
+    fn test_record_fail_1() {
         assert::fails(
             r#"
-rec_type = record(host=str.type, port=int.type)
+rec_type = record(host=str, port=int)
 rec_type(port=80)
 "#,
-            &["Missing parameter", "`host`"],
+            &["Missing named-only parameter", "`host`"],
         );
+    }
+
+    #[test]
+    fn test_record_fail_2() {
         assert::fails(
             r#"
-rec_type = record(host=str.type, port=int.type)
+rec_type = record(host=str, port=int)
 rec_type(host="localhost", port=80, mask=255)
 "#,
             &["extra named", "mask"],
         );
+    }
+
+    #[test]
+    fn test_record_fail_3() {
         assert::pass(
             r#"
-rec_type = record(host=str.type, port=int.type)
+rec_type = record(host=str, port=int)
 def foo(x: rec_type) -> rec_type:
     return x
 foo(rec_type(host="localhost", port=80))"#,
         );
+    }
+
+    #[test]
+    fn test_record_fail_4() {
         assert::pass(
             r#"
-v = [record(host=str.type, port=int.type)]
+v = [record(host=str, port=int)]
 v_0 = v[0]
 def foo(y: v_0) -> v_0:
     # TODO(nga): fails at compile time.
     return noop(y)
 foo(v[0](host="localhost", port=80))"#,
         );
+    }
+
+    #[test]
+    fn test_record_fail_5() {
         assert::pass(
             r#"
-rec_type = record(host=str.type, port=field(int.type, 80), mask=int.type)
+rec_type = record(host=str, port=field(int, 80), mask=int)
 assert_eq(rec_type(host="localhost", mask=255), rec_type(host="localhost", port=80, mask=255))"#,
         );
         // Make sure the default value is heap allocated (used to fail with a GC issue)
         assert::pass(
             r#"
 heap_string = "test{}".format(42)
-rec_type = record(test_gc=field(str.type, heap_string))
+rec_type = record(test_gc=field(str, heap_string))
 assert_eq(rec_type().test_gc, "test42")"#,
         );
     }
@@ -174,7 +198,7 @@ assert_eq(rec_type().test_gc, "test42")"#,
     fn test_record_equality() {
         assert::pass(
             r#"
-rec_type = record(host=str.type, port=field(int.type, 80))
+rec_type = record(host=str, port=field(int, 80))
 assert_eq(rec_type(host="s"), rec_type(host="s"))
 assert_eq(rec_type(host="s"), rec_type(host="s", port=80))
 assert_ne(rec_type(host="s"), rec_type(host="t"))
@@ -185,7 +209,7 @@ assert_ne(rec_type(host="s"), rec_type(host="t"))
         a.module(
             "m",
             r#"
-rec_type = record(host=str.type, port=field(int.type, 80))
+rec_type = record(host=str, port=field(int, 80))
 rec_val = rec_type(host="s")
 "#,
         );
@@ -201,14 +225,14 @@ assert_ne(rec_val, rec_type(host="t"))
         a.module(
             "m",
             r#"
-rt = record(host=str.type)
+rt = record(host=str)
 "#,
         );
         a.pass(
             r#"
 load('m', r1='rt')
-rt = record(host=str.type)
-diff = record(host=str.type)
+rt = record(host=str)
+diff = record(host=str)
 assert_ne(r1(host="test"), rt(host="test"))
 assert_ne(r1(host="test"), diff(host="test"))
 "#,
@@ -218,7 +242,7 @@ assert_ne(r1(host="test"), diff(host="test"))
     #[test]
     fn test_field_invalid() {
         assert::fails(
-            "field(str.type, None)",
+            "field(str, None)",
             &["does not match the type", "`default`"],
         );
         assert::fails("field(True)", &["`True`", "not a valid type"]);

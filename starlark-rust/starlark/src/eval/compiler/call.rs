@@ -17,12 +17,10 @@
 
 //! Compile function calls.
 
-use std::cell::Cell;
-
 use starlark_derive::VisitSpanMut;
 use starlark_syntax::slice_vec_ext::VecExt;
 
-use crate::collections::symbol_map::Symbol;
+use crate::collections::symbol::symbol::Symbol;
 use crate::eval::compiler::args::ArgsCompiledValue;
 use crate::eval::compiler::def_inline::local_as_value::local_as_value;
 use crate::eval::compiler::def_inline::InlineDefBody;
@@ -178,15 +176,15 @@ impl CallCompiled {
         };
 
         args.all_values_generic(expr_to_value, |arguments| {
-            let slots = vec![Cell::new(None); fun.parameters.len()];
+            let mut slots = vec![None; fun.parameters.len()];
             fun.parameters
-                .collect(arguments.frozen_to_v(), &slots, ctx.heap())
+                .collect(arguments.frozen_to_v(), &mut slots, ctx.heap())
                 .ok()?;
 
             let slots = slots
                 .into_try_map(|value| {
                     // Value must be set, but better ignore optimization here than panic.
-                    let value = value.get().ok_or(())?;
+                    let value = value.ok_or(())?;
                     // Everything should be frozen here, but if not,
                     // it is safer to abandon optimization.
                     value.unpack_frozen().ok_or(())
@@ -255,8 +253,8 @@ impl CallCompiled {
 
         let (before, after) = parse_format_one(&format)?;
 
-        let before = ctx.frozen_heap().alloc_str(&before);
-        let after = ctx.frozen_heap().alloc_str(&after);
+        let before = ctx.frozen_heap().alloc_str_intern(&before);
+        let after = ctx.frozen_heap().alloc_str_intern(&after);
         Some(ExprCompiled::format_one(before, arg.clone(), after, ctx))
     }
 

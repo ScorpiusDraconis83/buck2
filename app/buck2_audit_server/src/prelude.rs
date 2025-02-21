@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use buck2_audit::prelude::AuditPreludeCommand;
 use buck2_cli_proto::ClientContext;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::load_module::INTERPRETER_CALCULATION_IMPL;
 use buck2_interpreter::prelude_path::prelude_path;
@@ -21,28 +20,37 @@ use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
+
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
+enum AuditPreludeError {
+    #[error("Project has no prelude")]
+    NoPrelude,
+}
 
 #[async_trait]
-impl AuditSubcommand for AuditPreludeCommand {
+impl ServerAuditSubcommand for AuditPreludeCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         _client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx
-            .with_dice_ctx(async move |_server_ctx, ctx| {
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|_server_ctx, mut ctx| async move {
                 let mut stdout = stdout.as_writer();
                 // Print out all the Prelude-like stuff that is loaded into each module
                 let cell_resolver = ctx.get_cell_resolver().await?;
-                let prelude_path = prelude_path(&cell_resolver)?;
+                let Some(prelude_path) = prelude_path(&cell_resolver)? else {
+                    return Err(AuditPreludeError::NoPrelude.into());
+                };
                 writeln!(
                     stdout,
                     "{}",
                     INTERPRETER_CALCULATION_IMPL
                         .get()?
-                        .global_env_for_file_type(&ctx, StarlarkFileType::Buck)
+                        .global_env(&mut ctx)
                         .await?
                         .describe()
                 )?;
@@ -57,6 +65,6 @@ impl AuditSubcommand for AuditPreludeCommand {
 
                 Ok(())
             })
-            .await
+            .await?)
     }
 }

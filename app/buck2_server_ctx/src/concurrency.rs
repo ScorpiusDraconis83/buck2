@@ -15,12 +15,13 @@
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use async_condvar_fair::Condvar;
 use async_trait::async_trait;
+use buck2_cli_proto::client_context::PreemptibleWhen;
+use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
 use buck2_core::soft_error;
 use buck2_data::DiceBlockConcurrentCommandEnd;
 use buck2_data::DiceBlockConcurrentCommandStart;
@@ -30,30 +31,39 @@ use buck2_data::DiceSynchronizeSectionStart;
 use buck2_data::ExclusiveCommandWaitEnd;
 use buck2_data::ExclusiveCommandWaitStart;
 use buck2_data::NoActiveDiceState;
-use buck2_error::Context;
+use buck2_error::internal_error;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
-use buck2_futures::cancellation::ExplicitCancellationContext;
+use buck2_futures::cancellation::CancellationContext;
 use buck2_util::truncate::truncate;
 use buck2_wrapper_common::invocation_id::TraceId;
 use derive_more::Display;
 use dice::Dice;
-use dice::DiceComputations;
 use dice::DiceEquality;
 use dice::DiceTransaction;
 use dice::DiceTransactionUpdater;
 use dice::UserComputationData;
 use dupe::Dupe;
+use futures::future;
 use futures::future::BoxFuture;
+use futures::future::Either;
 use futures::future::Future;
 use futures::future::FutureExt;
 use futures::future::Shared;
+use futures::pin_mut;
 use itertools::Itertools;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::Mutex;
 use tokio::sync::MutexGuard;
 
+use crate::ctx::LockedPreviousCommandData;
+use crate::experiment_util::get_experiment_tags;
+
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum ConcurrencyHandlerError {
     #[error(
         "Recursive invocation of Buck, which is discouraged, but will probably work (using the same state). Trace Ids: {0}. Recursive invocation command: `{1}`"
@@ -62,11 +72,15 @@ enum ConcurrencyHandlerError {
     #[error(
         "Recursive invocation of Buck, with a different state. Use `--isolation-dir` on the inner invocation to fix this. Trace Ids: {0}. Recursive invocation command: `{1}`"
     )]
-    #[buck2(user)]
+    #[buck2(input)]
     NestedInvocationWithDifferentStates(String, String),
     #[error("`--exit-when-different-state` was set")]
-    #[buck2(user, typ = DaemonIsBusy)]
+    #[buck2(tag = DaemonIsBusy)]
     ExitWhenDifferentState,
+
+    #[error("`--preemptible` was set, and buck daemon preempted this command as another came in.")]
+    #[buck2(tag = DaemonPreempted)]
+    ExitOnPreemption,
 }
 
 #[derive(Clone, Dupe, Copy, Debug)]
@@ -86,16 +100,16 @@ pub enum BypassSemaphore {
 ///
 /// Currently, we allow concurrency if two `DiceTransactions` are deemed equivalent, such that
 /// any computation result that occurs in one is directly reusable by another.
-#[derive(Clone, Dupe, Allocative)]
+#[derive(Allocative)]
 pub struct ConcurrencyHandler {
-    data: Arc<Mutex<ConcurrencyHandlerData>>,
+    data: Mutex<ConcurrencyHandlerData>,
     // use an async condvar because the `wait` to `notify` spans across an async function (namely
     // the entire command execution).
     #[allocative(skip)]
-    cond: Arc<Condvar>,
+    cond: Condvar,
     dice: Arc<Dice>,
     /// Used to prevent commands (clean --stale) from running in parallel with dice commands
-    exclusive_command_lock: Arc<ExclusiveCommandLock>,
+    exclusive_command_lock: ExclusiveCommandLock,
 }
 
 #[derive(Allocative)]
@@ -130,6 +144,9 @@ struct CommandData {
     trace_id: TraceId,
     argv: Vec<String>,
     dispatcher: EventDispatcher,
+    preemption_setting: PreemptibleWhen,
+    #[allocative(skip)]
+    preempt: Option<oneshot::Sender<()>>,
 }
 
 impl CommandData {
@@ -242,13 +259,7 @@ pub trait DiceUpdater: Send + Sync {
     async fn update(
         &self,
         mut ctx: DiceTransactionUpdater,
-        _user_data: &mut UserComputationData,
-    ) -> anyhow::Result<DiceTransactionUpdater>;
-}
-
-#[async_trait]
-pub trait DiceDataProvider: Send + Sync + 'static {
-    async fn provide(&self, ctx: &DiceComputations) -> anyhow::Result<UserComputationData>;
+    ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)>;
 }
 
 #[derive(Allocative)]
@@ -257,6 +268,7 @@ struct ExclusiveCommandLock {
     owning_command: Arc<parking_lot::Mutex<VecDeque<String>>>,
 }
 
+#[allow(dead_code)] // fields never read
 enum ExclusiveCommandLockGuard<'a> {
     Shared(tokio::sync::RwLockReadGuard<'a, ()>),
     Exclusive(
@@ -306,35 +318,36 @@ impl ExclusiveCommandLock {
 }
 
 impl ConcurrencyHandler {
-    pub fn new(dice: Arc<Dice>) -> Self {
-        ConcurrencyHandler {
-            data: Arc::new(Mutex::new(ConcurrencyHandlerData {
+    pub fn new(dice: Arc<Dice>) -> Arc<Self> {
+        Arc::new(ConcurrencyHandler {
+            data: Mutex::new(ConcurrencyHandlerData {
                 dice_status: DiceStatus::idle(),
                 active_commands: SmallMap::new(),
                 next_command_id: CommandId(0),
                 cleanup_epoch: 0,
                 previously_tainted: false,
-            })),
-            cond: Default::default(),
+            }),
+            cond: Condvar::new(),
             dice,
-            exclusive_command_lock: Arc::new(ExclusiveCommandLock::new()),
-        }
+            exclusive_command_lock: ExclusiveCommandLock::new(),
+        })
     }
 
     /// Enters a critical section that requires concurrent command synchronization,
     /// and runs the given `exec` function in the critical section.
     pub async fn enter<F, Fut, R>(
-        &self,
+        self: &Arc<Self>,
         event_dispatcher: EventDispatcher,
-        data: &dyn DiceDataProvider,
         updates: &dyn DiceUpdater,
         exec: F,
         is_nested_invocation: bool,
         sanitized_argv: Vec<String>,
         exclusive_cmd: Option<String>,
         exit_when_different_state: bool,
-        cancellations: &ExplicitCancellationContext,
-    ) -> anyhow::Result<R>
+        cancellations: &CancellationContext,
+        preemptible: PreemptibleWhen,
+        previous_command_data: Arc<LockedPreviousCommandData>,
+    ) -> buck2_error::Result<R>
     where
         F: FnOnce(DiceTransaction) -> Fut,
         Fut: Future<Output = R> + Send,
@@ -358,18 +371,19 @@ impl ConcurrencyHandler {
             .await;
 
         let events = event_dispatcher.dupe();
-        let (_guard, transaction) = event_dispatcher
+        let (_guard, transaction, preempt_receiver) = event_dispatcher
             .span_async(DiceSynchronizeSectionStart {}, async move {
                 (
                     cancellations
                         .critical_section(|| {
                             self.wait_for_others(
-                                data,
                                 updates,
                                 events,
                                 is_nested_invocation,
                                 sanitized_argv,
                                 exit_when_different_state,
+                                preemptible,
+                                previous_command_data,
                             )
                         })
                         .await,
@@ -378,7 +392,16 @@ impl ConcurrencyHandler {
             })
             .await?;
 
-        Ok(exec(transaction).await)
+        let result = exec(transaction);
+        pin_mut!(result);
+        pin_mut!(preempt_receiver);
+
+        match future::select(result, preempt_receiver).await {
+            Either::Left((result, _)) => Ok(result),
+            Either::Right((_preemption, _)) => {
+                Err(ConcurrencyHandlerError::ExitOnPreemption.into())
+            }
+        }
     }
 
     // this is normally super unsafe, but because we are using an async condvar that takes care
@@ -386,30 +409,45 @@ impl ConcurrencyHandler {
     // The async condvar will handle properly allowing under threads to proceed, avoiding
     // starvation.
     async fn wait_for_others(
-        &self,
-        user_data: &dyn DiceDataProvider,
+        self: &Arc<Self>,
         updates: &dyn DiceUpdater,
         event_dispatcher: EventDispatcher,
         is_nested_invocation: bool,
         sanitized_argv: Vec<String>,
         exit_when_different_state: bool,
-    ) -> anyhow::Result<(OnExecExit, DiceTransaction)> {
+        preemptible: PreemptibleWhen,
+        previous_command_data: Arc<LockedPreviousCommandData>,
+    ) -> buck2_error::Result<(
+        OnExecExit,
+        DiceTransaction,
+        impl Future<Output = Result<(), RecvError>>,
+    )> {
+        // Have to put it on the function unfortunately, https://github.com/rust-lang/rust-clippy/issues/9047
+        #![allow(clippy::await_holding_invalid_type)]
+
         let trace = event_dispatcher.trace_id().dupe();
+        let current_sanitized_argv = sanitized_argv.clone();
 
         let span = tracing::span!(tracing::Level::DEBUG, "wait_for_others", trace = %trace);
+        // FIXME(JakobDegen): Clippy points out that tracing won't know when this future gets
+        // descheduled from this executor thread, so this may show up in the wrong places
         let _enter = span.enter();
 
         let mut data = self.data.lock().await;
 
         let command_id = data.next_command_id.increment();
 
+        let (preempt_sender, preempt_receiver) = oneshot::channel::<()>();
+
         let command_data = CommandData {
             trace_id: trace.dupe(),
             argv: sanitized_argv,
             dispatcher: event_dispatcher.dupe(),
+            preemption_setting: preemptible,
+            preempt: Some(preempt_sender),
         };
 
-        let (transaction, tainted) = loop {
+        let (mut transaction, tainted) = loop {
             match &data.dice_status {
                 DiceStatus::Cleanup { future, epoch } => {
                     tracing::debug!("ActiveDice is in cleanup");
@@ -439,11 +477,8 @@ impl ConcurrencyHandler {
 
                     let transaction = async {
                         let updater = self.dice.updater();
-                        let mut user_data = user_data
-                            .provide(updater.existing_state().await.deref())
-                            .await?;
 
-                        let transaction = updates.update(updater, &mut user_data).await?;
+                        let (transaction, user_data) = updates.update(updater).await?;
 
                         event_dispatcher
                             .span_async(buck2_data::DiceStateUpdateStart {}, async {
@@ -451,7 +486,7 @@ impl ConcurrencyHandler {
                                     async {
                                         let transaction =
                                             transaction.commit_with_data(user_data).await;
-                                        anyhow::Ok(transaction)
+                                        buck2_error::Ok(transaction)
                                     }
                                     .await,
                                     buck2_data::DiceStateUpdateEnd {},
@@ -467,6 +502,10 @@ impl ConcurrencyHandler {
                         // If we have a different state, attempt to transition to cleanup. This will
                         // succeed only if the current state is not in use.
                         if !is_same_state {
+                            // If the active commands are preemptible, preempt them.
+                            self.cancel_preemptible_commands(&mut data, is_same_state);
+
+                            // transition to cleanup == "wait until all other blocking commands finish"
                             if data.transition_to_cleanup(&self.dice) {
                                 continue;
                             }
@@ -493,12 +532,18 @@ impl ConcurrencyHandler {
                             }
                             BypassSemaphore::Run(state) => {
                                 self.emit_logs(state, &data.active_commands, &command_data)?;
+                                self.cancel_preemptible_commands(&mut data, is_same_state);
                                 break (transaction, false);
                             }
                             BypassSemaphore::Block => {
                                 if exit_when_different_state {
+                                    let active_commands: Vec<String> = data
+                                        .active_commands
+                                        .values()
+                                        .map(|d| TraceId::to_string(&d.trace_id))
+                                        .collect();
                                     return Err(ConcurrencyHandlerError::ExitWhenDifferentState)
-                                        .context("Buck daemon is busy processing another command");
+                                        .with_buck_error_context(|| format!("Buck daemon is busy processing another command: {}", active_commands.join(", ")));
                                 }
                                 // We should probably show more than the first here, but for now
                                 // this is what we have.
@@ -518,7 +563,7 @@ impl ConcurrencyHandler {
                                         },
                                         async {
                                             (
-                                                self.cond.wait((data, &*self.data)).await,
+                                                self.cond.wait((data, &self.data)).await,
                                                 DiceBlockConcurrentCommandEnd {
                                                     ending_active_trace_id: trace_id.to_string(),
                                                 },
@@ -550,15 +595,58 @@ impl ConcurrencyHandler {
             data.previously_tainted = true;
         }
 
-        // create the on exit drop handler, which will take care of notifying tasks.
-        let drop_guard = OnExecExit::new(self.dupe(), command_id, command_data, data);
+        if transaction
+            .is_injected_external_buckconfig_data_key_set()
+            .await?
+        {
+            let external_configs = transaction.get_injected_external_buckconfig_data().await?;
+            let current_external_configs: Vec<buck2_data::BuckconfigComponent> =
+                external_configs.get_buckconfig_components();
 
-        Ok((drop_guard, transaction))
+            let mut previous_command_data = previous_command_data.data.lock().unwrap();
+
+            previous_command_data.process_current_command(
+                event_dispatcher.dupe(),
+                current_external_configs.clone(),
+                current_sanitized_argv,
+                trace,
+            );
+
+            event_dispatcher.instant_event(buck2_data::TagEvent {
+                tags: get_experiment_tags(&current_external_configs),
+            });
+            event_dispatcher.instant_event(buck2_data::BuckconfigInputValues {
+                components: current_external_configs,
+            });
+        }
+        // create the on exit drop handler, which will take care of notifying tasks.
+        let drop_guard = OnExecExit::new(self.dupe(), command_id, command_data, data)?;
+        // This adds the task to the list of all tasks (see ::new impl)
+
+        Ok((drop_guard, transaction, preempt_receiver))
     }
 
     /// Access dice without locking for dumps.
     pub fn unsafe_dice(&self) -> &Arc<Dice> {
         &self.dice
+    }
+
+    fn cancel_preemptible_commands(&self, data: &mut ConcurrencyHandlerData, is_same_state: bool) {
+        // If the active commands are preemptible, interrupt them.
+        for cmd in data.active_commands.values_mut() {
+            if cmd.preemption_setting == PreemptibleWhen::Never {
+                continue;
+            }
+            if is_same_state && cmd.preemption_setting == PreemptibleWhen::OnDifferentState {
+                continue;
+            }
+            match cmd.preempt.take() {
+                Some(preempt) => {
+                    let _ = preempt.send(());
+                }
+                None => {}
+            };
+        }
     }
 
     fn determine_bypass_semaphore(
@@ -584,17 +672,18 @@ impl ConcurrencyHandler {
         state: RunState,
         active_commands: &SmallMap<CommandId, CommandData>,
         current_command: &CommandData,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let active_commands = format_traces(active_commands, current_command);
 
         match state {
             RunState::NestedSameState => {
                 soft_error!(
                     "nested_invocation_same_dice_state",
-                    anyhow::anyhow!(ConcurrencyHandlerError::NestedInvocationWithSameStates(
+                    ConcurrencyHandlerError::NestedInvocationWithSameStates(
                         active_commands,
                         current_command.format_argv(),
-                    ))
+                    )
+                    .into()
                 )?;
             }
             _ => {}
@@ -619,17 +708,22 @@ fn format_traces(
 
 /// Held to execute a command so that when the command is canceled, we properly remove its state
 /// from the handler so that it's no longer registered as a ongoing command.
-struct OnExecExit(Option<(ConcurrencyHandler, CommandId)>);
+struct OnExecExit(Option<(Arc<ConcurrencyHandler>, CommandId)>);
 
 impl OnExecExit {
     pub fn new(
-        handler: ConcurrencyHandler,
+        handler: Arc<ConcurrencyHandler>,
         command: CommandId,
         data: CommandData,
         mut guard: MutexGuard<'_, ConcurrencyHandlerData>,
-    ) -> Self {
-        guard.active_commands.insert(command, data);
-        Self(Some((handler, command)))
+    ) -> buck2_error::Result<Self> {
+        let prev = guard.active_commands.insert(command, data);
+        if prev.is_some() {
+            return Err(internal_error!(
+                "command id `{command}` is already registered"
+            ));
+        }
+        Ok(OnExecExit(Some((handler, command))))
     }
 }
 
@@ -641,7 +735,7 @@ impl Drop for OnExecExit {
         tokio::task::spawn(async move {
             let mut data = this.0.data.lock().await;
             data.active_commands
-                .remove(&this.1)
+                .shift_remove(&this.1)
                 .expect("command was active but not in active_commands");
             tracing::info!("Active command was removed: {}", this.1);
 
@@ -662,39 +756,33 @@ impl Drop for OnExecExit {
 mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::task::Poll;
     use std::time::Duration;
 
     use allocative::Allocative;
-    use anyhow::Context;
     use assert_matches::assert_matches;
     use async_trait::async_trait;
+    use buck2_common::legacy_configs::dice::SetLegacyConfigs;
     use buck2_core::is_open_source;
     use buck2_events::create_source_sink_pair;
-    use buck2_events::dispatch::EventDispatcher;
     use buck2_events::source::ChannelEventSource;
     use buck2_events::span::SpanId;
     use buck2_events::BuckEvent;
     use buck2_futures::cancellation::CancellationContext;
-    use buck2_wrapper_common::invocation_id::TraceId;
     use derivative::Derivative;
     use dice::DetectCycles;
-    use dice::Dice;
     use dice::DiceComputations;
-    use dice::DiceTransactionUpdater;
     use dice::InjectedKey;
     use dice::Key;
-    use dice::UserComputationData;
     use dupe::Dupe;
     use futures::pin_mut;
     use futures::poll;
     use parking_lot::Mutex;
     use tokio::sync::Barrier;
     use tokio::sync::RwLock;
-    use tokio::sync::Semaphore;
 
     use super::*;
+    use crate::ctx::LockedPreviousCommandData;
 
     struct NoChanges;
 
@@ -703,9 +791,8 @@ mod tests {
         async fn update(
             &self,
             ctx: DiceTransactionUpdater,
-            _user_data: &mut UserComputationData,
-        ) -> anyhow::Result<DiceTransactionUpdater> {
-            Ok(ctx)
+        ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
+            Ok((ctx, Default::default()))
         }
     }
 
@@ -716,10 +803,9 @@ mod tests {
         async fn update(
             &self,
             mut ctx: DiceTransactionUpdater,
-            _user_data: &mut UserComputationData,
-        ) -> anyhow::Result<DiceTransactionUpdater> {
+        ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
             ctx.changed_to(vec![(K, ())])?;
-            Ok(ctx)
+            Ok((ctx, Default::default()))
         }
     }
 
@@ -735,13 +821,12 @@ mod tests {
         }
     }
 
-    struct TestDiceDataProvider;
-
-    #[async_trait]
-    impl DiceDataProvider for TestDiceDataProvider {
-        async fn provide(&self, _ctx: &DiceComputations) -> anyhow::Result<UserComputationData> {
-            Ok(Default::default())
-        }
+    async fn make_default_dice() -> Arc<Dice> {
+        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let mut updater = dice.updater();
+        drop(updater.set_none_legacy_config_external_data());
+        updater.commit().await;
+        dice
     }
 
     #[tokio::test]
@@ -750,9 +835,7 @@ mod tests {
         if is_open_source() {
             return;
         }
-
-        let dice = Dice::builder().build(DetectCycles::Enabled);
-
+        let dice = make_default_dice().await;
         let concurrency = ConcurrencyHandler::new(dice);
 
         let traces1 = TraceId::new();
@@ -763,7 +846,6 @@ mod tests {
 
         let fut1 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces1),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -775,11 +857,12 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         let fut2 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces2),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -791,11 +874,12 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         let fut3 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces3),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -807,7 +891,9 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
 
         let (r1, r2, r3) = futures::future::join3(fut1, fut2, fut3).await;
@@ -818,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn nested_invocation_should_error() {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice);
 
@@ -829,7 +915,6 @@ mod tests {
 
         let fut1 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces1),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -841,12 +926,13 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
 
         let fut2 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces2),
-            &TestDiceDataProvider,
             &CtxDifferent,
             |_| {
                 let b = barrier.dupe();
@@ -858,7 +944,9 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
 
         match futures::future::try_join(fut1, fut2).await {
@@ -871,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_invocation_same_transaction() {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice);
 
@@ -883,7 +971,6 @@ mod tests {
 
         let fut1 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces1),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -895,11 +982,12 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         let fut2 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces2),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -911,11 +999,12 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         let fut3 = concurrency.enter(
             EventDispatcher::null_sink_with_trace(traces3),
-            &TestDiceDataProvider,
             &NoChanges,
             |_| {
                 let b = barrier.dupe();
@@ -927,7 +1016,9 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
 
         let (r1, r2, r3) = futures::future::join3(fut1, fut2, fut3).await;
@@ -937,8 +1028,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_invocation_different_traceid_blocks() -> anyhow::Result<()> {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+    async fn parallel_invocation_different_traceid_blocks() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
 
@@ -966,7 +1057,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces1),
-                        &TestDiceDataProvider,
                         &NoChanges,
                         |_| async move {
                             barrier.wait().await;
@@ -976,7 +1066,9 @@ mod tests {
                         Vec::new(),
                         None,
                         false,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -991,7 +1083,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces2),
-                        &TestDiceDataProvider,
                         &NoChanges,
                         |_| async move {
                             barrier.wait().await;
@@ -1001,7 +1092,9 @@ mod tests {
                         Vec::new(),
                         None,
                         false,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -1019,7 +1112,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces_different),
-                        &TestDiceDataProvider,
                         &CtxDifferent,
                         |_| async move {
                             arrived.store(true, Ordering::Relaxed);
@@ -1028,7 +1120,9 @@ mod tests {
                         Vec::new(),
                         None,
                         false,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -1054,8 +1148,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_invocation_exit_when_different_state() -> anyhow::Result<()> {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+    async fn parallel_invocation_exit_when_different_state() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
 
@@ -1083,7 +1177,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces1),
-                        &TestDiceDataProvider,
                         &NoChanges,
                         |_| async move {
                             barrier.wait().await;
@@ -1093,7 +1186,9 @@ mod tests {
                         Vec::new(),
                         None,
                         true,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -1108,7 +1203,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces2),
-                        &TestDiceDataProvider,
                         &NoChanges,
                         |_| async move {
                             barrier.wait().await;
@@ -1118,7 +1212,9 @@ mod tests {
                         Vec::new(),
                         None,
                         true,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -1136,7 +1232,6 @@ mod tests {
                 concurrency
                     .enter(
                         EventDispatcher::null_sink_with_trace(traces_different),
-                        &TestDiceDataProvider,
                         &CtxDifferent,
                         |_| async move {
                             arrived.store(true, Ordering::Relaxed);
@@ -1145,7 +1240,9 @@ mod tests {
                         Vec::new(),
                         None,
                         true,
-                        ExplicitCancellationContext::testing(),
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
                     )
                     .await
             }
@@ -1166,17 +1263,141 @@ mod tests {
         let fut3_result = fut3.await?;
 
         let fut3_error: buck2_error::Error = fut3_result.unwrap_err().into();
-        assert_eq!(
-            fut3_error.get_error_type(),
-            Some(buck2_error::ErrorType::DaemonIsBusy)
+        assert!(
+            fut3_error
+                .tags()
+                .contains(&buck2_error::ErrorTag::DaemonIsBusy),
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_invocation_exit_when_preemptible() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
+
+        let concurrency = ConcurrencyHandler::new(dice.dupe());
+
+        let traces1 = TraceId::new();
+        let traces2 = traces1.dupe();
+        let traces_different = TraceId::new();
+
+        let block1 = Arc::new(RwLock::new(()));
+        let blocked1 = block1.write().await;
+
+        let block2 = Arc::new(RwLock::new(()));
+        let blocked2 = block2.write().await;
+
+        let barrier1 = Arc::new(Barrier::new(3));
+        let barrier2 = Arc::new(Barrier::new(2));
+
+        let arrived = Arc::new(AtomicBool::new(false));
+
+        let fut1 = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let barrier = barrier1.dupe();
+            let b = block1.dupe();
+
+            async move {
+                concurrency
+                    .enter(
+                        EventDispatcher::null_sink_with_trace(traces1),
+                        &NoChanges,
+                        |_| async move {
+                            barrier.wait().await;
+                            let _g = b.read().await;
+                        },
+                        false,
+                        Vec::new(),
+                        None,
+                        false,
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Always,
+                        LockedPreviousCommandData::default().into(),
+                    )
+                    .await
+            }
+        });
+
+        let fut2 = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let barrier = barrier1.dupe();
+            let b = block2.dupe();
+
+            async move {
+                concurrency
+                    .enter(
+                        EventDispatcher::null_sink_with_trace(traces2),
+                        &NoChanges,
+                        |_| async move {
+                            barrier.wait().await;
+                            let _g = b.read().await;
+                        },
+                        false,
+                        Vec::new(),
+                        None,
+                        false,
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
+                    )
+                    .await
+            }
+        });
+
+        barrier1.wait().await;
+
+        let fut3 = tokio::spawn({
+            let concurrency = concurrency.dupe();
+            let barrier = barrier2.dupe();
+            let arrived = arrived.dupe();
+
+            async move {
+                barrier.wait().await;
+                concurrency
+                    .enter(
+                        EventDispatcher::null_sink_with_trace(traces_different),
+                        &CtxDifferent,
+                        |_| async move {
+                            arrived.store(true, Ordering::Relaxed);
+                        },
+                        false,
+                        Vec::new(),
+                        None,
+                        false,
+                        CancellationContext::testing(),
+                        PreemptibleWhen::Never,
+                        LockedPreviousCommandData::default().into(),
+                    )
+                    .await
+            }
+        });
+
+        barrier2.wait().await;
+
+        assert!(!arrived.load(Ordering::Relaxed));
+
+        drop(blocked1);
+        let fut1_result = fut1.await?;
+        let fut1_error: buck2_error::Error = fut1_result.unwrap_err().into();
+        assert!(
+            fut1_error
+                .tags()
+                .contains(&buck2_error::ErrorTag::DaemonPreempted),
+        );
+
+        assert!(!arrived.load(Ordering::Relaxed));
+
+        drop(blocked2);
+        fut2.await??;
+        fut3.await??;
 
         Ok(())
     }
 
     #[derive(Clone, Dupe, Derivative, Allocative, Display)]
     #[derivative(Hash, Eq, PartialEq, Debug)]
-    #[display(fmt = "CleanupTestKey")]
+    #[display("CleanupTestKey")]
     struct CleanupTestKey {
         #[derivative(Debug = "ignore", Hash = "ignore", PartialEq = "ignore")]
         is_executing: Arc<Mutex<()>>,
@@ -1186,7 +1407,6 @@ mod tests {
     impl Key for CleanupTestKey {
         type Value = ();
 
-        #[allow(clippy::await_holding_lock)]
         async fn compute(
             &self,
             _ctx: &mut DiceComputations,
@@ -1207,14 +1427,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_stage() -> anyhow::Result<()> {
+    async fn test_cleanup_stage() -> buck2_error::Result<()> {
         let key = CleanupTestKey {
             is_executing: Arc::new(Mutex::new(())),
         };
 
         let key = &key;
 
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
 
@@ -1223,9 +1443,8 @@ mod tests {
         concurrency
             .enter(
                 EventDispatcher::null(),
-                &TestDiceDataProvider,
                 &NoChanges,
-                |dice| async move {
+                |mut dice| async move {
                     let compute = dice.compute(key).fuse();
 
                     let started = async {
@@ -1250,7 +1469,9 @@ mod tests {
                 Vec::new(),
                 None,
                 false,
-                ExplicitCancellationContext::testing(),
+                CancellationContext::testing(),
+                PreemptibleWhen::Never,
+                LockedPreviousCommandData::default().into(),
             )
             .await?;
 
@@ -1259,7 +1480,6 @@ mod tests {
         concurrency
             .enter(
                 EventDispatcher::null(),
-                &TestDiceDataProvider,
                 &NoChanges,
                 |_dice| async move {
                     // The key should still be evaluating by now.
@@ -1269,7 +1489,9 @@ mod tests {
                 Vec::new(),
                 None,
                 false,
-                ExplicitCancellationContext::testing(),
+                CancellationContext::testing(),
+                PreemptibleWhen::Never,
+                LockedPreviousCommandData::default().into(),
             )
             .await?;
 
@@ -1278,7 +1500,6 @@ mod tests {
         concurrency
             .enter(
                 EventDispatcher::null(),
-                &TestDiceDataProvider,
                 &CtxDifferent,
                 |_dice| async move {
                     assert!(!key.is_executing.is_locked());
@@ -1287,7 +1508,9 @@ mod tests {
                 Vec::new(),
                 None,
                 false,
-                ExplicitCancellationContext::testing(),
+                CancellationContext::testing(),
+                PreemptibleWhen::Never,
+                LockedPreviousCommandData::default().into(),
             )
             .await?;
 
@@ -1297,7 +1520,7 @@ mod tests {
     async fn wait_for_event<F>(
         source: &mut ChannelEventSource,
         matcher: Box<F>,
-    ) -> anyhow::Result<BuckEvent>
+    ) -> buck2_error::Result<BuckEvent>
     where
         F: Fn(&BuckEvent) -> bool + Send,
     {
@@ -1314,13 +1537,13 @@ mod tests {
             }
         })
         .await
-        .context("Time out waiting for matching buck event")
+        .buck_error_context("Time out waiting for matching buck event")
     }
 
     async fn wait_for_exclusive_span_start(
         source: &mut ChannelEventSource,
         cmd: Option<&str>,
-    ) -> anyhow::Result<Option<SpanId>> {
+    ) -> buck2_error::Result<Option<SpanId>> {
         let cmd = cmd.map(|c| c.to_owned());
         Ok(wait_for_event(
             source,
@@ -1345,7 +1568,7 @@ mod tests {
     async fn wait_for_exclusive_span_end(
         source: &mut ChannelEventSource,
         span_id: Option<SpanId>,
-    ) -> anyhow::Result<BuckEvent> {
+    ) -> buck2_error::Result<BuckEvent> {
         wait_for_event(
             source,
             Box::new(|e: &BuckEvent| {
@@ -1363,8 +1586,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exclusive_command_lock() -> anyhow::Result<()> {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+    async fn exclusive_command_lock() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
         let concurrency = ConcurrencyHandler::new(dice.dupe());
         let (mut source, sink) = create_source_sink_pair();
         let dispatcher = EventDispatcher::new(TraceId::new(), sink);
@@ -1381,7 +1604,6 @@ mod tests {
                     concurrency
                         .enter(
                             dispatcher,
-                            &TestDiceDataProvider,
                             &NoChanges,
                             |_| async move {
                                 let _guard = mutex.try_lock().expect("Not exclusive!");
@@ -1395,7 +1617,9 @@ mod tests {
                             Vec::new(),
                             exclusive_cmd,
                             false,
-                            ExplicitCancellationContext::testing(),
+                            CancellationContext::testing(),
+                            PreemptibleWhen::Never,
+                            LockedPreviousCommandData::default().into(),
                         )
                         .await
                 }
@@ -1448,8 +1672,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thundering_herd() -> anyhow::Result<()> {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+    async fn test_thundering_herd() -> buck2_error::Result<()> {
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
 
@@ -1459,9 +1683,8 @@ mod tests {
             concurrency
                 .enter(
                     EventDispatcher::null(),
-                    &TestDiceDataProvider,
                     &CtxDifferent,
-                    |dice| async move {
+                    |mut dice| async move {
                         // NOTE: We need to actually compute something for DICE to be not-idle.
                         dice.compute(&K).await.unwrap();
                         tokio::task::yield_now().await;
@@ -1470,12 +1693,14 @@ mod tests {
                     Vec::new(),
                     None,
                     false,
-                    ExplicitCancellationContext::testing(),
+                    CancellationContext::testing(),
+                    PreemptibleWhen::Never,
+                    LockedPreviousCommandData::default().into(),
                 )
                 .await
         });
 
-        futures::future::try_join_all(tasks).await?;
+        buck2_util::future::try_join_all(tasks).await?;
 
         assert!(!concurrency.data.lock().await.previously_tainted);
 
@@ -1483,41 +1708,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_updates_are_synchronized() -> anyhow::Result<()> {
-        let dice = Dice::builder().build(DetectCycles::Enabled);
+    async fn test_updates_are_synchronized() -> buck2_error::Result<()> {
+        async fn wait_on(b: &AtomicBool) {
+            while !b.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
 
         struct Updater {
-            should_be_able_to_run: AtomicBool,
-            arrived_update: Semaphore,
+            // Set when the updater enters the update function
+            on_enter: AtomicBool,
+            // Set to indicate that the updater should exit its update function
+            allow_exit: AtomicBool,
         }
-
         #[async_trait]
         impl DiceUpdater for Updater {
             async fn update(
                 &self,
                 ctx: DiceTransactionUpdater,
-                _user_data: &mut UserComputationData,
-            ) -> anyhow::Result<DiceTransactionUpdater> {
-                self.arrived_update.add_permits(1);
-                tokio::task::yield_now().await;
-
-                if self.should_be_able_to_run.load(Ordering::SeqCst) {
-                    Ok(ctx)
-                } else {
-                    panic!("shouldn't be running")
-                }
+            ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
+                self.on_enter.store(true, Ordering::Relaxed);
+                wait_on(&self.allow_exit).await;
+                Ok((ctx, Default::default()))
             }
         }
 
         let updater1 = Updater {
-            should_be_able_to_run: AtomicBool::new(false),
-            arrived_update: Semaphore::new(0),
+            on_enter: AtomicBool::new(false),
+            allow_exit: AtomicBool::new(false),
         };
         let fut1 = concurrency.enter(
             EventDispatcher::null(),
-            &TestDiceDataProvider,
             &updater1,
             |_dice| async move {
                 tokio::task::yield_now().await;
@@ -1526,17 +1751,20 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         pin_mut!(fut1);
 
         let updater2 = Updater {
-            should_be_able_to_run: AtomicBool::new(false),
-            arrived_update: Semaphore::new(0),
+            on_enter: AtomicBool::new(false),
+            // We can set this to true immediately as we don't ever need the
+            // second one to wait on anything
+            allow_exit: AtomicBool::new(true),
         };
         let fut2 = concurrency.enter(
             EventDispatcher::null(),
-            &TestDiceDataProvider,
             &updater2,
             |_dice| async move {
                 tokio::task::yield_now().await;
@@ -1545,27 +1773,34 @@ mod tests {
             Vec::new(),
             None,
             false,
-            ExplicitCancellationContext::testing(),
+            CancellationContext::testing(),
+            PreemptibleWhen::Never,
+            LockedPreviousCommandData::default().into(),
         );
         pin_mut!(fut2);
 
-        // poll once will arrive at the `yield` in updater
-        assert_matches!(poll!(&mut fut1), Poll::Pending);
-        let _g = updater1.arrived_update.acquire().await?;
+        // Wait for the first updater's update to be entered
+        tokio::select! {
+            _ = &mut fut1 => panic!("First should not be able to exit yet"),
+            _ = wait_on(&updater1.on_enter) => (),
+        }
 
-        // polling multiple times on the second command will all be pending and not complete
-        assert_matches!(poll!(&mut fut2), Poll::Pending);
-        assert_matches!(poll!(&mut fut2), Poll::Pending);
-        assert_matches!(poll!(&mut fut2), Poll::Pending);
-        assert_matches!(poll!(&mut fut2), Poll::Pending);
+        // Now the first updater is blocked within its update function. Poll the
+        // second one many times so that it makes as much progress as it can
+        for _ in 0..100 {
+            assert_matches!(poll!(&mut fut2), Poll::Pending);
+        }
+        // But it should not have entered its update yet
+        assert!(
+            !updater2.on_enter.load(Ordering::Relaxed),
+            "Updaters are not correctly synchronized"
+        );
 
-        // now make the first command runnable
-        updater1.should_be_able_to_run.store(true, Ordering::SeqCst);
-        fut1.await?;
-
-        // 1 is done and dropped, so `2` can now finish
-        updater2.should_be_able_to_run.store(true, Ordering::SeqCst);
-        fut2.await?;
+        // Now unblock the first one and let both finish
+        updater1.allow_exit.store(true, Ordering::Relaxed);
+        let (a, b) = tokio::join!(fut1, fut2);
+        a.unwrap();
+        b.unwrap();
 
         Ok(())
     }

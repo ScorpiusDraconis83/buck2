@@ -7,7 +7,8 @@
  * of this source tree.
  */
 
-use buck2_interpreter::functions::more::REGISTER_BUCK2_BUILD_API_GLOBALS;
+use buck2_interpreter::downstream_crate_starlark_defs::REGISTER_BUCK2_BUILD_API_GLOBALS;
+use buck2_interpreter::downstream_crate_starlark_defs::REGISTER_BUCK2_BUILD_API_INTERNALS;
 use starlark::environment::GlobalsBuilder;
 
 use crate::actions::error_handler::register_action_error_handler_for_testing;
@@ -24,9 +25,11 @@ use crate::interpreter::rule_defs::provider::collection::register_provider_colle
 use crate::interpreter::rule_defs::provider::dependency::register_dependency;
 use crate::interpreter::rule_defs::provider::registration::register_builtin_providers;
 use crate::interpreter::rule_defs::register_rule_defs;
+use crate::interpreter::rule_defs::required_test_local_resource::register_required_test_local_resource;
 use crate::interpreter::rule_defs::resolved_macro::register_string_with_macros;
 use crate::interpreter::rule_defs::transitive_set::globals::register_transitive_set_types;
 use crate::interpreter::rule_defs::transitive_set::transitive_set_definition::register_transitive_set;
+use crate::interpreter::rule_defs::validation_spec::register_validation_spec;
 
 fn register_build_api_globals(globals: &mut GlobalsBuilder) {
     register_builtin_providers(globals);
@@ -45,9 +48,15 @@ fn register_build_api_globals(globals: &mut GlobalsBuilder) {
     register_artifact_value(globals);
     register_output_artifact(globals);
     register_action_error_types(globals);
+    register_validation_spec(globals);
+    register_required_test_local_resource(globals);
+}
+
+fn register_build_api_internals(globals: &mut GlobalsBuilder) {
     register_action_error_handler_for_testing(globals);
 }
 
 pub(crate) fn init_register_build_api_globals() {
     REGISTER_BUCK2_BUILD_API_GLOBALS.init(register_build_api_globals);
+    REGISTER_BUCK2_BUILD_API_INTERNALS.init(register_build_api_internals);
 }

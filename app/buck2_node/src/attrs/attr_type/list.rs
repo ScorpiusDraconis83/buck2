@@ -13,6 +13,7 @@ use std::ops::Deref;
 
 use allocative::Allocative;
 use buck2_util::arc_str::ArcSlice;
+use display_container::fmt_container;
 use gazebo::prelude::SliceExt;
 use serde_json::to_value;
 use serde_json::Value;
@@ -20,6 +21,7 @@ use serde_json::Value;
 use crate::attrs::attr_type::any_matches::AnyMatches;
 use crate::attrs::attr_type::AttrType;
 use crate::attrs::display::AttrDisplayWithContext;
+use crate::attrs::display::AttrDisplayWithContextExt;
 use crate::attrs::fmt_context::AttrFmtContext;
 use crate::attrs::json::ToJsonWithContext;
 
@@ -51,15 +53,7 @@ impl<C: Eq> Deref for ListLiteral<C> {
 
 impl<C: Eq + AttrDisplayWithContext> AttrDisplayWithContext for ListLiteral<C> {
     fn fmt(&self, ctx: &AttrFmtContext, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "[")?;
-        for (i, v) in self.0.iter().enumerate() {
-            if i != 0 {
-                write!(f, ",")?;
-            }
-            AttrDisplayWithContext::fmt(v, ctx, f)?;
-        }
-        write!(f, "]")?;
-        Ok(())
+        fmt_container(f, "[", "]", self.0.iter().map(|v| v.as_display(ctx)))
     }
 }
 
@@ -70,7 +64,10 @@ impl<C: Eq> FromIterator<C> for ListLiteral<C> {
 }
 
 impl<C: Eq + AnyMatches> AnyMatches for ListLiteral<C> {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         for v in self.0.iter() {
             if v.any_matches(filter)? {
                 return Ok(true);
@@ -81,7 +78,7 @@ impl<C: Eq + AnyMatches> AnyMatches for ListLiteral<C> {
 }
 
 impl<C: Eq + ToJsonWithContext> ToJsonWithContext for ListLiteral<C> {
-    fn to_json(&self, ctx: &AttrFmtContext) -> anyhow::Result<Value> {
+    fn to_json(&self, ctx: &AttrFmtContext) -> buck2_error::Result<Value> {
         Ok(to_value(self.try_map(|c| c.to_json(ctx))?)?)
     }
 }

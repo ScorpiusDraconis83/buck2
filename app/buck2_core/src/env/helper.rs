@@ -9,13 +9,12 @@
 
 use std::env;
 use std::env::VarError;
-use std::str::FromStr;
 use std::sync::OnceLock;
 
-use anyhow::Context;
+use buck2_error::BuckErrorContext;
 
 pub struct EnvHelper<T> {
-    convert: fn(&str) -> anyhow::Result<T>,
+    convert: fn(&str) -> buck2_error::Result<T>,
     var: &'static str,
     cell: OnceLock<Option<T>>,
 }
@@ -23,7 +22,7 @@ pub struct EnvHelper<T> {
 impl<T> EnvHelper<T> {
     pub const fn with_converter_from_macro(
         var: &'static str,
-        convert: fn(&str) -> anyhow::Result<T>,
+        convert: fn(&str) -> buck2_error::Result<T>,
     ) -> Self {
         Self {
             convert,
@@ -32,27 +31,11 @@ impl<T> EnvHelper<T> {
         }
     }
 
-    pub const fn new_from_macro(var: &'static str) -> Self
-    where
-        T: FromStr,
-        anyhow::Error: From<<T as FromStr>::Err>,
-    {
-        fn convert_from_str<T>(v: &str) -> anyhow::Result<T>
-        where
-            T: FromStr,
-            anyhow::Error: From<<T as FromStr>::Err>,
-        {
-            Ok(T::from_str(v)?)
-        }
-
-        Self::with_converter_from_macro(var, convert_from_str::<T>)
-    }
-
     // This code does not really require `'static` lifetime.
     // `EnvHelper` caches computed value. When it is used like
     // `EnvHelper::new(...).get(...)`, it performs unnecessary work.
     // To avoid it, we require `'static` lifetime, to force placing `EnvHelper` in static variable.
-    pub fn get(&'static self) -> anyhow::Result<Option<&T>> {
+    pub fn get(&'static self) -> buck2_error::Result<Option<&'static T>> {
         let var = self.var;
         let convert = self.convert;
 
@@ -60,19 +43,15 @@ impl<T> EnvHelper<T> {
             .get_or_try_init(move || match env::var(var) {
                 Ok(v) => {
                     tracing::info!("Env override found: ${} = {}", var, v);
-                    Ok(Some((convert)(&v).map_err(anyhow::Error::from)?))
+                    Ok(Some((convert)(&v)?))
                 }
                 Err(VarError::NotPresent) => Ok(None),
-                Err(VarError::NotUnicode(..)) => Err(anyhow::anyhow!("Variable is not unicode")),
+                Err(VarError::NotUnicode(..)) => Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Variable is not unicode"
+                )),
             })
             .map(Option::as_ref)
-            .with_context(|| format!("Invalid value for ${}", var))
-    }
-
-    pub fn get_copied(&'static self) -> anyhow::Result<Option<T>>
-    where
-        T: Copy,
-    {
-        Ok(self.get()?.copied())
+            .with_buck_error_context(|| format!("Invalid value for ${}", var))
     }
 }

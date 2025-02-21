@@ -19,11 +19,11 @@ use indexmap::IndexMap;
 /// Used by `audit classpath`.
 pub static CLASSPATH_FOR_TARGETS: LateBinding<
     for<'c> fn(
-        &'c DiceComputations,
+        &'c mut DiceComputations,
         Vec<ConfiguredTargetLabel>,
     ) -> Pin<
         Box<
-            dyn Future<Output = anyhow::Result<IndexMap<ConfiguredTargetLabel, Artifact>>>
+            dyn Future<Output = buck2_error::Result<IndexMap<ConfiguredTargetLabel, Artifact>>>
                 + Send
                 + 'c,
         >,

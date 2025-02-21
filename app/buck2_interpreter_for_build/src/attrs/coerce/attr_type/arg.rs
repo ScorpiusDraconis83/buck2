@@ -46,6 +46,7 @@ static UNIMPLEMENTED_MACROS: Lazy<HashSet<&'static str>> =
     Lazy::new(|| hashset!["classpath_abi", "maven_coords", "output", "query_paths",]);
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum MacroError {
     #[error("Expected a single target label argument. Got `[{}]`", (.0).join(", "))]
     ExpectedSingleTargetArgument(Vec<String>),
@@ -61,10 +62,10 @@ impl AttrTypeCoerce for ArgAttrType {
         _configurable: AttrIsConfigurable,
         ctx: &dyn AttrCoercionContext,
         value: Value,
-    ) -> anyhow::Result<CoercedAttr> {
+    ) -> buck2_error::Result<CoercedAttr> {
         let value = value
             .unpack_str()
-            .ok_or_else(|| anyhow::anyhow!(CoercionError::type_error(STRING_TYPE, value)))?;
+            .ok_or_else(|| CoercionError::type_error(STRING_TYPE, value))?;
 
         let mut items = parse_macros(value)?.into_items();
         if let [parser::ArgItem::String(val)] = items.as_mut_slice() {
@@ -125,11 +126,9 @@ impl AttrTypeCoerce for ArgAttrType {
 fn get_single_target_arg(
     args: Vec<String>,
     ctx: &dyn AttrCoercionContext,
-) -> anyhow::Result<ProvidersLabel> {
+) -> buck2_error::Result<ProvidersLabel> {
     if args.len() != 1 {
-        return Err(anyhow::anyhow!(MacroError::ExpectedSingleTargetArgument(
-            args
-        )));
+        return Err(MacroError::ExpectedSingleTargetArgument(args).into());
     }
     ctx.coerce_providers_label(&args[0])
 }
@@ -138,7 +137,7 @@ pub trait UnconfiguredMacroExt {
     fn new_location(
         ctx: &dyn AttrCoercionContext,
         args: Vec<String>,
-    ) -> anyhow::Result<UnconfiguredMacro> {
+    ) -> buck2_error::Result<UnconfiguredMacro> {
         Ok(UnconfiguredMacro::Location(get_single_target_arg(
             args, ctx,
         )?))
@@ -148,7 +147,7 @@ pub trait UnconfiguredMacroExt {
         ctx: &dyn AttrCoercionContext,
         args: Vec<String>,
         exec_dep: bool,
-    ) -> anyhow::Result<UnconfiguredMacro> {
+    ) -> buck2_error::Result<UnconfiguredMacro> {
         Ok(UnconfiguredMacro::Exe {
             label: get_single_target_arg(args, ctx)?,
             exec_dep,
@@ -158,11 +157,9 @@ pub trait UnconfiguredMacroExt {
     fn new_source(
         ctx: &dyn AttrCoercionContext,
         args: Vec<String>,
-    ) -> anyhow::Result<UnconfiguredMacro> {
+    ) -> buck2_error::Result<UnconfiguredMacro> {
         if args.len() != 1 {
-            return Err(anyhow::anyhow!(MacroError::ExpectedSinglePathArgument(
-                args
-            )));
+            return Err(MacroError::ExpectedSinglePathArgument(args).into());
         }
 
         ctx.coerce_path(&args[0], /* allow_directory */ true)
@@ -173,7 +170,7 @@ pub trait UnconfiguredMacroExt {
         ctx: &dyn AttrCoercionContext,
         var_name: String,
         mut args: Vec<String>,
-    ) -> anyhow::Result<UnconfiguredMacro> {
+    ) -> buck2_error::Result<UnconfiguredMacro> {
         // args should've already been checked to have len == 1 or 2
         let arg = if args.len() == 2 {
             Some(args.pop().unwrap())
@@ -191,7 +188,7 @@ pub trait UnconfiguredMacroExt {
         ctx: &dyn AttrCoercionContext,
         expansion_type: &str,
         args: Vec<String>,
-    ) -> anyhow::Result<UnconfiguredMacro> {
+    ) -> buck2_error::Result<UnconfiguredMacro> {
         if args.is_empty() || args.len() > 2 {
             return Err(
                 MacroError::InvalidNumberOfArgs(expansion_type.to_owned(), args.len()).into(),
@@ -237,14 +234,15 @@ impl UnconfiguredMacroExt for UnconfiguredMacro {}
 mod tests {
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::package::PackageLabel;
-    use buck2_core::target::label::TargetLabel;
+    use buck2_core::target::label::label::TargetLabel;
+    use buck2_error::buck2_error;
     use buck2_node::attrs::attr_type::AttrType;
     use buck2_node::attrs::coerced_deps_collector::CoercedDepsCollector;
-    use buck2_node::attrs::configurable::AttrIsConfigurable;
     use buck2_node::attrs::configuration_context::AttrConfigurationContext;
     use buck2_node::attrs::configured_attr_info_for_tests::ConfiguredAttrInfoForTests;
     use buck2_node::attrs::display::AttrDisplayWithContextExt;
     use buck2_node::attrs::testing::configuration_ctx;
+    use dupe::Dupe;
     use gazebo::prelude::SliceExt;
     use starlark::environment::GlobalsBuilder;
     use starlark::environment::Module;
@@ -258,14 +256,14 @@ mod tests {
 
     trait GetMacroDeps {
         type DepsType;
-        fn get_deps(&self) -> anyhow::Result<Vec<Self::DepsType>>;
+        fn get_deps(&self) -> buck2_error::Result<Vec<Self::DepsType>>;
     }
 
     impl GetMacroDeps for UnconfiguredMacro {
         type DepsType = TargetLabel;
-        fn get_deps(&self) -> anyhow::Result<Vec<Self::DepsType>> {
+        fn get_deps(&self) -> buck2_error::Result<Vec<Self::DepsType>> {
             let mut visitor = CoercedDepsCollector::new();
-            self.traverse(&mut visitor, &PackageLabel::testing_new("root", ""))?;
+            self.traverse(&mut visitor, PackageLabel::testing_new("root", ""))?;
             let CoercedDepsCollector {
                 deps, exec_deps, ..
             } = visitor;
@@ -274,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concat() -> anyhow::Result<()> {
+    fn test_concat() -> buck2_error::Result<()> {
         let env = Module::new();
         let globals = GlobalsBuilder::standard().with(register_select).build();
         let attr = AttrType::arg(true);
@@ -289,7 +287,7 @@ mod tests {
         assert_eq!(
             format!(
                 r#""$(exe root//:foo ({})) $(location root//:bar ({}))""#,
-                configuration_ctx().exec_cfg(),
+                configuration_ctx().exec_cfg()?,
                 ConfigurationData::testing_new(),
             ),
             configured.as_display_no_ctx().to_string(),
@@ -299,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_location() -> anyhow::Result<()> {
+    fn test_location() -> buck2_error::Result<()> {
         let ctx = coercion_ctx();
         let location = UnconfiguredMacro::new_location(&ctx, vec!["//some:target".to_owned()])?;
         let deps = location.get_deps()?.map(|t| t.to_string());
@@ -309,17 +307,20 @@ mod tests {
 
         if let MacroBase::Location(target) = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
-            configured.traverse(&mut info, &PackageLabel::testing_new("root", ""))?;
-            assert_eq!(smallset![target.clone()], info.deps);
+            configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
+            assert_eq!(smallset![target.dupe()], info.deps);
         } else {
-            return Err(anyhow::anyhow!("Expected Location"));
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Expected Location"
+            ));
         }
 
         Ok(())
     }
 
     #[test]
-    fn test_exe() -> anyhow::Result<()> {
+    fn test_exe() -> buck2_error::Result<()> {
         let ctx = coercion_ctx();
         let exe = UnconfiguredMacro::new_exe(&ctx, vec!["//some:target".to_owned()], true)?;
         let deps = exe.get_deps()?.map(|t| t.to_string());
@@ -331,19 +332,19 @@ mod tests {
 
         if let MacroBase::Exe { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
-            configured.traverse(&mut info, &PackageLabel::testing_new("root", ""))?;
-            assert_eq!(label.cfg(), config_ctx.exec_cfg().cfg());
-            assert_eq!(smallset![label.clone()], info.execution_deps);
+            configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
+            assert_eq!(label.cfg(), config_ctx.exec_cfg()?.cfg());
+            assert_eq!(smallset![label.dupe()], info.execution_deps);
             assert_eq!(smallset![], info.deps);
         } else {
-            return Err(anyhow::anyhow!("Expected Exe"));
+            return Err(buck2_error!(buck2_error::ErrorTag::Input, "Expected Exe"));
         }
 
         Ok(())
     }
 
     #[test]
-    fn test_exe_target() -> anyhow::Result<()> {
+    fn test_exe_target() -> buck2_error::Result<()> {
         let ctx = coercion_ctx();
         let exe = UnconfiguredMacro::new_exe(&ctx, vec!["//some:target".to_owned()], false)?;
         let deps = exe.get_deps()?.map(|t| t.to_string());
@@ -355,12 +356,12 @@ mod tests {
 
         if let MacroBase::Exe { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
-            configured.traverse(&mut info, &PackageLabel::testing_new("root", ""))?;
+            configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
             assert_eq!(label.cfg(), config_ctx.cfg().cfg());
             assert_eq!(smallset![], info.execution_deps);
-            assert_eq!(smallset![label.clone()], info.deps);
+            assert_eq!(smallset![label.dupe()], info.deps);
         } else {
-            return Err(anyhow::anyhow!("Expected Exe"));
+            return Err(buck2_error!(buck2_error::ErrorTag::Input, "Expected Exe"));
         }
 
         Ok(())

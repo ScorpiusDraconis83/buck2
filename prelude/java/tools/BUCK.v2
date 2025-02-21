@@ -1,3 +1,9 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+oncall("build_infra")
+
+source_listing()
+
 prelude = native
 
 prelude.python_bootstrap_binary(
@@ -70,6 +76,15 @@ prelude.python_bootstrap_library(
     ],
 )
 
+prelude.python_bootstrap_binary(
+    name = "postprocessor_runner",
+    main = "run_postprocessor.py",
+    visibility = ["PUBLIC"],
+    deps = [
+        ":utils_lib",
+    ],
+)
+
 prelude.python_bootstrap_library(
     name = "utils_lib",
     srcs = [
@@ -77,7 +92,7 @@ prelude.python_bootstrap_library(
     ],
     visibility = [
         "prelude//android/tools/...",
-        "prelude//kotlin/tools/...",
         "prelude//java/tools/...",
+        "prelude//kotlin/tools/...",
     ],
 )

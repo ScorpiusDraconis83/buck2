@@ -29,20 +29,28 @@ use starlark_derive::NoSerialize;
 
 use crate as starlark;
 use crate::any::ProvidesStaticType;
+use crate::docs::DocItem;
+use crate::docs::DocMember;
+use crate::docs::DocProperty;
+use crate::docs::DocType;
 use crate::typing::Ty;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueBasic;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Basic;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::typing::ty::AbstractType;
+use crate::values::typing::TypeType;
 use crate::values::AllocFrozenValue;
+use crate::values::AllocValue;
 use crate::values::FrozenHeap;
 use crate::values::FrozenValue;
+use crate::values::Heap;
 use crate::values::StarlarkValue;
+use crate::values::Value;
 
 #[derive(Debug, NoSerialize, Allocative, ProvidesStaticType)]
-struct StarlarkValueAsTypeStarlarkValue(fn() -> Ty);
+struct StarlarkValueAsTypeStarlarkValue(fn() -> Ty, fn() -> DocItem);
 
 #[starlark_value(type = "type")]
 impl<'v> StarlarkValue<'v> for StarlarkValueAsTypeStarlarkValue {
@@ -50,6 +58,10 @@ impl<'v> StarlarkValue<'v> for StarlarkValueAsTypeStarlarkValue {
 
     fn eval_type(&self) -> Option<Ty> {
         Some((self.0)())
+    }
+
+    fn documentation(&self) -> DocItem {
+        (self.1)()
     }
 }
 
@@ -91,7 +103,10 @@ impl Display for StarlarkValueAsTypeStarlarkValue {
 ///     const Temperature: StarlarkValueAsType<Temperature> = StarlarkValueAsType::new();
 /// }
 /// ```
-pub struct StarlarkValueAsType<T: StarlarkTypeRepr>(PhantomData<fn(&T)>);
+pub struct StarlarkValueAsType<T: StarlarkTypeRepr>(
+    &'static AValueRepr<AValueImpl<'static, AValueBasic<StarlarkValueAsTypeStarlarkValue>>>,
+    PhantomData<fn(&T)>,
+);
 
 impl<T: StarlarkTypeRepr> Debug for StarlarkValueAsType<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -109,31 +124,59 @@ impl<T: StarlarkTypeRepr> Display for StarlarkValueAsType<T> {
 
 impl<T: StarlarkTypeRepr> StarlarkValueAsType<T> {
     /// Constructor.
-    pub const fn new() -> Self {
-        Self(PhantomData)
+    ///
+    /// Use [`new_no_docs`](Self::new_no_docs) if `T` is not a `StarlarkValue`.
+    pub const fn new() -> Self
+    where
+        T: StarlarkValue<'static>,
+    {
+        StarlarkValueAsType(
+            &const {
+                alloc_static(StarlarkValueAsTypeStarlarkValue(
+                    T::starlark_type_repr,
+                    || DocItem::Type(DocType::from_starlark_value::<T>()),
+                ))
+            },
+            PhantomData,
+        )
     }
 
-    const INSTANCE: AValueRepr<AValueImpl<Basic, StarlarkValueAsTypeStarlarkValue>> = alloc_static(
-        Basic,
-        StarlarkValueAsTypeStarlarkValue(T::starlark_type_repr),
-    );
-}
-
-impl<T: StarlarkTypeRepr> Default for StarlarkValueAsType<T> {
-    fn default() -> Self {
-        Self::new()
+    /// Constructor.
+    pub const fn new_no_docs() -> Self {
+        StarlarkValueAsType(
+            &const {
+                alloc_static(StarlarkValueAsTypeStarlarkValue(
+                    T::starlark_type_repr,
+                    || {
+                        DocItem::Member(DocMember::Property(DocProperty {
+                            docs: None,
+                            typ: AbstractType::starlark_type_repr(),
+                        }))
+                    },
+                ))
+            },
+            PhantomData,
+        )
     }
 }
 
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for StarlarkValueAsType<T> {
+    type Canonical = <TypeType as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
-        AbstractType::starlark_type_repr()
+        <Self::Canonical as StarlarkTypeRepr>::starlark_type_repr()
+    }
+}
+
+impl<'v, T: StarlarkTypeRepr> AllocValue<'v> for StarlarkValueAsType<T> {
+    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
+        FrozenValue::new_repr(self.0).to_value()
     }
 }
 
 impl<T: StarlarkTypeRepr> AllocFrozenValue for StarlarkValueAsType<T> {
     fn alloc_frozen_value(self, _heap: &FrozenHeap) -> FrozenValue {
-        FrozenValue::new_repr(&Self::INSTANCE)
+        FrozenValue::new_repr(self.0)
     }
 }
 

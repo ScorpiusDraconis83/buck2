@@ -14,7 +14,7 @@ use std::fmt;
 
 pub mod action_key_owner;
 
-mod serialize_timestamp {
+pub mod serialize_timestamp {
     use serde::Deserialize;
     use serde::Deserializer;
     use serde::Serialize;
@@ -180,7 +180,7 @@ pub mod serialize_duration_as_micros {
     }
 
     #[cfg(test)]
-    mod test {
+    mod tests {
         use super::*;
 
         #[test]

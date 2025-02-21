@@ -3,6 +3,8 @@ id: common_issues
 title: Common Issues
 ---
 
+import { FbInternalOnly } from 'docusaurus-plugin-internaldocs-fb/internal';
+
 ## Why is stdin being swallowed?
 
 Buck2 offers an interactive console by default.
@@ -16,7 +18,7 @@ To find the location of output for a target, use
 `buck2 build //foo:bar --show-output`. This will print the output corresponding
 to each built target, in this case `//foo:bar output_path`.
 
-To only get the output path (without the target behorehand) you want to use
+To only get the output path (without the target beforehand) you want to use
 `buck2 build //foo:bar --show-simple-output`.
 
 The resultant path is relative to the root of the repo (such as
@@ -68,8 +70,9 @@ genrules and tests. For example:
   `buck2 test`, you have a recursive invocation where the outer command is
   `buck2 test` and the inner command is `buck2 build`
 
-Recursive invocations should specify an `--isolation-dir`, or else buck2 will
-return an error.
+Recursive invocations should specify an
+[`--isolation-dir`](../../concepts/isolation_dir.md), or else buck2 will return
+an error.
 
 ## Why did my build OOM?
 
@@ -91,7 +94,7 @@ declare any outputs artifacts, defined as outputs declared in:
 - `cmd_args` in `RunInfo`
 - `cmd_args` inside the `command` in `ExternalRunnerTestInfo`
 
-For example, building a target which is uses a `python_library` rule merely
-groups source files together, and does not generate any output artifacts such as
-a python executable. You would need to build a `python_binary` which uses that
+For example, building a target which uses a `python_library` rule merely groups
+source files together and does not generate any output artifacts such as a
+python executable. You would need to build a `python_binary` which uses that
 library in order to get an output.

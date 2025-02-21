@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use allocative::Allocative;
+use dice_error::result::CancellableResult;
 use dupe::Dupe;
 
 use crate::api::computations::DiceComputations;
@@ -18,19 +19,19 @@ use crate::api::storage_type::StorageType;
 use crate::api::user_data::UserComputationData;
 use crate::ctx::DiceComputationsImpl;
 use crate::impls::ctx::ModernComputeCtx;
-use crate::impls::ctx::PerComputeCtx;
 use crate::impls::ctx::SharedLiveTransactionCtx;
+use crate::impls::deps::graph::SeriesParallelDeps;
 use crate::impls::dice::DiceModern;
 use crate::impls::key::DiceKey;
 use crate::impls::key::DiceKeyErased;
 use crate::impls::key::ParentKey;
+use crate::impls::task::handle::DiceTaskHandle;
+use crate::impls::user_cycle::KeyComputingUserCycleDetectorData;
 use crate::impls::value::MaybeValidDiceValue;
-use crate::impls::worker::state::ActivationInfo;
-use crate::impls::worker::state::DiceWorkerStateComputing;
+use crate::impls::value::TrackedInvalidationPaths;
+use crate::impls::worker::state::DiceWorkerStateEvaluating;
 use crate::impls::worker::state::DiceWorkerStateFinishedEvaluating;
-use crate::result::CancellableResult;
 use crate::ActivationData;
-use crate::HashSet;
 
 /// Evaluates Keys
 #[derive(Clone, Dupe, Allocative)]
@@ -49,56 +50,41 @@ impl AsyncEvaluator {
         }
     }
 
-    pub(crate) async fn evaluate<'a, 'b>(
+    pub(crate) async fn evaluate(
         &self,
+        handle: &mut DiceTaskHandle<'_>,
         key: DiceKey,
-        state: DiceWorkerStateComputing<'a, 'b>,
-    ) -> CancellableResult<DiceWorkerStateFinishedEvaluating<'a, 'b>> {
+        state: DiceWorkerStateEvaluating,
+        cycles: KeyComputingUserCycleDetectorData,
+    ) -> CancellableResult<DiceWorkerStateFinishedEvaluating> {
         let key_erased = self.dice.key_index.get(key);
-
-        let (cycles, state) = state.evaluating();
 
         match key_erased {
             DiceKeyErased::Key(key_dyn) => {
-                let mut new_ctx = DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Regular(PerComputeCtx::new(
+                let mut new_ctx =
+                    DiceComputations(DiceComputationsImpl::Modern(ModernComputeCtx::new(
                         ParentKey::Some(key), // within this key's compute, this key is the parent
-                        self.per_live_version_ctx.dupe(),
-                        self.user_data.dupe(),
-                        self.dice.dupe(),
                         cycles,
-                    )),
-                ));
+                        self.dupe(),
+                    )));
 
                 let value = key_dyn
-                    .compute(&mut new_ctx, &state.cancellation_ctx().into_compatible())
+                    .compute(&mut new_ctx, &handle.cancellation_ctx())
                     .await;
-                let ((deps, dep_validity), evaluation_data, cycles) = match new_ctx.0 {
-                    DiceComputationsImpl::Legacy(_) => {
-                        unreachable!("modern dice created above")
-                    }
-                    DiceComputationsImpl::Modern(new_ctx) => new_ctx
-                        .into_regular()
-                        .expect("created regular above")
-                        .finalize(),
+                let (recorded_deps, evaluation_data, cycles) = match new_ctx.0 {
+                    DiceComputationsImpl::Modern(new_ctx) => new_ctx.finalize(),
                 };
 
-                let activation = ActivationInfo::new(
-                    &self.dice.key_index,
-                    &self.user_data.activation_tracker,
-                    key,
-                    deps.iter(),
-                    evaluation_data.into_activation_data(), // Projection keys can't set this.
-                );
-
                 state.finished(
+                    handle,
                     cycles,
                     KeyEvaluationResult {
-                        value: MaybeValidDiceValue::new(value, dep_validity),
-                        deps,
+                        value: MaybeValidDiceValue::new(value, recorded_deps.deps_validity),
+                        deps: recorded_deps.deps,
                         storage: key_dyn.storage_type(),
+                        invalidation_paths: recorded_deps.invalidation_paths,
                     },
-                    activation,
+                    evaluation_data.into_activation_data(),
                 )
             }
             DiceKeyErased::Projection(proj) => {
@@ -119,22 +105,16 @@ impl AsyncEvaluator {
 
                 let value = proj.proj().compute(base.value(), &ctx);
 
-                let activation = ActivationInfo::new(
-                    &self.dice.key_index,
-                    &self.user_data.activation_tracker,
-                    key,
-                    [proj.base()].iter(),
-                    ActivationData::Evaluated(None), // Projection keys can't set this.
-                );
-
                 state.finished(
+                    handle,
                     cycles,
                     KeyEvaluationResult {
                         value: MaybeValidDiceValue::new(value, base.value().validity()),
-                        deps: [proj.base()].into_iter().collect(),
+                        deps: SeriesParallelDeps::serial_from_vec(vec![proj.base()]),
                         storage: proj.proj().storage_type(),
+                        invalidation_paths: base.invalidation_paths().for_dependent(key),
                     },
-                    activation,
+                    ActivationData::Evaluated(None), // Projection keys can't set this.
                 )
             }
         }
@@ -147,6 +127,7 @@ pub(crate) struct SyncEvaluator {
     user_data: Arc<UserComputationData>,
     dice: Arc<DiceModern>,
     base: MaybeValidDiceValue,
+    base_invalidation_paths: TrackedInvalidationPaths,
 }
 
 impl SyncEvaluator {
@@ -154,11 +135,13 @@ impl SyncEvaluator {
         user_data: Arc<UserComputationData>,
         dice: Arc<DiceModern>,
         base: MaybeValidDiceValue,
+        base_invalidation_paths: TrackedInvalidationPaths,
     ) -> Self {
         Self {
             user_data,
             dice,
             base,
+            base_invalidation_paths,
         }
     }
 
@@ -178,8 +161,9 @@ impl SyncEvaluator {
 
                 KeyEvaluationResult {
                     value: MaybeValidDiceValue::new(value, self.base.validity()),
-                    deps: [proj.base()].into_iter().collect(),
+                    deps: SeriesParallelDeps::serial_from_vec(vec![proj.base()]),
                     storage: proj.proj().storage_type(),
+                    invalidation_paths: self.base_invalidation_paths.for_dependent(key),
                 }
             }
         }
@@ -188,6 +172,7 @@ impl SyncEvaluator {
 
 pub(crate) struct KeyEvaluationResult {
     pub(crate) value: MaybeValidDiceValue,
-    pub(crate) deps: HashSet<DiceKey>,
+    pub(crate) deps: SeriesParallelDeps,
     pub(crate) storage: StorageType,
+    pub(crate) invalidation_paths: TrackedInvalidationPaths,
 }

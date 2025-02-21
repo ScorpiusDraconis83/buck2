@@ -9,19 +9,22 @@
 
 use std::cell::RefCell;
 use std::fmt;
-use std::fmt::Display;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
-use buck2_core::bzl::ImportPath;
 use buck2_core::configuration::transition::id::TransitionId;
 use buck2_core::plugins::PluginKind;
+use buck2_error::BuckErrorContext;
+use buck2_interpreter::late_binding_ty::AnalysisContextReprLate;
+use buck2_interpreter::late_binding_ty::ProviderReprLate;
+use buck2_interpreter::late_binding_ty::TransitionReprLate;
+use buck2_interpreter::starlark_promise::StarlarkPromise;
 use buck2_interpreter::types::rule::FROZEN_PROMISE_ARTIFACT_MAPPINGS_GET_IMPL;
 use buck2_interpreter::types::rule::FROZEN_RULE_GET_IMPL;
 use buck2_interpreter::types::transition::transition_id_from_value;
 use buck2_node::attrs::attr::Attribute;
 use buck2_node::attrs::spec::AttributeSpec;
+use buck2_node::bzl_or_bxl_path::BzlOrBxlPath;
 use buck2_node::nodes::unconfigured::RuleKind;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_node::rule::Rule;
@@ -29,11 +32,13 @@ use buck2_node::rule_type::RuleType;
 use buck2_node::rule_type::StarlarkRuleType;
 use derive_more::Display;
 use dupe::Dupe;
+use either::Either;
 use gazebo::prelude::*;
 use itertools::Itertools;
 use starlark::any::ProvidesStaticType;
 use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
+use starlark::docs::DocMember;
 use starlark::docs::DocStringKind;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Arguments;
@@ -41,14 +46,20 @@ use starlark::eval::Evaluator;
 use starlark::eval::ParametersSpec;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
-use starlark::typing::Param;
+use starlark::typing::ParamSpec;
 use starlark::typing::Ty;
-use starlark::values::dict::DictOf;
+use starlark::values::dict::UnpackDictEntries;
+use starlark::values::list::ListType;
+use starlark::values::list::UnpackList;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::starlark_value;
+use starlark::values::typing::FrozenStarlarkCallable;
 use starlark::values::typing::StarlarkCallable;
+use starlark::values::typing::StarlarkCallableChecked;
 use starlark::values::AllocValue;
 use starlark::values::Freeze;
+use starlark::values::FreezeError;
+use starlark::values::FreezeResult;
 use starlark::values::Freezer;
 use starlark::values::FrozenRef;
 use starlark::values::FrozenStringValue;
@@ -59,6 +70,7 @@ use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueOfUnchecked;
 use starlark_map::small_map::SmallMap;
 
 use crate::attrs::starlark_attribute::StarlarkAttribute;
@@ -67,9 +79,15 @@ use crate::interpreter::build_context::PerFileTypeContext;
 use crate::interpreter::module_internals::ModuleInternals;
 use crate::nodes::attr_spec::AttributeSpecExt;
 use crate::nodes::unconfigured::TargetNodeExt;
-use crate::plugins::plugin_kind_from_value;
+use crate::plugins::PluginKindArg;
 
 pub static NAME_ATTRIBUTE_FIELD: &str = "name";
+
+#[derive(Debug, ProvidesStaticType, Trace, NoSerialize, Allocative, Clone, Copy)]
+enum RuleImpl<'v> {
+    BuildRule(StarlarkCallable<'v, (FrozenValue,), ListType<FrozenValue>>),
+    BxlAnon(StarlarkCallable<'v, (FrozenValue, FrozenValue), ListType<FrozenValue>>),
+}
 
 /// The callable that's returned from a `rule()` call. Once frozen, and called, it adds targets'
 /// parameters to the context
@@ -77,13 +95,14 @@ pub static NAME_ATTRIBUTE_FIELD: &str = "name";
 pub struct RuleCallable<'v> {
     /// The import path that contains the rule() call; stored here so we can retrieve extra
     /// information during `export_as()`
-    import_path: ImportPath,
+    rule_path: BzlOrBxlPath,
     /// Once exported, the `import_path` and `name` of the callable. Used in DICE to retrieve rule
     /// implementations
     id: RefCell<Option<StarlarkRuleType>>,
-    /// The implementation function for this rule. Must be callable and take a
-    /// ctx
-    implementation: Value<'v>,
+    /// The implementation function for this rule.
+    /// If is a build rule or anon rule in bzl must take a ctx,
+    /// If is a bxl anon rule must take a bxl context and attrs.
+    implementation: RuleImpl<'v>,
     // Field Name -> Attribute
     attributes: AttributeSpec,
     /// Type for the typechecker.
@@ -126,13 +145,14 @@ impl<'v> Display for RuleCallable<'v> {
 
 /// Errors around rule declaration, instantiation, validation, etc
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum RuleError {
     #[error("The output of rule() may only be called after the module is loaded")]
     RuleCalledBeforeFreezing,
     #[error("`{0}` is not a valid attribute name")]
     InvalidParameterName(String),
     #[error("Rule defined in `{0}` must be assigned to a variable, e.g. `my_rule = rule(...)`")]
-    RuleNotAssigned(ImportPath),
+    RuleNotAssigned(BzlOrBxlPath),
     #[error(
         "Rule defined with both `is_configuration_rule` and `is_toolchain_rule`, these options are mutually exclusive"
     )]
@@ -149,27 +169,40 @@ impl<'v> AllocValue<'v> for RuleCallable<'v> {
 
 impl<'v> RuleCallable<'v> {
     fn new(
-        implementation: StarlarkCallable<'v>,
-        attrs: DictOf<'v, &'v str, &'v StarlarkAttribute>,
+        implementation: RuleImpl<'v>,
+        attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
         cfg: Option<Value>,
         doc: &str,
         is_configuration_rule: bool,
         is_toolchain_rule: bool,
-        uses_plugins: Vec<Value<'v>>,
+        uses_plugins: Vec<PluginKind>,
         artifact_promise_mappings: Option<ArtifactPromiseMappings<'v>>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<RuleCallable<'v>> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> buck2_error::Result<RuleCallable<'v>> {
         // TODO(nmj): Add default attributes in here like 'name', 'visibility', etc
         // TODO(nmj): Verify that names are valid. This is technically handled by the Params
         //                 objects, but will blow up in a friendlier way here.
 
         let build_context = BuildContext::from_context(eval)?;
-        let bzl_path: ImportPath = match &build_context.additional {
-            PerFileTypeContext::Bzl(bzl_path) => bzl_path.bzl_path.clone(),
-            _ => return Err(RuleError::RuleNonInBzl.into()),
+
+        let rule_path: BzlOrBxlPath = match (&build_context.additional, &implementation) {
+            (PerFileTypeContext::Bzl(bzl_path), RuleImpl::BuildRule(_)) => {
+                BzlOrBxlPath::Bzl(bzl_path.bzl_path.clone())
+            }
+            (PerFileTypeContext::Bxl(bxl_path), RuleImpl::BxlAnon(_)) => {
+                BzlOrBxlPath::Bxl(bxl_path.clone())
+            }
+            (PerFileTypeContext::Bxl(_), RuleImpl::BuildRule(_)) => {
+                return Err(RuleError::RuleNonInBzl.into());
+            }
+            // TODO(nero): add error for it
+            (_, _) => unreachable!(
+                "unreachable, since bxl.anon_rule is not registered for eval for bzl files"
+            ),
         };
+
         let sorted_validated_attrs = attrs
-            .to_dict()
+            .entries
             .into_iter()
             .sorted_by(|(k1, _), (k2, _)| Ord::cmp(k1, k2))
             .map(|(name, value)| {
@@ -179,13 +212,9 @@ impl<'v> RuleCallable<'v> {
                     Ok((name.to_owned(), value.clone_attribute()))
                 }
             })
-            .collect::<anyhow::Result<Vec<(String, Attribute)>>>()?;
+            .collect::<buck2_error::Result<Vec<(String, Attribute)>>>()?;
 
         let cfg = cfg.try_map(transition_id_from_value)?;
-        let uses_plugins = uses_plugins
-            .into_iter()
-            .map(plugin_kind_from_value)
-            .collect::<anyhow::Result<_>>()?;
 
         let rule_kind = match (is_configuration_rule, is_toolchain_rule) {
             (false, false) => RuleKind::Normal,
@@ -199,9 +228,9 @@ impl<'v> RuleCallable<'v> {
         let ty = Ty::ty_function(attributes.ty_function());
 
         Ok(RuleCallable {
-            import_path: bzl_path,
+            rule_path,
             id: RefCell::new(None),
-            implementation: implementation.0,
+            implementation,
             attributes,
             ty,
             cfg,
@@ -211,6 +240,72 @@ impl<'v> RuleCallable<'v> {
             ignore_attrs_for_profiling: build_context.ignore_attrs_for_profiling,
             artifact_promise_mappings,
         })
+    }
+
+    fn new_anon_impl(
+        implementation: RuleImpl<'v>,
+        attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
+        doc: &str,
+        artifact_promise_mappings: SmallMap<
+            StringValue<'v>,
+            StarlarkCallable<'v, (FrozenValue,), UnpackList<FrozenValue>>,
+        >,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> buck2_error::Result<Self> {
+        Self::new(
+            implementation,
+            attrs,
+            None,
+            doc,
+            false,
+            false,
+            Vec::new(),
+            Some(ArtifactPromiseMappings {
+                mappings: artifact_promise_mappings
+                    .iter()
+                    .map(|(k, v)| (*k, v.0))
+                    .collect::<SmallMap<_, _>>(),
+            }),
+            eval,
+        )
+    }
+
+    fn new_anon(
+        implementation: StarlarkCallable<'v, (FrozenValue,), ListType<FrozenValue>>,
+        attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
+        doc: &str,
+        artifact_promise_mappings: SmallMap<
+            StringValue<'v>,
+            StarlarkCallable<'v, (FrozenValue,), UnpackList<FrozenValue>>,
+        >,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> buck2_error::Result<Self> {
+        Self::new_anon_impl(
+            RuleImpl::BuildRule(implementation),
+            attrs,
+            doc,
+            artifact_promise_mappings,
+            eval,
+        )
+    }
+
+    pub fn new_bxl_anon(
+        implementation: StarlarkCallable<'v, (FrozenValue, FrozenValue), ListType<FrozenValue>>,
+        attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
+        doc: &str,
+        artifact_promise_mappings: SmallMap<
+            StringValue<'v>,
+            StarlarkCallable<'v, (FrozenValue,), UnpackList<FrozenValue>>,
+        >,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> buck2_error::Result<Self> {
+        Self::new_anon_impl(
+            RuleImpl::BxlAnon(implementation),
+            attrs,
+            doc,
+            artifact_promise_mappings,
+            eval,
+        )
     }
 
     fn documentation_impl(&self) -> DocItem {
@@ -230,10 +325,9 @@ impl<'v> RuleCallable<'v> {
             parameters_spec.documentation(parameter_types, parameter_docs),
             Ty::none(),
             self.docs.as_deref(),
-            None,
         );
 
-        DocItem::Function(function_docs)
+        DocItem::Member(DocMember::Function(function_docs))
     }
 }
 
@@ -242,10 +336,10 @@ impl<'v> StarlarkValue<'v> for RuleCallable<'v> {
     fn export_as(
         &self,
         variable_name: &str,
-        _eval: &mut Evaluator<'v, '_>,
+        _eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<()> {
         *self.id.borrow_mut() = Some(StarlarkRuleType {
-            import_path: self.import_path.clone(),
+            path: self.rule_path.clone(),
             name: variable_name.to_owned(),
         });
         Ok(())
@@ -255,15 +349,15 @@ impl<'v> StarlarkValue<'v> for RuleCallable<'v> {
         &self,
         _me: Value<'v>,
         _args: &Arguments<'v, '_>,
-        _eval: &mut Evaluator<'v, '_>,
+        _eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        Err(starlark::Error::new_other(
+        Err(starlark::Error::new_other(buck2_error::Error::from(
             RuleError::RuleCalledBeforeFreezing,
-        ))
+        )))
     }
 
-    fn documentation(&self) -> Option<DocItem> {
-        Some(self.documentation_impl())
+    fn documentation(&self) -> DocItem {
+        self.documentation_impl()
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
@@ -271,18 +365,48 @@ impl<'v> StarlarkValue<'v> for RuleCallable<'v> {
     }
 
     fn get_type_starlark_repr() -> Ty {
-        Ty::function(vec![Param::kwargs(Ty::any())], Ty::none())
+        Ty::function(ParamSpec::kwargs(Ty::any()), Ty::none())
+    }
+}
+
+#[derive(Debug, ProvidesStaticType, Allocative, Clone, Dupe)]
+enum FrozenRuleImpl {
+    BuildRule(FrozenStarlarkCallable<(FrozenValue,), ListType<FrozenValue>>),
+    BxlAnon(FrozenStarlarkCallable<(FrozenValue, FrozenValue), ListType<FrozenValue>>),
+}
+
+impl FrozenRuleImpl {
+    fn to_frozen_value(self) -> FrozenValue {
+        match self {
+            FrozenRuleImpl::BuildRule(callable) => callable.0,
+            FrozenRuleImpl::BxlAnon(callable) => callable.0,
+        }
+    }
+}
+
+impl<'v> Freeze for RuleImpl<'v> {
+    type Frozen = FrozenRuleImpl;
+
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        match self {
+            RuleImpl::BuildRule(impl_) => Ok(FrozenRuleImpl::BuildRule(impl_.freeze(freezer)?)),
+            RuleImpl::BxlAnon(impl_) => Ok(FrozenRuleImpl::BxlAnon(impl_.freeze(freezer)?)),
+        }
     }
 }
 
 impl<'v> Freeze for RuleCallable<'v> {
     type Frozen = FrozenRuleCallable;
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         let frozen_impl = self.implementation.freeze(freezer)?;
         let rule_docs = self.documentation_impl();
         let id = match self.id.into_inner() {
             Some(x) => x,
-            None => return Err(RuleError::RuleNotAssigned(self.import_path).into()),
+            None => {
+                return Err(FreezeError::new(
+                    RuleError::RuleNotAssigned(self.rule_path).to_string(),
+                ));
+            }
         };
         let rule_type = Arc::new(id);
         let rule_name = rule_type.name.to_owned();
@@ -319,12 +443,12 @@ impl<'v> Freeze for RuleCallable<'v> {
 }
 
 #[derive(Debug, Display, ProvidesStaticType, NoSerialize, Allocative)]
-#[display(fmt = "{}()", "rule.rule_type.name()")]
+#[display("{}()", rule.rule_type.name())]
 pub struct FrozenRuleCallable {
     rule: Arc<Rule>,
     /// Identical to `rule.rule_type` but more specific type.
     rule_type: Arc<StarlarkRuleType>,
-    implementation: FrozenValue,
+    implementation: FrozenRuleImpl,
     signature: ParametersSpec<FrozenValue>,
     rule_docs: DocItem,
     ty: Ty,
@@ -333,15 +457,17 @@ pub struct FrozenRuleCallable {
 }
 starlark_simple_value!(FrozenRuleCallable);
 
-fn unpack_frozen_rule(rule: FrozenValue) -> anyhow::Result<FrozenRef<'static, FrozenRuleCallable>> {
+fn unpack_frozen_rule(
+    rule: FrozenValue,
+) -> buck2_error::Result<FrozenRef<'static, FrozenRuleCallable>> {
     rule.downcast_frozen_ref::<FrozenRuleCallable>()
-        .context("Expecting FrozenRuleCallable")
+        .buck_error_context("Expecting FrozenRuleCallable")
 }
 
 pub(crate) fn init_frozen_rule_get_impl() {
     FROZEN_RULE_GET_IMPL.init(|rule| {
         let rule = unpack_frozen_rule(rule)?;
-        Ok(rule.implementation)
+        Ok(rule.implementation.dupe().to_frozen_value())
     })
 }
 
@@ -351,15 +477,11 @@ pub(crate) fn init_frozen_promise_artifact_mappings_get_impl() {
         Ok(rule
             .artifact_promise_mappings
             .as_ref()
-            .map_or(SmallMap::new(), |m| m.mappings.clone()))
+            .map_or_else(SmallMap::new, |m| m.mappings.clone()))
     })
 }
 
 impl FrozenRuleCallable {
-    pub fn implementation(&self) -> FrozenValue {
-        self.implementation
-    }
-
     pub fn rule_type(&self) -> &Arc<StarlarkRuleType> {
         &self.rule_type
     }
@@ -381,7 +503,7 @@ impl<'v> StarlarkValue<'v> for FrozenRuleCallable {
         &self,
         _me: Value<'v>,
         args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let record_target_call_stack =
             ModuleInternals::from_context(eval, self.rule.rule_type.name())?
@@ -412,8 +534,8 @@ impl<'v> StarlarkValue<'v> for FrozenRuleCallable {
             .map_err(Into::into)
     }
 
-    fn documentation(&self) -> Option<DocItem> {
-        Some(self.rule_docs.clone())
+    fn documentation(&self) -> DocItem {
+        self.rule_docs.clone()
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
@@ -430,7 +552,7 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
     /// Define a rule. As a simple example:
     ///
     /// ```python
-    /// def _my_rule(ctx: "context") -> ["provider"]:
+    /// def _my_rule(ctx: AnalysisContext) -> list[Provider]:
     ///     output = ctx.actions.write("hello.txt", ctx.attrs.contents, executable = ctx.attrs.exe)
     ///     return [DefaultInfo(outputs = [output])]
     ///
@@ -440,57 +562,55 @@ pub fn register_rule_function(builder: &mut GlobalsBuilder) {
     /// })
     /// ```
     fn rule<'v>(
-        #[starlark(require = named)] r#impl: StarlarkCallable<'v>,
-        #[starlark(require = named)] attrs: DictOf<'v, &'v str, &'v StarlarkAttribute>,
-        #[starlark(require = named)] cfg: Option<Value>,
+        #[starlark(require = named)] r#impl: StarlarkCallableChecked<
+            'v,
+            (AnalysisContextReprLate,),
+            Either<ListType<ProviderReprLate>, StarlarkPromise>,
+        >,
+        #[starlark(require = named)] attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
+        #[starlark(require = named)] cfg: Option<ValueOfUnchecked<'v, TransitionReprLate>>,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named, default = false)] is_configuration_rule: bool,
         #[starlark(require = named, default = false)] is_toolchain_rule: bool,
         #[starlark(require = named, default = UnpackListOrTuple::default())]
-        uses_plugins: UnpackListOrTuple<Value<'v>>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<RuleCallable<'v>> {
-        RuleCallable::new(
-            r#impl,
+        uses_plugins: UnpackListOrTuple<PluginKindArg>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<RuleCallable<'v>> {
+        Ok(RuleCallable::new(
+            RuleImpl::BuildRule(StarlarkCallable::unchecked_new(r#impl.0)),
             attrs,
-            cfg,
+            cfg.map(|v| v.get()),
             doc,
             is_configuration_rule,
             is_toolchain_rule,
-            uses_plugins.items,
+            uses_plugins
+                .items
+                .into_iter()
+                .map(|PluginKindArg { plugin_kind }| plugin_kind)
+                .collect(),
             None,
             eval,
-        )
+        )?)
     }
 
     /// Define an anon rule, similar to how a normal rule is defined, except with an extra `artifact_promise_mappings` field. This
     /// is a dict where the keys are the string name of the artifact, and the values are the callable functions that produce
     /// the artifact. This is only intended to be used with anon targets.
     fn anon_rule<'v>(
-        #[starlark(require = named)] r#impl: StarlarkCallable<'v>,
-        #[starlark(require = named)] attrs: DictOf<'v, &'v str, &'v StarlarkAttribute>,
+        #[starlark(require = named)] r#impl: StarlarkCallable<
+            'v,
+            (FrozenValue,),
+            ListType<FrozenValue>,
+        >,
+        #[starlark(require = named)] attrs: UnpackDictEntries<&'v str, &'v StarlarkAttribute>,
         #[starlark(require = named, default = "")] doc: &str,
         #[starlark(require = named)] artifact_promise_mappings: SmallMap<
             StringValue<'v>,
-            StarlarkCallable<'v>,
+            StarlarkCallable<'v, (FrozenValue,), UnpackList<FrozenValue>>,
         >,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> anyhow::Result<RuleCallable<'v>> {
-        RuleCallable::new(
-            r#impl,
-            attrs,
-            None,
-            doc,
-            false,
-            false,
-            Vec::new(),
-            Some(ArtifactPromiseMappings {
-                mappings: artifact_promise_mappings
-                    .iter()
-                    .map(|(k, v)| (*k, v.0))
-                    .collect::<SmallMap<_, _>>(),
-            }),
-            eval,
-        )
+        RuleCallable::new_anon(r#impl, attrs, doc, artifact_promise_mappings, eval)
+            .map_err(Into::into)
     }
 }

@@ -9,13 +9,14 @@ load("@prelude//apple:apple_toolchain_types.bzl", "AppleToolchainInfo")
 load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo")
 load("@prelude//user:rule_spec.bzl", "RuleRegistrationSpec")
 
-def _impl(ctx: AnalysisContext) -> list[Provider]:
+def _apple_toolchain_override_impl(ctx: AnalysisContext) -> list[Provider]:
     base = ctx.attrs.base[AppleToolchainInfo]
     cxx_toolchain_override = ctx.attrs.cxx_toolchain[CxxToolchainInfo]
     return [
         DefaultInfo(),
         AppleToolchainInfo(
             actool = base.actool,
+            architecture = base.architecture,
             codesign = base.codesign,
             codesign_allocate = base.codesign_allocate,
             copy_scene_kit_assets = base.copy_scene_kit_assets,
@@ -29,16 +30,17 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
             installer = base.installer,
             libtool = base.libtool,
             lipo = base.lipo,
-            min_version = base.min_version,
+            mapc = base.mapc,
+            merge_index_store = base.merge_index_store,
             momc = base.momc,
-            odrcov = base.odrcov,
+            objdump = base.objdump,
             platform_path = base.platform_path,
+            prelude_rpaths = base.prelude_rpaths,
             sdk_build_version = base.sdk_build_version,
             sdk_name = base.sdk_name,
             sdk_path = base.sdk_path,
             sdk_version = base.sdk_version,
             swift_toolchain_info = base.swift_toolchain_info,
-            watch_kit_stub_binary = base.watch_kit_stub_binary,
             xcode_build_version = base.xcode_build_version,
             xcode_version = base.xcode_version,
             xctest = base.xctest,
@@ -47,7 +49,7 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
 
 registration_spec = RuleRegistrationSpec(
     name = "apple_toolchain_override",
-    impl = _impl,
+    impl = _apple_toolchain_override_impl,
     attrs = {
         "base": attrs.toolchain_dep(providers = [AppleToolchainInfo]),
         "cxx_toolchain": attrs.toolchain_dep(providers = [CxxToolchainInfo]),

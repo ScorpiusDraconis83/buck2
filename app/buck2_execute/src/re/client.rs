@@ -13,27 +13,26 @@ use std::time::Duration;
 use allocative::Allocative;
 use anyhow::Context;
 use buck2_core::buck2_env;
+use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::RemoteExecutorDependency;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
-use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
-use buck2_re_configuration::RemoteExecutionStaticMetadata;
+use buck2_error::buck2_error;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_re_configuration::RemoteExecutionStaticMetadataImpl;
 use chrono::DateTime;
 use chrono::Utc;
 use dupe::Dupe;
 use either::Either;
-use fbinit::FacebookInit;
 use futures::stream::BoxStream;
 use futures::FutureExt;
 use futures::StreamExt;
-use futures::TryFutureExt;
 use gazebo::prelude::*;
 use itertools::Itertools;
 use prost::Message;
 use remote_execution as RE;
-use remote_execution::ActionHistoryInfo;
 use remote_execution::ActionResultRequest;
 use remote_execution::ActionResultResponse;
 use remote_execution::BuckInfo;
@@ -41,14 +40,13 @@ use remote_execution::DownloadRequest;
 use remote_execution::ExecuteRequest;
 use remote_execution::ExecuteResponse;
 use remote_execution::ExecuteWithProgressResponse;
+use remote_execution::ExtendDigestsTtlRequest;
 use remote_execution::GetDigestsTtlRequest;
-use remote_execution::HostResourceRequirements;
 use remote_execution::InlinedBlobWithDigest;
 use remote_execution::NamedDigest;
 use remote_execution::NamedDigestWithPermissions;
 use remote_execution::REClient;
 use remote_execution::REClientBuilder;
-use remote_execution::REClientError;
 use remote_execution::RemoteExecutionMetadata;
 use remote_execution::Stage;
 use remote_execution::TActionResult2;
@@ -56,6 +54,9 @@ use remote_execution::TCode;
 use remote_execution::TDependency;
 use remote_execution::TDigest;
 use remote_execution::TExecutionPolicy;
+use remote_execution::THostResourceRequirements;
+use remote_execution::THostRuntimeRequirements;
+use remote_execution::TLocalCacheStats;
 use remote_execution::UploadRequest;
 use remote_execution::WriteActionResultRequest;
 use remote_execution::WriteActionResultResponse;
@@ -72,7 +73,13 @@ use crate::knobs::ExecutorGlobalKnobs;
 use crate::materialize::materializer::Materializer;
 use crate::re::action_identity::ReActionIdentity;
 use crate::re::convert::platform_to_proto;
+use crate::re::error::test_re_error;
+use crate::re::error::with_error_handler;
+use crate::re::error::RemoteExecutionError;
+use crate::re::manager::RemoteExecutionConfig;
 use crate::re::metadata::RemoteExecutionMetadataExt;
+use crate::re::stats::LocalCacheRemoteExecutionClientStats;
+use crate::re::stats::LocalCacheStats;
 use crate::re::stats::OpStats;
 use crate::re::stats::RemoteExecutionClientOpStats;
 use crate::re::stats::RemoteExecutionClientStats;
@@ -101,26 +108,20 @@ struct RemoteExecutionClientData {
     materializes: OpStats,
     write_action_results: OpStats,
     get_digest_expirations: OpStats,
+    extend_digest_ttl: OpStats,
+    local_cache: LocalCacheStats,
 }
 
 impl RemoteExecutionClient {
-    pub async fn new(
-        fb: FacebookInit,
-        skip_remote_cache: bool,
-        static_metadata: Arc<RemoteExecutionStaticMetadata>,
-        logs_dir_path: Option<&AbsNormPath>,
-        buck_out_path: &AbsNormPath,
-        is_paranoid_mode: bool,
-    ) -> anyhow::Result<Self> {
-        let client = RemoteExecutionClientImpl::new(
-            fb,
-            skip_remote_cache,
-            static_metadata,
-            logs_dir_path,
-            buck_out_path,
-            is_paranoid_mode,
-        )
-        .await?;
+    pub async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
+        if buck2_env!("BUCK2_TEST_FAIL_CONNECT", bool, applicability = testing)? {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Injected RE Connection error"
+            ));
+        }
+
+        let client = RemoteExecutionClientImpl::new(re_config).await?;
 
         Ok(Self {
             data: Arc::new(RemoteExecutionClientData {
@@ -132,33 +133,25 @@ impl RemoteExecutionClient {
                 materializes: OpStats::default(),
                 write_action_results: OpStats::default(),
                 get_digest_expirations: OpStats::default(),
+                extend_digest_ttl: OpStats::default(),
+                local_cache: Default::default(),
             }),
         })
     }
 
-    pub async fn new_retry(
-        fb: FacebookInit,
-        skip_remote_cache: bool,
-        times: usize, // 0 is treated as 1
-        static_metadata: Arc<RemoteExecutionStaticMetadata>,
-        logs_dir_path: Option<&AbsNormPath>,
-        buck_out_path: &AbsNormPath,
-        is_paranoid_mode: bool,
-    ) -> anyhow::Result<Self> {
+    pub async fn new_retry(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
         // Loop happens times-1 times at most
-        for i in 1..times {
-            match Self::new(
-                fb,
-                skip_remote_cache,
-                static_metadata.dupe(),
-                logs_dir_path,
-                buck_out_path,
-                is_paranoid_mode,
-            )
-            .await
-            {
+        for i in 1..re_config.connection_retries {
+            match Self::new(re_config).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    let e: buck2_error::Error = e.into();
+                    if e.find_typed_context::<RemoteExecutionError>().is_none() {
+                        // If we cannot connect to RE due to some non-RE error, we should not retry
+                        // And should just return the error immediately as it's unlikely to be flakey
+                        return Err(e.into());
+                    }
+
                     tracing::warn!(
                         "Failed to connect to RE, retrying after sleeping {} seconds: {:#?}",
                         i,
@@ -168,29 +161,14 @@ impl RemoteExecutionClient {
                 }
             }
         }
-        Self::new(
-            fb,
-            skip_remote_cache,
-            static_metadata,
-            logs_dir_path,
-            buck_out_path,
-            is_paranoid_mode,
-        )
-        .await
-    }
-
-    fn decorate_error(&self, source: anyhow::Error) -> anyhow::Error {
-        source.context(format!(
-            "Remote Execution Error ({})",
-            self.get_session_id()
-        ))
+        Self::new(re_config).await
     }
 
     pub async fn action_cache(
         &self,
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Option<ActionResultResponse>> {
+    ) -> buck2_error::Result<Option<ActionResultResponse>> {
         self.data
             .action_cache
             .op(self.data.client.action_cache(action_digest, use_case))
@@ -205,23 +183,21 @@ impl RemoteExecutionClient {
         dir_path: &ProjectRelativePath,
         input_dir: &ActionImmutableDirectory,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<UploadStats> {
+    ) -> buck2_error::Result<UploadStats> {
         self.data
             .uploads
-            .op(self
-                .data
-                .client
-                .upload(
-                    fs,
-                    materializer,
-                    blobs,
-                    dir_path,
-                    input_dir,
-                    use_case,
-                    digest_config,
-                )
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.upload(
+                fs,
+                materializer,
+                blobs,
+                dir_path,
+                input_dir,
+                use_case,
+                identity,
+                digest_config,
+            ))
             .await
     }
 
@@ -231,53 +207,49 @@ impl RemoteExecutionClient {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         self.data
             .uploads
-            .op(self
-                .data
-                .client
-                .upload_files_and_directories(
-                    files_with_digest,
-                    directories,
-                    inlined_blobs_with_digest,
-                    use_case,
-                )
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.upload_files_and_directories(
+                files_with_digest,
+                directories,
+                inlined_blobs_with_digest,
+                use_case,
+            ))
             .await
     }
 
-    pub async fn execute(
+    pub async fn execute<'a>(
         &self,
         action_digest: ActionDigest,
         platform: &RE::Platform,
-        dependencies: &[RemoteExecutorDependency],
+        dependencies: impl IntoIterator<Item = &'a RemoteExecutorDependency>,
         use_case: RemoteExecutorUseCase,
         identity: &ReActionIdentity<'_>,
         manager: &mut CommandExecutionManager,
         skip_cache_read: bool,
         skip_cache_write: bool,
         re_max_queue_time: Option<Duration>,
+        re_resource_units: Option<i64>,
         knobs: &ExecutorGlobalKnobs,
-    ) -> anyhow::Result<ExecuteResponseOrCancelled> {
+        meta_internal_extra_params: &MetaInternalExtraParams,
+    ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         self.data
             .executes
-            .op(self
-                .data
-                .client
-                .execute(
-                    action_digest,
-                    platform,
-                    dependencies,
-                    use_case,
-                    identity,
-                    manager,
-                    skip_cache_read,
-                    skip_cache_write,
-                    re_max_queue_time,
-                    knobs,
-                )
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.execute(
+                action_digest,
+                platform,
+                dependencies,
+                use_case,
+                identity,
+                manager,
+                skip_cache_read,
+                skip_cache_write,
+                re_max_queue_time,
+                re_resource_units,
+                knobs,
+                meta_internal_extra_params,
+            ))
             .await
     }
 
@@ -285,55 +257,58 @@ impl RemoteExecutionClient {
         &self,
         files: Vec<NamedDigestWithPermissions>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<()> {
-        self.data
+    ) -> buck2_error::Result<()> {
+        let stat = self
+            .data
             .materializes
             .op(self.data.client.materialize_files(files, use_case))
-            .await
+            .await?;
+        self.data.local_cache.update(&stat);
+        Ok(())
     }
 
     pub async fn download_typed_blobs<T: Message + Default>(
         &self,
+        identity: Option<&ReActionIdentity<'_>>,
         digests: Vec<TDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<T>> {
+    ) -> buck2_error::Result<Vec<T>> {
         self.data
             .downloads
             .op(self
                 .data
                 .client
-                .download_typed_blobs(digests, use_case)
-                .map_err(|e| self.decorate_error(e)))
+                .download_typed_blobs(identity, digests, use_case))
             .await
+            .map(|r| {
+                self.data.local_cache.update(&r.1);
+                r.0
+            })
     }
 
     pub async fn download_blob(
         &self,
         digest: &TDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> buck2_error::Result<Vec<u8>> {
         self.data
             .downloads
-            .op(self
-                .data
-                .client
-                .download_blob(digest, use_case)
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.download_blob(digest, use_case))
             .await
+            .map(|r| {
+                self.data.local_cache.update(&r.1);
+                r.0
+            })
     }
 
     pub async fn upload_blob(
         &self,
-        blob: Vec<u8>,
+        blob: InlinedBlobWithDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<TDigest> {
+    ) -> buck2_error::Result<TDigest> {
         self.data
             .uploads
-            .op(self
-                .data
-                .client
-                .upload_blob(blob, use_case)
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.upload_blob(blob, use_case))
             .await
     }
 
@@ -341,14 +316,22 @@ impl RemoteExecutionClient {
         &self,
         digests: Vec<TDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<(TDigest, DateTime<Utc>)>> {
+    ) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
         self.data
             .get_digest_expirations
-            .op(self
-                .data
-                .client
-                .get_digest_expirations(digests, use_case)
-                .map_err(|e| self.decorate_error(e)))
+            .op(self.data.client.get_digest_expirations(digests, use_case))
+            .await
+    }
+
+    pub async fn extend_digest_ttl(
+        &self,
+        digests: Vec<TDigest>,
+        ttl: Duration,
+        use_case: RemoteExecutorUseCase,
+    ) -> buck2_error::Result<()> {
+        self.data
+            .extend_digest_ttl
+            .op(self.data.client.extend_digest_ttl(digests, ttl, use_case))
             .await
     }
 
@@ -358,23 +341,26 @@ impl RemoteExecutionClient {
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
-    ) -> anyhow::Result<WriteActionResultResponse> {
+    ) -> buck2_error::Result<WriteActionResultResponse> {
         self.data
             .write_action_results
             .op(self
                 .data
                 .client
-                .write_action_result(digest, result, use_case, platform)
-                .map_err(|e| self.decorate_error(e)))
+                .write_action_result(digest, result, use_case, platform))
             .await
     }
 
     pub fn get_session_id(&self) -> &str {
-        self.data.client.client().get_session_id()
+        self.data.client.get_session_id()
     }
 
-    pub fn get_experiment_name(&self) -> anyhow::Result<Option<String>> {
-        self.data.client.client().get_experiment_name()
+    pub fn get_experiment_name(&self) -> buck2_error::Result<Option<String>> {
+        self.data
+            .client
+            .client()
+            .get_experiment_name()
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
     }
 
     pub fn fill_network_stats(&self, stats: &mut RemoteExecutionClientStats) {
@@ -387,6 +373,7 @@ impl RemoteExecutionClient {
         stats.materializes = RemoteExecutionClientOpStats::from(&self.data.materializes);
         stats.get_digest_expirations =
             RemoteExecutionClientOpStats::from(&self.data.get_digest_expirations);
+        stats.local_cache = LocalCacheRemoteExecutionClientStats::from(&self.data.local_cache);
     }
 }
 
@@ -404,6 +391,8 @@ struct RemoteExecutionClientImpl {
     /// How many files to kick off downloading concurrently for one request. This should be smaller
     /// than the files semaphore to ensure we can actually *acquire* that semaphore.
     download_chunk_size: usize,
+    /// Preserve file symlinks as symlinks when uploading action result.
+    respect_file_symlinks: bool,
 }
 
 fn re_platform(x: &RE::Platform) -> remote_execution::TPlatform {
@@ -418,22 +407,17 @@ fn re_platform(x: &RE::Platform) -> remote_execution::TPlatform {
 }
 
 impl RemoteExecutionClientImpl {
-    async fn new(
-        fb: FacebookInit,
-        skip_remote_cache: bool,
-        static_metadata: Arc<RemoteExecutionStaticMetadata>,
-        maybe_logs_dir_path: Option<&AbsNormPath>,
-        buck_out_path: &AbsNormPath,
-        is_paranoid_mode: bool,
-    ) -> anyhow::Result<Self> {
+    async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
+        let op_name = "REClientBuilder";
         tracing::info!("Creating a new RE client");
 
-        let res: anyhow::Result<Self> = try {
+        let res: buck2_error::Result<Self> = try {
             let download_concurrency =
                 buck2_env!("BUCK2_RE_DOWNLOAD_CONCURRENCY", type=usize, default=256)?;
 
             // Split things up into smaller chunks.
             let download_chunk_size = std::cmp::max(download_concurrency / 8, 1);
+            let static_metadata = &re_config.static_metadata;
 
             #[cfg(fbcode_build)]
             let client = {
@@ -448,6 +432,8 @@ impl RemoteExecutionClientImpl {
                 use remote_execution::ThreadConfig;
 
                 let mut re_client_config = create_default_config();
+
+                // gRPC settings
                 re_client_config.action_cache_client_config.connection_count =
                     static_metadata.action_cache_connection_count;
                 re_client_config.action_cache_client_config.address =
@@ -464,7 +450,7 @@ impl RemoteExecutionClientImpl {
                     ..Default::default()
                 };
 
-                if is_paranoid_mode {
+                if re_config.is_paranoid_mode {
                     // Dedupe is not compatible with us downloading blobs and moving them.
                     embedded_cas_daemon_config.disable_download_dedup = true;
                 }
@@ -482,8 +468,10 @@ impl RemoteExecutionClientImpl {
                 // want to tell the RE client to rely on an external
                 // CAS daemon to manage the cache.
                 if let Some(shared_cache) = &static_metadata.cas_shared_cache {
+                    use remote_execution::RemoteCASdAddress;
                     use remote_execution::RemoteCacheConfig;
                     use remote_execution::RemoteCacheManagerMode;
+                    use remote_execution::RemoteFetchPolicy;
 
                     let mode = match static_metadata
                         .cas_shared_cache_mode
@@ -495,17 +483,43 @@ impl RemoteExecutionClientImpl {
                     {
                         "BIG_FILES" => RemoteCacheManagerMode::BIG_FILES,
                         "ALL_FILES" => RemoteCacheManagerMode::ALL_FILES,
+                        "ALL_FILES_LOCAL_WITHOUT_SYNC" => {
+                            RemoteCacheManagerMode::ALL_FILES_LOCAL_WITHOUT_SYNC
+                        }
                         unknown => {
-                            return Err(anyhow::anyhow!(
+                            return Err(buck2_error!(
+                                buck2_error::ErrorTag::Input,
                                 "Unknown RemoteCacheManagerMode: {}",
                                 unknown
                             ));
                         }
                     };
+
+                    let (small_files_policy, large_files_policy) = match mode {
+                        RemoteCacheManagerMode::BIG_FILES => (
+                            RemoteFetchPolicy::LOCAL_FETCH_WITHOUT_SYNC,
+                            RemoteFetchPolicy::REMOTE_FETCH,
+                        ),
+                        RemoteCacheManagerMode::ALL_FILES => (
+                            RemoteFetchPolicy::REMOTE_FETCH,
+                            RemoteFetchPolicy::REMOTE_FETCH,
+                        ),
+                        RemoteCacheManagerMode::ALL_FILES_LOCAL_WITHOUT_SYNC => (
+                            RemoteFetchPolicy::LOCAL_FETCH_WITHOUT_SYNC,
+                            RemoteFetchPolicy::LOCAL_FETCH_WITHOUT_SYNC,
+                        ),
+                        _ => unreachable!(),
+                    };
+
                     let remote_cache_config = {
                         let mut remote_cache_config = RemoteCacheConfig {
                             mode,
                             port: static_metadata.cas_shared_cache_port,
+                            small_files: small_files_policy,
+                            large_files: large_files_policy,
+                            address: RemoteCASdAddress::tcp_port(
+                                static_metadata.cas_shared_cache_port.unwrap_or(23333),
+                            ),
                             ..Default::default()
                         };
                         if let Some(tls) = static_metadata.cas_shared_cache_tls {
@@ -564,9 +578,10 @@ impl RemoteExecutionClientImpl {
                 // Will either choose the SOFT_COPY (on some linux fs like btrfs/extfs etc, on Mac if using APFS) or FULL_COPY otherwise
                 embedded_cas_daemon_config.copy_policy = CopyPolicy::BEST_AVAILABLE;
                 embedded_cas_daemon_config.meterialization_mount_path = Some(
-                    buck_out_path
+                    re_config
+                        .buck_out_path
                         .to_str()
-                        .context("invalid meterialization_mount_path")?
+                        .buck_error_context("invalid meterialization_mount_path")?
                         .to_owned(),
                 );
 
@@ -584,25 +599,37 @@ impl RemoteExecutionClientImpl {
 
                 let minimal_blob_ttl_threshold =
                     static_metadata.minimal_blob_ttl_seconds.unwrap_or(3600);
+                let remaining_ttl_fraction_refresh_threshold = static_metadata
+                    .remaining_ttl_fraction_refresh_threshold
+                    .unwrap_or(0.1)
+                    as f64;
+                let remaining_ttl_random_extra_threshold = static_metadata
+                    .remaining_ttl_random_extra_threshold
+                    .unwrap_or(0.25)
+                    as f64;
                 embedded_cas_daemon_config.ttl_extending_config = Some(TTLExtendingConfig {
                     blocking_ttl_extending_seconds_threshold: minimal_blob_ttl_threshold,
+                    remaining_ttl_fraction_refresh_threshold,
+                    remaining_ttl_random_extra_threshold,
                     ..Default::default()
                 });
                 embedded_cas_daemon_config.action_cache_ttl_extending_config =
                     Some(TTLExtendingConfig {
                         blocking_ttl_extending_seconds_threshold: minimal_blob_ttl_threshold,
+                        remaining_ttl_fraction_refresh_threshold,
+                        remaining_ttl_random_extra_threshold,
                         ..Default::default()
                     });
 
                 re_client_config.cas_client_config =
                     CASDaemonClientCfg::embedded_config(embedded_cas_daemon_config);
-                if let Some(logs_dir_path) = maybe_logs_dir_path {
+                if let Some(logs_dir_path) = &re_config.logs_dir_path {
                     // make sure that the log dir exists as glog is expecting that :(
                     fs_util::create_dir_all(logs_dir_path)?;
                     re_client_config.log_file_location = Some(
                         logs_dir_path
                             .to_str()
-                            .context("Invalid log_file_location")?
+                            .buck_error_context("Invalid log_file_location")?
                             .to_owned(),
                     );
                     // keep last 10 sessions (similar to a number of buck builds)
@@ -653,32 +680,83 @@ impl RemoteExecutionClientImpl {
                     .to_owned();
 
                 re_client_config.disable_fallocate = static_metadata.disable_fallocate;
+
+                re_client_config.execute_over_thrift = Some(static_metadata.execute_over_thrift);
+
+                re_client_config
+                    .thrift_execution_client_config
+                    .concurrency_limit = static_metadata.execution_concurrency_limit;
+
+                if let Some(engine_tier) = static_metadata.engine_tier.to_owned() {
+                    re_client_config.thrift_execution_client_config.tier = engine_tier;
+                }
+
+                if static_metadata.engine_host.is_some() || static_metadata.engine_port.is_some() {
+                    if static_metadata.engine_host.is_some()
+                        && static_metadata.engine_port.is_some()
+                    {
+                        re_client_config.thrift_execution_client_config.host_port =
+                            Some(remote_execution::HostPort {
+                                host: static_metadata.engine_host.clone().unwrap(),
+                                port: static_metadata.engine_port.unwrap(),
+                                ..Default::default()
+                            });
+                    } else {
+                        return Err(buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Both engine_host and engine_port must be set if either is set"
+                        ));
+                    }
+                }
+
                 // TODO(ndmitchell): For now, we just drop RE log messages, but ideally we'd put them in our log stream.
                 let logger = slog::Logger::root(slog::Discard, slog::o!());
-                REClientBuilder::new(fb)
-                    .with_config(re_client_config)
-                    .with_logger(logger)
-                    .build_and_connect()
-                    .await?
+                // TODO T179215751: If RE client fails we don't get the RE session ID and we can't find the RE logs.
+                // Better to generate the RE session ID ourselves and pass it to the RE client.
+                with_error_handler(
+                    op_name,
+                    "<none>",
+                    REClientBuilder::new(re_config.fb)
+                        .with_config(re_client_config)
+                        .with_logger(logger)
+                        .build_and_connect()
+                        .await,
+                )
+                .await?
             };
 
             #[cfg(not(fbcode_build))]
             let client = {
-                let _unused = (fb, maybe_logs_dir_path, buck_out_path, is_paranoid_mode);
+                with_error_handler(
+                    op_name,
+                    "<none>",
+                    REClientBuilder::build_and_connect(&static_metadata.0).await,
+                )
+                .await?
+            };
 
-                REClientBuilder::build_and_connect(&static_metadata.0).await?
+            let respect_file_symlinks = {
+                #[cfg(fbcode_build)]
+                {
+                    static_metadata.respect_file_symlinks
+                }
+                #[cfg(not(fbcode_build))]
+                {
+                    false
+                }
             };
 
             Self {
                 client: Some(client),
-                skip_remote_cache,
+                skip_remote_cache: re_config.skip_remote_cache,
                 cas_semaphore: Arc::new(Semaphore::new(static_metadata.cas_semaphore_size())),
                 download_files_semapore: Arc::new(Semaphore::new(download_concurrency)),
                 download_chunk_size,
+                respect_file_symlinks,
             }
         };
 
-        res.context("RE: creating client")
+        res
     }
 
     fn client(&self) -> &REClient {
@@ -687,33 +765,38 @@ impl RemoteExecutionClientImpl {
             .expect("REClient is always present unless dropped")
     }
 
+    fn get_session_id(&self) -> &str {
+        self.client().get_session_id()
+    }
+
     async fn action_cache(
         &self,
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Option<ActionResultResponse>> {
-        let res = self
-            .client()
-            .get_action_cache_client()
-            .get_action_result(
-                use_case.metadata(),
-                ActionResultRequest {
-                    digest: action_digest.to_re(),
-                    ..Default::default()
-                },
-            )
-            .await;
+    ) -> buck2_error::Result<Option<ActionResultResponse>> {
+        let res = with_error_handler(
+            "action_cache",
+            self.get_session_id(),
+            self.client()
+                .get_action_cache_client()
+                .get_action_result(
+                    use_case.metadata(None),
+                    ActionResultRequest {
+                        digest: action_digest.to_re(),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await;
 
         match res {
             Ok(r) => Ok(Some(r)),
             Err(e) => {
-                if e.downcast_ref::<REClientError>()
-                    .map(|e| e.code == TCode::NOT_FOUND)
-                    == Some(true)
-                {
-                    Ok(None)
-                } else {
-                    Err(e)
+                let e: buck2_error::Error = e.into();
+                match e.find_typed_context::<RemoteExecutionError>() {
+                    Some(e) if e.code == TCode::NOT_FOUND => Ok(None),
+                    _ => Err(e.into()),
                 }
             }
         }
@@ -727,19 +810,27 @@ impl RemoteExecutionClientImpl {
         dir_path: &ProjectRelativePath,
         input_dir: &ActionImmutableDirectory,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<UploadStats> {
+    ) -> buck2_error::Result<UploadStats> {
         // Actually upload to CAS
         let _cas = self.cas_semaphore.acquire().await;
-        Uploader::upload(
-            fs,
-            self.client().get_cas_client(),
-            materializer,
-            dir_path,
-            input_dir,
-            blobs,
-            use_case,
-            digest_config,
+
+        with_error_handler(
+            "upload",
+            self.get_session_id(),
+            Uploader::upload(
+                fs,
+                self.client().get_cas_client(),
+                materializer,
+                dir_path,
+                input_dir,
+                blobs,
+                use_case,
+                identity,
+                digest_config,
+            )
+            .await,
         )
         .await
     }
@@ -750,20 +841,25 @@ impl RemoteExecutionClientImpl {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<()> {
-        self.client()
-            .get_cas_client()
-            .upload(
-                use_case.metadata(),
-                UploadRequest {
-                    files_with_digest: Some(files_with_digest),
-                    inlined_blobs_with_digest: Some(inlined_blobs_with_digest),
-                    directories: Some(directories),
-                    upload_only_missing: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+    ) -> buck2_error::Result<()> {
+        with_error_handler(
+            "upload_files_and_directories",
+            self.get_session_id(),
+            self.client()
+                .get_cas_client()
+                .upload(
+                    use_case.metadata(None),
+                    UploadRequest {
+                        files_with_digest: Some(files_with_digest),
+                        inlined_blobs_with_digest: Some(inlined_blobs_with_digest),
+                        directories: Some(directories),
+                        upload_only_missing: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await?;
         Ok(())
     }
 
@@ -778,6 +874,8 @@ impl RemoteExecutionClientImpl {
         knobs: &ExecutorGlobalKnobs,
     ) -> anyhow::Result<ExecuteResponseOrCancelled> {
         use buck2_data::re_stage;
+        use buck2_data::ReAfterAction;
+        use buck2_data::ReBeforeAction;
         use buck2_data::ReExecute;
         use buck2_data::ReQueue;
         use buck2_data::ReUnknown;
@@ -792,6 +890,8 @@ impl RemoteExecutionClientImpl {
         } else {
             None
         };
+
+        let re_use_case = metadata.use_case_id.clone();
 
         #[allow(clippy::large_enum_variant)]
         enum ResponseOrStateChange {
@@ -815,7 +915,7 @@ impl RemoteExecutionClientImpl {
                 async move {
                     loop {
                         let next = futures::future::select(
-                            manager.liveliness_observer.while_alive(),
+                            manager.inner.liveliness_observer.while_alive(),
                             receiver.next(),
                         );
 
@@ -862,20 +962,33 @@ impl RemoteExecutionClientImpl {
             action_digest: String,
             platform: &remote_execution::Platform,
             action_key: &Option<String>,
+            use_case: String,
         ) -> re_stage::Stage {
             match stage {
-                Stage::QUEUED => re_stage::Stage::Queue(ReQueue { action_digest }),
-                Stage::MATERIALIZING_INPUT => {
-                    re_stage::Stage::WorkerDownload(ReWorkerDownload { action_digest })
+                Stage::QUEUED => re_stage::Stage::Queue(ReQueue {
+                    action_digest,
+                    use_case,
+                }),
+                Stage::MATERIALIZING_INPUT => re_stage::Stage::WorkerDownload(ReWorkerDownload {
+                    action_digest,
+                    use_case,
+                }),
+                Stage::BEFORE_ACTION => {
+                    re_stage::Stage::BeforeActionExecution(ReBeforeAction { action_digest })
                 }
                 Stage::EXECUTING => re_stage::Stage::Execute(ReExecute {
                     action_digest,
                     platform: Some(platform_to_proto(platform)),
                     action_key: action_key.clone(),
+                    use_case,
                 }),
-                Stage::UPLOADING_OUTPUT => {
-                    re_stage::Stage::WorkerUpload(ReWorkerUpload { action_digest })
+                Stage::AFTER_ACTION => {
+                    re_stage::Stage::AfterActionExecution(ReAfterAction { action_digest })
                 }
+                Stage::UPLOADING_OUTPUT => re_stage::Stage::WorkerUpload(ReWorkerUpload {
+                    action_digest,
+                    use_case,
+                }),
                 _ => {
                     tracing::debug!(
                         "Received unexpected RE stage {:#?} for action: {}",
@@ -919,6 +1032,7 @@ impl RemoteExecutionClientImpl {
                     action_digest_str.clone(),
                     platform,
                     &action_key,
+                    re_use_case.clone(),
                 ),
                 manager,
                 re_max_queue_time,
@@ -942,30 +1056,22 @@ impl RemoteExecutionClientImpl {
         }
     }
 
-    pub async fn execute(
+    pub async fn execute<'a>(
         &self,
         action_digest: ActionDigest,
         platform: &RE::Platform,
-        dependencies: &[RemoteExecutorDependency],
+        dependencies: impl IntoIterator<Item = &'a RemoteExecutorDependency>,
         use_case: RemoteExecutorUseCase,
         identity: &ReActionIdentity<'_>,
         manager: &mut CommandExecutionManager,
         skip_cache_read: bool,
         skip_cache_write: bool,
         re_max_queue_time: Option<Duration>,
+        re_resource_units: Option<i64>,
         knobs: &ExecutorGlobalKnobs,
-    ) -> anyhow::Result<ExecuteResponseOrCancelled> {
+        meta_internal_extra_params: &MetaInternalExtraParams,
+    ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         let metadata = RemoteExecutionMetadata {
-            action_history_info: Some(ActionHistoryInfo {
-                action_key: identity.action_key.clone(),
-                disable_retry_on_oom: false,
-                ..Default::default()
-            }),
-            host_resource_requirements: Some(HostResourceRequirements {
-                affinity_keys: vec![identity.affinity_key.clone()],
-                input_files_bytes: identity.paths.input_files_bytes() as i64,
-                ..Default::default()
-            }),
             platform: Some(re_platform(platform)),
             do_not_cache: skip_cache_write,
             buck_info: Some(BuckInfo {
@@ -975,121 +1081,177 @@ impl RemoteExecutionClientImpl {
                 build_id: identity.trace_id.to_string(),
                 ..Default::default()
             }),
-            dependencies: dependencies
-                .iter()
-                .map(|dep| TDependency {
-                    smc_tier: dep.smc_tier.clone(),
-                    id: dep.id.clone(),
-                    ..Default::default()
-                })
-                .collect(),
-            ..use_case.metadata()
+            respect_file_symlinks: Some(self.respect_file_symlinks),
+            ..use_case.metadata(Some(identity))
         };
+
         let request = ExecuteRequest {
             skip_cache_lookup: self.skip_remote_cache || skip_cache_read,
-            execution_policy: Some(TExecutionPolicy::default()),
+            execution_policy: Some(TExecutionPolicy {
+                affinity_keys: vec![identity.affinity_key.clone()],
+                priority: meta_internal_extra_params
+                    .remote_execution_policy
+                    .priority
+                    .unwrap_or_default(),
+                region_preference: meta_internal_extra_params
+                    .remote_execution_policy
+                    .region_preference
+                    .clone()
+                    .unwrap_or_default(),
+                setup_preference_key: meta_internal_extra_params
+                    .remote_execution_policy
+                    .setup_preference_key
+                    .clone()
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
             action_digest: action_digest.to_re(),
+            host_runtime_requirements: THostRuntimeRequirements {
+                platform: re_platform(platform),
+                host_resource_requirements: THostResourceRequirements {
+                    input_files_bytes: identity.paths.input_files_bytes() as i64,
+                    resource_units: re_resource_units.unwrap_or_default(),
+                    ..Default::default()
+                },
+                dependencies: dependencies
+                    .into_iter()
+                    .map(|dep| TDependency {
+                        smc_tier: dep.smc_tier.clone(),
+                        id: dep.id.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        self.execute_impl(
-            metadata,
-            request,
-            &action_digest,
-            manager,
-            re_max_queue_time,
-            platform,
-            knobs,
+        let re_action = format!("Execute with digest {}", &action_digest);
+        with_error_handler(
+            re_action.as_str(),
+            self.get_session_id(),
+            self.execute_impl(
+                metadata,
+                request,
+                &action_digest,
+                manager,
+                re_max_queue_time,
+                platform,
+                knobs,
+            )
+            .await,
         )
         .await
-        .with_context(|| format!("RE: execution with digest {}", &action_digest))
     }
 
     /// Fetches a list of digests from the CAS and casts them to Tree objects.
     /// If fetching or decoding fails for one or more digests, returns an Err.
     async fn download_typed_blobs<T: Message + Default>(
         &self,
+        identity: Option<&ReActionIdentity<'_>>,
         digests: Vec<TDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<T>> {
+    ) -> buck2_error::Result<(Vec<T>, TLocalCacheStats)> {
         if digests.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), TLocalCacheStats::default()));
         }
         let expected_blobs = digests.len();
-        let response = self
-            .client()
-            .get_cas_client()
-            .download(
-                use_case.metadata(),
-                DownloadRequest {
-                    inlined_digests: Some(digests),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let response = with_error_handler(
+            "download_typed_blobs",
+            self.get_session_id(),
+            self.client()
+                .get_cas_client()
+                .download(
+                    use_case.metadata(identity),
+                    DownloadRequest {
+                        inlined_digests: Some(digests),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await?;
 
         let mut blobs: Vec<T> = Vec::with_capacity(expected_blobs);
         if let Some(ds) = response.inlined_blobs {
             for d in ds {
-                blobs.push(Message::decode(d.blob.as_slice()).with_context(|| {
-                    format!("Failed to Protobuf decode tree at `{}`", d.digest)
-                })?);
+                blobs.push(
+                    Message::decode(d.blob.as_slice()).with_buck_error_context(|| {
+                        format!("Failed to Protobuf decode tree at `{}`", d.digest)
+                    })?,
+                );
             }
         }
 
         // This shouldn't happen, but we can't just assume the CAS won't ever break
         if blobs.len() != expected_blobs {
-            return Err(anyhow::anyhow!(
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
                 "CAS client returned fewer blobs than expected."
             ));
         }
 
-        Ok(blobs)
+        Ok((blobs, response.local_cache_stats))
     }
 
     pub async fn download_blob(
         &self,
         digest: &TDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<u8>> {
-        let response = self
-            .client()
-            .get_cas_client()
-            .download(
-                use_case.metadata(),
-                DownloadRequest {
-                    inlined_digests: Some(vec![digest.clone()]),
-                    ..Default::default()
-                },
-            )
-            // boxed() to segment the future
-            .boxed()
-            .await
-            .with_context(|| format!("Download request failed for digest {}", digest))?;
+    ) -> buck2_error::Result<(Vec<u8>, TLocalCacheStats)> {
+        let re_action = format!("download_blob for digest {}", digest);
+        let response = with_error_handler(
+            re_action.as_str(),
+            self.get_session_id(),
+            self.client()
+                .get_cas_client()
+                .download(
+                    use_case.metadata(None),
+                    DownloadRequest {
+                        inlined_digests: Some(vec![digest.clone()]),
+                        ..Default::default()
+                    },
+                )
+                // boxed() to segment the future
+                .boxed()
+                .await,
+        )
+        .await?;
 
         response
             .inlined_blobs
             .into_iter()
             .flat_map(|blobs| blobs.into_iter())
             .next()
-            .map(|blob| blob.blob)
-            .with_context(|| format!("No digest was returned in request for {}", digest))
+            .map(|blob| (blob.blob, response.local_cache_stats))
+            .with_buck_error_context(|| format!("No digest was returned in request for {}", digest))
     }
 
     pub async fn upload_blob(
         &self,
-        blob: Vec<u8>,
+        blob: InlinedBlobWithDigest,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<TDigest> {
-        self.client().upload_blob(blob, use_case.metadata()).await
+    ) -> buck2_error::Result<TDigest> {
+        with_error_handler(
+            "upload_blob",
+            self.get_session_id(),
+            self.client()
+                .upload_blob_with_digest(blob.blob, blob.digest, use_case.metadata(None))
+                .await,
+        )
+        .await
     }
 
     async fn materialize_files(
         &self,
         files: Vec<NamedDigestWithPermissions>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<()> {
-        if buck2_env!("BUCK2_TEST_FAIL_RE_DOWNLOADS", bool)? {
-            return Err(anyhow::anyhow!("Injected error"));
+    ) -> buck2_error::Result<TLocalCacheStats> {
+        if buck2_env!(
+            "BUCK2_TEST_FAIL_RE_DOWNLOADS",
+            bool,
+            applicability = testing
+        )? {
+            return Err(test_re_error("Injected error", TCode::NOT_FOUND));
         }
 
         let use_case = &use_case;
@@ -1097,53 +1259,103 @@ impl RemoteExecutionClientImpl {
         let futs = chunks(files, self.download_chunk_size).map(|chunk| async move {
             let _permit = self
                 .download_files_semapore
-                .acquire_many(chunk.len().try_into().context("chunk is too large")?)
-                .await
-                .context("Failed to acquire download_files_semapore")?;
-
-            self.client()
-                .get_cas_client()
-                .download(
-                    use_case.metadata(),
-                    DownloadRequest {
-                        file_digests: Some(chunk),
-                        ..Default::default()
-                    },
+                .acquire_many(
+                    chunk
+                        .len()
+                        .try_into()
+                        .buck_error_context("chunk is too large")?,
                 )
-                .await?;
+                .await
+                .buck_error_context("Failed to acquire download_files_semapore")?;
 
-            anyhow::Ok(())
+            let response = with_error_handler(
+                "materialize_files",
+                self.get_session_id(),
+                self.client()
+                    .get_cas_client()
+                    .download(
+                        use_case.metadata(None),
+                        DownloadRequest {
+                            file_digests: Some(chunk),
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            )
+            .await?;
+
+            buck2_error::Ok(response.local_cache_stats)
         });
 
-        futures::future::try_join_all(futs).await?;
+        let stat = buck2_util::future::try_join_all(futs).await?.iter().fold(
+            TLocalCacheStats::default(),
+            |acc, x| TLocalCacheStats {
+                hits_files: acc.hits_files + x.hits_files,
+                hits_bytes: acc.hits_bytes + x.hits_bytes,
+                misses_files: acc.misses_files + x.misses_files,
+                misses_bytes: acc.misses_bytes + x.misses_bytes,
+                ..Default::default()
+            },
+        );
 
-        Ok(())
+        Ok(stat)
     }
 
     async fn get_digest_expirations(
         &self,
         digests: Vec<TDigest>,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<Vec<(TDigest, DateTime<Utc>)>> {
+    ) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
         let now = Utc::now();
 
-        let ttls = self
-            .client()
-            .get_cas_client()
-            .get_digests_ttl(
-                use_case.metadata(),
-                GetDigestsTtlRequest {
-                    digests,
-                    ..Default::default()
-                },
-            )
-            .await?
-            .digests_with_ttl;
+        let ttls = with_error_handler(
+            "get_digest_expirations",
+            self.get_session_id(),
+            self.client()
+                .get_cas_client()
+                .get_digests_ttl(
+                    use_case.metadata(None),
+                    GetDigestsTtlRequest {
+                        digests,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await?
+        .digests_with_ttl;
 
         Ok(ttls
             .into_iter()
             .map(|t| (t.digest, now + chrono::Duration::seconds(t.ttl)))
             .collect())
+    }
+
+    async fn extend_digest_ttl(
+        &self,
+        digests: Vec<TDigest>,
+        ttl: Duration,
+        use_case: RemoteExecutorUseCase,
+    ) -> buck2_error::Result<()> {
+        let use_case = &use_case;
+        // TODO(arr): use batch API from RE when it becomes available
+        with_error_handler(
+            "extend_digest_ttl",
+            self.get_session_id(),
+            self.client()
+                .get_cas_client()
+                .extend_digest_ttl(
+                    use_case.metadata(None),
+                    ExtendDigestsTtlRequest {
+                        digests,
+                        ttl: ttl.as_secs() as i64,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn write_action_result(
@@ -1152,21 +1364,26 @@ impl RemoteExecutionClientImpl {
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
-    ) -> anyhow::Result<WriteActionResultResponse> {
-        self.client()
-            .get_action_cache_client()
-            .write_action_result(
-                RemoteExecutionMetadata {
-                    platform: Some(re_platform(platform)),
-                    ..use_case.metadata()
-                },
-                WriteActionResultRequest {
-                    action_digest: digest.to_re(),
-                    action_result: result,
-                    ..Default::default()
-                },
-            )
-            .await
+    ) -> buck2_error::Result<WriteActionResultResponse> {
+        with_error_handler(
+            "write_action_result",
+            self.get_session_id(),
+            self.client()
+                .get_action_cache_client()
+                .write_action_result(
+                    RemoteExecutionMetadata {
+                        platform: Some(re_platform(platform)),
+                        ..use_case.metadata(None)
+                    },
+                    WriteActionResultRequest {
+                        action_digest: digest.to_re(),
+                        action_result: result,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await
     }
 }
 
@@ -1187,7 +1404,6 @@ impl Drop for RemoteExecutionClientImpl {
     }
 }
 
-#[allow(clippy::needless_collect)] // chunks() is not Send.
 fn chunks<T>(v: Vec<T>, chunk_size: usize) -> impl Iterator<Item = Vec<T>> {
     if !v.is_empty() && v.len() <= chunk_size {
         return Either::Left(std::iter::once(v));

@@ -11,9 +11,8 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use buck2_core::cells::name::CellName;
-
-use crate::legacy_configs::LegacyBuckConfig;
+use crate::legacy_configs::configs::LegacyBuckConfig;
+use crate::legacy_configs::key::BuckconfigKeyRef;
 
 /// Buckconfig trait.
 ///
@@ -21,24 +20,22 @@ use crate::legacy_configs::LegacyBuckConfig;
 /// * simple implementation which is backed by a buckconfig object, used in tests
 /// * DICE-backed implementation which records a dependency on buckconfig property in DICE
 pub trait LegacyBuckConfigView: Debug {
-    fn get(&self, section: &str, key: &str) -> anyhow::Result<Option<Arc<str>>>;
-}
+    fn get(&mut self, key: BuckconfigKeyRef) -> buck2_error::Result<Option<Arc<str>>>;
 
-impl dyn LegacyBuckConfigView + '_ {
-    pub fn parse<T: FromStr>(&self, section: &str, key: &str) -> anyhow::Result<Option<T>>
+    fn parse<T: FromStr>(&mut self, key: BuckconfigKeyRef) -> buck2_error::Result<Option<T>>
     where
-        anyhow::Error: From<<T as FromStr>::Err>,
+        buck2_error::Error: From<<T as FromStr>::Err>,
     {
-        self.get(section, key)?
-            .map(|s| LegacyBuckConfig::parse_impl(section, key, &s))
-            .transpose()
+        LegacyBuckConfig::parse_value(key, self.get(key)?.as_deref())
     }
-}
 
-/// All cell buckconfigs traits.
-pub trait LegacyBuckConfigsView {
-    fn get<'a>(&'a self, cell_name: CellName) -> anyhow::Result<&'a dyn LegacyBuckConfigView>;
-    fn iter<'a>(
-        &'a self,
-    ) -> Box<dyn Iterator<Item = (CellName, &'a dyn LegacyBuckConfigView)> + 'a>;
+    fn parse_list<T: FromStr>(
+        &mut self,
+        key: BuckconfigKeyRef,
+    ) -> buck2_error::Result<Option<Vec<T>>>
+    where
+        buck2_error::Error: From<<T as FromStr>::Err>,
+    {
+        LegacyBuckConfig::parse_list_value(key, self.get(key)?.as_deref())
+    }
 }

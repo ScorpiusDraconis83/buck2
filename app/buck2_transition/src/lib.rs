@@ -10,10 +10,10 @@
 #![feature(error_generic_member_access)]
 #![feature(try_blocks)]
 
-pub(crate) mod coerced_attr;
 pub(crate) mod transition;
 
 pub fn init_late_bindings() {
     transition::calculation_apply_transition::init_transition_calculation();
+    transition::calculation_fetch_transition::init_transition_attr_provider();
     transition::starlark::init_register_transition();
 }

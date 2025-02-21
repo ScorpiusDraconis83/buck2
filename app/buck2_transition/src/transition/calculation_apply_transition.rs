@@ -10,7 +10,10 @@
 use std::sync::Arc;
 
 use allocative::Allocative;
+use anyhow::Context;
 use async_trait::async_trait;
+use buck2_build_api::actions::query::PackageLabelOption;
+use buck2_build_api::actions::query::CONFIGURED_ATTR_TO_VALUE;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::platform_info::PlatformInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
@@ -20,38 +23,39 @@ use buck2_core::configuration::cfg_diff::cfg_diff;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::transition::applied::TransitionApplied;
 use buck2_core::configuration::transition::id::TransitionId;
-use buck2_core::target::label::TargetLabel;
-use buck2_error::Context;
+use buck2_core::provider::label::ProvidersLabel;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_futures::cancellation::CancellationContext;
 use buck2_interpreter::dice::starlark_provider::with_starlark_eval_provider;
-use buck2_interpreter::error::BuckStarlarkError;
+use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
-use buck2_interpreter::starlark_profiler::StarlarkProfilerOrInstrumentation;
-use buck2_node::attrs::coerced_attr::CoercedAttr;
+use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
+use buck2_interpreter::starlark_profiler::profiler::StarlarkProfilerOpt;
+use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
-use buck2_node::attrs::inspect_options::AttrInspectOptions;
-use buck2_node::nodes::unconfigured::TargetNodeRef;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
 use dupe::Dupe;
-use gazebo::prelude::*;
+use dupe::OptionDupedExt;
 use itertools::Itertools;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
-use starlark::values::dict::DictOf;
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::structs::AllocStruct;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::StarlarkResultExt;
 use starlark_map::ordered_map::OrderedMap;
 use starlark_map::sorted_map::SortedMap;
 
-use crate::coerced_attr::CoercedAttrResolveExt;
 use crate::transition::calculation_fetch_transition::FetchTransition;
 use crate::transition::starlark::FrozenTransition;
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Tier0)]
 enum ApplyTransitionError {
     #[error("transition function not marked as `split` must return a `PlatformInfo`")]
     NonSplitTransitionMustReturnPlatformInfo,
@@ -75,7 +79,7 @@ fn call_transition_function<'v>(
     conf: &ConfigurationData,
     refs: Value<'v>,
     attrs: Option<Value<'v>>,
-    eval: &mut Evaluator<'v, '_>,
+    eval: &mut Evaluator<'v, '_, '_>,
 ) -> anyhow::Result<TransitionApplied> {
     let mut args = vec![
         (
@@ -90,30 +94,38 @@ fn call_transition_function<'v>(
     }
     let new_platforms = eval
         .eval_function(transition.implementation.to_value(), &[], &args)
-        .map_err(BuckStarlarkError::new)?;
+        .map_err(buck2_error::Error::from)?;
     if transition.split {
-        match DictOf::<&str, &PlatformInfo>::unpack_value(new_platforms) {
+        match UnpackDictEntries::<&str, &PlatformInfo>::unpack_value(new_platforms)
+            .into_anyhow_result()?
+        {
             Some(dict) => {
                 let mut split = OrderedMap::new();
-                for (k, v) in dict.to_dict() {
+                for (k, v) in dict.entries {
                     let prev = split.insert(k.to_owned(), v.to_configuration()?);
                     assert!(prev.is_none());
                 }
                 Ok(TransitionApplied::Split(SortedMap::from(split)))
             }
-            None => Err(ApplyTransitionError::SplitTransitionMustReturnDict.into()),
+            None => Err(buck2_error::Error::from(
+                ApplyTransitionError::SplitTransitionMustReturnDict,
+            )
+            .into()),
         }
     } else {
-        match <&PlatformInfo>::unpack_value(new_platforms) {
-            Some(platform) => Ok(TransitionApplied::Single(platform.to_configuration()?)),
-            None => Err(ApplyTransitionError::NonSplitTransitionMustReturnPlatformInfo.into()),
+        match <&PlatformInfo>::unpack_value_err(new_platforms) {
+            Ok(platform) => Ok(TransitionApplied::Single(platform.to_configuration()?)),
+            Err(_) => Err(buck2_error::Error::from(
+                ApplyTransitionError::NonSplitTransitionMustReturnPlatformInfo,
+            )
+            .into()),
         }
     }
 }
 
 async fn do_apply_transition(
-    ctx: &DiceComputations,
-    attrs: Option<&[Option<CoercedAttr>]>,
+    ctx: &mut DiceComputations<'_>,
+    attrs: Option<&[Option<Arc<ConfiguredAttr>>]>,
     conf: &ConfigurationData,
     transition_id: &TransitionId,
 ) -> buck2_error::Result<TransitionApplied> {
@@ -122,7 +134,12 @@ async fn do_apply_transition(
     let mut refs = Vec::with_capacity(transition.refs.len());
     let mut refs_refs = Vec::new();
     for (s, t) in &transition.refs {
-        let provider_collection_value = ctx.fetch_transition_function_reference(t).await?;
+        let provider_collection_value = ctx
+            .fetch_transition_function_reference(
+                // TODO(T198210718)
+                &ProvidersLabel::default_for(t.dupe()),
+            )
+            .await?;
         refs.push((
             *s,
             // This is safe because we store a reference to provider collection in `refs_refs`.
@@ -133,13 +150,14 @@ async fn do_apply_transition(
     let print = EventDispatcherPrintHandler(get_dispatcher());
     with_starlark_eval_provider(
         ctx,
-        &mut StarlarkProfilerOrInstrumentation::disabled(),
-        format!("transition:{}", transition_id),
+        &mut StarlarkProfilerOpt::disabled(),
+        &StarlarkEvalKind::Transition(Arc::new(transition_id.clone())),
         move |provider, _| {
-            let mut eval = provider.make(&module)?;
+            let (mut eval, _) = provider.make(&module)?;
             eval.set_print_handler(&print);
+            eval.set_soft_error_handler(&Buck2StarlarkSoftErrorHandler);
             let refs = module.heap().alloc(AllocStruct(refs));
-            let attrs = match (&transition.attrs, attrs) {
+            let attrs = match (&transition.attrs_names_starlark, attrs) {
                 (Some(names), Some(values)) => {
                     if names.len() != values.len() {
                         return Err(
@@ -149,7 +167,12 @@ async fn do_apply_transition(
                     let mut attrs = Vec::with_capacity(names.len());
                     for (name, value) in names.iter().zip(values.iter()) {
                         let value = match value {
-                            Some(value) => value.to_value(module.heap()).with_context(|| {
+                            Some(value) => (CONFIGURED_ATTR_TO_VALUE.get()?)(
+                                &value,
+                                PackageLabelOption::TransitionAttr,
+                                module.heap(),
+                            )
+                            .with_buck_error_context(|| {
                                 format!(
                                     "Error converting attribute `{}={}` to Starlark value",
                                     name.as_str(),
@@ -167,11 +190,14 @@ async fn do_apply_transition(
                     return Err(ApplyTransitionError::InconsistentTransitionAndComputation.into());
                 }
             };
-            match call_transition_function(&transition, conf, refs, attrs, &mut eval)? {
+            match call_transition_function(&transition, conf, refs, attrs, &mut eval)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?
+            {
                 TransitionApplied::Single(new) => {
                     let new_2 =
                         match call_transition_function(&transition, &new, refs, attrs, &mut eval)
-                            .context("applying transition again on transition output")?
+                            .context("applying transition again on transition output")
+                            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?
                         {
                             TransitionApplied::Single(new_2) => new_2,
                             TransitionApplied::Split(_) => {
@@ -205,22 +231,18 @@ async fn do_apply_transition(
 pub(crate) trait ApplyTransition {
     /// Resolve `refs` param of transition function.
     async fn fetch_transition_function_reference(
-        &self,
-        target: &TargetLabel,
+        &mut self,
+        target: &ProvidersLabel,
     ) -> buck2_error::Result<FrozenProviderCollectionValue>;
 }
 
 #[async_trait]
-impl ApplyTransition for DiceComputations {
+impl ApplyTransition for DiceComputations<'_> {
     async fn fetch_transition_function_reference(
-        &self,
-        target: &TargetLabel,
+        &mut self,
+        target: &ProvidersLabel,
     ) -> buck2_error::Result<FrozenProviderCollectionValue> {
-        Ok(self
-            .get_configuration_analysis_result(target)
-            .await?
-            .providers()
-            .dupe())
+        Ok(self.get_configuration_analysis_result(target).await?.dupe())
     }
 }
 
@@ -234,13 +256,13 @@ pub(crate) fn init_transition_calculation() {
 impl TransitionCalculation for TransitionCalculationImpl {
     async fn apply_transition(
         &self,
-        ctx: &DiceComputations,
-        target_node: TargetNodeRef<'_>,
+        ctx: &mut DiceComputations<'_>,
+        configured_attrs: &OrderedMap<&str, Arc<ConfiguredAttr>>,
         cfg: &ConfigurationData,
         transition_id: &TransitionId,
-    ) -> anyhow::Result<Arc<TransitionApplied>> {
+    ) -> buck2_error::Result<Arc<TransitionApplied>> {
         #[derive(Debug, Eq, PartialEq, Hash, Clone, Display, Allocative)]
-        #[display(fmt = "{} ({}){}", transition_id, cfg, "self.fmt_attrs()")]
+        #[display("{} ({}){}", transition_id, cfg, self.fmt_attrs())]
         struct TransitionKey {
             cfg: ConfigurationData,
             transition_id: TransitionId,
@@ -248,7 +270,7 @@ impl TransitionCalculation for TransitionCalculationImpl {
             /// The attr value index is the index of attribute in transition object.
             /// Attributes are added here so multiple targets with the equal attributes
             /// (e.g. the same `java_version = 14`) share the transition computation.
-            attrs: Option<Vec<Option<CoercedAttr>>>,
+            attrs: Option<Vec<Option<Arc<ConfiguredAttr>>>>,
         }
 
         impl TransitionKey {
@@ -287,7 +309,7 @@ impl TransitionCalculation for TransitionCalculationImpl {
                         .await?
                 };
 
-                Ok(Arc::new(v.with_context(|| {
+                Ok(Arc::new(v.with_buck_error_context(|| {
                     format!("Error computing transition `{}`", self)
                 })?))
             }
@@ -304,12 +326,13 @@ impl TransitionCalculation for TransitionCalculationImpl {
         let transition = ctx.fetch_transition(transition_id).await?;
 
         #[allow(clippy::manual_map)]
-        let attrs = if let Some(attrs) = &transition.attrs {
-            Some(attrs.try_map(|attr| {
-                target_node
-                    .attr(attr, AttrInspectOptions::All)
-                    .map(|o| o.cloned())
-            })?)
+        let attrs = if let Some(attrs) = &transition.attrs_names_starlark {
+            Some(
+                attrs
+                    .iter()
+                    .map(|attr| configured_attrs.get(attr.as_str()).duped())
+                    .collect(),
+            )
         } else {
             None
         };
@@ -320,6 +343,6 @@ impl TransitionCalculation for TransitionCalculationImpl {
             attrs,
         };
 
-        ctx.compute(&key).await?.map_err(anyhow::Error::from)
+        ctx.compute(&key).await?.map_err(buck2_error::Error::from)
     }
 }

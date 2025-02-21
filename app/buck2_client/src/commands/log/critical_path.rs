@@ -8,22 +8,30 @@
  */
 
 use std::fmt;
+use std::io::Write;
 use std::time::Duration;
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
+use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
+use buck2_error::conversion::from_any_with_tag;
 use buck2_event_log::stream_value::StreamValue;
 use buck2_event_observer::display;
 use buck2_event_observer::display::TargetDisplayOptions;
+use serde::Serialize;
 use tokio_stream::StreamExt;
 
 use crate::commands::log::options::EventLogOptions;
+use crate::commands::log::transform_format;
+use crate::commands::log::LogCommandOutputFormat;
+use crate::commands::log::LogCommandOutputFormatWithWriter;
 
 /// Show the critical path for a selected build.
 ///
 /// This produces tab-delimited output listing every node on the critical path.
 ///
-/// It includes the kind of node, its name, category and identfier, as well as total duration
+/// It includes the kind of node, its name, category and identifier, as well as total duration
 /// (runtime of this node), user duration (duration the user can improve) and potential improvement
 /// before this node stops being on the critical path.
 ///
@@ -32,13 +40,21 @@ use crate::commands::log::options::EventLogOptions;
 pub struct CriticalPathCommand {
     #[clap(flatten)]
     event_log: EventLogOptions,
+    #[clap(
+        long,
+        help = "Which output format to use for this command",
+        default_value = "tabulated",
+        ignore_case = true,
+        value_enum
+    )]
+    format: LogCommandOutputFormat,
 }
 
 impl CriticalPathCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
-        let Self { event_log } = self;
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
+        let Self { event_log, format } = self;
 
-        ctx.with_runtime(async move |ctx| {
+        ctx.instant_command_no_log("log-critical-path", |ctx| async move {
             let log_path = event_log.get(&ctx).await?;
 
             let (invocation, mut events) = log_path.unpack_stream().await?;
@@ -55,7 +71,7 @@ impl CriticalPathCommand {
                                 Some(buck2_data::instant_event::Data::BuildGraphInfo(
                                     build_graph,
                                 )) => {
-                                    log_critical_path(&build_graph)?;
+                                    log_critical_path(&build_graph, format.clone())?;
                                 }
                                 _ => {}
                             }
@@ -66,125 +82,192 @@ impl CriticalPathCommand {
                 }
             }
 
-            anyhow::Ok(())
-        })?;
-
-        ExitResult::success()
+            buck2_error::Ok(())
+        })
+        .into()
     }
 }
 
-fn log_critical_path(critical_path: &buck2_data::BuildGraphExecutionInfo) -> anyhow::Result<()> {
+#[derive(Default)]
+struct OptionalDuration {
+    inner: Option<Duration>,
+}
+
+impl OptionalDuration {
+    fn new<T, E>(d: Option<T>) -> Result<Self, E>
+    where
+        T: TryInto<Duration, Error = E>,
+    {
+        Ok(Self {
+            inner: d.map(|d| d.try_into()).transpose()?,
+        })
+    }
+}
+
+impl fmt::Display for OptionalDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(inner) = self.inner {
+            write!(f, "{}", inner.as_micros())?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for OptionalDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if let Some(micros) = self.inner.map(|d| d.as_micros()) {
+            serializer.serialize_some(&micros)
+        } else {
+            serializer.serialize_none()
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct CriticalPathEntry<'a> {
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identifier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_kind: Option<&'a str>,
+    total_duration: OptionalDuration,
+    user_duration: OptionalDuration,
+    potential_improvement_duration: OptionalDuration,
+}
+
+fn log_critical_path(
+    critical_path: &buck2_data::BuildGraphExecutionInfo,
+    format: LogCommandOutputFormat,
+) -> buck2_error::Result<()> {
     let target_display_options = TargetDisplayOptions::for_log();
 
-    for entry in &critical_path.critical_path2 {
-        use buck2_data::critical_path_entry2::Entry;
+    buck2_client_ctx::stdio::print_with_writer::<buck2_error::Error, _>(|w| {
+        let mut log_writer = transform_format(format, w);
 
-        let kind;
-        let name;
-        let mut category = "";
-        let mut identifier = "";
+        for entry in &critical_path.critical_path2 {
+            use buck2_data::critical_path_entry2::Entry;
 
-        match &entry.entry {
-            Some(Entry::Analysis(analysis)) => {
-                use buck2_data::critical_path_entry2::analysis::Target;
+            let mut critical_path = CriticalPathEntry::default();
 
-                kind = "analysis";
+            match &entry.entry {
+                Some(Entry::Analysis(analysis)) => {
+                    use buck2_data::critical_path_entry2::analysis::Target;
 
-                name = match &analysis.target {
-                    Some(Target::StandardTarget(t)) => {
-                        display::display_configured_target_label(t, target_display_options)?
-                    }
-                    None => continue,
-                };
-            }
-            Some(Entry::ActionExecution(action_execution)) => {
-                use buck2_data::critical_path_entry2::action_execution::Owner;
+                    critical_path.kind = "analysis";
 
-                kind = "action";
-
-                name = match &action_execution.owner {
-                    Some(Owner::TargetLabel(t)) => {
-                        display::display_configured_target_label(t, target_display_options)?
-                    }
-                    Some(Owner::BxlKey(t)) => display::display_bxl_key(t)?,
-                    Some(Owner::AnonTarget(t)) => display::display_anon_target(t)?,
-                    None => continue,
-                };
-
-                match &action_execution.name {
-                    Some(name) => {
-                        category = &name.category;
-                        identifier = &name.identifier;
-                    }
-                    None => {}
+                    critical_path.name = match &analysis.target {
+                        Some(Target::StandardTarget(t)) => Some(
+                            display::display_configured_target_label(t, target_display_options)?,
+                        ),
+                        None => continue,
+                    };
                 }
-            }
-            Some(Entry::Materialization(materialization)) => {
-                use buck2_data::critical_path_entry2::materialization::Owner;
+                Some(Entry::ActionExecution(action_execution)) => {
+                    use buck2_data::critical_path_entry2::action_execution::Owner;
 
-                kind = "materialization";
+                    critical_path.kind = "action";
 
-                name = match &materialization.owner {
-                    Some(Owner::TargetLabel(t)) => {
-                        display::display_configured_target_label(t, target_display_options)?
+                    critical_path.name = Some(match &action_execution.owner {
+                        Some(Owner::TargetLabel(t)) => {
+                            display::display_configured_target_label(t, target_display_options)?
+                        }
+                        Some(Owner::BxlKey(t)) => display::display_bxl_key(t)?,
+                        Some(Owner::AnonTarget(t)) => display::display_anon_target(t)?,
+                        None => continue,
+                    });
+
+                    match &action_execution.name {
+                        Some(name) => {
+                            critical_path.category = Some(&name.category);
+                            critical_path.identifier = Some(&name.identifier);
+                        }
+                        None => {}
                     }
-                    Some(Owner::BxlKey(t)) => display::display_bxl_key(t)?,
-                    Some(Owner::AnonTarget(t)) => display::display_anon_target(t)?,
-                    None => continue,
-                };
 
-                identifier = &materialization.path;
-            }
-            Some(Entry::ComputeCriticalPath(..)) => {
-                kind = "compute-critical-path";
-                name = "".to_owned();
-            }
-            Some(Entry::Load(load)) => {
-                kind = "load";
-                name = load.package.clone();
-            }
-            Some(Entry::Listing(listing)) => {
-                kind = "listing";
-                name = listing.package.clone();
-            }
-            None => continue,
-        }
+                    critical_path.execution_kind = Some(
+                        buck2_data::ActionExecutionKind::from_i32(action_execution.execution_kind)
+                            .unwrap_or(buck2_data::ActionExecutionKind::NotSet)
+                            .as_str_name(),
+                    );
+                }
+                Some(Entry::FinalMaterialization(materialization)) => {
+                    use buck2_data::critical_path_entry2::final_materialization::Owner;
 
-        struct OptionalDuration {
-            inner: Option<Duration>,
-        }
+                    critical_path.kind = "materialization";
 
-        impl OptionalDuration {
-            fn new<T, E>(d: Option<T>) -> Result<Self, E>
-            where
-                T: TryInto<Duration, Error = E>,
-            {
-                Ok(Self {
-                    inner: d.map(|d| d.try_into()).transpose()?,
-                })
+                    critical_path.name = Some(match &materialization.owner {
+                        Some(Owner::TargetLabel(t)) => {
+                            display::display_configured_target_label(t, target_display_options)?
+                        }
+                        Some(Owner::BxlKey(t)) => display::display_bxl_key(t)?,
+                        Some(Owner::AnonTarget(t)) => display::display_anon_target(t)?,
+                        None => continue,
+                    });
+
+                    critical_path.identifier = Some(&materialization.path);
+                }
+                Some(Entry::ComputeCriticalPath(..)) => {
+                    critical_path.kind = "compute-critical-path";
+                    critical_path.name = None;
+                }
+                Some(Entry::Load(load)) => {
+                    critical_path.kind = "load";
+                    critical_path.name = Some(load.package.clone());
+                }
+                Some(Entry::Listing(listing)) => {
+                    critical_path.kind = "listing";
+                    critical_path.name = Some(listing.package.clone());
+                }
+                Some(Entry::GenericEntry(generic_entry)) => {
+                    critical_path.kind = &generic_entry.kind;
+                    critical_path.name = None;
+                }
+
+                None => continue,
             }
-        }
 
-        impl fmt::Display for OptionalDuration {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                if let Some(inner) = self.inner {
-                    write!(f, "{}", inner.as_micros())?;
+            critical_path.total_duration = OptionalDuration::new(entry.total_duration.clone())?;
+            critical_path.user_duration = OptionalDuration::new(entry.user_duration.clone())?;
+            critical_path.potential_improvement_duration =
+                OptionalDuration::new(entry.potential_improvement_duration.clone())?;
+
+            let res: Result<(), ClientIoError> = {
+                match &mut log_writer {
+                    LogCommandOutputFormatWithWriter::Tabulated(writer) => {
+                        writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            critical_path.kind,
+                            critical_path.name.unwrap_or_default(),
+                            critical_path.category.unwrap_or_default(),
+                            critical_path.identifier.unwrap_or_default(),
+                            critical_path.execution_kind.unwrap_or_default(),
+                            critical_path.total_duration,
+                            critical_path.user_duration,
+                            critical_path.potential_improvement_duration
+                        )?;
+                    }
+                    LogCommandOutputFormatWithWriter::Json(writer) => {
+                        serde_json::to_writer(writer.by_ref(), &critical_path)?;
+                        writer.write_all("\n".as_bytes())?;
+                    }
+                    LogCommandOutputFormatWithWriter::Csv(writer) => {
+                        writer
+                            .serialize(critical_path)
+                            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
+                    }
                 }
                 Ok(())
-            }
+            };
+            res?;
         }
-
-        buck2_client_ctx::println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            kind,
-            name,
-            category,
-            identifier,
-            OptionalDuration::new(entry.total_duration.clone())?,
-            OptionalDuration::new(entry.user_duration.clone())?,
-            OptionalDuration::new(entry.potential_improvement_duration.clone())?,
-        )?;
-    }
-
-    Ok(())
+        Ok(())
+    })
 }

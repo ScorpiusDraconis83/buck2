@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use buck2_cli_proto::ClientContext;
 use buck2_event_observer::dice_state::DiceState;
 use buck2_event_observer::pending_estimate::pending_estimate;
 use buck2_event_observer::span_tracker;
@@ -222,17 +221,17 @@ pub struct ActiveCommand {
 }
 
 impl ActiveCommand {
-    pub fn new(event_dispatcher: &EventDispatcher, client_ctx: &ClientContext) -> Self {
+    pub fn new(event_dispatcher: &EventDispatcher, sanitized_argv: Vec<String>) -> Self {
         let (sender, receiver) = oneshot::channel();
 
-        let state = Arc::new(ActiveCommandState::new(client_ctx.sanitized_argv.clone()));
+        let state = Arc::new(ActiveCommandState::new(sanitized_argv));
 
         let trace_id = event_dispatcher.trace_id().dupe();
         let result = {
             // Scope the guard so it's locked as little as possible
             let mut active_commands = ACTIVE_COMMANDS.lock();
 
-            let existing_active_commands = if active_commands.len() > 1 {
+            let existing_active_commands = if active_commands.len() > 0 {
                 Some(active_commands.clone())
             } else {
                 None
@@ -276,6 +275,10 @@ impl ActiveCommand {
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
+
+    use assert_matches::assert_matches;
+    use buck2_events::source::ChannelEventSource;
+    use buck2_events::Event;
 
     use super::*;
 
@@ -387,6 +390,8 @@ mod tests {
                                     finished: 2,
                                     check_deps_started: 0,
                                     check_deps_finished: 0,
+                                    compute_started: 0,
+                                    compute_finished: 0,
                                 },
                             );
                             map
@@ -405,6 +410,57 @@ mod tests {
                 closed: 1,
                 pending: 2
             }
+        );
+    }
+
+    fn create_dispatcher() -> (EventDispatcher, ChannelEventSource, TraceId) {
+        let (daemon_dispatcher_events, daemon_dispatcher_sink) =
+            buck2_events::create_source_sink_pair();
+        let trace_id = TraceId::new();
+        let dispatcher = EventDispatcher::new(trace_id.dupe(), daemon_dispatcher_sink);
+
+        (dispatcher, daemon_dispatcher_events, trace_id)
+    }
+
+    fn check_concurrent_command_trace_ids_eq(event: Option<Event>, expected_trace_ids: &[String]) {
+        assert_matches!(event, Some(Event::Buck(event)) => {
+            assert_matches!(
+                event.data(),
+                buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConcurrentCommands(
+                        buck2_data::ConcurrentCommands {
+                            trace_ids,
+                        }
+                    ))
+                }) => {
+                    // Use HashSets because  trace ids may not be reported in the same order that we specified.
+                    let trace_ids: HashSet<&String> = trace_ids.iter().collect();
+                    let expected_trace_ids: HashSet<&String> = expected_trace_ids.iter().collect();
+                    assert_eq!(trace_ids, expected_trace_ids);
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn test_multiple_active_commands() {
+        let (dispatcher1, mut source1, id1) = create_dispatcher();
+        let _active1 = ActiveCommand::new(&dispatcher1, Vec::new());
+
+        let (dispatcher2, mut source2, id2) = create_dispatcher();
+        let _active2 = ActiveCommand::new(&dispatcher2, Vec::new());
+
+        check_concurrent_command_trace_ids_eq(source1.try_receive(), &[id2.to_string()]);
+        check_concurrent_command_trace_ids_eq(source2.try_receive(), &[id1.to_string()]);
+
+        let (dispatcher3, mut source3, id3) = create_dispatcher();
+        let _active3 = ActiveCommand::new(&dispatcher3, Vec::new());
+
+        check_concurrent_command_trace_ids_eq(source1.try_receive(), &[id3.to_string()]);
+        check_concurrent_command_trace_ids_eq(source2.try_receive(), &[id3.to_string()]);
+        check_concurrent_command_trace_ids_eq(
+            source3.try_receive(),
+            &[id1.to_string(), id2.to_string()],
         );
     }
 }

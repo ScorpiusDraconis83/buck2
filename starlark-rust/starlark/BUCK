@@ -1,6 +1,5 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "alias", "buck_filegroup")
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -12,7 +11,7 @@ alias(
 buck_filegroup(
     name = "testcases",
     srcs = glob([
-        "src/**/golden/*",
+        "src/**/golden/**",
         "src/**/*.golden",
         "testcases/**",
     ]),
@@ -54,6 +53,7 @@ rust_library(
         "fbsource//third-party/rust:num-traits",
         "fbsource//third-party/rust:once_cell",
         "fbsource//third-party/rust:paste",
+        "fbsource//third-party/rust:ref-cast",
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:rustyline",
         "fbsource//third-party/rust:serde",

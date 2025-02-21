@@ -15,38 +15,60 @@ use buck2_core::cells::unchecked_cell_rel_path::UncheckedCellRelativePath;
 use crate::ignores::ignore_set::IgnoreSet;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 enum FileOpsError {
     #[error("Tried to read ignored dir `{0}` (reason: {1}).")]
     ReadIgnoredDir(String, String),
 }
 
-pub(crate) enum FileIgnoreResult {
+#[derive(Debug, Allocative)]
+pub enum FileIgnoreReason {
+    IgnoredByPattern { path: String, pattern: String },
+    IgnoredByCell { path: String, cell_name: CellName },
+}
+
+impl FileIgnoreReason {
+    pub fn describe(&self) -> String {
+        match self {
+            FileIgnoreReason::IgnoredByPattern { pattern, .. } => {
+                format!("config project.ignore contains `{}`", pattern)
+            }
+            FileIgnoreReason::IgnoredByCell { cell_name, .. } => {
+                format!("path is contained in cell `{}`", cell_name)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Allocative)]
+pub enum FileIgnoreResult {
     Ok,
-    IgnoredByPattern(String, String),
-    IgnoredByCell(String, CellName),
+    Ignored(FileIgnoreReason),
 }
 
 impl FileIgnoreResult {
     /// Converts the FileIgnoreResult to a Result<()> where any ignored case is converted to an Err
     /// with appropriate message. This should be used when it would be an error to interact with an
     /// ignored file.
-    pub(crate) fn into_result(self) -> anyhow::Result<()> {
+    pub fn into_result(self) -> buck2_error::Result<()> {
         match self {
             FileIgnoreResult::Ok => Ok(()),
-            FileIgnoreResult::IgnoredByPattern(path, pattern) => {
-                Err(anyhow::anyhow!(FileOpsError::ReadIgnoredDir(
+            FileIgnoreResult::Ignored(FileIgnoreReason::IgnoredByPattern { path, pattern }) => {
+                Err(FileOpsError::ReadIgnoredDir(
                     path,
-                    format!("file is matched by pattern `{}`", pattern)
-                )))
+                    format!("file is matched by pattern `{}`", pattern),
+                )
+                .into())
             }
-            FileIgnoreResult::IgnoredByCell(path, cell_name) => Err(anyhow::anyhow!(
+            FileIgnoreResult::Ignored(FileIgnoreReason::IgnoredByCell { path, cell_name }) => Err(
                 FileOpsError::ReadIgnoredDir(path, format!("file is part of cell `{}`", cell_name))
-            )),
+                    .into(),
+            ),
         }
     }
 
     /// Returns true if the file is ignored, false otherwise.
-    pub(crate) fn is_ignored(&self) -> bool {
+    pub fn is_ignored(&self) -> bool {
         match self {
             FileIgnoreResult::Ok => false,
             _ => true,
@@ -56,12 +78,12 @@ impl FileIgnoreResult {
 
 /// Ignores files based on configured ignore patterns and cell paths.
 #[derive(PartialEq, Eq, Allocative, Debug)]
-pub struct FileIgnores {
+pub struct CellFileIgnores {
     ignores: IgnoreSet,
     cell_ignores: NestedCells,
 }
 
-impl FileIgnores {
+impl CellFileIgnores {
     /// Creates a new FileIgnores intended for use by the interpreter.
     ///
     /// This will ignore files/dirs in the ignore spec and those in other cells.
@@ -69,8 +91,8 @@ impl FileIgnores {
         ignore_spec: &str,
         nested_cells: NestedCells,
         root_cell: bool,
-    ) -> anyhow::Result<FileIgnores> {
-        Ok(FileIgnores {
+    ) -> buck2_error::Result<CellFileIgnores> {
+        Ok(CellFileIgnores {
             ignores: IgnoreSet::from_ignore_spec(ignore_spec, root_cell)?,
             cell_ignores: nested_cells,
         })
@@ -80,14 +102,17 @@ impl FileIgnores {
         let candidate = globset::Candidate::new(path.as_str());
 
         if let Some(pattern) = self.ignores.matches_candidate(&candidate) {
-            return FileIgnoreResult::IgnoredByPattern(
-                path.as_str().to_owned(),
-                pattern.to_owned(),
-            );
+            return FileIgnoreResult::Ignored(FileIgnoreReason::IgnoredByPattern {
+                path: path.as_str().to_owned(),
+                pattern: pattern.to_owned(),
+            });
         }
 
         if let Some((_, cell_name, _)) = self.cell_ignores.matches(path) {
-            return FileIgnoreResult::IgnoredByCell(path.as_str().to_owned(), cell_name);
+            return FileIgnoreResult::Ignored(FileIgnoreReason::IgnoredByCell {
+                path: path.as_str().to_owned(),
+                cell_name,
+            });
         }
 
         FileIgnoreResult::Ok
@@ -102,10 +127,10 @@ mod tests {
     use buck2_core::cells::unchecked_cell_rel_path::UncheckedCellRelativePath;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
 
-    use crate::ignores::file_ignores::FileIgnores;
+    use crate::ignores::file_ignores::CellFileIgnores;
 
     #[test]
-    fn file_ignores() -> anyhow::Result<()> {
+    fn file_ignores() -> buck2_error::Result<()> {
         let cells = &[
             (
                 CellName::testing_new("root"),
@@ -121,7 +146,7 @@ mod tests {
             ),
         ];
         let nested_cells = NestedCells::from_cell_roots(cells, CellRootPath::testing_new("root"));
-        let ignores = FileIgnores::new_for_interpreter(
+        let ignores = CellFileIgnores::new_for_interpreter(
             "**/*.java , some/dir/**, one/*, \n    recursive, trailing_slash/",
             nested_cells,
             true,

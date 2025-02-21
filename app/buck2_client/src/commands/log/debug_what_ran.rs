@@ -8,12 +8,14 @@
  */
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_core::soft_error;
 
 use crate::commands::log::what_ran::WhatRanCommand;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum DebugWhatRanCommandError {
     #[error("`buck2 debug what-ran` is deprecated. Use `buck2 log what-ran` instead.")]
     Deprecated,
@@ -28,12 +30,13 @@ pub struct DebugWhatRanCommand {
 impl DebugWhatRanCommand {
     pub(crate) fn exec(
         self,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: ClientCommandContext<'_>,
     ) -> ExitResult {
         soft_error!(
             "debug_what_ran",
-            DebugWhatRanCommandError::Deprecated.into()
+            DebugWhatRanCommandError::Deprecated.into(),
+            deprecation: true
         )?;
         self.what_ran.exec(matches, ctx)
     }

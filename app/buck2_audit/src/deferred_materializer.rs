@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,11 +19,15 @@ use crate::AuditSubcommand;
     about = "Access and interact with the deferred materializer"
 )]
 pub struct DeferredMaterializerCommand {
-    #[clap(flatten)]
-    pub common_opts: CommonCommandOptions,
-
     #[clap(subcommand)]
     pub subcommand: DeferredMaterializerSubcommand,
+
+    /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
+    #[clap(flatten)]
+    pub _target_cfg: TargetCfgUnusedOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[derive(Debug, clap::Subcommand, serde::Serialize, serde::Deserialize)]

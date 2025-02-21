@@ -20,7 +20,7 @@ prelude_rule = record(
     further = field([str, None], None),
     attrs = field(dict[str, Attr]),
     impl = field([typing.Callable, None], None),
-    uses_plugins = field([list["PluginKind"], None], None),
+    uses_plugins = field([list[plugins.PluginKind], None], None),
 )
 
 AbiGenerationMode = ["unknown", "class", "source", "migrating_to_source_only", "source_only", "unrecognized"]
@@ -39,19 +39,19 @@ IncludeType = ["local", "system", "raw"]
 
 LinkableDepType = ["static", "static_pic", "shared"]
 
-Linkage = ["any", "static", "shared"]
-
 LogLevel = ["off", "severe", "warning", "info", "config", "fine", "finer", "finest", "all"]
 
 OnDuplicateEntry = ["fail", "overwrite", "append"]
+
+RawHeadersAsHeadersMode = ["enabled", "disabled"]
 
 SourceAbiVerificationMode = ["off", "log", "fail"]
 
 TestType = ["junit", "junit5", "testng"]
 
-Traversal = ["tree", "node", "subfolders"]
-
 UnusedDependenciesAction = ["unknown", "fail", "warn", "ignore", "unrecognized"]
+
+RuntimeDependencyHandling = ["none", "symlink"]
 
 def _name_arg(name_type):
     return {
@@ -129,7 +129,7 @@ def _platform_deps_arg():
 def _labels_arg():
     return {
         "labels": attrs.list(attrs.string(), default = [], doc = """
-    Set of arbitrary strings which allow you to annotate a `build rule`with tags
+    Set of arbitrary strings which allow you to annotate a `build rule` with tags
      that can be searched for over an entire dependency tree using `buck query()`
     .
 """),
@@ -205,8 +205,9 @@ def _exec_os_type_arg() -> Attr:
 
 def _allow_cache_upload_arg():
     return {
-        "allow_cache_upload": attrs.bool(
-            default = False,
+        "allow_cache_upload": attrs.option(
+            attrs.bool(),
+            default = None,
             doc = """
             Whether to allow uploading the output of this rule to be uploaded
             to cache when the action is executed locally if the configuration
@@ -214,6 +215,15 @@ def _allow_cache_upload_arg():
             permission to write to it).
             """,
         ),
+    }
+
+def _inject_test_env_arg():
+    return {
+        # NOTE: We make this a `dep` not an `exec_dep` even though we'll execute
+        # it, because it needs to execute in the same platform as the test itself
+        # (we run tests in the target platform not the exec platform, since the
+        # goal is to test the code that is being built!).
+        "_inject_test_env": attrs.default_only(attrs.dep(default = "prelude//test/tools:inject_test_env")),
     }
 
 buck = struct(
@@ -232,4 +242,5 @@ buck = struct(
     test_rule_timeout_ms = _test_rule_timeout_ms,
     target_os_type_arg = _target_os_type_arg,
     allow_cache_upload_arg = _allow_cache_upload_arg,
+    inject_test_env_arg = _inject_test_env_arg,
 )

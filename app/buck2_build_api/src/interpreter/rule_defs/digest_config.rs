@@ -18,6 +18,7 @@ use starlark::environment::MethodsStatic;
 use starlark::values::starlark_value;
 use starlark::values::AllocValue;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
@@ -36,10 +37,9 @@ use starlark::values::Value;
     Trace,
     ProvidesStaticType,
     NoSerialize,
-    Allocative,
-    StarlarkDocs
+    Allocative
 )]
-#[display(fmt = "{}", "self.digest_config")]
+#[display("{}", self.digest_config)]
 pub struct StarlarkDigestConfig {
     #[freeze(identity)]
     pub digest_config: DigestConfig,
@@ -61,19 +61,19 @@ impl<'v> AllocValue<'v> for StarlarkDigestConfig {
 
 #[starlark_module]
 fn digest_config_methods(builder: &mut MethodsBuilder) {
-    fn allows_sha1(this: &StarlarkDigestConfig) -> anyhow::Result<bool> {
+    fn allows_sha1(this: &StarlarkDigestConfig) -> starlark::Result<bool> {
         Ok(this.digest_config.cas_digest_config().allows_sha1())
     }
 
-    fn allows_sha256(this: &StarlarkDigestConfig) -> anyhow::Result<bool> {
+    fn allows_sha256(this: &StarlarkDigestConfig) -> starlark::Result<bool> {
         Ok(this.digest_config.cas_digest_config().allows_sha256())
     }
 
-    fn allows_blake3(this: &StarlarkDigestConfig) -> anyhow::Result<bool> {
+    fn allows_blake3(this: &StarlarkDigestConfig) -> starlark::Result<bool> {
         Ok(this.digest_config.cas_digest_config().allows_blake3())
     }
 
-    fn allows_blake3_keyed(this: &StarlarkDigestConfig) -> anyhow::Result<bool> {
+    fn allows_blake3_keyed(this: &StarlarkDigestConfig) -> starlark::Result<bool> {
         Ok(this.digest_config.cas_digest_config().allows_blake3_keyed())
     }
 }

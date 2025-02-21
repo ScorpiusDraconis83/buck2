@@ -16,40 +16,32 @@ use buck2_audit::subtargets::AuditSubtargetsCommand;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_cli_proto::ClientContext;
-use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::file_ops::HasFileOps;
-use buck2_common::pattern::resolve::resolve_target_patterns;
-use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::provider::label::ProvidersName;
-use buck2_node::nodes::frontend::TargetGraphCalculation;
-use buck2_node::target_calculation::ConfiguredTargetCalculation;
+use buck2_error::buck2_error;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::global_cfg_options_from_client_context;
-use buck2_server_ctx::pattern::parse_patterns_from_cli_args;
+use buck2_server_ctx::pattern_parse_and_resolve::parse_and_resolve_provider_labels_from_cli_args;
 use buck2_server_ctx::stdout_partial_output::StdoutPartialOutput;
 use buck2_util::indent::indent;
 use dice::DiceTransaction;
-use dupe::Dupe;
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
-use gazebo::prelude::*;
 
-use crate::AuditSubcommand;
+use crate::common::target_resolution_config::audit_command_target_resolution_config;
+use crate::ServerAuditSubcommand;
 
 #[async_trait]
-impl AuditSubcommand for AuditSubtargetsCommand {
+impl ServerAuditSubcommand for AuditSubtargetsCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
-        client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
+        _client_ctx: ClientContext,
+    ) -> buck2_error::Result<()> {
         server_ctx
             .with_dice_ctx(move |server_ctx, ctx| {
-                server_execute_with_dice(self, client_ctx, server_ctx, stdout, ctx)
+                server_execute_with_dice(self, server_ctx, stdout, ctx)
             })
             .await
     }
@@ -57,58 +49,31 @@ impl AuditSubcommand for AuditSubtargetsCommand {
 
 async fn server_execute_with_dice(
     command: &AuditSubtargetsCommand,
-    client_ctx: ClientContext,
     server_ctx: &dyn ServerCommandContextTrait,
     mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
     mut ctx: DiceTransaction,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     // TODO(raulgarcia4): Extract function where possible, shares a lot of code with audit providers.
-    let cells = ctx.get_cell_resolver().await?;
-    let global_cfg_options =
-        global_cfg_options_from_client_context(&client_ctx, server_ctx, &mut ctx).await?;
+    let target_resolution_config =
+        audit_command_target_resolution_config(&mut ctx, &command.target_cfg, server_ctx).await?;
 
-    let parsed_patterns = parse_patterns_from_cli_args::<ProvidersPatternExtra>(
+    let provider_labels = parse_and_resolve_provider_labels_from_cli_args(
         &mut ctx,
-        command
-            .patterns
-            .map(|pat| buck2_data::TargetPattern { value: pat.clone() })
-            .as_slice(),
+        &command.patterns,
         server_ctx.working_dir(),
     )
     .await?;
-    let resolved_pattern =
-        resolve_target_patterns(&cells, &parsed_patterns, &ctx.file_ops()).await?;
 
     let mut futs = FuturesOrdered::new();
-    for (package, spec) in resolved_pattern.specs {
-        let ctx = &ctx;
-        let targets = match spec {
-            buck2_core::pattern::PackageSpec::Targets(targets) => targets,
-            buck2_core::pattern::PackageSpec::All => {
-                let interpreter_results = ctx.get_interpreter_results(package.dupe()).await?;
-                interpreter_results
-                    .targets()
-                    .keys()
-                    .map(|target| {
-                        (
-                            target.to_owned(),
-                            ProvidersPatternExtra {
-                                providers: ProvidersName::Default,
-                            },
-                        )
-                    })
-                    .collect()
-            }
-        };
 
-        for (target_name, providers) in targets {
-            let label = providers.into_providers_label(package.dupe(), target_name.as_ref());
-            let providers_label = ctx
-                .get_configured_provider_label(&label, &global_cfg_options)
-                .await?;
-
+    for label in provider_labels {
+        for providers_label in target_resolution_config
+            .get_configured_provider_label(&mut ctx, &label)
+            .await?
+        {
             // `.push` is deprecated in newer `futures`,
             // but we did not updated vendored `futures` yet.
+            let mut ctx = ctx.clone();
             #[allow(deprecated)]
             futs.push(async move {
                 let result = ctx.get_providers(&providers_label).await;
@@ -131,32 +96,32 @@ async fn server_execute_with_dice(
                     if json_format {
                         fn serialize_nested_subtargets(
                             providers: &FrozenProviderCollection,
-                        ) -> serde_json::Value {
+                        ) -> buck2_error::Result<serde_json::Value> {
                             let mut entries = serde_json::Map::new();
                             for (subtarget, providers) in
-                                providers.default_info().sub_targets().iter()
+                                providers.default_info()?.sub_targets().iter()
                             {
                                 entries.insert(
                                     subtarget.to_string(),
-                                    serialize_nested_subtargets(providers),
+                                    serialize_nested_subtargets(providers)?,
                                 );
                             }
-                            serde_json::Value::Object(entries)
+                            Ok(serde_json::Value::Object(entries))
                         }
                         subtargets_map.insert(
                             target.to_string(),
                             serialize_nested_subtargets(
                                 v.require_compatible()?.provider_collection(),
-                            ),
+                            )?,
                         );
                     } else {
                         fn recursive_iterate(
                             providers: &FrozenProviderCollection,
                             stdout: &mut StdoutPartialOutput,
                             label: &mut Subtarget,
-                        ) -> anyhow::Result<()> {
+                        ) -> buck2_error::Result<()> {
                             for (subtarget, providers) in
-                                providers.default_info().sub_targets().iter()
+                                providers.default_info()?.sub_targets().iter()
                             {
                                 label.push(subtarget.to_string());
                                 writeln!(stdout, "{}", label)?;
@@ -176,7 +141,7 @@ async fn server_execute_with_dice(
                     for sub in v
                         .require_compatible()?
                         .provider_collection()
-                        .default_info()
+                        .default_info()?
                         .sub_targets()
                         .keys()
                     {
@@ -210,7 +175,8 @@ async fn server_execute_with_dice(
     stderr.flush()?;
 
     if at_least_one_evaluation_error {
-        Err(anyhow::anyhow!(
+        Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
             "Evaluation of at least one target provider failed"
         ))
     } else {

@@ -13,11 +13,14 @@ use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::V
 use buck2_build_api::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::unconfigured::TargetNode;
-use buck2_query::query::syntax::simple::eval::set::TargetSet;
+use buck2_query::query::syntax::simple::eval::file_set::FileSet;
 use dupe::Dupe;
 use futures::FutureExt;
+use indexmap::IndexSet;
 use starlark::environment::GlobalsBuilder;
+use starlark::eval::Evaluator;
 use starlark::starlark_module;
+use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
 use starlark::values::tuple::UnpackTuple;
 use starlark::values::Heap;
@@ -28,42 +31,80 @@ use starlark::values::ValueLike;
 use super::artifacts::visit_artifact_path_without_associated_deduped;
 use super::context::output::get_artifact_path_display;
 use super::context::output::get_cmd_line_inputs;
+use super::nodes::unconfigured::StarlarkTargetNode;
 use crate::bxl::starlark_defs::context::BxlContext;
+use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
+use crate::bxl::starlark_defs::file_set::StarlarkFileSet;
+use crate::bxl::starlark_defs::nodes::configured::StarlarkConfiguredTargetNode;
 use crate::bxl::starlark_defs::targetset::StarlarkTargetSet;
 use crate::bxl::starlark_defs::time::StarlarkInstant;
 
 /// Global methods on the target set.
 #[starlark_module]
 pub(crate) fn register_target_function(builder: &mut GlobalsBuilder) {
-    /// Creates an empty target set for configured nodes.
+    /// Creates a target set from a list of configured nodes.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_ctarget_set(ctx):
-    ///     targets = ctarget_set()
+    ///     targets = bxl.ctarget_set([cnode_a, cnode_b])
     ///     ctx.output.print(type(targets))
     ///     ctx.output.print(len(targets))
     /// ```
-    fn ctarget_set() -> anyhow::Result<StarlarkTargetSet<ConfiguredTargetNode>> {
-        Ok(StarlarkTargetSet::from(TargetSet::new()))
+    fn ctarget_set(
+        nodes: Option<UnpackList<StarlarkConfiguredTargetNode>>,
+    ) -> starlark::Result<StarlarkTargetSet<ConfiguredTargetNode>> {
+        Ok(StarlarkTargetSet::from_iter(
+            nodes
+                .unwrap_or(UnpackList::default())
+                .items
+                .into_iter()
+                .map(|node| node.0),
+        ))
     }
 
-    /// Creates an empty target set for unconfigured nodes.
+    /// Creates a target set from a list of unconfigured nodes.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_utarget_set(ctx):
-    ///     targets = utarget_set()
+    ///     targets = bxl.utarget_set([unode_a, unode_b])
     ///     ctx.output.print(type(targets))
     ///     ctx.output.print(len(targets))
     /// ```
-    fn utarget_set() -> anyhow::Result<StarlarkTargetSet<TargetNode>> {
-        Ok(StarlarkTargetSet::from(TargetSet::new()))
+    fn utarget_set(
+        nodes: Option<UnpackList<StarlarkTargetNode>>,
+    ) -> starlark::Result<StarlarkTargetSet<TargetNode>> {
+        Ok(StarlarkTargetSet::from_iter(
+            nodes
+                .unwrap_or(UnpackList::default())
+                .items
+                .into_iter()
+                .map(|node| node.0),
+        ))
+    }
+}
+
+/// Global methods on the file set.
+#[starlark_module]
+pub(crate) fn register_file_set_function(builder: &mut GlobalsBuilder) {
+    /// Creates an empty file set for configured nodes.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_file_set(ctx):
+    ///     files = file_set()
+    ///     ctx.output.print(type(files))
+    ///     ctx.output.print(len(files))
+    /// ```
+    fn file_set() -> starlark::Result<StarlarkFileSet> {
+        Ok(StarlarkFileSet(FileSet::new(IndexSet::new())))
     }
 }
 
 #[derive(Debug, buck2_error::Error, Clone)]
 #[error("Promise artifacts are not supported in `get_path_without_materialization()`")]
+#[buck2(tag = Input)]
 pub(crate) struct PromiseArtifactsNotSupported;
 
 /// Global methods on artifacts.
@@ -79,7 +120,7 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
     /// further actions, then it’s safe.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_get_path_without_materialization(ctx):
     ///     owner = ctx.cquery().owner("cell//path/to/file")[0]
     ///     artifact = owner.get_source("cell//path/to/file", ctx)
@@ -91,24 +132,24 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
         #[starlark(require=pos)] ctx: &'v BxlContext<'v>,
         #[starlark(require = named, default = false)] abs: bool,
         heap: &'v Heap,
-    ) -> anyhow::Result<StringValue<'v>> {
+    ) -> starlark::Result<StringValue<'v>> {
         let path = match this {
             ValueAsArtifactLikeUnpack::Artifact(a) => {
                 let artifact = a.artifact();
                 get_artifact_path_display(
                     artifact.get_path(),
                     abs,
-                    &ctx.data.project_fs,
-                    &ctx.data.artifact_fs,
+                    ctx.project_fs(),
+                    ctx.artifact_fs(),
                 )?
             }
             ValueAsArtifactLikeUnpack::DeclaredArtifact(a) => get_artifact_path_display(
                 a.get_artifact_path(),
                 abs,
-                &ctx.data.project_fs,
-                &ctx.data.artifact_fs,
+                ctx.project_fs(),
+                ctx.artifact_fs(),
             )?,
-            _ => return Err(PromiseArtifactsNotSupported.into()),
+            _ => return Err(buck2_error::Error::from(PromiseArtifactsNotSupported).into()),
         };
 
         Ok(heap.alloc_str(&path))
@@ -125,7 +166,7 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
     /// further actions, then it’s safe.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_get_paths_without_materialization(ctx):
     ///     node = ctx.configured_targets("root//bin:the_binary")
     ///     providers = ctx.analysis(node).providers()
@@ -137,7 +178,7 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
         #[starlark(require=pos)] ctx: &'v BxlContext<'v>,
         #[starlark(require = named, default = false)] abs: bool,
         heap: &'v Heap,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> starlark::Result<Value<'v>> {
         let inputs = get_cmd_line_inputs(cmd_line.0)?;
         let mut result = Vec::new();
 
@@ -147,7 +188,7 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
 
         let mut paths = Vec::new();
 
-        ctx.via_dice(|mut dice_ctx, bxl_ctx| {
+        ctx.via_dice(|dice_ctx, bxl_ctx| {
             dice_ctx.via(|dice_ctx| {
                 visit_artifact_path_without_associated_deduped(
                     &result,
@@ -156,8 +197,8 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
                         let path = get_artifact_path_display(
                             artifact_path,
                             abs,
-                            &bxl_ctx.project_fs,
-                            &bxl_ctx.artifact_fs,
+                            bxl_ctx.project_fs(),
+                            bxl_ctx.artifact_fs(),
                         )?;
 
                         paths.push(path);
@@ -178,7 +219,7 @@ pub(crate) fn register_instant_function(builder: &mut GlobalsBuilder) {
     /// Creates an Instant at the current time.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_elapsed_millis(ctx):
     ///     instant = now()
     ///     time_a = instant.elapsed_millis()
@@ -188,9 +229,10 @@ pub(crate) fn register_instant_function(builder: &mut GlobalsBuilder) {
     ///     ctx.output.print(time_a)
     ///     ctx.output.print(time_b)
     /// ```
-    fn now() -> anyhow::Result<StarlarkInstant> {
-        // TODO(nga): this function is callable from interpreter/analysis context,
-        //   where it can cause non-determinism.
+    ///
+    /// This function is only accessible through Bxl.
+    fn now(eval: &mut Evaluator) -> starlark::Result<StarlarkInstant> {
+        BxlEvalExtra::from_context(eval)?;
         Ok(StarlarkInstant(Instant::now()))
     }
 }
@@ -200,7 +242,10 @@ pub(crate) fn register_instant_function(builder: &mut GlobalsBuilder) {
 /// then we hide the stacktrace. Otherwise, we emit the stacktrace to users.
 #[derive(Debug, buck2_error::Error, Clone)]
 #[error("fail:{0}")]
+#[buck2(tag = Tier0)]
 pub(crate) struct BxlErrorWithoutStacktrace(String);
+
+impl std::error::Error for BxlErrorWithoutStacktrace {}
 
 /// Global method for error handling.
 #[starlark_module]

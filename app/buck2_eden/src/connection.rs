@@ -17,23 +17,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use buck2_core;
 use buck2_core::fs::fs_util;
-use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::paths::abs_path::AbsPath;
+use buck2_core::fs::paths::abs_path::AbsPathBuf;
+use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::soft_error;
+use buck2_error::buck2_error;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use dupe::Dupe;
-use edenfs::client::EdenService;
-use edenfs::errors::eden_service::ListMountsError;
-use edenfs::types::BinaryHash;
-use edenfs::types::EdenErrorType;
-use edenfs::types::FileAttributeData;
-use edenfs::types::FileAttributeDataOrErrorV2;
-use edenfs::types::FileAttributeDataV2;
-use edenfs::types::MountState;
-use edenfs::types::PathString;
-use edenfs::types::SourceControlType;
-use fb303_core::client::BaseService;
+use edenfs::MountState;
+use edenfs_clients::EdenService;
+use fb303_core_clients::BaseService;
 use fbinit::FacebookInit;
 use futures::future::BoxFuture;
 use futures::future::Future;
@@ -41,8 +39,14 @@ use futures::future::FutureExt;
 use futures::future::Shared;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use sorted_vector_map::SortedVectorMap;
 use tokio::sync::Semaphore;
+
+use crate::error::ConnectAndRequestError;
+use crate::error::ErrorHandlingStrategy;
+use crate::error::HasErrorHandlingStrategy;
+use crate::error::IsMountReadyError;
+use crate::error::MountNeverBecameReady;
+use crate::semaphore;
 
 #[derive(Allocative)]
 pub struct EdenConnectionManager {
@@ -50,11 +54,13 @@ pub struct EdenConnectionManager {
     connection: Mutex<EdenConnection>,
     /// Eden has limits on concurrency and will return server overloaded (or timeout) errors if we
     /// send too many. Experimentally, even for large builds (see details in D36136516), we don't
-    /// much performance improvement beyond 2K concurrent requests, regardless of whether Eden has
-    /// a fast or slow connectin to source control, a warm cache or not, and a lot of CPU available
-    /// to run or not.
+    /// get much performance improvement beyond 2K concurrent requests, regardless of whether Eden
+    /// has a fast or slow connection to source control, a warm cache or not, and a lot of CPU
+    /// available to run or not.
     #[allocative(skip)]
     semaphore: Semaphore,
+    /// The project root, relative to the eden mount point
+    project_root: ForwardRelativePathBuf,
 }
 
 #[derive(Deserialize, Debug)]
@@ -69,63 +75,98 @@ struct EdenConfig {
     config: Config,
 }
 
+#[derive(Allocative)]
+struct EdenMountPoint(AbsPathBuf);
+
 impl EdenConnectionManager {
     pub fn new(
         fb: FacebookInit,
-        root: &AbsNormPath,
-        semaphore: Semaphore,
-    ) -> anyhow::Result<Option<Self>> {
-        let eden_root = root.as_abs_path().join(".eden");
-        if !eden_root.exists() {
+        project_root: &ProjectRoot,
+        semaphore: Option<Semaphore>,
+    ) -> buck2_error::Result<Option<Self>> {
+        let dot_eden_dir = project_root.root().as_abs_path().join(".eden");
+        if !dot_eden_dir.exists() {
             return Ok(None);
         }
-        let connector = Self::get_eden_connector(fb, &eden_root)?;
+        let connector = Self::get_eden_connector(fb, &dot_eden_dir)?;
+
+        let canon_project_root = fs_util::canonicalize(project_root.root())?;
+        let canon_eden_mount = fs_util::canonicalize(&connector.mount.0)?;
+
+        let rel_project_root = canon_project_root
+            .strip_prefix(&canon_eden_mount)
+            .with_buck_error_context(|| {
+                format!(
+                    "Eden root {} was not a prefix of the project root {}",
+                    canon_eden_mount, canon_project_root
+                )
+            })?;
 
         let connection = Mutex::new(EdenConnection {
             epoch: 0,
             client: connector.connect(),
         });
 
+        let semaphore = semaphore.unwrap_or(semaphore::default());
+
         Ok(Some(Self {
             connector,
             connection,
             semaphore,
+            project_root: rel_project_root.into_owned(),
         }))
     }
 
-    fn get_eden_connector(fb: FacebookInit, eden_root: &AbsPath) -> anyhow::Result<EdenConnector> {
+    fn get_eden_connector(
+        fb: FacebookInit,
+        dot_eden_dir: &AbsPath,
+    ) -> buck2_error::Result<EdenConnector> {
         // Based off of how watchman picks up the config: fbcode/watchman/watcher/eden.cpp:138
         if cfg!(windows) {
-            let config_path = eden_root.join("config");
+            let config_path = dot_eden_dir.join("config");
             let config_contents = fs_util::read_to_string(config_path)?;
-            let config: EdenConfig = toml::from_str(&config_contents)?;
-            let root = Arc::new(config.config.root);
-            let socket = PathBuf::from(config.config.socket);
-            Ok(EdenConnector { fb, root, socket })
+            let config: EdenConfig = toml::from_str(&config_contents)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
+            let mount = Arc::new(EdenMountPoint(AbsPathBuf::new(config.config.root)?));
+            let socket = AbsPathBuf::new(PathBuf::from(config.config.socket))?;
+            Ok(EdenConnector { fb, mount, socket })
         } else {
-            let root = fs_util::read_link(eden_root.join("root"))?
-                .to_str()
-                .context("Eden root is not UTF-8")?
-                .to_owned();
-            let root = Arc::new(root);
-            let socket = fs_util::read_link(eden_root.join("socket"))?;
-            Ok(EdenConnector { fb, root, socket })
+            let mount = fs_util::read_link(dot_eden_dir.join("root"))?;
+            let mount = Arc::new(EdenMountPoint(AbsPathBuf::new(mount)?));
+            let socket = AbsPathBuf::new(fs_util::read_link(dot_eden_dir.join("socket"))?)?;
+            Ok(EdenConnector { fb, mount, socket })
         }
     }
 
-    pub fn get_root(&self) -> &str {
-        &self.connector.root
+    pub fn get_mount_point(&self) -> Vec<u8> {
+        self.connector
+            .mount
+            .0
+            .as_path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec()
     }
 
-    pub fn get_mount_point(&self) -> Vec<u8> {
-        self.connector.root.as_bytes().to_vec()
+    /// Converts project relative paths to values that are suitable for passing to Eden requests
+    pub fn project_paths_as_eden_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a ProjectRelativePath>,
+    ) -> Vec<Vec<u8>> {
+        paths
+            .into_iter()
+            .map(|p| self.project_root.join(p).to_string().into_bytes())
+            .collect()
     }
 
     /// Returns a string like "20220102-030405", assuming this is a release version. This is
     /// pattern-matched off of what the Eden CLI does.
-    pub async fn get_eden_version(&self) -> anyhow::Result<Option<String>> {
+    pub async fn get_eden_version(&self) -> buck2_error::Result<Option<String>> {
         let fb303 = self.connector.connect_fb303()?;
-        let values = fb303.getRegexExportedValues("^build_.*").await?;
+        let values = fb303
+            .getRegexExportedValues("^build_.*")
+            .await
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
 
         fn join_version(values: &BTreeMap<String, String>) -> Option<String> {
             let version = values.get("build_package_version")?;
@@ -149,6 +190,7 @@ impl EdenConnectionManager {
 
         let mut connection = (*self.connection.lock()).clone();
         let mut attempts = 0;
+        let mut retries = 0;
 
         let _permit = self
             .semaphore
@@ -173,7 +215,18 @@ impl EdenConnectionManager {
             .await;
 
             let err = match res {
-                Ok(res) => break Ok(res),
+                Ok(res) => {
+                    // Attempts may be > 1 if we had to reconnect. We only want to log a soft error
+                    // on retry. Solely for logging purposes, don't panic if value wasn't "thrown"
+                    if retries > 0 {
+                        soft_error!(
+                            "eden_io_succeeded_after_retry",
+                            buck2_error!(buck2_error::ErrorTag::Input, "Eden IO retried {} times", retries),
+                            quiet: true
+                        ).ok();
+                    }
+                    break Ok(res);
+                }
                 Err(e) => e,
             };
 
@@ -191,6 +244,7 @@ impl EdenConnectionManager {
                 }
                 ErrorHandlingStrategy::Retry => {
                     // Our request failed but needs retrying.
+                    retries += 1;
                     tracing::info!("Retrying Eden request after: {:#}", err);
                 }
                 ErrorHandlingStrategy::Abort => {
@@ -212,7 +266,7 @@ type EdenClientFuture =
 /// An Eden client and an epoch to keep track of reconnections.
 #[derive(Clone, Allocative)]
 struct EdenConnection {
-    /// This stats at zero and increments every time we reconnect. We use this to keep track of
+    /// This starts at zero and increments every time we reconnect. We use this to keep track of
     /// whether another client already recycled the connection when we need to reconnect.
     epoch: usize,
     #[allocative(skip)]
@@ -224,36 +278,41 @@ struct EdenConnection {
 struct EdenConnector {
     #[allocative(skip)]
     fb: FacebookInit,
-    root: Arc<String>,
-    socket: PathBuf,
+    mount: Arc<EdenMountPoint>,
+    socket: AbsPathBuf,
+}
+
+fn thrift_builder(
+    fb: FacebookInit,
+    socket: &AbsPathBuf,
+) -> buck2_error::Result<::thriftclient::ThriftChannelBuilder> {
+    // NOTE: This timeout is absurdly high, but bear in mind that what we're
+    // "comparing" to is a FS call that has no timeouts at all.
+    const THRIFT_TIMEOUT_MS: u32 = 120_000;
+
+    Ok(
+        ::thriftclient::ThriftChannelBuilder::from_path(fb, socket.as_path())
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?
+            .with_conn_timeout(THRIFT_TIMEOUT_MS)
+            .with_recv_timeout(THRIFT_TIMEOUT_MS)
+            .with_secure(false),
+    )
 }
 
 impl EdenConnector {
     fn connect(&self) -> EdenClientFuture {
         let socket = self.socket.clone();
         let fb = self.fb;
-        let root = self.root.dupe();
+        let mount = self.mount.dupe();
 
         tokio::task::spawn(async move {
             tracing::info!("Creating a new Eden connection via `{}`", socket.display());
-            let eden: anyhow::Result<Arc<dyn EdenService + Send + Sync>>;
+            let eden: Arc<dyn EdenService + Send + Sync> = thrift_builder(fb, &socket)?
+                .build_client(::edenfs_clients::make_EdenService)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                .buck_error_context("Error constructing Eden client")?;
 
-            #[cfg(fbcode_build)]
-            {
-                eden = fbcode::thrift_builder(fb, socket)?
-                    .build_client(::edenfs::client::make_EdenService);
-            }
-
-            #[cfg(not(fbcode_build))]
-            {
-                let _ignored = fb;
-                let _ignored = socket;
-                eden = Err(anyhow::anyhow!("Eden I/O is not available in Cargo builds"))
-            }
-
-            let eden = eden.context("Error constructing Eden client")?;
-
-            wait_until_mount_is_ready(eden.as_ref(), &root).await?;
+            wait_until_mount_is_ready(eden.as_ref(), &mount).await?;
 
             Ok(eden)
         })
@@ -265,35 +324,24 @@ impl EdenConnector {
         .shared()
     }
 
-    #[cfg(fbcode_build)]
-    fn connect_fb303(&self) -> anyhow::Result<Arc<dyn BaseService + Send + Sync>> {
-        fbcode::thrift_builder(self.fb, &self.socket)?
-            .build_client(::fb303_core::client::make_BaseService)
+    fn connect_fb303(&self) -> buck2_error::Result<Arc<dyn BaseService + Send + Sync>> {
+        thrift_builder(self.fb, &self.socket)?
+            .build_client(::fb303_core_clients::make_BaseService)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
     }
-
-    #[cfg(not(fbcode_build))]
-    fn connect_fb303(&self) -> anyhow::Result<Arc<dyn BaseService + Send + Sync>> {
-        Err(anyhow::anyhow!("Eden I/O is not available in Cargo builds"))
-    }
-}
-
-#[derive(buck2_error::Error, Debug)]
-#[error("Mount never became ready: `{}`", self.mount)]
-struct MountNeverBecameReady {
-    mount: Arc<String>,
 }
 
 /// Delay until a mount becomes ready (up to 10 seconds).
 async fn wait_until_mount_is_ready(
     eden: &(dyn EdenService + Send + Sync),
-    root: &Arc<String>,
-) -> anyhow::Result<()> {
+    mount: &EdenMountPoint,
+) -> buck2_error::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     for _ in 0..10 {
         interval.tick().await;
-        match is_mount_ready(eden, root).await {
+        match is_mount_ready(eden, mount).await {
             Ok(true) => return Ok(()),
             Ok(false) => {
                 // Fallthrough to keep going
@@ -305,194 +353,29 @@ async fn wait_until_mount_is_ready(
         }
     }
 
-    Err(MountNeverBecameReady { mount: root.dupe() }.into())
-}
-
-#[derive(buck2_error::Error, Debug)]
-pub enum IsMountReadyError {
-    #[error("Mount does not exist in Eden: `{}`", .mount)]
-    MountDoesNotExist { mount: Arc<String> },
-    #[error(transparent)]
-    RequestError(ListMountsError),
+    Err(MountNeverBecameReady {
+        mount: mount.0.clone(),
+    }
+    .into())
 }
 
 /// Check if a given mount is ready.
 async fn is_mount_ready(
     eden: &(dyn EdenService + Send + Sync),
-    root: &Arc<String>,
+    mount: &EdenMountPoint,
 ) -> Result<bool, IsMountReadyError> {
     let mounts = eden
         .listMounts()
         .await
         .map_err(IsMountReadyError::RequestError)?;
 
-    for mount in mounts {
-        if mount.mountPoint == root.as_bytes() {
-            return Ok(mount.state == MountState::RUNNING);
+    for candidate in mounts {
+        if candidate.mountPoint == mount.0.as_path().as_os_str().as_encoded_bytes() {
+            return Ok(candidate.state == MountState::RUNNING);
         }
     }
 
-    Err(IsMountReadyError::MountDoesNotExist { mount: root.dupe() })
-}
-
-#[derive(buck2_error::Error, Debug)]
-pub enum ConnectAndRequestError<E> {
-    #[error(transparent)]
-    ConnectionError(anyhow::Error),
-
-    #[error(transparent)]
-    RequestError(E),
-}
-
-#[derive(Copy, Clone, Dupe, PartialEq, Eq)]
-pub enum ErrorHandlingStrategy {
-    Reconnect,
-    Retry,
-    Abort,
-}
-
-pub trait HasErrorHandlingStrategy {
-    fn error_handling_strategy(&self) -> ErrorHandlingStrategy;
-}
-
-impl<E: HasErrorHandlingStrategy> HasErrorHandlingStrategy for ConnectAndRequestError<E> {
-    fn error_handling_strategy(&self) -> ErrorHandlingStrategy {
-        match self {
-            Self::ConnectionError(..) => ErrorHandlingStrategy::Reconnect,
-            Self::RequestError(e) => e.error_handling_strategy(),
-        }
-    }
-}
-
-impl HasErrorHandlingStrategy for IsMountReadyError {
-    fn error_handling_strategy(&self) -> ErrorHandlingStrategy {
-        match self {
-            Self::MountDoesNotExist { .. } => ErrorHandlingStrategy::Abort,
-            Self::RequestError(e) => e.error_handling_strategy(),
-        }
-    }
-}
-
-macro_rules! impl_has_error_handling_strategy {
-    ($err: ident) => {
-        impl HasErrorHandlingStrategy for ::edenfs::errors::eden_service::$err {
-            fn error_handling_strategy(&self) -> ErrorHandlingStrategy {
-                match self {
-                    Self::ThriftError(..) => ErrorHandlingStrategy::Reconnect,
-                    Self::ApplicationException(..) => ErrorHandlingStrategy::Retry,
-                    Self::ex(..) => ErrorHandlingStrategy::Abort,
-                }
-            }
-        }
-    };
-}
-
-impl_has_error_handling_strategy!(GetAttributesFromFilesError);
-impl_has_error_handling_strategy!(GetAttributesFromFilesV2Error);
-impl_has_error_handling_strategy!(GlobFilesError);
-impl_has_error_handling_strategy!(ListMountsError);
-impl_has_error_handling_strategy!(SynchronizeWorkingCopyError);
-impl_has_error_handling_strategy!(SetPathObjectIdError);
-impl_has_error_handling_strategy!(RemoveRecursivelyError);
-impl_has_error_handling_strategy!(EnsureMaterializedError);
-impl_has_error_handling_strategy!(ReaddirError);
-impl_has_error_handling_strategy!(GetSHA1Error);
-
-#[derive(Debug, buck2_error::Error)]
-pub enum EdenError {
-    #[error("Eden POSIX error (code = {}): {}", .code, .error.message)]
-    PosixError {
-        error: edenfs::types::EdenError,
-        code: i32,
-    },
-
-    #[error("Eden service error: {}", .error.message)]
-    ServiceError { error: edenfs::types::EdenError },
-
-    #[error("Eden returned an unexpected field: {}", .field)]
-    UnknownField { field: i32 },
-}
-
-impl From<edenfs::types::EdenError> for EdenError {
-    fn from(error: edenfs::types::EdenError) -> Self {
-        if error.errorType == EdenErrorType::POSIX_ERROR {
-            if let Some(error_code) = error.errorCode {
-                return Self::PosixError {
-                    error,
-                    code: error_code,
-                };
-            }
-        }
-
-        Self::ServiceError { error }
-    }
-}
-
-pub trait EdenDataIntoResult {
-    type Data;
-
-    fn into_result(self) -> Result<Self::Data, EdenError>;
-}
-
-macro_rules! impl_eden_data_into_result {
-    ($typ: ident, $data: ty, $ok_variant: ident) => {
-        impl EdenDataIntoResult for ::edenfs::types::$typ {
-            type Data = $data;
-
-            fn into_result(self) -> Result<Self::Data, EdenError> {
-                match self {
-                    Self::$ok_variant(data) => Ok(data),
-                    Self::error(e) => Err(e.into()),
-                    Self::UnknownField(field) => Err(EdenError::UnknownField { field }),
-                }
-            }
-        }
-    };
-}
-
-impl_eden_data_into_result!(
-    SourceControlTypeOrError,
-    SourceControlType,
-    sourceControlType
-);
-
-impl_eden_data_into_result!(FileAttributeDataOrError, FileAttributeData, data);
-
-impl_eden_data_into_result!(
-    FileAttributeDataOrErrorV2,
-    FileAttributeDataV2,
-    fileAttributeData
-);
-
-impl_eden_data_into_result!(SizeOrError, i64, size);
-
-impl_eden_data_into_result!(Sha1OrError, BinaryHash, sha1);
-
-impl_eden_data_into_result!(Blake3OrError, BinaryHash, blake3);
-
-impl_eden_data_into_result!(
-    DirListAttributeDataOrError,
-    SortedVectorMap<PathString, FileAttributeDataOrErrorV2>,
-    dirListAttributeData
-);
-
-#[cfg(fbcode_build)]
-mod fbcode {
-    use std::path::Path;
-
-    use super::*;
-
-    pub fn thrift_builder<P: AsRef<Path>>(
-        fb: FacebookInit,
-        socket: P,
-    ) -> anyhow::Result<::thriftclient::ThriftChannelBuilder> {
-        // NOTE: This timeout is absurdly high, but bear in mind that what we're
-        // "comparing" to is a FS call that has no timeouts at all.
-        const THRIFT_TIMEOUT_MS: u32 = 120_000;
-
-        Ok(::thriftclient::ThriftChannelBuilder::from_path(fb, socket)?
-            .with_conn_timeout(THRIFT_TIMEOUT_MS)
-            .with_recv_timeout(THRIFT_TIMEOUT_MS)
-            .with_secure(false))
-    }
+    Err(IsMountReadyError::MountDoesNotExist {
+        mount: mount.0.clone(),
+    })
 }

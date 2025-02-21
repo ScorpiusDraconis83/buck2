@@ -12,24 +12,29 @@
 use std::str::FromStr;
 
 use allocative::Allocative;
-use buck2_common::legacy_configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+use buck2_core::rollout_percentage::RolloutPercentage;
 
 static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
 
 /// We put functions here that both things need to implement for code that isn't gated behind a
 /// fbcode_build or not(fbcode_build)
 pub trait RemoteExecutionStaticMetadataImpl: Sized {
-    fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> anyhow::Result<Self>;
+    fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self>;
     fn cas_semaphore_size(&self) -> usize;
 }
 
 #[allow(unused)]
 mod fbcode {
+    use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+
     use super::*;
 
     /// Metadata that doesn't change between executions
     #[derive(Clone, Debug, Default, Allocative)]
     pub struct RemoteExecutionStaticMetadata {
+        // gRPC settings
         pub cas_address: Option<String>,
         pub cas_connection_count: i32,
         pub cas_shared_cache: Option<String>,
@@ -40,7 +45,7 @@ mod fbcode {
         pub action_cache_connection_count: i32,
         pub engine_address: Option<String>,
         pub engine_connection_count: i32,
-
+        // End gRPC settings
         pub verbose_logging: bool,
 
         pub use_manifold_rich_client: bool,
@@ -64,83 +69,192 @@ mod fbcode {
 
         // ttl management
         pub minimal_blob_ttl_seconds: Option<i64>,
+        // When less than (X*100)% of TTL remains, refresh data in the store
+        pub remaining_ttl_fraction_refresh_threshold: Option<f32>,
+        // Adds a randomness to when refresh the TTL
+        pub remaining_ttl_random_extra_threshold: Option<f32>,
+
         pub disable_fallocate: bool,
+        pub respect_file_symlinks: bool,
+
+        // Thrift settings
+        pub execute_over_thrift: bool,
+        pub execution_concurrency_limit: i32,
+        pub engine_tier: Option<String>,
+        pub engine_host: Option<String>,
+        pub engine_port: Option<i32>,
+        // End Thrift settings
     }
 
     impl RemoteExecutionStaticMetadataImpl for RemoteExecutionStaticMetadata {
-        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> anyhow::Result<Self> {
+        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
             Ok(Self {
-                cas_address: legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_address")?,
+                cas_address: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_address",
+                })?,
                 cas_connection_count: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_connection_count")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "cas_connection_count",
+                    })?
                     .unwrap_or(16),
-                cas_shared_cache: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_shared_cache")?,
-                cas_shared_cache_mode: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_shared_cache_mode")?,
-                cas_shared_cache_port: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_shared_cache_port")?,
-                cas_shared_cache_tls: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_shared_cache_tls")?,
-                action_cache_address: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "action_cache_address")?,
+                cas_shared_cache: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache",
+                })?,
+                cas_shared_cache_mode: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache_mode",
+                })?,
+                cas_shared_cache_port: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache_port",
+                })?,
+                cas_shared_cache_tls: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_shared_cache_tls",
+                })?,
+                action_cache_address: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "action_cache_address",
+                })?,
                 action_cache_connection_count: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "action_cache_connection_count")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "action_cache_connection_count",
+                    })?
                     .unwrap_or(4),
-                engine_address: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "engine_address")?,
+                engine_address: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "engine_address",
+                })?,
                 engine_connection_count: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "engine_connection_count")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "engine_connection_count",
+                    })?
                     .unwrap_or(4),
                 verbose_logging: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "verbose_logging")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "verbose_logging",
+                    })?
                     .unwrap_or(false),
                 cas_thread_count: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_thread_count")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "cas_thread_count",
+                    })?
                     .unwrap_or(4),
                 cas_thread_count_ratio: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_thread_count_ratio")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "cas_thread_count_ratio",
+                    })?
                     .unwrap_or(0.0),
                 use_manifold_rich_client: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "use_manifold_rich_client_new")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "use_manifold_rich_client_new",
+                    })?
                     .unwrap_or(true),
                 use_zippy_rich_client: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "use_zippy_rich_client")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "use_zippy_rich_client",
+                    })?
                     .unwrap_or(false),
                 use_p2p: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "use_p2p")?
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "use_p2p",
+                    })?
                     .unwrap_or(false),
-                rich_client_channels_per_blob: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "rich_client_channels_per_blob")?,
-                rich_client_attempt_timeout_ms: legacy_config.parse(
-                    BUCK2_RE_CLIENT_CFG_SECTION,
-                    "rich_client_attempt_timeout_ms",
-                )?,
-                rich_client_retries_count: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "rich_client_retries_count")?,
-                force_enable_deduplicate_find_missing: legacy_config.parse(
-                    BUCK2_RE_CLIENT_CFG_SECTION,
-                    "force_enable_deduplicate_find_missing",
-                )?,
-                features_config_path: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "features_config_path")?,
-                curl_reactor_max_number_of_retries: legacy_config.parse(
-                    BUCK2_RE_CLIENT_CFG_SECTION,
-                    "curl_reactor_max_number_of_retries",
-                )?,
-                curl_reactor_connection_timeout_ms: legacy_config.parse(
-                    BUCK2_RE_CLIENT_CFG_SECTION,
-                    "curl_reactor_connection_timeout_ms",
-                )?,
-                curl_reactor_request_timeout_ms: legacy_config.parse(
-                    BUCK2_RE_CLIENT_CFG_SECTION,
-                    "curl_reactor_request_timeout_ms",
-                )?,
-                minimal_blob_ttl_seconds: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "minimal_blob_ttl_seconds")?,
+                rich_client_channels_per_blob: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "rich_client_channels_per_blob",
+                })?,
+                rich_client_attempt_timeout_ms: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "rich_client_attempt_timeout_ms",
+                })?,
+                rich_client_retries_count: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "rich_client_retries_count",
+                })?,
+                force_enable_deduplicate_find_missing: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "force_enable_deduplicate_find_missing",
+                })?,
+                features_config_path: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "features_config_path",
+                })?,
+                curl_reactor_max_number_of_retries: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "curl_reactor_max_number_of_retries",
+                })?,
+                curl_reactor_connection_timeout_ms: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "curl_reactor_connection_timeout_ms",
+                })?,
+                curl_reactor_request_timeout_ms: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "curl_reactor_request_timeout_ms",
+                })?,
+                minimal_blob_ttl_seconds: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "minimal_blob_ttl_seconds",
+                })?,
                 disable_fallocate: legacy_config
-                    .parse(BUCK2_RE_CLIENT_CFG_SECTION, "disable_fallocate")?
-                    .unwrap_or(false),
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "disable_fallocate",
+                    })?
+                    .unwrap_or(RolloutPercentage::never())
+                    .roll(),
+                remaining_ttl_fraction_refresh_threshold: legacy_config.parse(
+                    BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "remaining_ttl_fraction_refresh_threshold",
+                    },
+                )?,
+                remaining_ttl_random_extra_threshold: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "remaining_ttl_random_extra_threshold",
+                })?,
+                respect_file_symlinks: legacy_config
+                    .parse::<RolloutPercentage>(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "respect_file_symlinks",
+                    })?
+                    .unwrap_or(RolloutPercentage::never())
+                    .roll(),
+                execute_over_thrift: legacy_config
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "execute_over_thrift",
+                    })?
+                    .unwrap_or(true),
+                execution_concurrency_limit: legacy_config
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "execution_concurrency_limit",
+                    })?
+                    .unwrap_or(4000),
+                engine_tier: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "engine_tier",
+                })?,
+                engine_host: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "engine_host",
+                })?,
+                engine_port: legacy_config.parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "engine_port",
+                })?,
             })
         }
 
@@ -159,7 +273,7 @@ mod not_fbcode {
     pub struct RemoteExecutionStaticMetadata(pub Buck2OssReConfiguration);
 
     impl RemoteExecutionStaticMetadataImpl for RemoteExecutionStaticMetadata {
-        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> anyhow::Result<Self> {
+        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
             Ok(Self(Buck2OssReConfiguration::from_legacy_config(
                 legacy_config,
             )?))
@@ -206,6 +320,14 @@ pub struct Buck2OssReConfiguration {
     pub capabilities: Option<bool>,
     /// The instance name to use in requests.
     pub instance_name: Option<String>,
+    /// Use the Meta version of the request metadata
+    pub use_fbcode_metadata: bool,
+    /// The max size for a GRPC message to be decoded.
+    pub max_decoding_message_size: Option<usize>,
+    /// The max cumulative blob size for `Read` and `BatchReadBlobs` methods.
+    pub max_total_batch_size: Option<usize>,
+    /// Maximum number of concurrent upload requests for each action.
+    pub max_concurrent_uploads_per_action: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -215,17 +337,18 @@ pub struct HttpHeader {
 }
 
 impl FromStr for HttpHeader {
-    type Err = anyhow::Error;
+    type Err = buck2_error::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut iter = s.split(':');
-        match (iter.next(), iter.next(), iter.next()) {
-            (Some(key), Some(value), None) => Ok(Self {
+        let mut iter = s.splitn(2, ':');
+        match (iter.next(), iter.next()) {
+            (Some(key), Some(value)) => Ok(Self {
                 key: key.trim().to_owned(),
                 value: value.trim().to_owned(),
             }),
-            _ => Err(anyhow::anyhow!(
-                "Invalid header (expect exactly one `:`): `{}`",
+            _ => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Invalid header (expect name and value separated by `:`): `{}`",
                 s
             )),
         }
@@ -233,32 +356,79 @@ impl FromStr for HttpHeader {
 }
 
 impl Buck2OssReConfiguration {
-    pub fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> anyhow::Result<Self> {
+    pub fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
         // this is used for all three services by default, if given; if one of
         // them has an explicit address given as well though, use that instead
-        let default_address: Option<String> =
-            legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "address")?;
+        let default_address: Option<String> = legacy_config.parse(BuckconfigKeyRef {
+            section: BUCK2_RE_CLIENT_CFG_SECTION,
+            property: "address",
+        })?;
 
         Ok(Self {
             cas_address: legacy_config
-                .parse(BUCK2_RE_CLIENT_CFG_SECTION, "cas_address")?
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "cas_address",
+                })?
                 .or(default_address.clone()),
             engine_address: legacy_config
-                .parse(BUCK2_RE_CLIENT_CFG_SECTION, "engine_address")?
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "engine_address",
+                })?
                 .or(default_address.clone()),
             action_cache_address: legacy_config
-                .parse(BUCK2_RE_CLIENT_CFG_SECTION, "action_cache_address")?
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "action_cache_address",
+                })?
                 .or(default_address),
             tls: legacy_config
-                .parse(BUCK2_RE_CLIENT_CFG_SECTION, "tls")?
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "tls",
+                })?
                 .unwrap_or(true),
-            tls_ca_certs: legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "tls_ca_certs")?,
-            tls_client_cert: legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "tls_client_cert")?,
+            tls_ca_certs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "tls_ca_certs",
+            })?,
+            tls_client_cert: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "tls_client_cert",
+            })?,
             http_headers: legacy_config
-                .parse_list(BUCK2_RE_CLIENT_CFG_SECTION, "http_headers")?
+                .parse_list(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "http_headers",
+                })?
                 .unwrap_or_default(), // Empty list is as good None.
-            capabilities: legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "capabilities")?,
-            instance_name: legacy_config.parse(BUCK2_RE_CLIENT_CFG_SECTION, "instance_name")?,
+            capabilities: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "capabilities",
+            })?,
+            instance_name: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "instance_name",
+            })?,
+            use_fbcode_metadata: legacy_config
+                .parse(BuckconfigKeyRef {
+                    section: BUCK2_RE_CLIENT_CFG_SECTION,
+                    property: "use_fbcode_metadata",
+                })?
+                .unwrap_or(true),
+            max_decoding_message_size: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "max_decoding_message_size",
+            })?,
+            max_total_batch_size: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "max_total_batch_size",
+            })?,
+            max_concurrent_uploads_per_action: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "max_concurrent_uploads_per_action",
+            })?,
         })
     }
 }

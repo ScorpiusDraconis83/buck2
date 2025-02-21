@@ -25,6 +25,7 @@ use buck2_node::nodes::eval_result::EvaluationResult;
 use buck2_node::nodes::targets_map::TargetsMap;
 use buck2_node::nodes::targets_map::TargetsMapRecordError;
 use buck2_node::nodes::unconfigured::TargetNode;
+use buck2_node::oncall::Oncall;
 use buck2_node::package::Package;
 use buck2_node::super_package::SuperPackage;
 use dupe::Dupe;
@@ -46,14 +47,17 @@ impl From<ModuleInternals> for EvaluationResult {
         } = internals;
         let recorder = match state.into_inner() {
             State::BeforeTargets(_) => TargetsRecorder::new(),
-            State::Targets(RecordingTargets { recorder, .. }) => recorder,
+            State::RecordingTargets(RecordingTargets { recorder, .. }) => recorder,
         };
         EvaluationResult::new(buildfile_path, imports, super_package, recorder.take())
     }
 }
 
-#[derive(Debug)]
-struct Oncall(Arc<String>);
+#[derive(Debug, Default)]
+struct BeforeTargets {
+    oncall: Option<Oncall>,
+    has_read_oncall: bool,
+}
 
 #[derive(Debug)]
 struct RecordingTargets {
@@ -64,9 +68,9 @@ struct RecordingTargets {
 #[derive(Debug)]
 enum State {
     /// No targets recorded yet, `oncall` call is allowed unless it was already called.
-    BeforeTargets(Option<Oncall>),
+    BeforeTargets(BeforeTargets),
     /// First target seen.
-    Targets(RecordingTargets),
+    RecordingTargets(RecordingTargets),
 }
 
 /// ModuleInternals contains the module/package-specific information for
@@ -109,11 +113,14 @@ impl PackageImplicits {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum OncallErrors {
     #[error("Called `oncall` after one or more targets were declared, `oncall` must be first.")]
     OncallAfterTargets,
     #[error("Called `oncall` more than once in the file.")]
     DuplicateOncall,
+    #[error("Called `oncall` after calling `read_oncall`, `oncall` must be first.")]
+    AfterReadOncall,
 }
 
 impl ModuleInternals {
@@ -130,7 +137,7 @@ impl ModuleInternals {
         Self {
             attr_coercion_context,
             buildfile_path,
-            state: RefCell::new(State::BeforeTargets(None)),
+            state: RefCell::new(State::BeforeTargets(BeforeTargets::default())),
             imports,
             package_implicits,
             record_target_call_stacks,
@@ -144,7 +151,7 @@ impl ModuleInternals {
         &self.attr_coercion_context
     }
 
-    pub fn record(&self, target_node: TargetNode) -> anyhow::Result<()> {
+    pub fn record(&self, target_node: TargetNode) -> buck2_error::Result<()> {
         match self.recording_targets().recorder.record(target_node) {
             Ok(()) => Ok(()),
             Err(e @ TargetsMapRecordError::RegisteredTargetTwice { .. }) => {
@@ -158,15 +165,17 @@ impl ModuleInternals {
         }
     }
 
-    pub(crate) fn set_oncall(&self, name: &str) -> anyhow::Result<()> {
+    pub(crate) fn set_oncall(&self, name: &str) -> buck2_error::Result<()> {
         match &mut *self.state.borrow_mut() {
-            State::BeforeTargets(Some(_)) => Err(OncallErrors::DuplicateOncall.into()),
-            State::BeforeTargets(oncall) => {
-                assert!(oncall.is_none());
-                *oncall = Some(Oncall(Arc::new(name.to_owned())));
-                Ok(())
-            }
-            State::Targets(..) => {
+            State::BeforeTargets(x) => match x.oncall {
+                _ if x.has_read_oncall => Err(OncallErrors::AfterReadOncall.into()),
+                Some(_) => Err(OncallErrors::DuplicateOncall.into()),
+                None => {
+                    x.oncall = Some(Oncall::new(name));
+                    Ok(())
+                }
+            },
+            State::RecordingTargets(..) => {
                 // We require oncall to be first both so users can find it,
                 // and so we can propagate it to all targets more easily.
                 Err(OncallErrors::OncallAfterTargets.into())
@@ -174,13 +183,23 @@ impl ModuleInternals {
         }
     }
 
+    pub(crate) fn get_oncall(&self) -> Option<Oncall> {
+        match &mut *self.state.borrow_mut() {
+            State::BeforeTargets(x) => {
+                x.has_read_oncall = true;
+                x.oncall.dupe()
+            }
+            State::RecordingTargets(t) => t.package.oncall.dupe(),
+        }
+    }
+
     fn recording_targets(&self) -> RefMut<RecordingTargets> {
         RefMut::map(self.state.borrow_mut(), |state| {
             loop {
                 match state {
-                    State::BeforeTargets(oncall) => {
-                        let oncall = mem::take(oncall).map(|Oncall(name)| name);
-                        *state = State::Targets(RecordingTargets {
+                    State::BeforeTargets(BeforeTargets { oncall, .. }) => {
+                        let oncall = mem::take(oncall);
+                        *state = State::RecordingTargets(RecordingTargets {
                             package: Arc::new(Package {
                                 buildfile_path: self.buildfile_path.dupe(),
                                 oncall,
@@ -189,7 +208,7 @@ impl ModuleInternals {
                         });
                         continue;
                     }
-                    State::Targets(r) => return r,
+                    State::RecordingTargets(r) => return r,
                 }
             }
         })
@@ -225,6 +244,11 @@ impl ModuleInternals {
         spec: &'a GlobSpec,
     ) -> impl Iterator<Item = &'a PackageRelativePath> {
         spec.resolve_glob(self.package_listing.files())
+    }
+
+    pub(crate) fn sub_packages(&self) -> impl Iterator<Item = &PackageRelativePath> {
+        self.package_listing
+            .subpackages_within(PackageRelativePath::empty())
     }
 }
 

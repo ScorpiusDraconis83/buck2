@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use starlark::codemap::CodeMap;
 use starlark::docs::DocItem;
+use starlark::docs::DocMember;
 use starlark::docs::DocParam;
 use starlark_syntax::codemap::ResolvedPos;
 use starlark_syntax::syntax::ast::AssignP;
@@ -46,7 +47,8 @@ pub(crate) struct Symbol {
     pub(crate) detail: Option<String>,
     pub(crate) kind: SymbolKind,
     pub(crate) doc: Option<DocItem>,
-    pub(crate) param: Option<DocParam>,
+    /// Name with `*` prefixes, the param.
+    pub(crate) param: Option<(String, DocParam)>,
 }
 
 /// Walk the AST recursively and discover symbols.
@@ -101,14 +103,14 @@ pub(crate) fn find_symbols_at_location<P: AstPayload>(
             }
             StmtP::Def(def) => {
                 // Peek into the function definition to find the docstring.
-                let doc = get_doc_item_for_def(def);
+                let doc = get_doc_item_for_def(def, codemap);
                 symbols
                     .entry(def.name.ident.clone())
                     .or_insert_with(|| Symbol {
                         name: def.name.ident.clone(),
                         kind: SymbolKind::Method,
                         detail: None,
-                        doc: doc.clone().map(DocItem::Function),
+                        doc: doc.clone().map(|x| DocItem::Member(DocMember::Function(x))),
                         param: None,
                     });
 
@@ -118,20 +120,19 @@ pub(crate) fn find_symbols_at_location<P: AstPayload>(
                     .contains(cursor_position)
                 {
                     symbols.extend(def.params.iter().filter_map(|param| match &param.node {
-                        ParameterP::Normal(p, _) | ParameterP::WithDefaultValue(p, _, _) => {
-                            Some((
-                                p.ident.clone(),
-                                Symbol {
-                                    name: p.ident.clone(),
-                                    kind: SymbolKind::Variable,
-                                    detail: None,
-                                    doc: None,
-                                    param: doc.as_ref().and_then(|doc| {
-                                        doc.find_param_with_name(&p.ident).cloned()
-                                    }),
-                                },
-                            ))
-                        }
+                        ParameterP::Normal(p, ..) => Some((
+                            p.ident.clone(),
+                            Symbol {
+                                name: p.ident.clone(),
+                                kind: SymbolKind::Variable,
+                                detail: None,
+                                doc: None,
+                                param: doc.as_ref().and_then(|doc| {
+                                    doc.find_param_with_name(&p.ident)
+                                        .map(|(name, doc)| (name, doc.clone()))
+                                }),
+                            },
+                        )),
                         _ => None,
                     }));
                     walk(codemap, &def.body, cursor_position, symbols);

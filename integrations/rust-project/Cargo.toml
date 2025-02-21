@@ -11,9 +11,17 @@ version = "0.0.0"
 anyhow = { workspace = true }
 clap = { workspace = true }
 crossbeam = { workspace = true }
+dunce = { workspace = true }
+elf = "0.7.0"
 lsp-server = { workspace = true }
 lsp-types = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-core = "0.1.32"
 tracing-subscriber = { workspace = true }
+whoami = "1.4.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

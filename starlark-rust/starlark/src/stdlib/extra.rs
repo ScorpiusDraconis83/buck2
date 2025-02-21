@@ -28,6 +28,7 @@ use crate::values::none::NoneOr;
 use crate::values::none::NoneType;
 use crate::values::tuple::UnpackTuple;
 use crate::values::typing::iter::StarlarkIter;
+use crate::values::StringValue;
 use crate::values::Value;
 use crate::values::ValueOfUnchecked;
 
@@ -46,7 +47,7 @@ pub fn filter(builder: &mut GlobalsBuilder) {
     fn filter<'v>(
         #[starlark(require = pos)] func: NoneOr<ValueOfUnchecked<'v, StarlarkFunction>>,
         #[starlark(require = pos)] seq: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Vec<Value<'v>>> {
         let mut res = Vec::new();
 
@@ -81,7 +82,7 @@ pub fn map(builder: &mut GlobalsBuilder) {
     fn map<'v>(
         #[starlark(require = pos)] func: ValueOfUnchecked<'v, StarlarkFunction>,
         #[starlark(require = pos)] seq: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Vec<Value<'v>>> {
         let it = seq.get().iterate(eval.heap())?;
         let mut res = Vec::with_capacity(it.size_hint().0);
@@ -117,13 +118,13 @@ impl fmt::Display for PrintWrapper<'_, '_> {
 /// Invoked from `print` or `pprint` to print a value.
 pub trait PrintHandler {
     /// If this function returns error, evaluation fails with this error.
-    fn println(&self, text: &str) -> anyhow::Result<()>;
+    fn println(&self, text: &str) -> crate::Result<()>;
 }
 
 pub(crate) struct StderrPrintHandler;
 
 impl PrintHandler for StderrPrintHandler {
-    fn println(&self, text: &str) -> anyhow::Result<()> {
+    fn println(&self, text: &str) -> crate::Result<()> {
         eprintln!("{}", text);
         Ok(())
     }
@@ -135,7 +136,7 @@ pub fn print(builder: &mut GlobalsBuilder) {
     fn print(
         #[starlark(args)] args: UnpackTuple<Value>,
         eval: &mut Evaluator,
-    ) -> anyhow::Result<NoneType> {
+    ) -> starlark::Result<NoneType> {
         // In practice most users should want to put the print somewhere else, but this does for now
         // Unfortunately, we can't use PrintWrapper because strings to_str() and Display are different.
         eval.print_handler
@@ -149,11 +150,50 @@ pub fn pprint(builder: &mut GlobalsBuilder) {
     fn pprint(
         #[starlark(args)] args: UnpackTuple<Value>,
         eval: &mut Evaluator,
-    ) -> anyhow::Result<NoneType> {
+    ) -> starlark::Result<NoneType> {
         // In practice most users may want to put the print somewhere else, but this does for now
         eval.print_handler
             .println(&format!("{:#}", PrintWrapper(&args.items)))?;
         Ok(NoneType)
+    }
+}
+
+fn pretty_repr<'v>(
+    a: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> anyhow::Result<StringValue<'v>> {
+    use std::fmt::Write;
+
+    let mut s = eval.string_pool.alloc();
+    write!(s, "{:#}", a).unwrap();
+    let r = eval.heap().alloc_str(&s);
+    eval.string_pool.release(s);
+    Ok(r)
+}
+
+#[starlark_module]
+pub fn pstr(builder: &mut GlobalsBuilder) {
+    /// Like `str`, but produces more verbose pretty-printed output
+    fn pstr<'v>(
+        #[starlark(require = pos)] a: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StringValue<'v>> {
+        if let Some(a) = StringValue::new(a) {
+            return Ok(a);
+        }
+
+        pretty_repr(a, eval)
+    }
+}
+
+#[starlark_module]
+pub fn prepr(builder: &mut GlobalsBuilder) {
+    /// Like `repr`, but produces more verbose pretty-printed output
+    fn prepr<'v>(
+        #[starlark(require = pos)] a: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<StringValue<'v>> {
+        pretty_repr(a, eval)
     }
 }
 
@@ -228,7 +268,7 @@ assert_eq(["11",8], map(double, ["1",4]))
             s: Rc<RefCell<String>>,
         }
         impl PrintHandler for PrintHandlerImpl {
-            fn println(&self, s: &str) -> anyhow::Result<()> {
+            fn println(&self, s: &str) -> crate::Result<()> {
                 *self.s.borrow_mut() = s.to_owned();
                 Ok(())
             }
@@ -238,5 +278,35 @@ assert_eq(["11",8], map(double, ["1",4]))
         a.set_print_handler(&print_handler);
         a.pass("print('hw')");
         assert_eq!("hw", s_copy.borrow().as_str());
+    }
+
+    #[test]
+    fn test_pstr() {
+        assert::pass(
+            r#"
+assert_eq(pstr([]), "[]")
+assert_eq(pstr([1,2,[]]), """[
+  1,
+  2,
+  []
+]""")
+assert_eq(pstr("abcd"), "abcd")
+"#,
+        );
+    }
+
+    #[test]
+    fn test_prepr() {
+        assert::pass(
+            r#"
+assert_eq(prepr([]), "[]")
+assert_eq(prepr([1,2,[]]), """[
+  1,
+  2,
+  []
+]""")
+assert_eq(prepr("abcd"), "\"abcd\"")
+"#,
+        );
     }
 }

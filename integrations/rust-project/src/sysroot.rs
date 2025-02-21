@@ -15,13 +15,13 @@ use std::process::Stdio;
 use anyhow::Context;
 use tracing::instrument;
 
-use crate::buck::relative_to;
 use crate::buck::truncate_line_ending;
 use crate::buck::utf8_output;
 use crate::buck::Buck;
 use crate::json_project::Sysroot;
 
-pub enum SysrootConfig {
+#[derive(Debug)]
+pub(crate) enum SysrootConfig {
     Sysroot(PathBuf),
     BuckConfig,
     Rustup,
@@ -36,80 +36,44 @@ pub enum SysrootConfig {
 /// `sysroot_src` is the directory that contains the source to std crates:
 /// <https://rust-analyzer.github.io/manual.html#non-cargo-based-projects>
 #[instrument(ret)]
-pub fn resolve_buckconfig_sysroot(
+pub(crate) fn resolve_buckconfig_sysroot(
+    buck: &Buck,
     project_root: &Path,
-    relative_paths: bool,
 ) -> Result<Sysroot, anyhow::Error> {
-    let buck = Buck::default();
+    let sysroot_src = project_root.join(buck.resolve_sysroot_src()?);
+    let sysroot: PathBuf = {
+        // TODO(diliopoulos): remove hardcoded path to toolchain sysroot and replace with something
+        // derived from buck, e.g.
+        //
+        // $ buck cquery -u fbcode//buck2/integrations/rust-project:rust-project -a compiler fbcode//buck2/platform/toolchain:rust_bootstrap
+        // ...
+        //     "compiler": "fbcode//tools/build/buck/wrappers:rust-platform010-clang-17-nosan-compiler (fbcode//buck2/platform/execution:linux-x86_64#54c5d1cbad5316cb)"
+        // $ buck cquery -u fbcode//buck2/integrations/rust-project:rust-project -a exe fbcode//tools/build/buck/wrappers:rust-platform010-clang-17-nosan-compiler
+        // ...
+        //     "exe": "fbcode//third-party-buck/platform010/build/rust/llvm-fb-17:bin/rustc (fbcode//buck2/platform/execution:linux-x86_64#54c5d1cbad5316cb)",
+        let fbsource_rustc = project_root.join("xplat/rust/toolchain/current/basic/bin/rustc");
+        let mut sysroot_cmd = Command::new(fbsource_rustc);
+        sysroot_cmd
+            .arg("--print=sysroot")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let sysroot_child = sysroot_cmd.spawn()?;
 
-    if cfg!(target_os = "linux") {
-        let base: PathBuf = if relative_paths {
-            PathBuf::from("")
-        } else {
-            project_root.into()
-        };
-
-        let sysroot_src = buck.resolve_sysroot_src()?;
-        let sysroot_src = if relative_paths {
-            sysroot_src
-        } else {
-            project_root.join(sysroot_src)
-        };
-
-        // TODO(diliopoulos): remove hardcoded path to toolchain sysroot and replace with:
-        // buck2 run fbcode//third-party-buck/platform010/build/rust:bin/rustc -- --print sysroot
-        let sysroot = Sysroot {
-            sysroot: base.join("fbcode/third-party-buck/platform010/build/rust/llvm-fb-15"),
-            sysroot_src: Some(sysroot_src),
-        };
-
-        return Ok(sysroot);
-    }
-    // Spawn both `rustc` and `buck audit config` in parallel without blocking.
-    let fbsource_rustc = project_root.join("xplat/rust/toolchain/current/basic/bin/rustc");
-    let mut sysroot_cmd = if cfg!(target_os = "macos") {
-        // On Apple silicon, buck builds at Meta run under Rosetta.
-        // So we force an x86-64 sysroot to avoid mixing architectures.
-        let mut cmd = Command::new("arch");
-        cmd.arg("-x86_64").arg(fbsource_rustc);
-        cmd
-    } else {
-        Command::new(fbsource_rustc)
-    };
-    sysroot_cmd
-        .arg("--print=sysroot")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let sysroot_child = sysroot_cmd.spawn()?;
-
-    let sysroot_src = buck.resolve_sysroot_src()?;
-    let sysroot_src = if relative_paths {
-        sysroot_src
-    } else {
-        project_root.join(sysroot_src)
+        let mut sysroot = utf8_output(sysroot_child.wait_with_output(), &sysroot_cmd)
+            .context("error asking rustc for sysroot")?;
+        truncate_line_ending(&mut sysroot);
+        sysroot.into()
     };
 
-    // Now block while we wait for both processes.
-    let mut sysroot = utf8_output(sysroot_child.wait_with_output(), &sysroot_cmd)
-        .context("error asking rustc for sysroot")?;
-    truncate_line_ending(&mut sysroot);
-
-    let mut sysroot: PathBuf = sysroot.into();
-    if relative_paths {
-        sysroot = relative_to(&sysroot, project_root);
-    }
-
-    let sysroot = Sysroot {
+    Ok(Sysroot {
         sysroot,
         sysroot_src: Some(sysroot_src),
-    };
-
-    Ok(sysroot)
+    })
 }
 
 #[instrument(ret)]
-pub fn resolve_rustup_sysroot() -> Result<Sysroot, anyhow::Error> {
+pub(crate) fn resolve_rustup_sysroot() -> Result<Sysroot, anyhow::Error> {
     let mut cmd = Command::new("rustc");
     cmd.arg("--print=sysroot")
         .stdin(Stdio::null())
@@ -119,10 +83,16 @@ pub fn resolve_rustup_sysroot() -> Result<Sysroot, anyhow::Error> {
     let mut output = utf8_output(cmd.output(), &cmd)?;
     truncate_line_ending(&mut output);
     let sysroot = PathBuf::from(output);
+    let sysroot_src = sysroot
+        .join("lib")
+        .join("rustlib")
+        .join("src")
+        .join("rust")
+        .join("library");
 
     let sysroot = Sysroot {
         sysroot,
-        sysroot_src: None,
+        sysroot_src: Some(sysroot_src),
     };
     Ok(sysroot)
 }

@@ -14,23 +14,26 @@ use std::hash::Hasher;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_build_api::bxl::types::BxlFunctionLabel;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
-use buck2_core::base_deferred_key::BaseDeferredKeyDyn;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyDyn;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_core::provider::label::ConfiguredProvidersLabel;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::action_key_owner::BaseDeferredKeyProto;
 use buck2_data::ToProtoMessage;
+use buck2_error::BuckErrorContext;
+use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use cmp_any::PartialEqAny;
 use dupe::Dupe;
 use starlark_map::ordered_map::OrderedMap;
 
 use crate::bxl::starlark_defs::cli_args::CliArgValue;
+use crate::bxl::starlark_defs::context::actions::BxlExecutionResolution;
 
 #[derive(
     Clone,
@@ -69,26 +72,31 @@ impl BxlKey {
         &self.0.bxl_args
     }
 
-    pub(crate) fn into_base_deferred_key_dyn_impl(
+    fn into_base_deferred_key_dyn_impl(
         self,
-        execution_platform_resolution: ExecutionPlatformResolution,
-        exec_deps: Vec<ConfiguredProvidersLabel>,
-        toolchains: Vec<ConfiguredProvidersLabel>,
+        execution_resolution: BxlExecutionResolution,
     ) -> Arc<dyn BaseDeferredKeyDyn> {
         Arc::new(BxlDynamicKeyData {
             key: self.0,
-            execution_platform_resolution,
-            exec_deps,
-            toolchains,
+            execution_resolution,
         })
     }
 
+    pub(crate) fn into_base_deferred_key(
+        self,
+        execution_resolution: BxlExecutionResolution,
+    ) -> BaseDeferredKey {
+        BaseDeferredKey::BxlLabel(BaseDeferredKeyBxl(
+            self.into_base_deferred_key_dyn_impl(execution_resolution),
+        ))
+    }
+
     pub(crate) fn from_base_deferred_key_dyn_impl_err(
-        key: Arc<dyn BaseDeferredKeyDyn>,
-    ) -> anyhow::Result<Self> {
+        key: BaseDeferredKeyBxl,
+    ) -> buck2_error::Result<Self> {
         BxlDynamicKey::from_base_deferred_key_dyn_impl(key)
             .map(|k| BxlKey(k.0.key.dupe()))
-            .context("Not BxlKey (internal error)")
+            .internal_error("Not BxlKey")
     }
 
     pub(crate) fn global_cfg_options(&self) -> &GlobalCfgOptions {
@@ -97,6 +105,10 @@ impl BxlKey {
 
     pub(crate) fn force_print_stacktrace(&self) -> bool {
         self.0.force_print_stacktrace
+    }
+
+    pub(crate) fn as_starlark_eval_kind(&self) -> StarlarkEvalKind {
+        StarlarkEvalKind::Bxl(self.0.dupe())
     }
 }
 
@@ -111,7 +123,7 @@ impl BxlKey {
     PartialOrd,
     Allocative
 )]
-#[display(fmt = "{}", "spec")]
+#[display("{}", spec)]
 struct BxlKeyData {
     spec: BxlFunctionLabel,
     bxl_args: Arc<OrderedMap<String, CliArgValue>>,
@@ -136,12 +148,10 @@ impl BxlKeyData {
 // construct the hashed path. However, we still need to include them in the BxlDynamicKeyData so that we can pass
 // them from the root BXL to the dynamic BXL context, and then access them on the dynamic BXL context's actions factory.
 #[derive(Clone, derive_more::Display, Debug, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "{}", "key")]
+#[display("{}", key)]
 pub(crate) struct BxlDynamicKeyData {
     key: Arc<BxlKeyData>,
-    execution_platform_resolution: ExecutionPlatformResolution,
-    pub(crate) exec_deps: Vec<ConfiguredProvidersLabel>,
-    pub(crate) toolchains: Vec<ConfiguredProvidersLabel>,
+    pub(crate) execution_resolution: BxlExecutionResolution,
 }
 
 pub(crate) struct BxlDynamicKey(pub(crate) Arc<BxlDynamicKeyData>);
@@ -151,14 +161,14 @@ impl BxlDynamicKey {
         BxlKey(self.0.key.dupe())
     }
 
-    fn from_base_deferred_key_dyn_impl(key: Arc<dyn BaseDeferredKeyDyn>) -> Option<Self> {
-        key.into_any().downcast().ok().map(BxlDynamicKey)
+    fn from_base_deferred_key_dyn_impl(key: BaseDeferredKeyBxl) -> Option<Self> {
+        key.0.into_any().downcast().ok().map(BxlDynamicKey)
     }
 
     pub(crate) fn from_base_deferred_key_dyn_impl_err(
-        key: Arc<dyn BaseDeferredKeyDyn>,
-    ) -> anyhow::Result<Self> {
-        Self::from_base_deferred_key_dyn_impl(key).context("Not BxlDynamicKey (internal error)")
+        key: BaseDeferredKeyBxl,
+    ) -> buck2_error::Result<Self> {
+        Self::from_base_deferred_key_dyn_impl(key).internal_error("Not BxlDynamicKey")
     }
 }
 
@@ -193,7 +203,9 @@ impl BaseDeferredKeyDyn for BxlDynamicKeyData {
 
         let exec_platform = {
             let mut hasher = DefaultHasher::new();
-            self.execution_platform_resolution.hash(&mut hasher);
+            self.execution_resolution
+                .resolved_execution
+                .hash(&mut hasher);
             let output_hash = hasher.finish();
             format!("{:x}", output_hash)
         };
@@ -243,6 +255,10 @@ impl BaseDeferredKeyDyn for BxlDynamicKeyData {
     }
 
     fn execution_platform_resolution(&self) -> &ExecutionPlatformResolution {
-        &self.execution_platform_resolution
+        &self.execution_resolution.resolved_execution
+    }
+
+    fn global_cfg_options(&self) -> Option<GlobalCfgOptions> {
+        Some(self.key.global_cfg_options.dupe())
     }
 }

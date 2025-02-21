@@ -3,6 +3,8 @@ id: configurations
 title: Configurations
 ---
 
+For rule authors see also: [Configurations](../rule_authors/configurations.md)
+
 When building a target, buck always builds it in a particular "configuration."
 The configuration typically includes information like the target os, target
 arch, sanitizers, opt level, etc. One way to understand the effect that a
@@ -11,10 +13,10 @@ will compute the appropriate configuration for a target and display a version of
 that target's attributes with the configuration applied. The `uquery` command
 will not apply a configuration.
 
-Here is a heavily trimmed version of the outpus of invoking `uquery` and
+Here is a heavily trimmed version of the outputs of invoking `uquery` and
 `cquery` on `//buck2/app/buck2_core:buck2_core`.
 
-```
+```sh
 > buck2 uquery -A '"//buck2/app/buck2_core:buck2_core"'
 {
   "fbcode//buck2/app/buck2_core:buck2_core": {
@@ -53,7 +55,7 @@ Here is a heavily trimmed version of the outpus of invoking `uquery` and
 }
 ```
 
-```
+```sh
 > buck2 cquery -A '"//buck2/app/buck2_core:buck2_core"'
 {
   "fbcode//buck2/app/buck2_core:buck2_core (ovr_config//platform/linux:<OMITTED>)": {

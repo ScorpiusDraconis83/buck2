@@ -25,7 +25,7 @@ pub struct Graph {
 
 impl Graph {
     #[inline]
-    pub fn iter_vertices(&self) -> impl Iterator<Item = VertexId> + DoubleEndedIterator {
+    pub fn iter_vertices(&self) -> impl DoubleEndedIterator<Item = VertexId> {
         self.vertices.keys()
     }
 
@@ -236,6 +236,7 @@ impl Graph {
 }
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tier0)]
 pub enum TopoSortError {
     #[error("cycle")]
     Cycle,
@@ -257,6 +258,7 @@ impl AddEdges for VertexData<OptionalVertexId> {
 }
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tier0)]
 pub enum AddEdgesError {
     #[error("overflow")]
     Overflow,
@@ -279,7 +281,7 @@ pub struct PathCost {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
     use crate::test_utils::make_dag;

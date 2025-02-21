@@ -17,12 +17,11 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::execute::error::ExecuteError;
 use buck2_build_api::actions::Action;
-use buck2_build_api::actions::ActionExecutable;
 use buck2_build_api::actions::ActionExecutionCtx;
-use buck2_build_api::actions::PristineActionExecutable;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_core::category::Category;
+use buck2_core::category::CategoryRef;
 use buck2_execute::execute::request::CommandExecutionOutput;
 use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::CommandExecutionRequest;
@@ -38,7 +37,7 @@ use starlark::values::OwnedFrozenValue;
 ///
 /// This action is for testing, and bypasses the need to create starlark values and frozen
 /// modules
-#[derive(Allocative)]
+#[derive(Allocative, Clone, PartialEq)]
 pub(crate) struct SimpleUnregisteredAction {
     cmd: Vec<String>,
     category: Category,
@@ -91,7 +90,7 @@ impl UnregisteredAction for SimpleUnregisteredAction {
         outputs: IndexSet<BuildArtifact>,
         _starlark_data: Option<OwnedFrozenValue>,
         _error_handler: Option<OwnedFrozenValue>,
-    ) -> anyhow::Result<Box<dyn Action>> {
+    ) -> buck2_error::Result<Box<dyn Action>> {
         Ok(Box::new(SimpleAction {
             inputs: BoxSliceSet::from(inputs),
             outputs: BoxSliceSet::from(outputs),
@@ -108,29 +107,26 @@ impl Action for SimpleAction {
         buck2_data::ActionKind::NotSet
     }
 
-    fn inputs(&self) -> anyhow::Result<Cow<'_, [ArtifactGroup]>> {
+    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
         Ok(Cow::Borrowed(self.inputs.as_slice()))
     }
 
-    fn outputs(&self) -> anyhow::Result<Cow<'_, [BuildArtifact]>> {
-        Ok(Cow::Borrowed(self.outputs.as_slice()))
+    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+        Cow::Borrowed(self.outputs.as_slice())
     }
 
-    fn as_executable(&self) -> ActionExecutable<'_> {
-        ActionExecutable::Pristine(self)
+    fn first_output(&self) -> &BuildArtifact {
+        &self.outputs.as_slice()[0]
     }
 
-    fn category(&self) -> &Category {
-        &self.category
+    fn category(&self) -> CategoryRef {
+        self.category.as_ref()
     }
 
     fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
     }
-}
 
-#[async_trait]
-impl PristineActionExecutable for SimpleAction {
     async fn execute(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
@@ -149,6 +145,8 @@ impl PristineActionExecutable for SimpleAction {
                     .collect(),
                 ctx.fs(),
                 ctx.digest_config(),
+                ctx.run_action_knobs()
+                    .add_empty_dot_buckconfig_to_re_commands,
             )?,
             sorted_vector_map![],
         );
@@ -156,7 +154,13 @@ impl PristineActionExecutable for SimpleAction {
         let prepared_action = ctx.prepare_action(&req)?;
         let manager = ctx.command_execution_manager();
         let result = ctx.exec_cmd(manager, &req, &prepared_action).await;
-        let (outputs, meta) = ctx.unpack_command_execution_result(&req, result, false, false)?;
+        let (outputs, meta) = ctx.unpack_command_execution_result(
+            req.executor_preference,
+            result,
+            false,
+            false,
+            None,
+        )?;
 
         Ok((outputs, meta))
     }

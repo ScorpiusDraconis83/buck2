@@ -9,7 +9,7 @@
     "version": "1.0.0",
     "repository": {
         "type": "git",
-        "url": "https://github.com/facebookexperimental/starlark-rust"
+        "url": "https://github.com/facebook/starlark-rust"
     },
     "publisher": "facebook",
     "categories": [],
@@ -133,7 +133,7 @@
         "@types/node": "^16.10.2",
         "@typescript-eslint/parser": "^4.32.0",
         "eslint": "^7.32.0",
-        "mocha": "^9.0.0",
+        "mocha": "^11.1.0",
         "typescript": "^4.4.3"
     },
     "dependencies": {

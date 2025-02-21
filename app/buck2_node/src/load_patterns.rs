@@ -11,18 +11,19 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::file_ops::HasFileOps;
+use buck2_common::dice::file_ops::DiceFileOps;
 use buck2_common::pattern::package_roots::collect_package_roots;
 use buck2_common::pattern::resolve::ResolvedPattern;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::PatternType;
-use buck2_core::pattern::ParsedPattern;
 use buck2_core::target::name::TargetName;
 use buck2_events::dispatch::console_message;
+use buck2_futures::owning_future::OwningFuture;
+use buck2_util::hash::BuckHasherBuilder;
 use dice::DiceComputations;
+use dice::LinearRecomputeDiceComputations;
 use dupe::Dupe;
-use fnv::FnvBuildHasher;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::FutureExt;
@@ -37,26 +38,28 @@ use crate::nodes::unconfigured::TargetNodeRef;
 use crate::super_package::SuperPackage;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum BuildErrors {
     #[error("Did not find package with name `{0}`.")]
     MissingPackage(PackageLabel),
 }
 
 async fn resolve_patterns_and_load_buildfiles<'c, T: PatternType>(
-    ctx: &'c DiceComputations,
+    ctx: &'c LinearRecomputeDiceComputations<'_>,
     parsed_patterns: Vec<ParsedPattern<T>>,
-) -> anyhow::Result<(
+) -> buck2_error::Result<(
     ResolvedPattern<T>,
-    impl Stream<Item = (PackageLabel, anyhow::Result<Arc<EvaluationResult>>)> + 'c,
+    impl Stream<Item = (PackageLabel, buck2_error::Result<Arc<EvaluationResult>>)> + 'c,
 )> {
     let mut spec = ResolvedPattern::<T>::new();
     let mut recursive_packages = Vec::new();
 
-    struct Builder<'c> {
-        ctx: &'c DiceComputations,
-        already_loading: HashSet<PackageLabel, FnvBuildHasher>,
-        load_package_futs:
-            FuturesUnordered<BoxFuture<'c, (PackageLabel, anyhow::Result<Arc<EvaluationResult>>)>>,
+    struct Builder<'c, 'd> {
+        ctx: &'c LinearRecomputeDiceComputations<'d>,
+        already_loading: HashSet<PackageLabel, BuckHasherBuilder>,
+        load_package_futs: FuturesUnordered<
+            BoxFuture<'c, (PackageLabel, buck2_error::Result<Arc<EvaluationResult>>)>,
+        >,
     }
 
     let mut builder = Builder {
@@ -65,18 +68,21 @@ async fn resolve_patterns_and_load_buildfiles<'c, T: PatternType>(
         already_loading: HashSet::default(),
     };
 
-    impl<'c> Builder<'c> {
+    impl Builder<'_, '_> {
         fn load_package(&mut self, package: PackageLabel) {
             if !self.already_loading.insert(package.dupe()) {
                 return;
             }
 
             // it's important that this is not async and the temporary spawn happens when the function is called as we don't immediately start polling these.
+            // so DO NOT USE async move here
             self.load_package_futs.push(
-                self.ctx
-                    .get_interpreter_results(package.dupe())
-                    .map(|res| (package, res))
-                    .boxed(),
+                OwningFuture::new(self.ctx.get(), move |ctx| {
+                    ctx.get_interpreter_results(package)
+                        .map(move |res| (package, res))
+                        .boxed()
+                })
+                .boxed(),
             )
         }
     }
@@ -97,14 +103,11 @@ async fn resolve_patterns_and_load_buildfiles<'c, T: PatternType>(
         }
     }
 
-    let file_ops = ctx.file_ops();
-    let cell_resolver = ctx.get_cell_resolver().await?;
-
-    collect_package_roots(&file_ops, &cell_resolver, recursive_packages, |package| {
+    collect_package_roots(&DiceFileOps(&ctx), recursive_packages, |package| {
         let package = package?;
         spec.add_package(package.dupe());
         builder.load_package(package);
-        anyhow::Ok(())
+        buck2_error::Ok(())
     })
     .await?;
 
@@ -180,7 +183,7 @@ impl<T: PatternType> LoadedPatterns<T> {
 
     pub fn iter_loaded_targets_by_package(
         &self,
-    ) -> impl Iterator<Item = (PackageLabel, anyhow::Result<Vec<TargetNode>>)> + '_ {
+    ) -> impl Iterator<Item = (PackageLabel, buck2_error::Result<Vec<TargetNode>>)> + '_ {
         self.results.iter().map(|(package, result)| {
             let targets = result
                 .as_ref()
@@ -216,13 +219,13 @@ fn apply_spec<T: PatternType>(
     spec: ResolvedPattern<T>,
     load_results: BTreeMap<PackageLabel, buck2_error::Result<Arc<EvaluationResult>>>,
     skip_missing_targets: MissingTargetBehavior,
-) -> anyhow::Result<LoadedPatterns<T>> {
+) -> buck2_error::Result<LoadedPatterns<T>> {
     let mut all_targets: BTreeMap<_, buck2_error::Result<PackageLoadedPatterns<T>>> =
         BTreeMap::new();
     for (pkg, pkg_spec) in spec.specs.into_iter() {
         let result = match load_results.get(&pkg) {
             Some(r) => r,
-            None => return Err(anyhow::anyhow!(BuildErrors::MissingPackage(pkg))),
+            None => return Err(BuildErrors::MissingPackage(pkg).into()),
         };
         match result {
             Ok(res) => {
@@ -258,18 +261,21 @@ fn apply_spec<T: PatternType>(
 }
 
 pub async fn load_patterns<T: PatternType>(
-    ctx: &DiceComputations,
+    ctx: &mut DiceComputations<'_>,
     parsed_patterns: Vec<ParsedPattern<T>>,
     skip_missing_targets: MissingTargetBehavior,
-) -> anyhow::Result<LoadedPatterns<T>> {
-    let (spec, mut load_package_futs) =
-        resolve_patterns_and_load_buildfiles(ctx, parsed_patterns).await?;
+) -> buck2_error::Result<LoadedPatterns<T>> {
+    ctx.with_linear_recompute(|ctx| async move {
+        let (spec, mut load_package_futs) =
+            resolve_patterns_and_load_buildfiles(&ctx, parsed_patterns).await?;
 
-    let mut results: BTreeMap<PackageLabel, buck2_error::Result<Arc<EvaluationResult>>> =
-        BTreeMap::new();
-    while let Some((pkg, load_res)) = load_package_futs.next().await {
-        results.insert(pkg, load_res.map_err(buck2_error::Error::from));
-    }
+        let mut results: BTreeMap<PackageLabel, buck2_error::Result<Arc<EvaluationResult>>> =
+            BTreeMap::new();
+        while let Some((pkg, load_res)) = load_package_futs.next().await {
+            results.insert(pkg, load_res.map_err(buck2_error::Error::from));
+        }
 
-    apply_spec(spec, results, skip_missing_targets)
+        apply_spec(spec, results, skip_missing_targets)
+    })
+    .await
 }

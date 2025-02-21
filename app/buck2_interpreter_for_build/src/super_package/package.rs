@@ -8,8 +8,9 @@
  */
 
 use buck2_core::cells::name::CellName;
+use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
-use buck2_core::pattern::ParsedPattern;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_node::visibility::VisibilityPattern;
 use buck2_node::visibility::VisibilitySpecification;
 use buck2_node::visibility::VisibilityWithinViewBuilder;
@@ -21,16 +22,11 @@ use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::none::NoneType;
 
 use crate::interpreter::build_context::BuildContext;
-use crate::interpreter::build_context::PerFileTypeContext;
 use crate::super_package::eval_ctx::PackageFileVisibilityFields;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum PackageFileError {
-    #[error(
-        "`package()` can only be called in `PACKAGE` files \
-        or in `bzl` files included from `PACKAGE` files"
-    )]
-    NotPackage,
     #[error("`package()` function can be used at most once per `PACKAGE` file")]
     AtMostOnce,
 }
@@ -39,7 +35,8 @@ fn parse_visibility(
     patterns: &[String],
     cell_name: CellName,
     cell_resolver: &CellResolver,
-) -> anyhow::Result<VisibilitySpecification> {
+    cell_alias_resolver: &CellAliasResolver,
+) -> buck2_error::Result<VisibilitySpecification> {
     let mut builder = VisibilityWithinViewBuilder::with_capacity(patterns.len());
     for pattern in patterns {
         if pattern == VisibilityPattern::PUBLIC {
@@ -49,6 +46,7 @@ fn parse_visibility(
                 pattern,
                 cell_name,
                 cell_resolver,
+                cell_alias_resolver,
             )?));
         }
     }
@@ -59,7 +57,8 @@ fn parse_within_view(
     patterns: &[String],
     cell_name: CellName,
     cell_resolver: &CellResolver,
-) -> anyhow::Result<WithinViewSpecification> {
+    cell_alias_resolver: &CellAliasResolver,
+) -> buck2_error::Result<WithinViewSpecification> {
     let mut builder = VisibilityWithinViewBuilder::with_capacity(patterns.len());
     for pattern in patterns {
         if pattern == VisibilityPattern::PUBLIC {
@@ -69,6 +68,7 @@ fn parse_within_view(
                 pattern,
                 cell_name,
                 cell_resolver,
+                cell_alias_resolver,
             )?));
         }
     }
@@ -85,25 +85,24 @@ pub(crate) fn register_package_function(globals: &mut GlobalsBuilder) {
         #[starlark(require=named, default=UnpackListOrTuple::default())]
         within_view: UnpackListOrTuple<String>,
         eval: &mut Evaluator,
-    ) -> anyhow::Result<NoneType> {
+    ) -> starlark::Result<NoneType> {
         let build_context = BuildContext::from_context(eval)?;
-        let package_file_eval_ctx = match &build_context.additional {
-            PerFileTypeContext::Package(package_file_eval_ctx) => package_file_eval_ctx,
-            _ => return Err(PackageFileError::NotPackage.into()),
-        };
+        let package_file_eval_ctx = build_context.additional.require_package_file("package")?;
         let visibility = parse_visibility(
             &visibility.items,
             build_context.cell_info().name().name(),
             build_context.cell_info().cell_resolver(),
+            build_context.cell_info().cell_alias_resolver(),
         )?;
         let within_view = parse_within_view(
             &within_view.items,
             build_context.cell_info().name().name(),
             build_context.cell_info().cell_resolver(),
+            build_context.cell_info().cell_alias_resolver(),
         )?;
 
         match &mut *package_file_eval_ctx.visibility.borrow_mut() {
-            Some(_) => return Err(PackageFileError::AtMostOnce.into()),
+            Some(_) => return Err(buck2_error::Error::from(PackageFileError::AtMostOnce).into()),
             x => {
                 *x = Some(PackageFileVisibilityFields {
                     visibility,

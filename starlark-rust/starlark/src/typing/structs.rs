@@ -25,11 +25,13 @@ use dupe::Dupe;
 use starlark_map::sorted_map::SortedMap;
 
 use crate::typing::custom::TyCustomImpl;
+use crate::typing::error::TypingNoContextError;
+use crate::typing::error::TypingNoContextOrInternalError;
 use crate::typing::Ty;
 use crate::typing::TyBasic;
 use crate::typing::TypingBinOp;
 use crate::typing::TypingOracleCtx;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
+use crate::util::arc_str::ArcStr;
 use crate::values::structs::StructRef;
 use crate::values::typing::type_compiled::alloc::TypeMatcherAlloc;
 use crate::values::typing::type_compiled::matcher::TypeMatcher;
@@ -60,25 +62,30 @@ impl TyCustomImpl for TyStruct {
         Some("struct")
     }
 
-    fn bin_op(&self, bin_op: TypingBinOp, rhs: &TyBasic, ctx: &TypingOracleCtx) -> Result<Ty, ()> {
+    fn bin_op(
+        &self,
+        bin_op: TypingBinOp,
+        rhs: &TyBasic,
+        ctx: &TypingOracleCtx,
+    ) -> Result<Ty, TypingNoContextOrInternalError> {
         match bin_op {
             TypingBinOp::Less => {
                 // TODO(nga): do not clone.
-                if ctx.intersects_basic(&TyBasic::custom(self.clone()), rhs) {
+                if ctx.intersects_basic(&TyBasic::custom(self.clone()), rhs)? {
                     Ok(Ty::bool())
                 } else {
-                    Err(())
+                    Err(TypingNoContextOrInternalError::Typing)
                 }
             }
-            _ => Err(()),
+            _ => Err(TypingNoContextOrInternalError::Typing),
         }
     }
 
-    fn attribute(&self, attr: &str) -> Result<Ty, ()> {
+    fn attribute(&self, attr: &str) -> Result<Ty, TypingNoContextError> {
         match self.fields.get(attr) {
             Some(ty) => Ok(ty.clone()),
             None if self.extra => Ok(Ty::any()),
-            _ => Err(()),
+            _ => Err(TypingNoContextError),
         }
     }
 

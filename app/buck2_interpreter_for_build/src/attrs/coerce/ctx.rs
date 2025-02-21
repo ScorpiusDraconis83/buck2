@@ -10,24 +10,27 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::cells::name::CellName;
+use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::package::package_relative_path::PackageRelativePath;
 use buck2_core::package::package_relative_path::PackageRelativePathBuf;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
 use buck2_core::provider::label::ProvidersLabel;
 use buck2_core::soft_error;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::coerced_path::CoercedDirectory;
 use buck2_node::attrs::coerced_path::CoercedPath;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
+use buck2_node::configuration::resolved::ConfigurationSettingKey;
 use buck2_node::query::query_functions::CONFIGURED_GRAPH_QUERY_FUNCTIONS;
 use buck2_query::query::syntax::simple::eval::error::QueryError;
 use buck2_query::query::syntax::simple::functions::QueryLiteralVisitor;
@@ -38,7 +41,8 @@ use buck2_util::arc_str::ArcStr;
 use bumpalo::Bump;
 use dupe::Dupe;
 use dupe::IterDupedExt;
-use hashbrown::raw::RawTable;
+use hashbrown::hash_table;
+use hashbrown::HashTable;
 use tracing::info;
 
 use super::interner::AttrCoercionInterner;
@@ -46,6 +50,7 @@ use crate::attrs::coerce::arc_str_interner::ArcStrInterner;
 use crate::attrs::coerce::str_hash::str_hash;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum BuildAttrCoercionContextError {
     #[error("Expected a label, got the pattern `{0}`.")]
     RequiredLabel(String),
@@ -66,6 +71,7 @@ pub struct BuildAttrCoercionContext {
     /// Used to coerce targets
     cell_resolver: CellResolver,
     cell_name: CellName,
+    cell_alias_resolver: CellAliasResolver,
     /// Used to resolve relative targets. This is present when a build file
     /// is being evaluated, however it is absent if an extension file is being
     /// evaluated. The latter case occurs when default values for attributes
@@ -75,11 +81,12 @@ pub struct BuildAttrCoercionContext {
     package_boundary_exception: bool,
     /// Allocator for `label_cache`.
     alloc: Bump,
+    global_label_interner: Arc<ConcurrentTargetLabelInterner>,
     /// Label coercion cache. We use `RawTable` where because `HashMap` API
     /// requires either computing hash twice (for get, then for insert) or
     /// allocating a key to perform a query using `entry` API.
     /// Strings are owned by `alloc`, using bump allocator makes evaluation 0.5% faster.
-    label_cache: RefCell<RawTable<(u64, *const str, ProvidersLabel)>>,
+    label_cache: RefCell<HashTable<(u64, *const str, ProvidersLabel)>>,
     str_interner: ArcStrInterner,
     list_interner: AttrCoercionInterner<ArcSlice<CoercedAttr>>,
     // TODO(scottcao): Dict and selects need separate interners right now because
@@ -88,7 +95,7 @@ pub struct BuildAttrCoercionContext {
     // reduce key duplication in selects since select keys are more likely to be deduplicated
     // than select values
     dict_interner: AttrCoercionInterner<ArcSlice<(CoercedAttr, CoercedAttr)>>,
-    select_interner: AttrCoercionInterner<ArcSlice<(TargetLabel, CoercedAttr)>>,
+    select_interner: AttrCoercionInterner<ArcSlice<(ConfigurationSettingKey, CoercedAttr)>>,
 }
 
 impl Debug for BuildAttrCoercionContext {
@@ -102,16 +109,20 @@ impl BuildAttrCoercionContext {
     fn new(
         cell_resolver: CellResolver,
         cell_name: CellName,
+        cell_alias_resolver: CellAliasResolver,
         enclosing_package: Option<(PackageLabel, PackageListing)>,
         package_boundary_exception: bool,
+        global_label_interner: Arc<ConcurrentTargetLabelInterner>,
     ) -> Self {
         Self {
             cell_resolver,
             cell_name,
+            cell_alias_resolver,
             enclosing_package,
             package_boundary_exception,
             alloc: Bump::new(),
-            label_cache: RefCell::new(RawTable::new()),
+            global_label_interner,
+            label_cache: RefCell::new(HashTable::new()),
             str_interner: ArcStrInterner::new(),
             list_interner: AttrCoercionInterner::new(),
             dict_interner: AttrCoercionInterner::new(),
@@ -119,33 +130,53 @@ impl BuildAttrCoercionContext {
         }
     }
 
-    pub fn new_no_package(cell_resolver: CellResolver, cell_name: CellName) -> Self {
-        Self::new(cell_resolver, cell_name, None, false)
+    pub fn new_no_package(
+        cell_resolver: CellResolver,
+        cell_name: CellName,
+        cell_alias_resolver: CellAliasResolver,
+        global_label_interner: Arc<ConcurrentTargetLabelInterner>,
+    ) -> Self {
+        Self::new(
+            cell_resolver,
+            cell_name,
+            cell_alias_resolver,
+            None,
+            false,
+            global_label_interner,
+        )
     }
 
     pub fn new_with_package(
         cell_resolver: CellResolver,
+        cell_alias_resolver: CellAliasResolver,
         enclosing_package: (PackageLabel, PackageListing),
         package_boundary_exception: bool,
+        global_label_interner: Arc<ConcurrentTargetLabelInterner>,
     ) -> Self {
         Self::new(
             cell_resolver,
             enclosing_package.0.cell_name(),
+            cell_alias_resolver,
             Some(enclosing_package),
             package_boundary_exception,
+            global_label_interner,
         )
     }
 
-    pub fn parse_pattern<P: PatternType>(&self, value: &str) -> anyhow::Result<ParsedPattern<P>> {
+    pub fn parse_pattern<P: PatternType>(
+        &self,
+        value: &str,
+    ) -> buck2_error::Result<ParsedPattern<P>> {
         ParsedPattern::parsed_opt_absolute(
             value,
             self.enclosing_package.as_ref().map(|x| x.0.as_cell_path()),
             self.cell_name,
             &self.cell_resolver,
+            &self.cell_alias_resolver,
         )
     }
 
-    fn coerce_label_no_cache(&self, value: &str) -> anyhow::Result<ProvidersLabel> {
+    fn coerce_label_no_cache(&self, value: &str) -> buck2_error::Result<ProvidersLabel> {
         // TODO(nmj): Make this take an import path / package
         match self.parse_pattern::<ProvidersPatternExtra>(value)? {
             ParsedPattern::Target(package, target_name, providers) => {
@@ -158,7 +189,7 @@ impl BuildAttrCoercionContext {
     fn require_enclosing_package(
         &self,
         msg: &str,
-    ) -> anyhow::Result<&(PackageLabel, PackageListing)> {
+    ) -> buck2_error::Result<&(PackageLabel, PackageListing)> {
         self.enclosing_package.as_ref().ok_or_else(|| {
             BuildAttrCoercionContextError::NotBuildFileContext(msg.to_owned()).into()
         })
@@ -166,22 +197,27 @@ impl BuildAttrCoercionContext {
 }
 
 impl AttrCoercionContext for BuildAttrCoercionContext {
-    fn coerce_providers_label(&self, value: &str) -> anyhow::Result<ProvidersLabel> {
+    fn coerce_providers_label(&self, value: &str) -> buck2_error::Result<ProvidersLabel> {
         let hash = str_hash(value);
         let mut label_cache = self.label_cache.borrow_mut();
 
-        if let Some((_h, _v, label)) = label_cache.get(hash, |(_h, v, _)| value == unsafe { &**v })
-        {
-            return Ok(label.clone());
-        }
-
-        let label = self.coerce_label_no_cache(value)?;
-        label_cache.insert(
+        match label_cache.entry(
             hash,
-            (hash, self.alloc.alloc_str(value), label.clone()),
-            |(h, _v, _)| *h,
-        );
-        Ok(label)
+            |(h, v, _)| *h == hash && value == unsafe { &**v },
+            |(h, _, _)| *h,
+        ) {
+            hash_table::Entry::Occupied(e) => Ok(e.get().2.dupe()),
+            hash_table::Entry::Vacant(e) => {
+                let label = self.coerce_label_no_cache(value)?;
+
+                let (target_label, providers) = label.into_parts();
+                let target_label = self.global_label_interner.intern(target_label);
+                let label = ProvidersLabel::new(target_label, providers);
+
+                e.insert((hash, self.alloc.alloc_str(value), label.dupe()));
+                Ok(label)
+            }
+        }
     }
 
     fn intern_str(&self, value: &str) -> ArcStr {
@@ -201,12 +237,12 @@ impl AttrCoercionContext for BuildAttrCoercionContext {
 
     fn intern_select(
         &self,
-        value: Vec<(TargetLabel, CoercedAttr)>,
-    ) -> ArcSlice<(TargetLabel, CoercedAttr)> {
+        value: Vec<(ConfigurationSettingKey, CoercedAttr)>,
+    ) -> ArcSlice<(ConfigurationSettingKey, CoercedAttr)> {
         self.select_interner.intern(value)
     }
 
-    fn coerce_path(&self, value: &str, allow_directory: bool) -> anyhow::Result<CoercedPath> {
+    fn coerce_path(&self, value: &str, allow_directory: bool) -> buck2_error::Result<CoercedPath> {
         let path = <&PackageRelativePath>::try_from(value)?;
         let (package, listing) = self.require_enclosing_package(value)?;
 
@@ -245,7 +281,7 @@ impl AttrCoercionContext for BuildAttrCoercionContext {
             if self.package_boundary_exception {
                 info!("{} (could be due to a package boundary violation)", e);
             } else {
-                soft_error!("source_file_missing", e.into())?;
+                soft_error!("source_file_missing", e.into(), quiet: true)?;
             }
 
             Ok(CoercedPath::File(path.to_arc()))
@@ -255,7 +291,7 @@ impl AttrCoercionContext for BuildAttrCoercionContext {
     fn coerce_target_pattern(
         &self,
         pattern: &str,
-    ) -> anyhow::Result<ParsedPattern<TargetPatternExtra>> {
+    ) -> buck2_error::Result<ParsedPattern<TargetPatternExtra>> {
         self.parse_pattern(pattern)
     }
 
@@ -264,7 +300,7 @@ impl AttrCoercionContext for BuildAttrCoercionContext {
         visitor: &mut dyn QueryLiteralVisitor,
         expr: &Spanned<Expr>,
         query: &str,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         CONFIGURED_GRAPH_QUERY_FUNCTIONS
             .get()?
             .visit_literals(visitor, expr)

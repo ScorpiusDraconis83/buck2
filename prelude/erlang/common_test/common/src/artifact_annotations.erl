@@ -18,7 +18,9 @@
 %%% % @format
 
 -module(artifact_annotations).
--compile(warn_missing_spec).
+-compile(warn_missing_spec_all).
+
+-eqwalizer(ignore).
 
 -include_lib("common/include/buck_ct_records.hrl").
 
@@ -37,7 +39,7 @@
 -export_type([annotation_function/0]).
 
 -spec serialize(test_result_artifact_annotations()) -> binary().
-serialize(ArtifactAnnotation) -> jsone:encode(ArtifactAnnotation).
+serialize(ArtifactAnnotation) -> json:encode(ArtifactAnnotation).
 
 -spec create_artifact_annotation(file:filename(), #test_env{}) -> test_result_artifact_annotations().
 create_artifact_annotation(FileName, TestEnv) ->

@@ -11,9 +11,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::Context;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonCommandOptions;
+use buck2_client_ctx::daemon::client::kill::kill_command_impl;
 use buck2_client_ctx::daemon::client::BuckdLifecycleLock;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::final_console::FinalConsole;
@@ -26,24 +28,20 @@ use buck2_core::fs::fs_util;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::paths::abs_path::AbsPath;
 use buck2_core::fs::paths::abs_path::AbsPathBuf;
+use buck2_error::BuckErrorContext;
 use dupe::Dupe;
 use gazebo::prelude::SliceExt;
-use humantime;
 use threadpool::ThreadPool;
 use walkdir::WalkDir;
 
 use crate::commands::clean_stale::parse_clean_stale_args;
 use crate::commands::clean_stale::CleanStaleCommand;
-use crate::commands::kill::kill_command_impl;
 
 /// Delete generated files and caches.
 ///
 /// The command also kills the buck2 daemon.
 #[derive(Debug, clap::Parser)]
 pub struct CleanCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     #[clap(
         long = "dry-run",
         help = "Performs a dry-run and prints the paths that would be removed."
@@ -59,7 +57,7 @@ the specified duration, without killing the daemon",
     stale: Option<Option<humantime::Duration>>,
 
     // Like stale but since a specific timestamp, for testing
-    #[clap(long = "keep-since-time", conflicts_with = "stale", hidden = true)]
+    #[clap(long = "keep-since-time", conflicts_with = "stale", hide = true)]
     keep_since_time: Option<i64>,
 
     /// Only considers tracked artifacts for cleanup.
@@ -70,10 +68,17 @@ the specified duration, without killing the daemon",
     ///  - Writing to `buck-out` without being expected by Buck
     #[clap(long = "tracked-only", requires = "stale")]
     tracked_only: bool,
+
+    /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
+    #[clap(flatten)]
+    _target_cfg: TargetCfgUnusedOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 impl CleanCommand {
-    pub fn exec(self, matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         if let Some(keep_since_arg) = parse_clean_stale_args(self.stale, self.keep_since_time)? {
             let cmd = CleanStaleCommand {
                 common_opts: self.common_opts,
@@ -84,28 +89,33 @@ impl CleanCommand {
             return cmd.exec(matches, ctx);
         }
 
-        ctx.instant_command("clean", async move |ctx| {
-            let buck_out_dir = ctx.paths()?.buck_out_path();
-            let daemon_dir = ctx.paths()?.daemon_dir()?;
-            let console = &self.common_opts.console_opts.final_console();
+        ctx.instant_command(
+            "clean",
+            &self.common_opts.event_log_opts,
+            |ctx| async move {
+                let buck_out_dir = ctx.paths()?.buck_out_path();
+                let daemon_dir = ctx.paths()?.daemon_dir()?;
+                let console = &self.common_opts.console_opts.final_console();
 
-            if self.dry_run {
-                return clean(buck_out_dir, daemon_dir, console, None).await;
-            }
+                if self.dry_run {
+                    return clean(buck_out_dir, daemon_dir, console, None).await;
+                }
 
-            // Kill the daemon and make sure a new daemon does not spin up while we're performing clean up operations
-            // This will ensure we have exclusive access to the directories in question
-            let lifecycle_lock = BuckdLifecycleLock::lock_with_timeout(
-                daemon_dir.clone(),
-                StartupDeadline::duration_from_now(Duration::from_secs(10))?,
-            )
-            .await
-            .with_context(|| "Error locking buckd lifecycle.lock")?;
+                // Kill the daemon and make sure a new daemon does not spin up while we're performing clean up operations
+                // This will ensure we have exclusive access to the directories in question
+                let lifecycle_lock = BuckdLifecycleLock::lock_with_timeout(
+                    daemon_dir.clone(),
+                    StartupDeadline::duration_from_now(Duration::from_secs(10))?,
+                )
+                .await
+                .with_buck_error_context(|| "Error locking buckd lifecycle.lock")?;
 
-            kill_command_impl(&lifecycle_lock, "`buck2 clean` was invoked").await?;
+                kill_command_impl(&lifecycle_lock, "`buck2 clean` was invoked").await?;
 
-            clean(buck_out_dir, daemon_dir, console, Some(&lifecycle_lock)).await
-        })
+                clean(buck_out_dir, daemon_dir, console, Some(&lifecycle_lock)).await
+            },
+        )
+        .into()
     }
 
     pub fn sanitize_argv(&self, argv: Argv) -> SanitizedArgv {
@@ -119,20 +129,15 @@ async fn clean(
     console: &FinalConsole,
     // None means "dry run".
     lifecycle_lock: Option<&BuckdLifecycleLock>,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let mut paths_to_clean = Vec::new();
-    // Try to clean EdenFS based buck-out first. For EdenFS based buck-out, "eden rm"
-    // is efficient. Notice eden rm will remove the buck-out root directory,
-    // but for the native fs, the buck-out root directory is kept.
-    if let Some(paths) = try_clean_eden_buck_out(&buck_out_dir, lifecycle_lock.is_none()).await? {
-        paths_to_clean = paths;
-    } else if buck_out_dir.exists() {
+    if buck_out_dir.exists() {
         paths_to_clean =
             collect_paths_to_clean(&buck_out_dir)?.map(|path| path.display().to_string());
         if lifecycle_lock.is_some() {
             tokio::task::spawn_blocking(move || clean_buck_out_with_retry(&buck_out_dir))
                 .await?
-                .context("Failed to spawn clean")?;
+                .buck_error_context("Failed to spawn clean")?;
         }
     }
 
@@ -149,7 +154,9 @@ async fn clean(
     Ok(())
 }
 
-fn collect_paths_to_clean(buck_out_path: &AbsNormPathBuf) -> anyhow::Result<Vec<AbsNormPathBuf>> {
+fn collect_paths_to_clean(
+    buck_out_path: &AbsNormPathBuf,
+) -> buck2_error::Result<Vec<AbsNormPathBuf>> {
     let mut paths_to_clean = vec![];
     let dir = fs_util::read_dir(buck_out_path)?;
     for entry in dir {
@@ -165,7 +172,7 @@ fn collect_paths_to_clean(buck_out_path: &AbsNormPathBuf) -> anyhow::Result<Vec<
 /// the daemon can fail with this error: `The process cannot access the
 /// file because it is being used by another process.`. To get around this,
 /// add a single retry.
-fn clean_buck_out_with_retry(path: &AbsNormPathBuf) -> anyhow::Result<()> {
+fn clean_buck_out_with_retry(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
     let mut result = clean_buck_out(path);
     match result {
         Ok(_) => {
@@ -182,7 +189,7 @@ fn clean_buck_out_with_retry(path: &AbsNormPathBuf) -> anyhow::Result<()> {
     result
 }
 
-fn clean_buck_out(path: &AbsNormPathBuf) -> anyhow::Result<()> {
+fn clean_buck_out(path: &AbsNormPathBuf) -> buck2_error::Result<()> {
     let walk = WalkDir::new(path);
     let thread_pool = ThreadPool::new(num_cpus::get());
     let error = Arc::new(Mutex::new(None));
@@ -198,7 +205,8 @@ fn clean_buck_out(path: &AbsNormPathBuf) -> anyhow::Result<()> {
             let error = error.dupe();
             thread_pool.execute(move || {
                 // The wlak gives us back absolute paths since we give it absolute paths.
-                let res = AbsPath::new(dir_entry.path()).and_then(fs_util::remove_file);
+                let res = AbsPath::new(dir_entry.path())
+                    .and_then(|p| fs_util::remove_file(p).map_err(Into::into));
 
                 match res {
                     Ok(_) => {}
@@ -215,7 +223,7 @@ fn clean_buck_out(path: &AbsNormPathBuf) -> anyhow::Result<()> {
 
     thread_pool.join();
     if let Some(e) = error.lock().unwrap().take() {
-        return Err(e);
+        return Err(e.into());
     }
 
     // first entry is buck-out root dir and we don't want to remove it
@@ -224,62 +232,4 @@ fn clean_buck_out(path: &AbsNormPathBuf) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(fbcode_build)]
-async fn try_clean_eden_buck_out(
-    buck_out: &AbsNormPathBuf,
-    dryrun: bool,
-) -> anyhow::Result<Option<Vec<String>>> {
-    use std::process::Stdio;
-
-    use buck2_execute::materialize::eden_api::is_recas_eden_mount;
-    use buck2_util::process::async_background_command;
-
-    if !cfg!(unix) {
-        return Ok(None);
-    }
-
-    if !is_recas_eden_mount(buck_out)? {
-        return Ok(None);
-    }
-
-    // Run eden rm <buck-out> to rm a mount
-    let mut eden_rm_cmd = async_background_command("eden");
-    eden_rm_cmd
-        .arg("rm")
-        .arg("-y") // No promot
-        .arg(buck_out.as_os_str())
-        .current_dir("/")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    buck2_client_ctx::eprintln!(
-        "The following command will be executed: `eden rm -y {}`",
-        buck_out
-    )?;
-
-    if !dryrun {
-        eden_rm_cmd
-            .spawn()
-            .context("Failed to start to remove EdenFS buck-out mount.")?
-            .wait()
-            .await
-            .context("Failed to remove EdenFS buck-out mount.")?;
-
-        // eden rm might not delete the buck-out completed.
-        if buck_out.exists() {
-            fs_util::remove_dir(buck_out)?;
-        }
-    }
-
-    Ok(Some(vec![buck_out.display().to_string()]))
-}
-
-#[cfg(not(fbcode_build))]
-async fn try_clean_eden_buck_out(
-    _buck_out: &AbsNormPathBuf,
-    _dryrun: bool,
-) -> anyhow::Result<Option<Vec<String>>> {
-    Ok(None)
 }

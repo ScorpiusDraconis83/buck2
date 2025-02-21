@@ -6,13 +6,15 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+# pyre-strict
+
 import argparse
 import sys
 
 from .scrubber import scrub
 
 
-def _parse_args():
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Tool to postprocess executables/dylibs."
     )
@@ -35,15 +37,20 @@ def _parse_args():
         "--adhoc-codesign-tool",
         help="An adhoc codesign tool to use to re-sign the executables/dylibs, if provided.",
     )
+    parser.add_argument(
+        "--persisted-targets-file",
+        help="A JSON file with additional targets that must be preserved by the scrubber.",
+    )
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = _parse_args()
     try:
         scrub(
             input_file=args.input,
             output_file=args.output,
+            persisted_targets_file=args.persisted_targets_file,
             targets_file=args.targets_file,
             spec_file=args.spec_file,
             adhoc_codesign_tool=args.adhoc_codesign_tool,

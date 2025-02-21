@@ -124,6 +124,7 @@ fn main() -> io::Result<()> {
         .type_attribute("buck.data.CommandExecutionStats", "#[derive(Copy, dupe::Dupe)]")
         .type_attribute(".", "#[derive(::serde::Serialize, ::serde::Deserialize)]")
         .type_attribute(".", "#[derive(::allocative::Allocative)]")
+        .type_attribute("buck.data.SoftError", "#[derive(Eq, Hash)]")
         .field_attribute(
             "timestamp",
             "#[serde(with = \"crate::serialize_timestamp\")]",
@@ -173,6 +174,10 @@ fn main() -> io::Result<()> {
         .field_attribute(
             "bxl_ensure_artifacts_duration",
             "#[serde(rename = \"bxl_ensure_artifacts_duration_us\", with = \"crate::serialize_duration_as_micros\")]",
+        )
+        .field_attribute(
+            "install_duration",
+            "#[serde(rename = \"install_duration_us\", with = \"crate::serialize_duration_as_micros\")]",
         )
         .field_attribute(
             "CriticalPathEntry2.user_duration",

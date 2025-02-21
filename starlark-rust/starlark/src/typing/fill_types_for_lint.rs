@@ -26,6 +26,7 @@ use starlark_syntax::syntax::ast::AssignTargetP;
 use starlark_syntax::syntax::ast::AstLiteral;
 use starlark_syntax::syntax::ast::AstString;
 use starlark_syntax::syntax::ast::BinOp;
+use starlark_syntax::syntax::ast::CallArgsP;
 use starlark_syntax::syntax::ast::DefP;
 use starlark_syntax::syntax::ast::ExprP;
 use starlark_syntax::syntax::ast::ForP;
@@ -34,13 +35,14 @@ use starlark_syntax::syntax::ast::LoadP;
 use starlark_syntax::syntax::ast::StmtP;
 use starlark_syntax::syntax::def::DefParamKind;
 use starlark_syntax::syntax::def::DefParams;
+use starlark_syntax::syntax::def::DefRegularParamMode;
 use starlark_syntax::syntax::type_expr::TypeExprUnpackP;
+use starlark_syntax::syntax::type_expr::TypePathP;
 
 use crate::codemap::Span;
 use crate::codemap::Spanned;
 use crate::environment::slots::ModuleSlotId;
 use crate::eval::compiler::constants::Constants;
-use crate::eval::compiler::scope::payload::CstArgument;
 use crate::eval::compiler::scope::payload::CstAssignIdent;
 use crate::eval::compiler::scope::payload::CstAssignIdentExt;
 use crate::eval::compiler::scope::payload::CstExpr;
@@ -51,12 +53,14 @@ use crate::eval::compiler::scope::payload::CstTypeExpr;
 use crate::eval::compiler::scope::ModuleScopeData;
 use crate::eval::compiler::scope::ResolvedIdent;
 use crate::eval::compiler::scope::Slot;
+use crate::typing::callable_param::ParamIsRequired;
 use crate::typing::error::InternalError;
 use crate::typing::error::TypingError;
 use crate::typing::Approximation;
-use crate::typing::Param;
+use crate::typing::ParamSpec;
 use crate::typing::Ty;
 use crate::typing::TypingOracleCtx;
+use crate::util::arc_str::ArcStr;
 use crate::values::tuple::AllocTuple;
 use crate::values::types::ellipsis::Ellipsis;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
@@ -133,7 +137,7 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
     fn call(
         &mut self,
         _f: &CstExpr,
-        _args: &[CstArgument],
+        _args: &CallArgsP<CstPayload>,
     ) -> Result<GlobalValue<'v>, InternalError> {
         // TODO(nga): could be a call like `record(...)`, and we need to evaluate it.
         Ok(GlobalValue::any())
@@ -437,34 +441,46 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
     }
 
     fn top_level_def(&mut self, def: &DefP<CstPayload>) -> Result<(), InternalError> {
-        let def_params = DefParams::unpack(&def.params, self.ctx.codemap)
-            .map_err(InternalError::from_diagnostic)?;
+        let DefParams {
+            params: def_params,
+            indices: _,
+        } = DefParams::unpack(&def.params, self.ctx.codemap)
+            .map_err(InternalError::from_eval_exception)?;
 
-        let mut params = Vec::with_capacity(def_params.params.len());
-        for (i, param) in def_params.params.iter().enumerate() {
+        let mut pos_only = Vec::new();
+        let mut pos_or_name = Vec::new();
+        let mut args = None;
+        let mut name_only = Vec::new();
+        let mut kwargs = None;
+
+        for param in def_params {
             let ty = self.get_ty_expr_opt(param.ty)?;
             match param.kind {
-                DefParamKind::Regular(default_value) => {
-                    let pos_only = i < def_params.num_positional as usize;
+                DefParamKind::Regular(mode, default_value) => {
                     let name = param.ident.ident.as_str();
-                    let param = if pos_only {
-                        Param::pos_or_name(name, ty)
-                    } else {
-                        Param::name_only(name, ty)
+                    let required = match default_value.is_some() {
+                        true => ParamIsRequired::No,
+                        false => ParamIsRequired::Yes,
                     };
-                    let param = if default_value.is_some() {
-                        param.optional()
-                    } else {
-                        param
+                    match mode {
+                        DefRegularParamMode::PosOnly => pos_only.push((required, ty)),
+                        DefRegularParamMode::PosOrName => {
+                            pos_or_name.push((ArcStr::from(name), required, ty))
+                        }
+                        DefRegularParamMode::NameOnly => {
+                            name_only.push((ArcStr::from(name), required, ty))
+                        }
                     };
-                    params.push(param);
                 }
-                DefParamKind::Args => params.push(Param::args(ty)),
-                DefParamKind::Kwargs => params.push(Param::kwargs(ty)),
+                DefParamKind::Args => args = Some(ty),
+                DefParamKind::Kwargs => kwargs = Some(ty),
             }
         }
 
         let result = self.get_ty_expr_opt(def.return_type.as_deref())?;
+
+        let params = ParamSpec::new_parts(pos_only, pos_or_name, args, name_only, kwargs)
+            .map_err(|e| InternalError::from_error(e, def.signature_span(), self.ctx.codemap))?;
 
         self.assign_ident_value(&def.name, GlobalValue::ty(Ty::function(params, result)))
     }
@@ -501,11 +517,11 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
         Ty::any()
     }
 
-    fn try_proper_ty(
+    fn eval_path(
         &mut self,
-        first: &CstIdent,
-        rem: &[Spanned<&str>],
-    ) -> Result<Option<Ty>, InternalError> {
+        path: &TypePathP<CstPayload>,
+    ) -> Result<Option<Value<'v>>, InternalError> {
+        let TypePathP { first, rem } = path;
         let Some(mut value) = self.expr_ident(first)?.value else {
             return Ok(None);
         };
@@ -516,10 +532,18 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
                     let span = first.span.merge(x.span);
                     self.errors
                         .push(TypingError::new(e, span, self.ctx.codemap));
-                    return Ok(Some(Ty::any()));
+                    return Ok(None);
                 }
             }
         }
+        Ok(Some(value))
+    }
+
+    fn try_proper_ty(&mut self, path: &TypePathP<CstPayload>) -> Result<Option<Ty>, InternalError> {
+        let TypePathP { first, rem } = path;
+        let Some(value) = self.eval_path(path)? else {
+            return Ok(None);
+        };
         match TypeCompiled::new(value, self.heap) {
             Ok(ty) => Ok(Some(ty.as_ty().clone())),
             Err(e) => {
@@ -527,13 +551,14 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
                     Span::merge_all(iter::once(first.span).chain(rem.iter().map(|x| x.span)));
                 self.errors
                     .push(TypingError::new_anyhow(e, span, self.ctx.codemap));
-                Ok(Some(Ty::any()))
+                Ok(None)
             }
         }
     }
 
-    fn path_ty(&mut self, first: &CstIdent, rem: &[Spanned<&str>]) -> Result<Ty, InternalError> {
-        if let Some(ty) = self.try_proper_ty(first, rem)? {
+    fn path_ty(&mut self, path: &TypePathP<CstPayload>) -> Result<Ty, InternalError> {
+        let TypePathP { first, rem } = path;
+        if let Some(ty) = self.try_proper_ty(path)? {
             return Ok(ty);
         }
 
@@ -546,20 +571,25 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
         x: &Spanned<TypeExprUnpackP<CstPayload>>,
     ) -> Result<Ty, InternalError> {
         match &x.node {
+            TypeExprUnpackP::Ellipsis => {
+                self.approximations
+                    .push(Approximation::new("Ellipsis cannot be used as type", x));
+                Ok(Ty::any())
+            }
+            TypeExprUnpackP::List(..) => {
+                self.approximations.push(Approximation::new(
+                    "List literal [...] cannot be used as type",
+                    x,
+                ));
+                Ok(Ty::any())
+            }
             TypeExprUnpackP::Tuple(xs) => {
                 Ok(Ty::tuple(xs.try_map(|x| self.from_type_expr_impl(x))?))
             }
             TypeExprUnpackP::Union(xs) => {
                 Ok(Ty::unions(xs.try_map(|x| self.from_type_expr_impl(x))?))
             }
-            TypeExprUnpackP::Literal(x) => {
-                if x.is_empty() || x.starts_with('_') {
-                    Ok(Ty::any())
-                } else {
-                    Ok(Ty::name(x))
-                }
-            }
-            TypeExprUnpackP::Path(first, rem) => self.path_ty(first, rem),
+            TypeExprUnpackP::Path(path) => self.path_ty(path),
             TypeExprUnpackP::Index(a, i) => {
                 if let Some(a) = self.expr_ident(a)?.value {
                     if !a.ptr_eq(Constants::get().fn_list.0.to_value()) {
@@ -591,62 +621,90 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
                 }
             }
             TypeExprUnpackP::Index2(a, i0, i1) => {
-                if let Some(a) = self.expr_ident(a)?.value {
-                    if !a.ptr_eq(Constants::get().fn_dict.0.to_value()) {
-                        self.approximations.push(Approximation::new("Not dict", x));
-                        return Ok(Ty::any());
-                    }
-                    let i0 = self.from_type_expr_impl(i0)?;
-                    let i1 = self.from_type_expr_impl(i1)?;
-                    let i0 = TypeCompiled::from_ty(&i0, self.heap);
-                    let i1 = TypeCompiled::from_ty(&i1, self.heap);
-                    match a.get_ref().at2(i0.to_inner(), i1.to_inner(), self.heap) {
-                        Ok(t) => match TypeCompiled::new(t, self.heap) {
-                            Ok(ty) => Ok(ty.as_ty().clone()),
-                            Err(_) => {
+                if let Some(a) = self.eval_path(a)? {
+                    if a.ptr_eq(Constants::get().fn_dict.0.to_value()) {
+                        let i0 = self.from_type_expr_impl(i0)?;
+                        let i1 = self.from_type_expr_impl(i1)?;
+                        let i0 = TypeCompiled::from_ty(&i0, self.heap);
+                        let i1 = TypeCompiled::from_ty(&i1, self.heap);
+                        match a.get_ref().at2(i0.to_inner(), i1.to_inner(), self.heap) {
+                            Ok(t) => match TypeCompiled::new(t, self.heap) {
+                                Ok(ty) => Ok(ty.as_ty().clone()),
+                                Err(_) => {
+                                    self.approximations
+                                        .push(Approximation::new("TypeCompiled::new failed", x));
+                                    Ok(Ty::any())
+                                }
+                            },
+                            Err(e) => {
                                 self.approximations
-                                    .push(Approximation::new("TypeCompiled::new failed", x));
+                                    .push(Approximation::new("Getitem2 failed", e));
                                 Ok(Ty::any())
                             }
-                        },
-                        Err(e) => {
-                            self.approximations
-                                .push(Approximation::new("Getitem2 failed", e));
-                            Ok(Ty::any())
                         }
-                    }
-                } else {
-                    self.approximations
-                        .push(Approximation::new("Not global", x));
-                    Ok(Ty::any())
-                }
-            }
-            TypeExprUnpackP::Index2Ellipsis(a, i) => {
-                if let Some(a) = self.expr_ident(a)?.value {
-                    if !a.ptr_eq(Constants::get().fn_tuple.0.to_value()) {
-                        // TODO(nga): this should be an error.
-                        self.approximations.push(Approximation::new("Not tuple", x));
-                        return Ok(Ty::any());
-                    }
-                    let i = self.from_type_expr_impl(i)?;
-                    let i = TypeCompiled::from_ty(&i, self.heap);
-                    match a
-                        .get_ref()
-                        .at2(i.to_inner(), Ellipsis::new_value().to_value(), self.heap)
-                    {
-                        Ok(t) => match TypeCompiled::new(t, self.heap) {
-                            Ok(ty) => Ok(ty.as_ty().clone()),
-                            Err(_) => {
+                    } else if a.ptr_eq(Constants::get().fn_tuple.0.to_value()) {
+                        let i0 = self.from_type_expr_impl(i0)?;
+                        let TypeExprUnpackP::Ellipsis = i1.node else {
+                            self.approximations
+                                .push(Approximation::new("Expecting ellipsis in tuple[x, ...]", x));
+                            return Ok(Ty::any());
+                        };
+                        let r0 = TypeCompiled::from_ty(&i0, self.heap);
+                        match a.get_ref().at2(
+                            r0.to_inner(),
+                            Ellipsis::new_value().to_value(),
+                            self.heap,
+                        ) {
+                            Ok(t) => match TypeCompiled::new(t, self.heap) {
+                                Ok(ty) => Ok(ty.as_ty().clone()),
+                                Err(_) => {
+                                    self.approximations
+                                        .push(Approximation::new("TypeCompiled::new failed", x));
+                                    Ok(Ty::any())
+                                }
+                            },
+                            Err(e) => {
                                 self.approximations
-                                    .push(Approximation::new("TypeCompiled::new failed", x));
+                                    .push(Approximation::new("Getitem2 failed", e));
                                 Ok(Ty::any())
                             }
-                        },
-                        Err(e) => {
-                            self.approximations
-                                .push(Approximation::new("Getitem2 failed", e));
-                            Ok(Ty::any())
                         }
+                    } else if a.ptr_eq(Constants::get().typing_callable.0.to_value()) {
+                        let TypeExprUnpackP::List(items) = &i0.node else {
+                            self.approximations.push(Approximation::new(
+                                "Expecting list in Callable[[...], ...]",
+                                x,
+                            ));
+                            return Ok(Ty::any());
+                        };
+                        let args = items.try_map(|x| {
+                            Ok(
+                                TypeCompiled::from_ty(&self.from_type_expr_impl(x)?, self.heap)
+                                    .to_inner(),
+                            )
+                        })?;
+                        let args = self.heap.alloc_list(&args);
+                        let ret = self.from_type_expr_impl(i1)?;
+                        let ret = TypeCompiled::from_ty(&ret, self.heap).to_inner();
+                        match a.get_ref().at2(args, ret, self.heap) {
+                            Ok(t) => match TypeCompiled::new(t, self.heap) {
+                                Ok(ty) => Ok(ty.as_ty().clone()),
+                                Err(_) => {
+                                    self.approximations
+                                        .push(Approximation::new("TypeCompiled::new failed", x));
+                                    Ok(Ty::any())
+                                }
+                            },
+                            Err(e) => {
+                                self.approximations
+                                    .push(Approximation::new("Getitem2 failed", e));
+                                Ok(Ty::any())
+                            }
+                        }
+                    } else {
+                        self.approximations
+                            .push(Approximation::new("Not dict or tuple", x));
+                        return Ok(Ty::any());
                     }
                 } else {
                     self.approximations

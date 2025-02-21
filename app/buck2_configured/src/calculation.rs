@@ -11,25 +11,30 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buck2_common::dice::cycles::CycleAdapterDescriptor;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
 use buck2_core::configuration::data::ConfigurationData;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_core::target::target_configured_target_label::TargetConfiguredTargetLabel;
 use buck2_node::cfg_constructor::CFG_CONSTRUCTOR_CALCULATION_IMPL;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::nodes::unconfigured::RuleKind;
+use buck2_node::nodes::unconfigured::TargetNode;
+use buck2_node::super_package::SuperPackage;
 use buck2_node::target_calculation::ConfiguredTargetCalculationImpl;
 use buck2_node::target_calculation::CONFIGURED_TARGET_CALCULATION;
 use buck2_util::cycle_detector::CycleDescriptor;
 use derive_more::Display;
 use dice::DiceComputations;
+use dice::DynKey;
 use dupe::Dupe;
 use gazebo::prelude::*;
 
 use crate::configuration::calculation::ConfigurationCalculation;
+use crate::configuration::calculation::ExecutionPlatformResolutionKey;
 use crate::nodes::calculation::get_execution_platform_toolchain_dep;
 use crate::nodes::calculation::ConfiguredTargetNodeKey;
-use crate::target::TargetConfiguredTargetLabel;
+use crate::nodes::calculation::ToolchainExecutionPlatformCompatibilityKey;
 
 struct ConfiguredTargetCalculationInstance;
 
@@ -41,13 +46,19 @@ pub(crate) fn init_configured_target_calculation() {
 impl ConfiguredTargetCalculationImpl for ConfiguredTargetCalculationInstance {
     async fn get_configured_target(
         &self,
-        ctx: &DiceComputations,
+        ctx: &mut DiceComputations<'_>,
         target: &TargetLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredTargetLabel> {
+    ) -> buck2_error::Result<ConfiguredTargetLabel> {
         let (node, super_package) = ctx.get_target_node_with_super_package(target).await?;
 
-        let get_platform_configuration = async || -> buck2_error::Result<ConfigurationData> {
+        async fn get_platform_configuration(
+            ctx: &mut DiceComputations<'_>,
+            global_cfg_options: &GlobalCfgOptions,
+            target: &TargetLabel,
+            node: &TargetNode,
+            super_package: &SuperPackage,
+        ) -> buck2_error::Result<ConfigurationData> {
             let current_cfg = match global_cfg_options.target_platform.as_ref() {
                 Some(global_target_platform) => {
                     ctx.get_platform_configuration(global_target_platform)
@@ -59,23 +70,34 @@ impl ConfiguredTargetCalculationImpl for ConfiguredTargetCalculationInstance {
                 },
             };
 
-            Ok(CFG_CONSTRUCTOR_CALCULATION_IMPL
+            CFG_CONSTRUCTOR_CALCULATION_IMPL
                 .get()?
                 .eval_cfg_constructor(
                     ctx,
                     node.as_ref(),
-                    &super_package,
+                    super_package,
                     current_cfg,
                     &global_cfg_options.cli_modifiers,
+                    node.rule_type(),
                 )
-                .await?)
-        };
+                .await
+        }
 
         match node.rule_kind() {
             RuleKind::Configuration => Ok(target.configure(ConfigurationData::unbound())),
-            RuleKind::Normal => Ok(target.configure(get_platform_configuration().await?)),
+            RuleKind::Normal => Ok(target.configure(
+                get_platform_configuration(ctx, global_cfg_options, target, &node, &super_package)
+                    .await?,
+            )),
             RuleKind::Toolchain => {
-                let cfg = get_platform_configuration().await?;
+                let cfg = get_platform_configuration(
+                    ctx,
+                    global_cfg_options,
+                    target,
+                    &node,
+                    &super_package,
+                )
+                .await?;
                 let exec_cfg = get_execution_platform_toolchain_dep(
                     ctx,
                     &TargetConfiguredTargetLabel::new_configure(target, cfg.dupe()),
@@ -91,7 +113,7 @@ impl ConfiguredTargetCalculationImpl for ConfiguredTargetCalculationInstance {
 }
 
 #[derive(Debug, buck2_error::Error, Clone, Dupe)]
-#[buck2(user)]
+#[buck2(input)]
 #[error("{}", display_configured_graph_cycle_error(&.cycle[..]))]
 pub struct ConfiguredGraphCycleError {
     cycle: Arc<Vec<ConfiguredGraphCycleKeys>>,
@@ -119,8 +141,12 @@ fn display_configured_graph_cycle_error(cycle: &[ConfiguredGraphCycleKeys]) -> S
 // configured graph cycles.
 #[derive(Debug, Display, Clone, Eq, PartialEq, Hash)]
 pub enum ConfiguredGraphCycleKeys {
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     ConfiguredTargetNode(ConfiguredTargetNodeKey),
+    #[display("{}", _0)]
+    ToolchainExecutionPlatformCompatibility(ToolchainExecutionPlatformCompatibilityKey),
+    #[display("{}", _0)]
+    ExecutionPlatformResolution(ExecutionPlatformResolutionKey),
 }
 
 #[derive(Debug)]
@@ -139,10 +165,21 @@ impl CycleDescriptor for ConfiguredGraphCycleDescriptor {
 }
 
 impl CycleAdapterDescriptor for ConfiguredGraphCycleDescriptor {
-    fn to_key(key: &dyn std::any::Any) -> Option<Self::Key> {
+    fn to_key(key: &DynKey) -> Option<Self::Key> {
         if let Some(v) = key.downcast_ref::<ConfiguredTargetNodeKey>() {
             return Some(ConfiguredGraphCycleKeys::ConfiguredTargetNode(v.dupe()));
         }
+        if let Some(v) = key.downcast_ref::<ExecutionPlatformResolutionKey>() {
+            return Some(ConfiguredGraphCycleKeys::ExecutionPlatformResolution(
+                v.dupe(),
+            ));
+        }
+        if let Some(v) = key.downcast_ref::<ToolchainExecutionPlatformCompatibilityKey>() {
+            return Some(
+                ConfiguredGraphCycleKeys::ToolchainExecutionPlatformCompatibility(v.dupe()),
+            );
+        }
+
         None
     }
 }

@@ -57,14 +57,10 @@ use serde::de::DeserializeOwned;
 use starlark::analysis::AstModuleLint;
 use starlark::codemap::Pos;
 use starlark::codemap::Span;
-use starlark::docs::render_docs_as_code;
-use starlark::docs::Doc;
 use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
 use starlark::docs::DocModule;
-use starlark::docs::Identifier;
-use starlark::docs::Location;
 use starlark::errors::EvalMessage;
 use starlark::syntax::AstModule;
 use starlark::syntax::Dialect;
@@ -79,14 +75,6 @@ use crate::server::LspServerSettings;
 use crate::server::LspUrl;
 use crate::server::StringLiteralResult;
 
-/// Get the path from a URL, trimming off things like the leading slash that gets
-/// appended in some windows test environments.
-#[cfg(windows)]
-fn get_path_from_uri(uri: &str) -> PathBuf {
-    PathBuf::from(uri.trim_start_match('/'))
-}
-
-#[cfg(not(windows))]
 fn get_path_from_uri(uri: &str) -> PathBuf {
     PathBuf::from(uri)
 }
@@ -138,7 +126,11 @@ impl LspContext for TestServerContext {
     fn parse_file_with_contents(&self, uri: &LspUrl, content: String) -> LspEvalResult {
         match uri {
             LspUrl::File(path) | LspUrl::Starlark(path) => {
-                match AstModule::parse(&path.to_string_lossy(), content, &Dialect::Extended) {
+                match AstModule::parse(
+                    &path.to_string_lossy(),
+                    content,
+                    &Dialect::AllOptionsInternal,
+                ) {
                     Ok(ast) => {
                         let diagnostics = ast
                             .lint(None)
@@ -296,7 +288,12 @@ impl LspContext for TestServerContext {
             members: self
                 .builtin_symbols
                 .keys()
-                .map(|name| (name.clone(), DocMember::Function(DocFunction::default())))
+                .map(|name| {
+                    (
+                        name.clone(),
+                        DocItem::Member(DocMember::Function(DocFunction::default())),
+                    )
+                })
                 .collect(),
         }
     }
@@ -363,25 +360,22 @@ impl TestServer {
     }
 
     /// A static set of "builtins" to use for testing
-    fn testing_builtins(root: &Path) -> anyhow::Result<HashMap<LspUrl, Vec<Doc>>> {
+    fn testing_builtins(root: &Path) -> anyhow::Result<HashMap<LspUrl, DocModule>> {
         let prelude_path = root.join("dir/prelude.bzl");
         let ret = hashmap! {
-            LspUrl::try_from(Url::parse("starlark:/native/builtin.bzl")?)? => vec![
-                Doc::named_item("native_function1".to_owned(), DocItem::Function(DocFunction::default())),
-                Doc::named_item("native_function2".to_owned(),DocItem::Function(DocFunction::default())),
-            ],
-            LspUrl::try_from(Url::from_file_path(prelude_path).unwrap())? => vec![
-                Doc {
-                    id: Identifier {
-                        name: "prelude_function".to_owned(),
-                        location: Some(Location {
-                            path: "//dir/prelude.bzl".to_owned(),
-                        }),
-                    },
-                    item: DocItem::Function(DocFunction::default()),
-                    custom_attrs: Default::default(),
-                },
-            ]
+            LspUrl::try_from(Url::parse("starlark:/native/builtin.bzl")?)? => DocModule {
+                docs: None,
+                members: [
+                    ("native_function1".to_owned(), DocItem::Member(DocMember::Function(DocFunction::default()))),
+                    ("native_function2".to_owned(), DocItem::Member(DocMember::Function(DocFunction::default()))),
+                ].into_iter().collect(),
+            },
+            LspUrl::try_from(Url::from_file_path(prelude_path).unwrap())? => DocModule {
+                docs: None,
+                members: [
+                    ("prelude_function".to_owned(), DocItem::Member(DocMember::Function(DocFunction::default()))),
+                ].into_iter().collect()
+            },
         };
         Ok(ret)
     }
@@ -417,9 +411,9 @@ impl TestServer {
         let mut builtin_symbols = HashMap::new();
 
         for (u, ds) in builtin {
-            builtin_docs.insert(u.clone(), render_docs_as_code(&ds));
-            for d in ds {
-                builtin_symbols.insert(d.id.name, u.clone());
+            builtin_docs.insert(u.clone(), ds.render_as_code());
+            for (sym, _) in ds.members {
+                builtin_symbols.insert(sym, u.clone());
             }
         }
 
@@ -660,9 +654,11 @@ impl TestServer {
         Ok(())
     }
 
-    /// Set the file contents that `get_load_contents()` will return. The path must be absolute.
-    pub fn set_file_contents(&self, path: PathBuf, contents: String) -> anyhow::Result<()> {
-        let path = get_path_from_uri(&format!("{}", path.display()));
+    /// Set the file contents that `get_load_contents()` will return.
+    pub fn set_file_contents(&self, file_uri: &Url, contents: String) -> anyhow::Result<()> {
+        let path = file_uri
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("Invalid file URI: {}", file_uri))?;
         if !path.is_absolute() {
             Err(TestServerError::SetFileNotAbsolute(path).into())
         } else {

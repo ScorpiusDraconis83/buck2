@@ -20,21 +20,21 @@ pub struct Config {
     pub env: Vec<EnvValue>,
 
     /// Max number of seconds allowed to run a test.
-    #[clap(long, default_value = "600", parse(try_from_str=try_parse_timeout_from_str))]
+    #[clap(long, default_value = "600", value_parser = try_parse_timeout_from_str)]
     pub timeout: Duration,
 
     /// Ignored arg included for backwards compatibility.
-    #[clap(long, hidden = true)]
+    #[clap(long, hide = true)]
     buck_test_info: String,
 
     /// Passthrough argments to test binary.
     /// Available as a workaround for when test features are available.
-    #[clap(long, multiple = true, allow_hyphen_values = true)]
+    #[clap(long, num_args=1.., allow_hyphen_values = true)]
     pub test_arg: Vec<String>,
 }
 
 /// Uiltity that can be used to parse Env values from CLI arguments.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct EnvValue {
     pub name: String,
     pub value: String,
@@ -50,17 +50,21 @@ impl EnvValue {
 }
 
 impl FromStr for EnvValue {
-    type Err = EnvValueParseError;
+    type Err = anyhow::Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input.split_once('=') {
             Some((key, value)) => Ok(EnvValue::new(key, value)),
-            None => Err(EnvValueParseError::IncorrectSyntax(input.to_owned())),
+            None => Err(
+                buck2_error::Error::from(EnvValueParseError::IncorrectSyntax(input.to_owned()))
+                    .into(),
+            ),
         }
     }
 }
 
 #[derive(Debug, buck2_error::Error, PartialEq)]
+#[buck2(tag = Input)]
 pub enum EnvValueParseError {
     #[error("Incorrect syntax for env value. Please use name=value. Input: `{0}`")]
     IncorrectSyntax(String),

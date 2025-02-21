@@ -131,7 +131,7 @@ impl<C: Component> Component for Bordered<C> {
         }
         if let Some(bottom) = &self.border.bottom {
             let lines = construct_vertical_padding(bottom.clone(), output.max_line_length());
-            output.0.extend(lines);
+            output.extend(lines);
         }
 
         Ok(output)
@@ -146,6 +146,7 @@ mod tests {
     use crate::components::echo::Echo;
 
     #[derive(AsRef, Debug)]
+    #[allow(dead_code)]
     struct Msg(Lines);
 
     #[test]

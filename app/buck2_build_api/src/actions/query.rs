@@ -18,15 +18,17 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_artifact::actions::key::ActionKey;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::CellResolver;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
+use buck2_core::package::PackageLabel;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_execute::artifact::fs::ExecutorFs;
+use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_query::query::environment::QueryTarget;
 use buck2_query::query::graph::node::LabeledNode;
 use buck2_query::query::graph::node::NodeKey;
@@ -40,6 +42,8 @@ use indexmap::IndexMap;
 use internment::ArcIntern;
 use ref_cast::RefCast;
 use serde::Serialize;
+use starlark::values::Heap;
+use starlark::values::Value;
 
 use crate::actions::RegisteredAction;
 use crate::analysis::AnalysisResult;
@@ -196,7 +200,7 @@ pub struct AnalysisData {
 }
 
 impl AnalysisData {
-    pub fn providers(&self) -> anyhow::Result<FrozenProviderCollectionValue> {
+    pub fn providers(&self) -> buck2_error::Result<FrozenProviderCollectionValue> {
         self.analysis.lookup_inner(&self.target)
     }
 
@@ -247,12 +251,22 @@ pub enum ActionQueryNodeRef {
     Action(ActionKey),
 }
 
+#[derive(Copy, Clone)]
+pub enum PackageLabelOption {
+    PackageLabel(PackageLabel),
+    TransitionAttr,
+}
+
 impl NodeKey for ActionQueryNodeRef {}
 
 impl ActionQueryNodeRef {
-    pub fn require_action(&self) -> anyhow::Result<&ActionKey> {
+    pub fn require_action(&self) -> buck2_error::Result<&ActionKey> {
         match self {
-            Self::Analysis(a) => Err(anyhow::anyhow!("Not an action: {}", a)),
+            Self::Analysis(a) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Not an action: {}",
+                a
+            )),
             Self::Action(a) => Ok(a),
         }
     }
@@ -270,9 +284,13 @@ impl QueryTarget for ActionQueryNode {
         }
     }
 
+    fn name(&self) -> Cow<str> {
+        Cow::Owned(self.node_key().to_string())
+    }
+
     /// Return the path to the buildfile that defines this target, e.g. `fbcode//foo/bar/TARGETS`
     fn buildfile_path(&self) -> &BuildFilePath {
-        // TODO(cjhopman): In addition to implementing this, we should be able to return an anyhow::Error here rather than panicking.
+        // TODO(cjhopman): In addition to implementing this, we should be able to return an buck2_error::Error here rather than panicking.
         unimplemented!("buildfile not yet implemented in aquery")
     }
 
@@ -295,10 +313,19 @@ impl QueryTarget for ActionQueryNode {
         self.deps()
     }
 
+    fn configuration_deps<'a>(&'a self) -> impl Iterator<Item = &'a Self::Key> + Send + 'a {
+        std::iter::empty()
+    }
+
+    fn toolchain_deps<'a>(&'a self) -> impl Iterator<Item = &'a Self::Key> + Send + 'a {
+        // TODO(ezgi): implement toolchain deps for aquery
+        std::iter::empty()
+    }
+
     fn attr_any_matches(
         attr: &Self::Attr<'_>,
-        filter: &dyn Fn(&str) -> anyhow::Result<bool>,
-    ) -> anyhow::Result<bool> {
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         filter(&attr.0)
     }
 
@@ -337,6 +364,13 @@ impl QueryTarget for ActionQueryNode {
         Ok(())
     }
 
+    fn defined_attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+        &self,
+        func: F,
+    ) -> Result<(), E> {
+        self.attrs_for_each(func)
+    }
+
     fn map_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(&self, key: &str, mut func: F) -> R {
         let mut res = None;
 
@@ -344,7 +378,7 @@ impl QueryTarget for ActionQueryNode {
             if k == key {
                 res = Some(func(Some(attr)));
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<(), buck2_error::Error>(())
         })
         .unwrap();
         match res {
@@ -357,8 +391,13 @@ impl QueryTarget for ActionQueryNode {
         &self,
         mut _func: F,
     ) -> Result<(), E> {
-        // TODO(cjhopman): In addition to implementing this, we should be able to return an anyhow::Error here rather than panicking.
+        // TODO(cjhopman): In addition to implementing this, we should be able to return an buck2_error::Error here rather than panicking.
         unimplemented!("inputs not yet implemented in aquery")
+    }
+
+    fn map_any_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(&self, key: &str, func: F) -> R {
+        // aquery doesn't have special attrs, so this is the same as map_attr
+        self.map_attr(key, func)
     }
 }
 
@@ -387,14 +426,12 @@ pub fn iter_action_inputs<'a>(
         type Item = &'a SetProjectionInputs;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.queue.pop_front().map(|node| {
+            self.queue.pop_front().inspect(|node| {
                 for child in &*node.node.children {
                     if self.visited.insert(child) {
                         self.queue.push_back(child);
                     }
                 }
-
-                node
             })
         }
     }
@@ -416,7 +453,7 @@ pub fn iter_action_inputs<'a>(
 
 pub static FIND_MATCHING_ACTION: LateBinding<
     for<'c> fn(
-        &'c DiceComputations,
+        &'c mut DiceComputations,
         // Working dir.
         &'c ProjectRelativePath,
         // target cfg info (target platform, cli modifiers)
@@ -425,7 +462,7 @@ pub static FIND_MATCHING_ACTION: LateBinding<
         // path_after_target_name
         ForwardRelativePathBuf,
     ) -> Pin<
-        Box<dyn Future<Output = anyhow::Result<Option<ActionQueryNode>>> + Send + 'c>,
+        Box<dyn Future<Output = buck2_error::Result<Option<ActionQueryNode>>> + Send + 'c>,
     >,
 > = LateBinding::new("FIND_MATCHING_ACTION");
 
@@ -437,5 +474,14 @@ pub static PRINT_ACTION_NODE: LateBinding<
         json: bool,
         output_attributes: &'a [String],
         cell_resolver: &'a CellResolver,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>,
+    ) -> Pin<Box<dyn Future<Output = buck2_error::Result<()>> + Send + 'a>>,
 > = LateBinding::new("PRINT_ACTION_NODE");
+
+/// Use of "configured_attr_to_value" in `buck2_transition` from `buck2_analysis`.
+pub static CONFIGURED_ATTR_TO_VALUE: LateBinding<
+    for<'v> fn(
+        this: &ConfiguredAttr,
+        pkg: PackageLabelOption,
+        heap: &'v Heap,
+    ) -> buck2_error::Result<Value<'v>>,
+> = LateBinding::new("CONFIGURED_ATTR_TO_VALUE");

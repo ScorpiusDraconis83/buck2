@@ -36,12 +36,16 @@ use crate::lexer::Token;
 use crate::syntax::ast::ArgumentP;
 use crate::syntax::ast::AstExpr;
 use crate::syntax::ast::AstStmt;
+use crate::syntax::ast::CallArgsP;
 use crate::syntax::ast::ExprP;
 use crate::syntax::ast::IdentP;
 use crate::syntax::ast::LoadArgP;
 use crate::syntax::ast::Stmt;
 use crate::syntax::grammar::StarlarkParser;
+use crate::syntax::lint_suppressions::LintSuppressions;
+use crate::syntax::lint_suppressions::LintSuppressionsBuilder;
 use crate::syntax::state::ParserState;
+use crate::syntax::validate::validate_module;
 use crate::syntax::AstLoad;
 use crate::syntax::Dialect;
 
@@ -96,7 +100,7 @@ fn parse_error_add_span(
     };
 
     crate::Error::new_spanned(
-        crate::ErrorKind::Other(anyhow::anyhow!(message)),
+        crate::ErrorKind::Parser(anyhow::anyhow!(message)),
         span,
         codemap,
     )
@@ -110,7 +114,7 @@ fn parse_error_add_span(
 /// The internal details (statements/expressions) are deliberately omitted, as they change
 /// more regularly. A few methods to obtain information about the AST are provided.
 #[derive(Derivative)]
-#[derivative(Debug)]
+#[derivative(Debug, Clone)]
 pub struct AstModule {
     #[derivative(Debug = "ignore")]
     pub(crate) codemap: CodeMap,
@@ -119,6 +123,9 @@ pub struct AstModule {
     /// Opt-in typecheck.
     /// Specified with `@starlark-rust: typecheck`.
     pub(crate) typecheck: bool,
+    /// Lint issues suppressed in this module using inline comments of shape
+    /// # starlark-lint-disable <ISSUE_NAME>, <ISSUE_NAME>, ...
+    lint_suppressions: LintSuppressions,
 }
 
 /// This trait is not exported as public API of starlark.
@@ -156,13 +163,27 @@ impl AstModule {
         statement: AstStmt,
         dialect: &Dialect,
         typecheck: bool,
+        lint_suppressions: LintSuppressions,
     ) -> crate::Result<AstModule> {
-        Stmt::validate(&codemap, &statement, dialect).map_err(EvalException::into_error)?;
+        let mut errors = Vec::new();
+        validate_module(
+            &statement,
+            &mut ParserState {
+                codemap: &codemap,
+                dialect,
+                errors: &mut errors,
+            },
+        );
+        // We need the first error, so we don't use `.pop()`.
+        if let Some(err) = errors.into_iter().next() {
+            return Err(err.into_error());
+        }
         Ok(AstModule {
             codemap,
             statement,
             dialect: dialect.clone(),
             typecheck,
+            lint_suppressions,
         })
     }
 
@@ -192,6 +213,10 @@ impl AstModule {
         let typecheck = content.contains("@starlark-rust: typecheck");
         let codemap = CodeMap::new(filename.to_owned(), content);
         let lexer = Lexer::new(codemap.source(), dialect, codemap.dupe());
+        // Store lint suppressions found during parsing
+        let mut lint_suppressions_builder = LintSuppressionsBuilder::new();
+        // Keep track of block of comments, used for accumulating lint suppressions
+        let mut in_comment_block = false;
         let mut errors = Vec::new();
         match StarlarkParser::new().parse(
             &mut ParserState {
@@ -199,13 +224,33 @@ impl AstModule {
                 dialect,
                 errors: &mut errors,
             },
-            lexer.filter(|t| !matches!(t, Ok((_, Token::Comment(_), _)))),
+            lexer.filter(|token| match token {
+                // Filter out comment tokens and accumulate lint suppressions
+                Ok((start, Token::Comment(comment), end)) => {
+                    lint_suppressions_builder.parse_comment(&codemap, comment, *start, *end);
+                    in_comment_block = true;
+                    false
+                }
+                _ => {
+                    if in_comment_block {
+                        lint_suppressions_builder.end_of_comment_block(&codemap);
+                        in_comment_block = false;
+                    }
+                    true
+                }
+            }),
         ) {
             Ok(v) => {
                 if let Some(err) = errors.into_iter().next() {
                     return Err(err.into_error());
                 }
-                Ok(AstModule::create(codemap, v, dialect, typecheck)?)
+                Ok(AstModule::create(
+                    codemap,
+                    v,
+                    dialect,
+                    typecheck,
+                    lint_suppressions_builder.build(),
+                )?)
             }
             Err(p) => Err(parse_error_add_span(p, codemap.source().len(), &codemap)),
         }
@@ -251,6 +296,11 @@ impl AstModule {
         self.codemap.file_span(x)
     }
 
+    /// Get back the AST statement for the module
+    pub fn statement(&self) -> &AstStmt {
+        &self.statement
+    }
+
     /// Locations where statements occur.
     pub fn stmt_locations(&self) -> Vec<FileSpan> {
         fn go(x: &AstStmt, codemap: &CodeMap, res: &mut Vec<FileSpan>) {
@@ -291,16 +341,18 @@ impl AstModule {
                                 },
                             }),
                         }),
-                        vec![
-                            Spanned {
-                                span: lhs.span,
-                                node: ArgumentP::Positional(*lhs),
-                            },
-                            Spanned {
-                                span: rhs.span,
-                                node: ArgumentP::Positional(*rhs),
-                            },
-                        ],
+                        CallArgsP {
+                            args: vec![
+                                Spanned {
+                                    span: lhs.span,
+                                    node: ArgumentP::Positional(*lhs),
+                                },
+                                Spanned {
+                                    span: rhs.span,
+                                    node: ArgumentP::Positional(*rhs),
+                                },
+                            ],
+                        },
                     ),
                     None => ExprP::Op(lhs, op, rhs),
                 },
@@ -311,6 +363,12 @@ impl AstModule {
         }
 
         self.statement.visit_expr_mut(|x| f(x, replace));
+    }
+
+    /// Check if a given Lint short_name and span is suppressed in this module
+    pub fn is_suppressed(&self, issue_short_name: &str, issue_span: Span) -> bool {
+        self.lint_suppressions
+            .is_suppressed(issue_short_name, issue_span)
     }
 }
 

@@ -7,6 +7,8 @@
  * of this source tree.
  */
 
+use buck2_data::Snapshot;
+use buck2_error::conversion::from_any_with_tag;
 use superconsole::DrawMode;
 use superconsole::Line;
 use superconsole::Lines;
@@ -36,6 +38,10 @@ impl ReState {
         if self.first_snapshot.is_none() {
             self.first_snapshot = Some(snapshot.clone());
         }
+    }
+
+    pub fn first_snapshot(&self) -> &Option<Snapshot> {
+        &self.first_snapshot
     }
 
     pub fn render_header(
@@ -114,12 +120,14 @@ impl ReState {
         &self,
         name: &str,
         stat: u64,
-    ) -> anyhow::Result<Option<Line>> {
+    ) -> buck2_error::Result<Option<Line>> {
         let line = format!(
             "{name:<20}: \
             {stat:>5} bytes"
         );
-        Ok(Some(Line::unstyled(&line)?))
+        Ok(Some(Line::unstyled(&line).map_err(|e| {
+            from_any_with_tag(e, buck2_error::ErrorTag::Tier0)
+        })?))
     }
 
     fn render_detailed_items(
@@ -128,7 +136,7 @@ impl ReState {
         started: u32,
         finished_successfully: u32,
         finished_with_error: u32,
-    ) -> anyhow::Result<Option<Line>> {
+    ) -> buck2_error::Result<Option<Line>> {
         let in_progress = started
             .saturating_sub(finished_successfully)
             .saturating_sub(finished_with_error);
@@ -141,10 +149,35 @@ impl ReState {
             {finished_successfully:>5} success, \
             {finished_with_error:>5} error"
         );
-        Ok(Some(Line::unstyled(&line)?))
+        Ok(Some(Line::unstyled(&line).map_err(|e| {
+            from_any_with_tag(e, buck2_error::ErrorTag::Tier0)
+        })?))
     }
 
-    fn render_detailed(&self, two_snapshots: &TwoSnapshots) -> anyhow::Result<Vec<Line>> {
+    fn render_local_cache_stat(
+        &self,
+        name: &str,
+        hits_files: i64,
+        hits_bytes: i64,
+        misses_files: i64,
+        misses_bytes: i64,
+    ) -> buck2_error::Result<Option<Line>> {
+        let line = format!(
+            "{:<20}: \
+            {:>5} / {:>5} files hits, \
+            {:>5} / {:>5} files misses ",
+            name,
+            HumanizedBytes::new(hits_bytes as u64),
+            hits_files,
+            HumanizedBytes::new(misses_bytes as u64),
+            misses_files,
+        );
+        Ok(Some(Line::unstyled(&line).map_err(|e| {
+            from_any_with_tag(e, buck2_error::ErrorTag::Tier0)
+        })?))
+    }
+
+    fn render_detailed(&self, two_snapshots: &TwoSnapshots) -> buck2_error::Result<Vec<Line>> {
         let mut r = Vec::new();
         if let (Some(first), Some((_, last))) = (&self.first_snapshot, &two_snapshots.last) {
             r.extend(self.render_detailed_items(
@@ -194,6 +227,14 @@ impl ReState {
                 "http_download_bytes",
                 last.http_download_bytes - first.http_download_bytes,
             )?);
+
+            r.extend(self.render_local_cache_stat(
+                "local_artifact_cache",
+                last.local_cache_hits_files - first.local_cache_hits_files,
+                last.local_cache_hits_bytes - first.local_cache_hits_bytes,
+                last.local_cache_misses_files - first.local_cache_misses_files,
+                last.local_cache_misses_bytes - first.local_cache_misses_bytes,
+            )?);
         }
         Ok(r)
     }
@@ -203,12 +244,15 @@ impl ReState {
         two_snapshots: &TwoSnapshots,
         detailed: bool,
         draw_mode: DrawMode,
-    ) -> anyhow::Result<Lines> {
+    ) -> buck2_error::Result<Lines> {
         let header = match self.render_header(two_snapshots, draw_mode) {
             Some(header) => header,
             None => return Ok(Lines::new()),
         };
-        let mut lines = vec![Line::unstyled(&header)?];
+        let mut lines = vec![
+            Line::unstyled(&header)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?,
+        ];
         if detailed {
             lines.extend(self.render_detailed(two_snapshots)?);
         }

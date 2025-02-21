@@ -5,6 +5,8 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+# pyre-strict
+
 from abc import ABCMeta, abstractmethod
 from pathlib import Path
 from typing import List, Optional, Union
@@ -18,14 +20,16 @@ class ICodesignCommandFactory(metaclass=ABCMeta):
         identity_fingerprint: str,
         entitlements: Optional[Path],
         codesign_args: List[str],
+        extra_file_paths: Optional[List[Path]],
     ) -> List[Union[str, Path]]:
         raise NotImplementedError
 
 
 class DefaultCodesignCommandFactory(ICodesignCommandFactory):
-    _command_args = ["--force", "--sign"]
+    codesign_tool: Path
+    _command_args: List[str] = ["--force", "--sign"]
 
-    def __init__(self, codesign_tool: Optional[Path]):
+    def __init__(self, codesign_tool: Optional[Path]) -> None:
         self.codesign_tool = codesign_tool or Path("codesign")
 
     def codesign_command(
@@ -34,7 +38,12 @@ class DefaultCodesignCommandFactory(ICodesignCommandFactory):
         identity_fingerprint: str,
         entitlements: Optional[Path],
         codesign_args: List[str],
+        extra_file_paths: Optional[List[Path]],
     ) -> List[Union[str, Path]]:
+        if extra_file_paths:
+            raise RuntimeError(
+                f"Extra codesign paths unsupported for non-dry signing (path: `{path}`, extra paths: `{extra_file_paths}`)"
+            )
         entitlements_args = ["--entitlements", entitlements] if entitlements else []
         return (
             [self.codesign_tool]
@@ -47,12 +56,10 @@ class DefaultCodesignCommandFactory(ICodesignCommandFactory):
 
 
 class DryRunCodesignCommandFactory(ICodesignCommandFactory):
-    def __init__(self, codesign_tool: Path):
-        self.codesign_tool = codesign_tool
-        self.codesign_on_copy_file_paths = None
+    codesign_tool: Path
 
-    def set_codesign_on_copy_file_paths(self, file_paths: List[Path]) -> None:
-        self.codesign_on_copy_file_paths = file_paths
+    def __init__(self, codesign_tool: Path) -> None:
+        self.codesign_tool = codesign_tool
 
     def codesign_command(
         self,
@@ -60,11 +67,12 @@ class DryRunCodesignCommandFactory(ICodesignCommandFactory):
         identity_fingerprint: str,
         entitlements: Optional[Path],
         codesign_args: List[str],
+        extra_file_paths: Optional[List[Path]],
     ) -> List[Union[str, Path]]:
         args = [path, "--identity", identity_fingerprint]
         if entitlements:
             args += ["--entitlements", entitlements] if entitlements else []
-        if self.codesign_on_copy_file_paths:
+        if extra_file_paths:
             args += ["--extra-paths-to-sign"]
-            args += self.codesign_on_copy_file_paths
+            args += extra_file_paths
         return [self.codesign_tool] + args

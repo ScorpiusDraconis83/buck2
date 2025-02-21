@@ -14,21 +14,36 @@ load(
     "get_auto_link_group_specs",
 )
 load(
-    "@prelude//cxx:cxx_toolchain_types.bzl",
-    "CxxToolchainInfo",
-    "PicBehavior",
+    "@prelude//cxx:cxx_context.bzl",
+    "get_cxx_toolchain_info",
 )
 load(
+    "@prelude//cxx:cxx_toolchain_types.bzl",
+    "CxxToolchainInfo",
+    "LinkerType",
+    "PicBehavior",
+)
+load("@prelude//cxx:groups.bzl", "get_dedupped_roots_from_groups")
+load(
     "@prelude//cxx:link_groups.bzl",
+    "BuildLinkGroupsContext",
     "LinkGroupContext",
+    "collect_linkables",
     "create_link_groups",
     "find_relevant_roots",
     "get_filtered_labels_to_links_map",
     "get_filtered_links",
     "get_link_group_info",
     "get_link_group_preferred_linkage",
+    "get_public_link_group_nodes",
     "get_transitive_deps_matching_labels",
     "is_link_group_shlib",
+)
+load(
+    "@prelude//cxx:linker.bzl",
+    "LINKERS",
+    "get_rpath_origin",
+    "get_shared_library_flags",
 )
 load(
     "@prelude//cxx:preprocessor.bzl",
@@ -49,6 +64,7 @@ load(
 load(
     "@prelude//haskell:library_info.bzl",
     "HaskellLibraryInfo",
+    "HaskellLibraryInfoTSet",
     "HaskellLibraryProvider",
 )
 load(
@@ -57,7 +73,6 @@ load(
     "HaskellProfLinkInfo",
     "attr_link_style",
     "cxx_toolchain_link_style",
-    "merge_haskell_link_infos",
 )
 load(
     "@prelude//haskell:toolchain.bzl",
@@ -90,7 +105,6 @@ load(
     "LinkInfo",
     "LinkInfos",
     "LinkStyle",
-    "Linkage",
     "LinkedObject",
     "MergedLinkInfo",
     "SharedLibLinkable",
@@ -109,7 +123,7 @@ load(
     "create_linkable_graph",
     "create_linkable_graph_node",
     "create_linkable_node",
-    "get_linkable_graph_node_map_func",
+    "reduce_linkable_graph",
 )
 load(
     "@prelude//linking:linkables.bzl",
@@ -119,14 +133,16 @@ load(
     "@prelude//linking:shared_libraries.bzl",
     "SharedLibraryInfo",
     "create_shared_libraries",
+    "create_shlib_symlink_tree",
     "merge_shared_libraries",
     "traverse_shared_library_info",
 )
+load("@prelude//linking:types.bzl", "Linkage")
 load(
     "@prelude//python:python.bzl",
     "PythonLibraryInfo",
 )
-load("@prelude//utils:set.bzl", "set")
+load("@prelude//utils:argfile.bzl", "at_argfile")
 load("@prelude//utils:utils.bzl", "filter_and_map_idx", "flatten")
 
 HaskellIndexingTSet = transitive_set()
@@ -238,7 +254,7 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
         def archive_linkable(lib):
             return ArchiveLinkable(
                 archive = Archive(artifact = lib),
-                linker_type = "gnu",
+                linker_type = LinkerType("gnu"),
             )
 
         def shared_linkable(lib):
@@ -256,18 +272,28 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
         ]
 
         hlibinfos[link_style] = hlibinfo
-        hlinkinfos[link_style] = [hlibinfo]
+        hlinkinfos[link_style] = ctx.actions.tset(
+            HaskellLibraryInfoTSet,
+            value = hlibinfo,
+            children = [lib.info[link_style] for lib in haskell_infos],
+        )
         prof_hlibinfos[link_style] = prof_hlibinfo
-        prof_hlinkinfos[link_style] = [prof_hlibinfo]
+        prof_hlinkinfos[link_style] = ctx.actions.tset(
+            HaskellLibraryInfoTSet,
+            value = prof_hlibinfo,
+            children = [lib.prof_info[link_style] for lib in haskell_infos],
+        )
         link_infos[link_style] = LinkInfos(
             default = LinkInfo(
                 pre_flags = ctx.attrs.exported_linker_flags,
+                post_flags = ctx.attrs.exported_post_linker_flags,
                 linkables = linkables,
             ),
         )
         prof_link_infos[link_style] = LinkInfos(
             default = LinkInfo(
                 pre_flags = ctx.attrs.exported_linker_flags,
+                post_flags = ctx.attrs.exported_post_linker_flags,
                 linkables = prof_linkables,
             ),
         )
@@ -307,6 +333,7 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
     solibs = {}
     for soname, lib in ctx.attrs.shared_libs.items():
         solibs[soname] = LinkedObject(output = lib, unstripped_output = lib)
+    shared_libs = create_shared_libraries(ctx, solibs)
 
     linkable_graph = create_linkable_graph(
         ctx,
@@ -316,7 +343,7 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 ctx = ctx,
                 exported_deps = ctx.attrs.deps,
                 link_infos = {_to_lib_output_style(s): v for s, v in link_infos.items()},
-                shared_libs = solibs,
+                shared_libs = shared_libs,
                 default_soname = None,
             ),
         ),
@@ -325,7 +352,7 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     inherited_pp_info = cxx_inherited_preprocessor_infos(ctx.attrs.deps)
     own_pp_info = CPreprocessor(
-        relative_args = CPreprocessorArgs(args = flatten([["-isystem", d] for d in ctx.attrs.cxx_header_dirs])),
+        args = CPreprocessorArgs(args = flatten([["-isystem", d] for d in ctx.attrs.cxx_header_dirs])),
     )
 
     return [
@@ -334,11 +361,11 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
         cxx_merge_cpreprocessors(ctx, [own_pp_info], inherited_pp_info),
         merge_shared_libraries(
             ctx.actions,
-            create_shared_libraries(ctx, solibs),
+            shared_libs,
             shared_library_infos,
         ),
         merge_link_group_lib_info(deps = ctx.attrs.deps),
-        merge_haskell_link_infos(haskell_infos + [haskell_link_infos]),
+        haskell_link_infos,
         merged_link_info,
         HaskellProfLinkInfo(
             prof_infos = prof_merged_link_info,
@@ -349,12 +376,12 @@ def haskell_prebuilt_library_impl(ctx: AnalysisContext) -> list[Provider]:
 def _srcs_to_objfiles(
         ctx: AnalysisContext,
         odir: Artifact,
-        osuf: str) -> cmd_args:
-    objfiles = cmd_args()
+        osuf: str) -> list[Artifact]:
+    objfiles = []
     for src, _ in srcs_to_pairs(ctx.attrs.srcs):
         # Don't link boot sources, as they're only meant to be used for compiling.
         if is_haskell_src(src):
-            objfiles.add(cmd_args([odir, "/", paths.replace_extension(src, "." + osuf)], delimiter = ""))
+            objfiles.append(odir.project(paths.replace_extension(src, "." + osuf)))
     return objfiles
 
 _REGISTER_PACKAGE = """\
@@ -362,8 +389,9 @@ set -eu
 GHC_PKG=$1
 DB=$2
 PKGCONF=$3
+ALWAYS_USE_CACHE=$4
 "$GHC_PKG" init "$DB"
-"$GHC_PKG" register --package-conf "$DB" --no-expand-pkgroot "$PKGCONF"
+"$GHC_PKG" register --package-conf "$DB" --no-expand-pkgroot $ALWAYS_USE_CACHE "$PKGCONF"
 """
 
 # Create a package
@@ -398,10 +426,6 @@ def _make_package(
     # Don't expose boot sources, as they're only meant to be used for compiling.
     modules = [src_to_module_name(x) for x, _ in srcs_to_pairs(ctx.attrs.srcs) if is_haskell_src(x)]
 
-    uniq_hlis = {}
-    for x in hlis:
-        uniq_hlis[x.id] = x
-
     if enable_profiling:
         # Add the `-p` suffix otherwise ghc will look for objects
         # following this logic (https://fburl.com/code/3gmobm5x) and will fail.
@@ -430,36 +454,52 @@ def _make_package(
         "import-dirs:" + ", ".join(import_dirs),
         "library-dirs:" + ", ".join(library_dirs),
         "extra-libraries: " + libname,
-        "depends: " + ", ".join(uniq_hlis),
+        "depends: " + ", ".join([lib.id for lib in hlis]),
     ]
     pkg_conf = ctx.actions.write("pkg-" + artifact_suffix + ".conf", conf)
 
     db = ctx.actions.declare_output("db-" + artifact_suffix)
 
-    db_deps = {}
-    for x in uniq_hlis.values():
-        db_deps[repr(x.db)] = x.db
+    # While the list of hlis is unique, there may be multiple packages in the same db.
+    # Cutting down the GHC_PACKAGE_PATH significantly speeds up GHC.
+    db_deps = {x.db: None for x in hlis}.keys()
 
     # So that ghc-pkg can find the DBs for the dependencies. We might
     # be able to use flags for this instead, but this works.
     ghc_package_path = cmd_args(
-        db_deps.values(),
+        db_deps,
         delimiter = ":",
     )
 
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
+
+    # --always-use-cache is a custom option to ghc-pkg that tells it to ignore the
+    # modification time on the package cache and use it anyway. This is useful in
+    # RE where file modification times can't be relied upon; without this option
+    # ghc-pkg will fall back to reading all the package configs which is much
+    # slower.
+    if haskell_toolchain.support_always_use_cache:
+        use_cache_arg = "--always-use-cache"
+    else:
+        use_cache_arg = ""
+
     ctx.actions.run(
-        cmd_args([
-            "sh",
-            "-c",
-            _REGISTER_PACKAGE,
-            "",
-            haskell_toolchain.packager,
-            db.as_output(),
-            pkg_conf,
-        ]).hidden(hi.values()).hidden(lib.values()),  # needs hi, because ghc-pkg checks that the .hi files exist
+        cmd_args(
+            [
+                "sh",
+                "-c",
+                _REGISTER_PACKAGE,
+                "",
+                haskell_toolchain.packager,
+                db.as_output(),
+                pkg_conf,
+                use_cache_arg,
+            ],
+            # needs hi, because ghc-pkg checks that the .hi files exist
+            hidden = hi.values() + lib.values(),
+        ),
         category = "haskell_package_" + artifact_suffix.replace("-", "_"),
-        env = {"GHC_PACKAGE_PATH": ghc_package_path},
+        env = {"GHC_PACKAGE_PATH": ghc_package_path} if db_deps else {},
     )
 
     return db
@@ -471,6 +511,19 @@ HaskellLibBuildOutput = record(
     compiled = CompileResultInfo,
     libs = list[Artifact],
 )
+
+def _get_haskell_shared_library_name_linker_flags(
+        linker_type: LinkerType,
+        soname: str) -> list[str]:
+    if linker_type == LinkerType("gnu"):
+        return ["-Wl,-soname,{}".format(soname)]
+    elif linker_type == LinkerType("darwin"):
+        # Passing `-install_name @rpath/...` or
+        # `-Xlinker -install_name -Xlinker @rpath/...` instead causes
+        # ghc-9.6.3: panic! (the 'impossible' happened)
+        return ["-Wl,-install_name,@rpath/{}".format(soname)]
+    else:
+        fail("Unknown linker type '{}'.".format(linker_type))
 
 def _build_haskell_lib(
         ctx,
@@ -504,33 +557,37 @@ def _build_haskell_lib(
     if link_style == LinkStyle("static_pic"):
         libstem += "_pic"
 
+    dynamic_lib_suffix = "." + LINKERS[linker_info.type].default_shared_library_extension
     static_lib_suffix = "_p.a" if enable_profiling else ".a"
-    libfile = "lib" + libstem + (".so" if link_style == LinkStyle("shared") else static_lib_suffix)
+    libfile = "lib" + libstem + (dynamic_lib_suffix if link_style == LinkStyle("shared") else static_lib_suffix)
 
     lib_short_path = paths.join("lib-{}".format(artifact_suffix), libfile)
 
     linfos = [x.prof_info if enable_profiling else x.info for x in hlis]
-    uniq_infos = dedupe(flatten([x[link_style] for x in linfos]))
+
+    # only gather direct dependencies
+    uniq_infos = [x[link_style].value for x in linfos]
 
     objfiles = _srcs_to_objfiles(ctx, compiled.objects, osuf)
 
     if link_style == LinkStyle("shared"):
         lib = ctx.actions.declare_output(lib_short_path)
-        link = cmd_args(haskell_toolchain.linker)
-        link.add(haskell_toolchain.linker_flags)
-        link.add(ctx.attrs.linker_flags)
-        link.add("-o", lib.as_output())
-        link.add(
-            "-shared",
-            "-dynamic",
-            "-optl",
-            "-Wl,-soname",
-            "-optl",
-            "-Wl," + libfile,
+        link = cmd_args(
+            [haskell_toolchain.linker] +
+            [haskell_toolchain.linker_flags] +
+            [ctx.attrs.linker_flags] +
+            ["-o", lib.as_output()] +
+            [
+                get_shared_library_flags(linker_info.type),
+                "-dynamic",
+                cmd_args(
+                    _get_haskell_shared_library_name_linker_flags(linker_info.type, libfile),
+                    prepend = "-optl",
+                ),
+            ] +
+            [objfiles],
+            hidden = compiled.stubs,
         )
-
-        link.add(objfiles)
-        link.hidden(compiled.stubs)
 
         infos = get_link_args_for_strategy(
             ctx,
@@ -552,7 +609,7 @@ def _build_haskell_lib(
     else:  # static flavours
         # TODO: avoid making an archive for a single object, like cxx does
         # (but would that work with Template Haskell?)
-        archive = make_archive(ctx, lib_short_path, [compiled.objects], objfiles)
+        archive = make_archive(ctx, lib_short_path, objfiles)
         lib = archive.artifact
         libs = [lib] + archive.external_objects
         link_infos = LinkInfos(
@@ -676,11 +733,19 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
             if enable_profiling:
                 prof_hlib_infos[link_style] = hlib
-                prof_hlink_infos[link_style] = [hlib]
+                prof_hlink_infos[link_style] = ctx.actions.tset(
+                    HaskellLibraryInfoTSet,
+                    value = hlib,
+                    children = [li.prof_info[link_style] for li in hlis],
+                )
                 prof_link_infos[link_style] = hlib_build_out.link_infos
             else:
                 hlib_infos[link_style] = hlib
-                hlink_infos[link_style] = [hlib]
+                hlink_infos[link_style] = ctx.actions.tset(
+                    HaskellLibraryInfoTSet,
+                    value = hlib,
+                    children = [li.info[link_style] for li in hlis],
+                )
                 link_infos[link_style] = hlib_build_out.link_infos
 
             # Build the indices and create subtargets only once, with profiling
@@ -707,6 +772,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
         preferred_linkage,
         pic_behavior,
     )
+    shared_libs = create_shared_libraries(ctx, solibs)
 
     # TODO(cjhopman): this haskell implementation does not consistently handle LibOutputStyle
     # and LinkStrategy as expected and it's hard to tell what the intent of the existing code is
@@ -749,7 +815,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 preferred_linkage = preferred_linkage,
                 exported_deps = ctx.attrs.deps,
                 link_infos = {_to_lib_output_style(s): v for s, v in link_infos.items()},
-                shared_libs = solibs,
+                shared_libs = shared_libs,
                 # TODO(cjhopman): this should be set to non-None
                 default_soname = None,
             ),
@@ -782,10 +848,10 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
             lib = hlib_infos,
             prof_lib = prof_hlib_infos,
         ),
-        merge_haskell_link_infos(hlis + [HaskellLinkInfo(
+        HaskellLinkInfo(
             info = hlink_infos,
             prof_info = prof_hlink_infos,
-        )]),
+        ),
         merged_link_info,
         HaskellProfLinkInfo(
             prof_infos = prof_merged_link_info,
@@ -794,7 +860,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
         cxx_merge_cpreprocessors(ctx, pp, inherited_pp_info),
         merge_shared_libraries(
             ctx.actions,
-            create_shared_libraries(ctx, solibs),
+            shared_libs,
             shared_library_infos,
         ),
         haskell_haddock_lib(ctx, pkgname),
@@ -839,7 +905,7 @@ def haskell_library_impl(ctx: AnalysisContext) -> list[Provider]:
 def derive_indexing_tset(
         actions: AnalysisActions,
         link_style: LinkStyle,
-        value: [Artifact, None],
+        value: Artifact | None,
         children: list[Dependency]) -> HaskellIndexingTSet:
     index_children = []
     for dep in children:
@@ -877,17 +943,20 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     haskell_toolchain = ctx.attrs._haskell_toolchain[HaskellToolchainInfo]
 
     output = ctx.actions.declare_output(ctx.attrs.name)
-    link = cmd_args(haskell_toolchain.compiler)
-    link.add("-o", output.as_output())
-    link.add(haskell_toolchain.linker_flags)
-    link.add(ctx.attrs.linker_flags)
+    link = cmd_args(
+        [haskell_toolchain.compiler] +
+        ["-o", output.as_output()] +
+        [haskell_toolchain.linker_flags] +
+        [ctx.attrs.linker_flags],
+        hidden = compiled.stubs,
+    )
 
-    link.hidden(compiled.stubs)
+    link_args = cmd_args()
 
     osuf, _hisuf = output_extensions(link_style, enable_profiling)
 
     objfiles = _srcs_to_objfiles(ctx, compiled.objects, osuf)
-    link.add(objfiles)
+    link_args.add(objfiles)
 
     indexing_tsets = {}
     if compiled.producing_indices:
@@ -904,28 +973,39 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         deps = slis,
     )
 
-    sos = {}
+    sos = []
 
+    link_strategy = to_link_strategy(link_style)
     if link_group_info != None:
         own_binary_link_flags = []
         auto_link_groups = {}
         link_group_libs = {}
         link_deps = linkables(attr_deps(ctx))
-        linkable_graph_node_map = get_linkable_graph_node_map_func(link_group_info.graph)()
+        reduced_linkable_graph = reduce_linkable_graph(link_group_info.graph)
+        linkable_graph_node_map = reduced_linkable_graph.nodes
         link_group_preferred_linkage = get_link_group_preferred_linkage(link_group_info.groups.values())
 
         # If we're using auto-link-groups, where we generate the link group links
         # in the prelude, the link group map will give us the link group libs.
         # Otherwise, pull them from the `LinkGroupLibInfo` provider from out deps.
         auto_link_group_specs = get_auto_link_group_specs(ctx, link_group_info)
+        executable_deps = [d.linkable_graph.nodes.value.label for d in link_deps if d.linkable_graph != None]
+        public_nodes = get_public_link_group_nodes(
+            linkable_graph_node_map,
+            link_group_info.mappings,
+            executable_deps,
+            None,
+        )
         if auto_link_group_specs != None:
             linked_link_groups = create_link_groups(
                 ctx = ctx,
+                link_strategy = link_strategy,
+                linkable_graph = reduced_linkable_graph,
                 link_group_mappings = link_group_info.mappings,
                 link_group_preferred_linkage = link_group_preferred_linkage,
-                executable_deps = [d.linkable_graph.nodes.value.label for d in link_deps if d.linkable_graph != None],
+                executable_deps = executable_deps,
                 link_group_specs = auto_link_group_specs,
-                linkable_graph_node_map = linkable_graph_node_map,
+                public_nodes = public_nodes,
             )
             for name, linked_link_group in linked_link_groups.libs.items():
                 auto_link_groups[name] = linked_link_group.artifact
@@ -944,36 +1024,48 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         link_group_relevant_roots = find_relevant_roots(
             linkable_graph_node_map = linkable_graph_node_map,
             link_group_mappings = link_group_info.mappings,
-            roots = [
-                mapping.root
-                for group in link_group_info.groups.values()
-                for mapping in group.mappings
-                if mapping.root != None
-            ],
+            roots = get_dedupped_roots_from_groups(link_group_info.groups.values()),
         )
 
-        labels_to_links_map = get_filtered_labels_to_links_map(
-            linkable_graph_node_map = linkable_graph_node_map,
-            link_group = None,
+        roots = set(
+            [
+                d.linkable_graph.nodes.value.label
+                for d in link_deps
+                if d.linkable_graph != None
+            ] +
+            link_group_relevant_roots,
+        )
+        is_executable_link = True
+        pic_behavior = PicBehavior("supported")
+        exec_linkables = collect_linkables(
+            reduced_linkable_graph,
+            is_executable_link,
+            link_strategy,
+            link_group_preferred_linkage,
+            pic_behavior,
+            roots,
+        )
+        build_context = BuildLinkGroupsContext(
+            public_nodes = public_nodes,
+            linkable_graph = reduced_linkable_graph,
             link_groups = link_group_info.groups,
             link_group_mappings = link_group_info.mappings,
             link_group_preferred_linkage = link_group_preferred_linkage,
+            link_strategy = link_strategy,
+            pic_behavior = pic_behavior,
             link_group_libs = {
                 name: (lib.label, lib.shared_link_infos)
                 for name, lib in link_group_libs.items()
             },
-            link_strategy = to_link_strategy(link_style),
-            roots = (
-                [
-                    d.linkable_graph.nodes.value.label
-                    for d in link_deps
-                    if d.linkable_graph != None
-                ] +
-                link_group_relevant_roots
-            ),
+            prefer_stripped = False,
+            prefer_optimized = False,
+        )
+        labels_to_links = get_filtered_labels_to_links_map(
+            link_group = None,
+            linkables = exec_linkables,
             is_executable_link = True,
+            build_context = build_context,
             force_static_follows_dependents = True,
-            pic_behavior = PicBehavior("supported"),
         )
 
         # NOTE: Our Haskell DLL support impl currently links transitive haskell
@@ -994,25 +1086,26 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
                 pre_flags = own_binary_link_flags,
             ),
         )
-        link_infos.extend(get_filtered_links(labels_to_links_map, set(public_nodes)))
+        link_infos.extend(get_filtered_links(labels_to_links.map, set(public_nodes)))
         infos = LinkArgs(infos = link_infos)
 
         link_group_ctx = LinkGroupContext(
             link_group_mappings = link_group_info.mappings,
             link_group_libs = link_group_libs,
             link_group_preferred_linkage = link_group_preferred_linkage,
-            labels_to_links_map = labels_to_links_map,
+            labels_to_links_map = labels_to_links.map,
+            targets_consumed_by_link_groups = {},
         )
 
-        for name, shared_lib in traverse_shared_library_info(shlib_info).items():
+        for shared_lib in traverse_shared_library_info(shlib_info):
             label = shared_lib.label
             if is_link_group_shlib(label, link_group_ctx):
-                sos[name] = shared_lib.lib
+                sos.append(shared_lib)
 
         # When there are no matches for a pattern based link group,
         # `link_group_mappings` will not have an entry associated with the lib.
         for _name, link_group_lib in link_group_libs.items():
-            sos.update(link_group_lib.shared_libs)
+            sos.extend(link_group_lib.shared_libs.libraries)
 
     else:
         nlis = []
@@ -1025,21 +1118,32 @@ def haskell_binary_impl(ctx: AnalysisContext) -> list[Provider]:
             li = lib.get(MergedLinkInfo)
             if li != None:
                 nlis.append(li)
-        for name, shared_lib in traverse_shared_library_info(shlib_info).items():
-            sos[name] = shared_lib.lib
+        sos.extend(traverse_shared_library_info(shlib_info))
         infos = get_link_args_for_strategy(ctx, nlis, to_link_strategy(link_style))
 
-    link.add(cmd_args(unpack_link_args(infos), prepend = "-optl"))
+    link_args.add(cmd_args(unpack_link_args(infos), prepend = "-optl"))
 
+    link.add(at_argfile(
+        actions = ctx.actions,
+        name = "args.haskell_link_argsfile",
+        args = link_args,
+        allow_args = True,
+    ))
     ctx.actions.run(link, category = "haskell_link")
-
-    run = cmd_args(output)
 
     if link_style == LinkStyle("shared") or link_group_info != None:
         sos_dir = "__{}__shared_libs_symlink_tree".format(ctx.attrs.name)
-        link.add("-optl", "-Wl,-rpath", "-optl", "-Wl,$ORIGIN/{}".format(sos_dir))
-        symlink_dir = ctx.actions.symlinked_dir(sos_dir, {n: o.output for n, o in sos.items()})
-        run.hidden(symlink_dir)
+        rpath_ref = get_rpath_origin(get_cxx_toolchain_info(ctx).linker_info.type)
+        rpath_ldflag = "-Wl,{}/{}".format(rpath_ref, sos_dir)
+        link.add("-optl", "-Wl,-rpath", "-optl", rpath_ldflag)
+        symlink_dir = create_shlib_symlink_tree(
+            actions = ctx.actions,
+            out = sos_dir,
+            shared_libs = sos,
+        )
+        run = cmd_args(output, hidden = symlink_dir)
+    else:
+        run = cmd_args(output)
 
     providers = [
         DefaultInfo(default_output = output),

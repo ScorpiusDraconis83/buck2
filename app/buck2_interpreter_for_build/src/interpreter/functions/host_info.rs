@@ -106,7 +106,7 @@ fn new_host_info(
 }
 
 #[starlark_module]
-pub fn register_host_info(builder: &mut GlobalsBuilder) {
+pub(crate) fn register_host_info(builder: &mut GlobalsBuilder) {
     /// The `host_info()` function is used to get the current OS and processor architecture on the host. The structure returned is laid out thusly:
     ///
     /// ```python
@@ -136,8 +136,8 @@ pub fn register_host_info(builder: &mut GlobalsBuilder) {
     /// ```
     #[starlark(speculative_exec_safe)]
     fn host_info<'v>(
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<ValueOfUnchecked<'v, StructRef<'v>>> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<ValueOfUnchecked<'v, StructRef<'v>>> {
         // Keeping this `speculative_exec_safe` is safe because BuildContext's `HostInfo`,
         // even when evaluated speculatively, is going to be the same across all interpreters
         // that might reuse each other's output.
@@ -152,7 +152,7 @@ pub fn register_host_info(builder: &mut GlobalsBuilder) {
 #[derivative(PartialEq)]
 pub struct HostInfo {
     // These first three fields are for equality only, otherwise not used
-    platform: InterpreterHostPlatform,
+    pub platform: InterpreterHostPlatform,
     arch: InterpreterHostArchitecture,
     xcode: Option<XcodeVersionInfo>,
     // The actual value which we ignore for equality, which is OK because of above

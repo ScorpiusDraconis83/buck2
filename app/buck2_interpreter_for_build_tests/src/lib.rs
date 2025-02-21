@@ -12,14 +12,15 @@
 
 #[cfg(test)]
 mod attr;
+mod attrs;
 mod functions;
 pub mod interpreter;
+mod label;
 mod rule;
 pub mod select;
 mod super_package;
 mod tests;
 mod uncategorized;
-mod uncategorized_2;
 
 #[test]
 fn init_late_bindings_for_test() {
@@ -27,5 +28,6 @@ fn init_late_bindings_for_test() {
     fn init() {
         buck2_interpreter_for_build::init_late_bindings();
         buck2_build_api::init_late_bindings();
+        buck2_transition::init_late_bindings();
     }
 }

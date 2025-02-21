@@ -10,20 +10,20 @@
 use std::cell::OnceCell;
 use std::fmt::Debug;
 
-use buck2_common::legacy_configs::view::LegacyBuckConfigView;
+use buck2_core::bxl::BxlFilePath;
 use buck2_core::cells::build_file_cell::BuildFileCell;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::cells::CellResolver;
 use buck2_core::package::PackageLabel;
 use buck2_interpreter::build_context::STARLARK_PATH_FROM_BUILD_CONTEXT;
 use buck2_interpreter::file_type::StarlarkFileType;
-use buck2_interpreter::paths::bxl::BxlFilePath;
 use buck2_interpreter::paths::path::StarlarkPath;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 
-use crate::interpreter::buckconfig::LegacyBuckConfigForStarlark;
+use crate::interpreter::buckconfig::BuckConfigsViewForStarlark;
+use crate::interpreter::buckconfig::LegacyBuckConfigsForStarlark;
 use crate::interpreter::bzl_eval_ctx::BzlEvalCtx;
 use crate::interpreter::cell_info::InterpreterCellInfo;
 use crate::interpreter::functions::host_info::HostInfo;
@@ -31,6 +31,7 @@ use crate::interpreter::module_internals::ModuleInternals;
 use crate::super_package::eval_ctx::PackageFileEvalCtx;
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(input)]
 enum BuildContextError {
     #[error(
         "This function is unavailable during analysis (usual solution is to place the information on a toolchain)"
@@ -79,7 +80,7 @@ impl PerFileTypeContext {
     /// For example, for `foo//bar/PACKAGE` this returns `foo//bar`.
     /// For `foo//bar/baz/BUCK` this returns `foo//bar/baz`.
     /// Throws an error if it's used in any other context.
-    fn base_path(&self) -> anyhow::Result<CellPath> {
+    fn base_path(&self) -> buck2_error::Result<CellPath> {
         match self {
             PerFileTypeContext::Build(module) => {
                 Ok(module.buildfile_path().package().to_cell_path())
@@ -96,7 +97,10 @@ impl PerFileTypeContext {
         self.starlark_path().file_type()
     }
 
-    pub(crate) fn require_build(&self, function_name: &str) -> anyhow::Result<&ModuleInternals> {
+    pub(crate) fn require_build(
+        &self,
+        function_name: &str,
+    ) -> buck2_error::Result<&ModuleInternals> {
         match self {
             PerFileTypeContext::Build(internals) => Ok(internals),
             x => {
@@ -105,7 +109,7 @@ impl PerFileTypeContext {
         }
     }
 
-    pub(crate) fn into_build(self) -> anyhow::Result<ModuleInternals> {
+    pub(crate) fn into_build(self) -> buck2_error::Result<ModuleInternals> {
         match self {
             PerFileTypeContext::Build(internals) => Ok(internals),
             x => Err(BuildContextError::NotBuildFileNoFunction(x.file_type()).into()),
@@ -115,7 +119,7 @@ impl PerFileTypeContext {
     pub(crate) fn require_package_file(
         &self,
         function_name: &str,
-    ) -> anyhow::Result<&PackageFileEvalCtx> {
+    ) -> buck2_error::Result<&PackageFileEvalCtx> {
         match self {
             PerFileTypeContext::Package(ctx) => Ok(ctx),
             x => Err(
@@ -124,7 +128,7 @@ impl PerFileTypeContext {
         }
     }
 
-    pub(crate) fn into_package_file(self) -> anyhow::Result<PackageFileEvalCtx> {
+    pub(crate) fn into_package_file(self) -> buck2_error::Result<PackageFileEvalCtx> {
         match self {
             PerFileTypeContext::Package(ctx) => Ok(ctx),
             x => Err(BuildContextError::NotPackageFileNoFunction(x.file_type()).into()),
@@ -153,18 +157,15 @@ pub struct BuildContext<'a> {
     /// `load()` statements.
     pub cell_info: &'a InterpreterCellInfo,
 
-    /// Current cell file buckconfig.
-    pub(crate) buckconfig: LegacyBuckConfigForStarlark<'a>,
-    /// Buckconfig of the root cell.
-    pub(crate) root_buckconfig: LegacyBuckConfigForStarlark<'a>,
+    pub(crate) buckconfigs: LegacyBuckConfigsForStarlark<'a>,
 
-    pub host_info: &'a HostInfo,
+    pub(crate) host_info: &'a HostInfo,
 
     /// Context specific to type type.
     pub additional: PerFileTypeContext,
 
     /// When true, rule function is no-op.
-    pub ignore_attrs_for_profiling: bool,
+    pub(crate) ignore_attrs_for_profiling: bool,
 
     /// Peak allocated bytes limit for starlark.
     pub(crate) starlark_peak_allocated_byte_limit: OnceCell<Option<u64>>,
@@ -175,18 +176,15 @@ impl<'a> BuildContext<'a> {
     pub(crate) fn new_for_module(
         module: &'a Module,
         cell_info: &'a InterpreterCellInfo,
-        buckconfig: &'a (dyn LegacyBuckConfigView + 'a),
-        root_buckconfig: &'a (dyn LegacyBuckConfigView + 'a),
+        buckconfigs: &'a mut dyn BuckConfigsViewForStarlark,
         host_info: &'a HostInfo,
         additional: PerFileTypeContext,
         ignore_attrs_for_profiling: bool,
     ) -> BuildContext<'a> {
-        let buckconfig = LegacyBuckConfigForStarlark::new(module, buckconfig);
-        let root_buckconfig = LegacyBuckConfigForStarlark::new(module, root_buckconfig);
+        let buckconfigs = LegacyBuckConfigsForStarlark::new(module, buckconfigs);
         BuildContext {
             cell_info,
-            buckconfig,
-            root_buckconfig,
+            buckconfigs,
             host_info,
             additional,
             ignore_attrs_for_profiling,
@@ -194,13 +192,11 @@ impl<'a> BuildContext<'a> {
         }
     }
 
-    pub fn from_context<'v>(eval: &Evaluator<'v, 'a>) -> anyhow::Result<&'a BuildContext<'a>> {
-        match eval.extra {
-            None => Err(BuildContextError::UnavailableDuringAnalysis.into()),
-            Some(extra) => Ok(extra
-                .downcast_ref::<BuildContext>()
-                .unwrap_or_else(|| panic!("Unable to access context extra. Wrong type."))),
-        }
+    pub fn from_context<'v, 'a1>(
+        eval: &Evaluator<'v, 'a1, 'a>,
+    ) -> buck2_error::Result<&'a1 BuildContext<'a>> {
+        let f = || eval.extra?.downcast_ref::<BuildContext>();
+        f().ok_or_else(|| BuildContextError::UnavailableDuringAnalysis.into())
     }
 
     pub(crate) fn cell_info(&self) -> &InterpreterCellInfo {
@@ -215,7 +211,7 @@ impl<'a> BuildContext<'a> {
         self.cell_info.cell_resolver()
     }
 
-    pub fn require_package(&self) -> anyhow::Result<PackageLabel> {
+    pub fn require_package(&self) -> buck2_error::Result<PackageLabel> {
         match &self.additional {
             PerFileTypeContext::Build(module) => Ok(module.buildfile_path().package()),
             _ => Err(BuildContextError::PackageOnlyFromBuildFile.into()),
@@ -226,7 +222,7 @@ impl<'a> BuildContext<'a> {
         self.additional.starlark_path()
     }
 
-    pub(crate) fn base_path(&self) -> anyhow::Result<CellPath> {
+    pub(crate) fn base_path(&self) -> buck2_error::Result<CellPath> {
         self.additional.base_path()
     }
 }
@@ -240,7 +236,10 @@ pub(crate) fn init_starlark_path_from_build_context() {
 /// EvalResult at the end of interpreting
 impl ModuleInternals {
     /// Try to get this inner context from the `ctx.extra` property.
-    pub fn from_context<'a>(ctx: &'a Evaluator, function_name: &str) -> anyhow::Result<&'a Self> {
+    pub fn from_context<'a>(
+        ctx: &'a Evaluator,
+        function_name: &str,
+    ) -> buck2_error::Result<&'a Self> {
         BuildContext::from_context(ctx)?
             .additional
             .require_build(function_name)

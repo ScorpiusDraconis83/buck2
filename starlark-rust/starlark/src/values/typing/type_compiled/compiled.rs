@@ -23,7 +23,6 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use allocative::Allocative;
-use anyhow::Context;
 use dupe::Dupe;
 use starlark_derive::starlark_module;
 use starlark_derive::starlark_value;
@@ -42,8 +41,8 @@ use crate::private::Private;
 use crate::typing::Ty;
 use crate::values::dict::DictRef;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueBasic;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Basic;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::list::ListRef;
 use crate::values::none::NoneType;
@@ -55,13 +54,16 @@ use crate::values::typing::type_compiled::matchers::IsAny;
 use crate::values::AllocValue;
 use crate::values::Demand;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::FrozenHeap;
 use crate::values::FrozenValue;
 use crate::values::Heap;
 use crate::values::NoSerialize;
 use crate::values::StarlarkValue;
+use crate::values::StringValue;
 use crate::values::Trace;
 use crate::values::Value;
+use crate::values::ValueLifetimeless;
 use crate::values::ValueLike;
 
 #[derive(Debug, Error)]
@@ -82,11 +84,12 @@ enum TypingError {
     PerhapsYouMeant(String, String),
     #[error("Value of type `{1}` does not match type `{2}`: {0}")]
     ValueDoesNotMatchType(String, &'static str, String),
+    #[error("String literals are not allowed in type expressions: `{0}`")]
+    StringLiteralNotAllowed(String),
 }
 
 pub(crate) trait TypeCompiledDyn: Debug + Allocative + Send + Sync + 'static {
     fn as_ty_dyn(&self) -> &Ty;
-    fn matches_dyn(&self, value: Value) -> bool;
     fn is_runtime_wildcard_dyn(&self) -> bool;
     fn to_frozen_dyn(&self, heap: &FrozenHeap) -> TypeCompiled<FrozenValue>;
 }
@@ -102,9 +105,6 @@ where
 {
     fn as_ty_dyn(&self) -> &Ty {
         &self.ty
-    }
-    fn matches_dyn(&self, value: Value) -> bool {
-        self.type_compiled_impl.matches(value)
     }
     fn is_runtime_wildcard_dyn(&self) -> bool {
         self.type_compiled_impl.is_wildcard()
@@ -132,14 +132,14 @@ impl<T> TypeCompiledImplAsStarlarkValue<T>
 where
     TypeCompiledImplAsStarlarkValue<T>: StarlarkValue<'static>,
 {
-    pub(crate) const fn alloc_static(imp: T, ty: Ty) -> AValueRepr<AValueImpl<Basic, Self>> {
-        alloc_static(
-            Basic,
-            TypeCompiledImplAsStarlarkValue {
-                type_compiled_impl: imp,
-                ty,
-            },
-        )
+    pub(crate) const fn alloc_static(
+        imp: T,
+        ty: Ty,
+    ) -> AValueRepr<AValueImpl<'static, AValueBasic<TypeCompiledImplAsStarlarkValue<T>>>> {
+        alloc_static(TypeCompiledImplAsStarlarkValue {
+            type_compiled_impl: imp,
+            ty,
+        })
     }
 }
 
@@ -236,7 +236,7 @@ fn type_compiled_methods(methods: &mut MethodsBuilder) {
     ProvidesStaticType
 )]
 #[repr(transparent)]
-pub struct TypeCompiled<V>(
+pub struct TypeCompiled<V: ValueLifetimeless>(
     /// `V` is `TypeCompiledImplAsStarlarkValue`.
     V,
 );
@@ -253,7 +253,9 @@ impl<'v, V: ValueLike<'v>> Display for TypeCompiled<V> {
     }
 }
 
-impl<V> StarlarkTypeRepr for TypeCompiled<V> {
+impl<V: ValueLifetimeless> StarlarkTypeRepr for TypeCompiled<V> {
+    type Canonical = TypeCompiledImplAsStarlarkValue<DummyTypeMatcher>;
+
     fn starlark_type_repr() -> Ty {
         TypeCompiledImplAsStarlarkValue::<DummyTypeMatcher>::starlark_type_repr()
     }
@@ -274,7 +276,7 @@ impl<'v, V: ValueLike<'v>> TypeCompiled<V> {
         self.to_value()
             .0
             .request_value::<&dyn TypeCompiledDyn>()
-            .context("Not TypeCompiledImpl (internal error)")
+            .ok_or_else(|| anyhow::anyhow!("Not TypeCompiledImpl (internal error)"))
     }
 
     /// Check if given value matches this type.
@@ -295,20 +297,21 @@ impl<'v, V: ValueLike<'v>> TypeCompiled<V> {
 
     #[cold]
     #[inline(never)]
-    fn check_type_error(self, value: Value<'v>, arg_name: Option<&str>) -> anyhow::Result<()> {
-        Err(TypingError::TypeAnnotationMismatch(
-            value.to_str(),
-            value.get_type().to_owned(),
-            self.to_string(),
-            match arg_name {
-                None => "return type".to_owned(),
-                Some(x) => format!("argument `{}`", x),
-            },
-        )
-        .into())
+    fn check_type_error(self, value: Value<'v>, arg_name: Option<&str>) -> crate::Result<()> {
+        Err(crate::Error::new_other(
+            TypingError::TypeAnnotationMismatch(
+                value.to_str(),
+                value.get_type().to_owned(),
+                self.to_string(),
+                match arg_name {
+                    None => "return type".to_owned(),
+                    Some(x) => format!("argument `{}`", x),
+                },
+            ),
+        ))
     }
 
-    pub(crate) fn check_type(self, value: Value<'v>, arg_name: Option<&str>) -> anyhow::Result<()> {
+    pub(crate) fn check_type(self, value: Value<'v>, arg_name: Option<&str>) -> crate::Result<()> {
         if self.matches(value) {
             Ok(())
         } else {
@@ -348,13 +351,10 @@ impl<'v, V: ValueLike<'v>> Hash for TypeCompiled<V> {
 impl<'v, V: ValueLike<'v>> PartialEq for TypeCompiled<V> {
     #[allow(clippy::manual_unwrap_or)]
     fn eq(&self, other: &Self) -> bool {
-        match self.0.to_value().equals(other.0.to_value()) {
-            Ok(b) => b,
-            Err(_) => {
-                // Unreachable, but we should not panic in `PartialEq`.
-                false
-            }
-        }
+        self.0
+            .to_value()
+            .equals(other.0.to_value())
+            .unwrap_or_default()
     }
 }
 
@@ -392,6 +392,13 @@ impl<'v> TypeCompiled<Value<'v>> {
         TypeCompiledFactory::alloc_ty(&Ty::list(t.as_ty().clone()), heap)
     }
 
+    pub(crate) fn type_set_of(
+        t: TypeCompiled<Value<'v>>,
+        heap: &'v Heap,
+    ) -> TypeCompiled<Value<'v>> {
+        TypeCompiledFactory::alloc_ty(&Ty::set(t.as_ty().clone()), heap)
+    }
+
     pub(crate) fn type_any_of_two(
         t0: TypeCompiled<Value<'v>>,
         t1: TypeCompiled<Value<'v>>,
@@ -418,11 +425,6 @@ impl<'v> TypeCompiled<Value<'v>> {
         TypeCompiledFactory::alloc_ty(&ty, heap)
     }
 
-    /// For `p: "xxx"`, parse that `"xxx"` as type.
-    pub(crate) fn from_str(t: &str, heap: &'v Heap) -> TypeCompiled<Value<'v>> {
-        TypeCompiledFactory::alloc_ty(&Ty::name(t), heap)
-    }
-
     /// Parse `[t1, t2, ...]` as type.
     fn from_list(t: &ListRef<'v>, heap: &'v Heap) -> anyhow::Result<TypeCompiled<Value<'v>>> {
         match t.content() {
@@ -441,8 +443,8 @@ impl<'v> TypeCompiled<Value<'v>> {
 
     /// Evaluate type annotation at runtime.
     pub fn new(ty: Value<'v>, heap: &'v Heap) -> anyhow::Result<Self> {
-        if let Some(s) = ty.unpack_str() {
-            Ok(TypeCompiled::from_str(s, heap))
+        if let Some(s) = StringValue::new(ty) {
+            return Err(TypingError::StringLiteralNotAllowed(s.to_string()).into());
         } else if ty.is_none() {
             Ok(TypeCompiledFactory::alloc_ty(&Ty::none(), heap))
         } else if let Some(t) = Tuple::from_value(ty) {
@@ -475,8 +477,9 @@ impl TypeCompiled<FrozenValue> {
 
     /// `typing.Any`.
     pub fn any() -> TypeCompiled<FrozenValue> {
-        static ANYTHING: AValueRepr<AValueImpl<Basic, TypeCompiledImplAsStarlarkValue<IsAny>>> =
-            TypeCompiledImplAsStarlarkValue::alloc_static(IsAny, Ty::any());
+        static ANYTHING: AValueRepr<
+            AValueImpl<'static, AValueBasic<TypeCompiledImplAsStarlarkValue<IsAny>>>,
+        > = TypeCompiledImplAsStarlarkValue::alloc_static(IsAny, Ty::any());
 
         TypeCompiled::unchecked_new(FrozenValue::new_repr(&ANYTHING))
     }

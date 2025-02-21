@@ -24,22 +24,21 @@ use allocative::Allocative;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use either::Either;
-use serde::Serialize;
-use serde::Serializer;
 use starlark_derive::Trace;
-use starlark_syntax::syntax::type_expr::type_str_literal_is_wildcard;
+use starlark_syntax::codemap::CodeMap;
+use starlark_syntax::codemap::Span;
+use starlark_syntax::codemap::Spanned;
 
 use crate as starlark;
-use crate::docs::DocFunction;
-use crate::docs::DocMember;
-use crate::docs::DocParam;
+use crate::__derive_refs::components::NativeCallableComponents;
 use crate::eval::compiler::small_vec_1::SmallVec1;
 use crate::typing::arc_ty::ArcTy;
 use crate::typing::basic::TyBasic;
+use crate::typing::call_args::TyCallArgs;
+use crate::typing::callable::TyCallable;
 use crate::typing::custom::TyCustom;
 use crate::typing::custom::TyCustomImpl;
-use crate::typing::function::Param;
-use crate::typing::function::ParamMode;
+use crate::typing::error::TypingNoContextError;
 use crate::typing::function::TyCustomFunction;
 use crate::typing::function::TyCustomFunctionImpl;
 use crate::typing::function::TyFunction;
@@ -47,8 +46,9 @@ use crate::typing::small_arc_vec::SmallArcVec1;
 use crate::typing::starlark_value::TyStarlarkValue;
 use crate::typing::structs::TyStruct;
 use crate::typing::tuple::TyTuple;
+use crate::typing::ParamSpec;
+use crate::typing::TypingOracleCtx;
 use crate::values::bool::StarlarkBool;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
 use crate::values::typing::never::TypingNever;
 use crate::values::StarlarkValue;
 use crate::values::Value;
@@ -103,43 +103,6 @@ pub struct Ty {
     alternatives: SmallArcVec1<TyBasic>,
 }
 
-impl Serialize for Ty {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Arbitrary custom types are not deserializable, so serialization to string is enough.
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-/// The name of an atomic type.
-#[derive(Debug, Clone, Dupe, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative)]
-pub struct TyName(ArcStr);
-
-impl Display for TyName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\"", self.0.as_str())
-    }
-}
-
-impl PartialEq<str> for TyName {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl TyName {
-    pub(crate) fn new(s: impl Into<ArcStr>) -> TyName {
-        TyName(s.into())
-    }
-
-    /// Get the underlying `str` for a `TyName`.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 fn merge_adjacent<T>(xs: Vec<T>, f: impl Fn(T, T) -> Either<T, (T, T)>) -> SmallVec1<T> {
     let mut res = SmallVec1::new();
     let mut last = None;
@@ -165,32 +128,6 @@ impl Ty {
     /// Create a [`Ty::any`], but tagged in such a way it can easily be found.
     pub fn todo() -> Self {
         Ty::any()
-    }
-
-    fn try_name_special(name: &str) -> Option<Self> {
-        match name {
-            name if type_str_literal_is_wildcard(name) => Some(Self::any()),
-            "list" => Some(Self::list(Ty::any())),
-            "dict" => Some(Self::dict(Ty::any(), Ty::any())),
-            "function" => Some(Self::any_function()),
-            "struct" => Some(Self::custom(TyStruct::any())),
-            "never" => Some(Self::never()),
-            "NoneType" => Some(Self::none()),
-            "bool" => Some(Self::bool()),
-            "int" => Some(Self::int()),
-            "float" => Some(Self::float()),
-            "string" => Some(Self::string()),
-            "tuple" => Some(Self::any_tuple()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn name(name: &str) -> Self {
-        if let Some(x) = Self::try_name_special(name) {
-            x
-        } else {
-            Ty::basic(TyBasic::Name(TyName::new(name)))
-        }
     }
 
     /// Turn a type back into a name, potentially erasing some structure.
@@ -222,7 +159,8 @@ impl Ty {
         Ty::basic(TyBasic::Any)
     }
 
-    pub(crate) const fn never() -> Self {
+    /// Never type: can hold no value.
+    pub const fn never() -> Self {
         Ty {
             alternatives: SmallArcVec1::empty(),
         }
@@ -276,6 +214,15 @@ impl Ty {
         Self::dict(Ty::any(), Ty::any())
     }
 
+    /// Create a set type.
+    pub fn set(item: Ty) -> Self {
+        Ty::basic(TyBasic::set(item))
+    }
+
+    pub(crate) fn any_set() -> Self {
+        Self::set(Ty::any())
+    }
+
     /// Create a tuple of two elements
     pub fn tuple2(a: Ty, b: Ty) -> Self {
         Ty::tuple(vec![a, b])
@@ -296,8 +243,13 @@ impl Ty {
     }
 
     /// Create a function type.
-    pub fn function(params: Vec<Param>, result: Ty) -> Self {
+    pub fn function(params: ParamSpec, result: Ty) -> Self {
         Self::ty_function(TyFunction::new(params, result))
+    }
+
+    /// Create a function type.
+    pub fn callable(params: ParamSpec, result: Ty) -> Self {
+        Ty::basic(TyBasic::Callable(TyCallable::new(params, result)))
     }
 
     /// Create a function type.
@@ -306,17 +258,15 @@ impl Ty {
     }
 
     /// Create a function, where the first argument is the result of `.type`.
-    pub fn ctor_function(type_attr: &Ty, params: Vec<Param>, result: Ty) -> Self {
+    pub fn ctor_function(type_attr: Ty, params: ParamSpec, result: Ty) -> Self {
         Self::custom(TyCustomFunction(TyFunction::new_with_type_attr(
-            params,
-            result,
-            type_attr.clone(),
+            params, result, type_attr,
         )))
     }
 
     /// Function type that accepts any arguments and returns any result.
-    pub(crate) fn any_function() -> Self {
-        Ty::basic(TyBasic::Callable)
+    pub(crate) fn any_callable() -> Self {
+        Ty::basic(TyBasic::Callable(TyCallable::any()))
     }
 
     pub(crate) fn any_struct() -> Self {
@@ -420,8 +370,8 @@ impl Ty {
     /// If at least one was successful, return the union of all successful results.
     pub(crate) fn typecheck_union_simple(
         &self,
-        typecheck: impl Fn(&TyBasic) -> Result<Ty, ()>,
-    ) -> Result<Ty, ()> {
+        typecheck: impl Fn(&TyBasic) -> Result<Ty, TypingNoContextError>,
+    ) -> Result<Ty, TypingNoContextError> {
         if self.is_any() || self.is_never() {
             Ok(self.dupe())
         } else {
@@ -433,11 +383,11 @@ impl Ty {
                     for basic in xs {
                         match typecheck(basic) {
                             Ok(ty) => good.push(ty),
-                            Err(()) => {}
+                            Err(TypingNoContextError) => {}
                         }
                     }
                     if good.is_empty() {
-                        Err(())
+                        Err(TypingNoContextError)
                     } else {
                         Ok(Ty::unions(good))
                     }
@@ -474,79 +424,136 @@ impl Ty {
         Ty::custom(TyCustomFunction(f))
     }
 
-    pub(crate) fn from_docs_member(member: &DocMember) -> Self {
-        match member {
-            DocMember::Property(x) => x.typ.clone(),
-            DocMember::Function(x) => Self::from_docs_function(x),
-        }
-    }
-
     /// Typechecker type of value.
     pub fn of_value(value: Value) -> Ty {
         if let Some(t) = value.get_ref().typechecker_ty() {
             t
         } else {
-            Ty::from_docs_member(&DocMember::from_value(value))
+            value.get_type_starlark_repr()
         }
     }
 
-    pub(crate) fn from_docs_function(function: &DocFunction) -> Self {
-        let mut params = Vec::with_capacity(function.params.len());
-        let mut seen_no_args = false;
-        for p in &function.params {
-            match p {
-                DocParam::Arg {
-                    name,
-                    typ,
-                    default_value,
-                    ..
-                } => {
-                    let mut r = if seen_no_args {
-                        Param::name_only(name, typ.clone())
-                    } else {
-                        Param::pos_or_name(name, typ.clone())
-                    };
-                    if default_value.is_some() {
-                        r = r.optional();
-                    }
-                    params.push(r);
-                }
-                DocParam::OnlyPosBefore => {
-                    for x in params.iter_mut() {
-                        if matches!(x.mode, ParamMode::PosOrName(_)) {
-                            x.mode = ParamMode::PosOnly;
-                        }
-                    }
-                }
-                DocParam::NoArgs => seen_no_args = true,
-                DocParam::Args { typ, .. } => {
-                    seen_no_args = true;
-                    params.push(Param::args(typ.clone()))
-                }
-                DocParam::Kwargs { typ, .. } => params.push(Param::kwargs(typ.clone())),
-            }
-        }
-        let result = function.ret.typ.clone();
-        match &function.as_type {
-            None => Ty::function(params, result),
-            Some(type_attr) => Ty::ctor_function(type_attr, params, result),
+    /// Check if the value of this type can be called with given arguments and expected return type.
+    #[must_use]
+    pub(crate) fn check_call<'a>(
+        &self,
+        pos: impl IntoIterator<Item = Ty>,
+        named: impl IntoIterator<Item = (&'a str, Ty)>,
+        args: Option<Ty>,
+        kwargs: Option<Ty>,
+        expected_return_type: Ty,
+    ) -> bool {
+        let oracle = TypingOracleCtx {
+            codemap: CodeMap::empty_static(),
+        };
+        let Ok(ret) = oracle.validate_call(
+            Span::default(),
+            self,
+            &TyCallArgs {
+                pos: pos
+                    .into_iter()
+                    .map(|p| Spanned {
+                        span: Span::default(),
+                        node: p,
+                    })
+                    .collect(),
+                named: named
+                    .into_iter()
+                    .map(|p| Spanned {
+                        span: Span::default(),
+                        node: p,
+                    })
+                    .collect(),
+                args: args.map(|t| Spanned {
+                    span: Span::default(),
+                    node: t,
+                }),
+                kwargs: kwargs.map(|t| Spanned {
+                    span: Span::default(),
+                    node: t,
+                }),
+            },
+        ) else {
+            return false;
+        };
+        let Ok(ok) = oracle.intersects(&ret, &expected_return_type) else {
+            return false;
+        };
+        ok
+    }
+
+    pub(crate) fn check_intersects(&self, other: &Ty) -> crate::Result<bool> {
+        let oracle = TypingOracleCtx {
+            codemap: CodeMap::empty_static(),
+        };
+        match oracle.intersects(self, other) {
+            Ok(ok) => Ok(ok),
+            Err(e) => Err(e.into_error()),
         }
     }
-}
 
-impl Display for Ty {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.alternatives.as_slice() {
+    pub(crate) fn from_native_callable_components(
+        comp: &NativeCallableComponents,
+        as_type: Option<Ty>,
+    ) -> starlark::Result<Self> {
+        let result = comp.return_type.clone();
+
+        let params = comp.param_spec.param_spec();
+
+        match as_type {
+            None => Ok(Ty::function(params, result)),
+            Some(type_attr) => Ok(Ty::ctor_function(type_attr, params, result)),
+        }
+    }
+
+    pub(crate) fn fmt_with_config(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        config: &TypeRenderConfig,
+    ) -> fmt::Result {
+        match self.iter_union() {
             [] => write!(f, "{}", TypingNever::TYPE),
             xs => {
                 for (i, x) in xs.iter().enumerate() {
                     if i != 0 {
                         write!(f, " | ")?;
                     }
-                    write!(f, "{}", x)?;
+                    x.fmt_with_config(f, config)?;
                 }
                 Ok(())
             }
         }
+    }
+
+    pub(crate) fn display_with<'a>(&'a self, config: &'a TypeRenderConfig) -> TyDisplay<'a> {
+        TyDisplay { ty: self, config }
+    }
+}
+
+/// Configuration for rendering types.
+pub enum TypeRenderConfig {
+    /// Uses the default rendering configuration.
+    Default,
+    /// Uses for linked type in doc
+    LinkedType {
+        /// The function to render linked type element
+        render_linked_ty_starlark_value: Box<dyn Fn(&TyStarlarkValue) -> String>,
+    },
+}
+
+pub(crate) struct TyDisplay<'a> {
+    ty: &'a Ty,
+    config: &'a TypeRenderConfig,
+}
+
+impl Display for TyDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.ty.fmt_with_config(f, self.config)
+    }
+}
+
+impl Display for Ty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_with_config(f, &TypeRenderConfig::Default)
     }
 }

@@ -1,9 +1,18 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+oncall("build_infra")
+
+source_listing()
+
 erlang_application(
     name = "buck2_shell_utils",
     srcs = glob(["src/*.erl"]),
     applications = [
         "kernel",
         "stdlib",
+        # search relies on json, until fully on OTP 27 we must depend on
+        # the vendored version for a self-contained library
+        "prelude//erlang/toolchain:toolchain_json",
     ],
     erl_opts = [
         "+debug_info",
@@ -11,7 +20,6 @@ erlang_application(
     ],
     included_applications = [
         "prelude//erlang/common_test/test_exec:test_exec",
-        "prelude//erlang/toolchain:resources[jsone]",
     ],
     shell_libs = [],
     visibility = ["PUBLIC"],

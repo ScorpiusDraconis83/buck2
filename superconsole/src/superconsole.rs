@@ -11,13 +11,14 @@ use std::cmp;
 use std::env;
 use std::io;
 
+use crossterm::cursor::MoveToColumn;
+use crossterm::cursor::MoveUp;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use crossterm::tty::IsTty;
 use crossterm::QueueableCommand;
 
 use crate::ansi_support::enable_ansi_support;
-use crate::components::Canvas;
 use crate::components::Component;
 use crate::components::DrawMode;
 use crate::content::Line;
@@ -35,12 +36,16 @@ const MAX_GRAPHEME_BUFFER: usize = 1000000;
 /// while a log area of emitted messages is produced above.
 /// Producing output from sources other than SuperConsole while break the TUI.
 pub struct SuperConsole {
-    root: Canvas,
+    /// Number of lines that were used to render the canvas last time.
+    canvas_contents: Lines,
+    /// Buffer storing the lines we should emit next time we render.
     to_emit: Lines,
-    // A default screen size to use if the size cannot be fetched
-    // from the terminal. This generally is only used for testing
-    // situations.
+    /// A default screen size to use if the size cannot be fetched
+    /// from the terminal. This generally is only used for testing
+    /// situations.
     fallback_size: Option<Dimensions>,
+    /// The terminal handle to write a buffer to the screen.
+    /// All IO goes through this handle.
     pub(crate) output: Box<dyn SuperConsoleOutput>,
 }
 
@@ -48,7 +53,7 @@ impl SuperConsole {
     /// Build a new SuperConsole with a root component.
     pub fn new() -> Option<Self> {
         Self::compatible().then(|| {
-            Self::new_internal(
+            Self::new_with_output(
                 None,
                 Box::new(BlockingSuperConsoleOutput::new(Box::new(io::stderr()))),
             )
@@ -58,18 +63,18 @@ impl SuperConsole {
     /// Force a new SuperConsole to be built with a root component, regardless of
     /// whether the tty is compatible
     pub fn forced_new(fallback_size: Dimensions) -> Self {
-        Self::new_internal(
+        Self::new_with_output(
             Some(fallback_size),
             Box::new(BlockingSuperConsoleOutput::new(Box::new(io::stderr()))),
         )
     }
 
-    pub(crate) fn new_internal(
+    pub(crate) fn new_with_output(
         fallback_size: Option<Dimensions>,
         output: Box<dyn SuperConsoleOutput>,
     ) -> Self {
         Self {
-            root: Canvas::new(),
+            canvas_contents: Lines::new(),
             to_emit: Lines::new(),
             fallback_size,
             output,
@@ -120,7 +125,6 @@ impl SuperConsole {
     pub fn finalize_with_mode(
         mut self,
         root: &dyn Component,
-
         mode: DrawMode,
     ) -> anyhow::Result<()> {
         self.render_with_mode(root, mode)?;
@@ -140,8 +144,8 @@ impl SuperConsole {
 
     /// Queues the passed lines to be drawn on the next render.
     /// The lines *will not* appear until the next render is called.
-    pub fn emit(&mut self, mut lines: Lines) {
-        self.to_emit.0.append(&mut lines.0);
+    pub fn emit(&mut self, lines: Lines) {
+        self.to_emit.extend(lines);
     }
 
     fn size(&self) -> anyhow::Result<Dimensions> {
@@ -154,10 +158,32 @@ impl SuperConsole {
         }
     }
 
+    /// The first step of drawing.  It moves the buffer up to be overwritten and sets the length to 0.
+    /// This is used to clear the scratch area so that any possibly emitted messages can write over it.
+    pub(crate) fn clear_canvas_pre(writer: &mut Vec<u8>, mut height: usize) -> anyhow::Result<()> {
+        while height > 0 {
+            // We can only move up at most u16 at a time, so repeat until we move up enough
+            let step = height.try_into().unwrap_or(u16::MAX);
+            writer.queue(MoveUp(step))?;
+            height -= step as usize;
+        }
+        writer.queue(MoveToColumn(0))?;
+        Ok(())
+    }
+
+    /// The last step of drawing. Ensures there is nothing else below on the console.
+    /// Important in case the new canvas was smaller than the last.
+    pub(crate) fn clear_canvas_post(writer: &mut Vec<u8>) -> anyhow::Result<()> {
+        writer.queue(Clear(ClearType::FromCursorDown))?;
+        Ok(())
+    }
+
     /// Clears the canvas portion of the superconsole.
     pub fn clear(&mut self) -> anyhow::Result<()> {
-        let mut buffer = vec![];
-        self.root.clear(&mut buffer)?;
+        let mut buffer = Vec::new();
+        Self::clear_canvas_pre(&mut buffer, self.canvas_contents.len())?;
+        self.canvas_contents = Lines::new();
+        Self::clear_canvas_post(&mut buffer)?;
         self.output.output(buffer)
     }
 
@@ -180,38 +206,45 @@ impl SuperConsole {
         &mut self,
         buffer: &mut Vec<u8>,
         root: &dyn Component,
-
         mode: DrawMode,
         size: Dimensions,
     ) -> anyhow::Result<()> {
         /// Heuristic to determine if a buffer is too large to buffer.
         /// Can be tuned, but is currently set to 1000000 graphemes.
-        #[allow(clippy::ptr_arg)]
         fn is_big(buf: &Lines) -> bool {
             let len: usize = buf.iter().map(Line::len).sum();
             len > MAX_GRAPHEME_BUFFER
         }
 
-        // Go the beginning of the canvas.
-        self.root.move_up(buffer)?;
-
         // Pre-draw the frame *and then* start rendering emitted messages.
-        let mut frame = self.root.draw(root, size, mode)?;
+        let mut canvas = root.draw(size, mode)?;
+        // We don't trust the child to not truncate the result.
+        canvas.shrink_lines_to_dimensions(size);
+
         // Render at most a single frame if this not the last render.
         // Does not buffer if there is a ridiculous amount of data.
         let limit = match mode {
             DrawMode::Normal if !is_big(&self.to_emit) => {
-                let limit = size.height.saturating_sub(frame.len());
+                let limit = size.height.saturating_sub(canvas.len());
                 // arbitrary value picked so we don't starve `emit` on small terminal sizes.
                 Some(cmp::max(limit, MINIMUM_EMIT))
             }
             _ => None,
         };
-        self.to_emit.render(buffer, limit)?;
-        frame.render(buffer, None)?;
 
-        // clear any residue from the previous render.
-        buffer.queue(Clear(ClearType::FromCursorDown))?;
+        // How much of the canvas hasn't changed, so I can avoid overwriting
+        // and thus avoid flickering things like URL's in VS Code terminal.
+        let reuse_prefix = if self.to_emit.is_empty() {
+            self.canvas_contents.lines_equal(&canvas)
+        } else {
+            0
+        };
+
+        Self::clear_canvas_pre(buffer, self.canvas_contents.len() - reuse_prefix)?;
+        self.to_emit.render_with_limit(buffer, limit)?;
+        canvas.render_from_line(buffer, reuse_prefix)?;
+        Self::clear_canvas_post(buffer)?;
+        self.canvas_contents = canvas;
 
         Ok(())
     }
@@ -227,9 +260,9 @@ mod tests {
     use crate::testing::frame_contains;
     use crate::testing::test_console;
     use crate::testing::SuperConsoleTestingExt;
-    use crate::Lines;
 
     #[derive(AsRef, Debug)]
+    #[allow(dead_code)]
     struct Msg(Lines);
 
     #[test]
@@ -262,7 +295,7 @@ mod tests {
             vec!["line 1"].try_into()?;
             MAX_GRAPHEME_BUFFER * 2
         ]));
-        let root = Echo(Lines(vec![vec!["line"].try_into()?; 1]));
+        let root = Echo(Lines(vec![vec!["line"].try_into()?]));
         let mut buffer = Vec::new();
 
         // Even though we have more messages than fit on the screen in the `to_emit` buffer
@@ -284,7 +317,7 @@ mod tests {
     fn test_block_render() -> anyhow::Result<()> {
         let mut console = test_console();
 
-        let root = Echo(Lines(vec![vec!["state"].try_into()?; 1]));
+        let root = Echo(Lines(vec![vec!["state"].try_into()?]));
 
         console.render(&root)?;
         assert_eq!(console.test_output()?.frames.len(), 1);
@@ -306,7 +339,7 @@ mod tests {
     fn test_block_lines() -> anyhow::Result<()> {
         let mut console = test_console();
 
-        let root = Echo(Lines(vec![vec!["state"].try_into()?; 1]));
+        let root = Echo(Lines(vec![vec!["state"].try_into()?]));
 
         console.test_output_mut()?.should_render = false;
         console.emit(Lines(vec![vec!["line 1"].try_into()?]));
@@ -335,7 +368,7 @@ mod tests {
     fn test_block_finalize() -> anyhow::Result<()> {
         let mut console = test_console();
 
-        let root = Echo(Lines(vec![vec!["state"].try_into()?; 1]));
+        let root = Echo(Lines(vec![vec!["state"].try_into()?]));
 
         console.test_output_mut()?.should_render = false;
         console.emit(Lines(vec![vec!["line 1"].try_into()?]));
@@ -352,6 +385,44 @@ mod tests {
         assert!(frame_contains(&frame, "line 1"));
         assert!(frame_contains(&frame, "line 2"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_reuse_buffer() -> anyhow::Result<()> {
+        let mut console = test_console();
+
+        console.render(&Echo(Lines(vec![
+            vec!["http://example.com/ link"].try_into()?,
+            vec!["number 1, special 1"].try_into()?,
+        ])))?;
+        console.render(&Echo(Lines(vec![
+            vec!["http://example.com/ link"].try_into()?,
+            vec!["number 2, special 2"].try_into()?,
+        ])))?;
+        console.emit(Lines(vec![vec!["special 3"].try_into()?]));
+        console.render(&Echo(Lines(vec![
+            vec!["http://example.com/ link"].try_into()?,
+            vec!["number 3"].try_into()?,
+        ])))?;
+        console.render(&Echo(Lines(vec![
+            vec!["http://example.com/ link"].try_into()?,
+            vec!["special 4"].try_into()?,
+            vec!["number 4"].try_into()?,
+        ])))?;
+
+        let frames = &console.test_output()?.frames;
+        assert_eq!(frames.len(), 4);
+        // We expect the URL to be omitted on some frames, because it didn't change.
+        let expect_url = [0, 2];
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                frame_contains(frame, "http://example.com/"),
+                expect_url.contains(&i),
+            );
+            assert!(frame_contains(frame, format!("number {}", i + 1)));
+            assert!(frame_contains(frame, format!("special {}", i + 1)));
+        }
         Ok(())
     }
 }

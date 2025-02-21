@@ -15,6 +15,10 @@
  * limitations under the License.
  */
 
+use std::convert::Infallible;
+
+use dupe::Dupe;
+
 use crate::typing::Ty;
 use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::structs::value::FrozenStruct;
@@ -30,7 +34,7 @@ use crate::values::Value;
 ///
 /// Struct implementation (for example, memory layout) may change,
 /// this type provides implementation agnostics API to it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Dupe)]
 pub struct StructRef<'v>(&'v Struct<'v>);
 
 impl<'v> StructRef<'v> {
@@ -52,20 +56,24 @@ impl<'v> StructRef<'v> {
 }
 
 impl<'v> StarlarkTypeRepr for StructRef<'v> {
+    type Canonical = Self;
+
     fn starlark_type_repr() -> Ty {
         FrozenStruct::starlark_type_repr()
     }
 }
 
 impl<'v> UnpackValue<'v> for StructRef<'v> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        StructRef::from_value(value)
+    type Error = Infallible;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(StructRef::from_value(value))
     }
 }
 
 /// Reference to the frozen struct.
 #[derive(Debug)]
-pub struct FrozenStructRef<'f>(&'f FrozenStruct);
+pub struct FrozenStructRef<'f>(pub(crate) &'f FrozenStruct);
 
 impl<'f> FrozenStructRef<'f> {
     /// Iterate over struct fields.

@@ -23,16 +23,16 @@ use allocative::Allocative;
 use dupe::Dupe;
 use starlark_map::sorted_map::SortedMap;
 use starlark_syntax::codemap::Span;
-use starlark_syntax::codemap::Spanned;
 
+use crate::typing::call_args::TyCallArgs;
+use crate::typing::callable::TyCallable;
 use crate::typing::custom::TyCustomImpl;
+use crate::typing::error::TypingNoContextError;
+use crate::typing::error::TypingNoContextOrInternalError;
 use crate::typing::error::TypingOrInternalError;
-use crate::typing::function::TyCustomFunctionImpl;
 use crate::typing::starlark_value::TyStarlarkValue;
-use crate::typing::Arg;
 use crate::typing::Ty;
 use crate::typing::TyBasic;
-use crate::typing::TyFunction;
 use crate::typing::TypingOracleCtx;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::typing::type_compiled::alloc::TypeMatcherAlloc;
@@ -40,17 +40,13 @@ use crate::values::typing::type_compiled::type_matcher_factory::TypeMatcherFacto
 
 #[derive(Debug, thiserror::Error)]
 enum TyUserError {
-    #[error(
-        "Type `{0}` specifies custom callable, but underlying `StarlarkValue` is not callable"
-    )]
+    #[error("Type `{0}` specifies custom callable, but underlying `StarlarkValue` is not callable")]
     CallableNotCallable(String),
     #[error(
         "Type `{0}` specifies custom indexable, but underlying `StarlarkValue` is not indexable"
     )]
     IndexableNotIndexable(String),
-    #[error(
-        "Type `{0}` specifies custom iterable, but underlying `StarlarkValue` is not iterable"
-    )]
+    #[error("Type `{0}` specifies custom iterable, but underlying `StarlarkValue` is not iterable")]
     IterableNotIterable(String),
 }
 
@@ -110,7 +106,7 @@ pub struct TyUserParams {
     /// Custom fields for this type (use `TyStarlarkValue` fields if not specified).
     pub fields: TyUserFields,
     /// Set if more precise callable signature is known than `base` provides.
-    pub callable: Option<TyFunction>,
+    pub callable: Option<TyCallable>,
     /// Set if more precise index signature is known than `base` provides.
     pub index: Option<TyUserIndex>,
     /// Set if more precise iter item is known than `base` provides.
@@ -121,7 +117,7 @@ pub struct TyUserParams {
 
 /// Type description for arbitrary type.
 #[derive(Allocative, Debug, derive_more::Display)]
-#[display(fmt = "{}", name)]
+#[display("{}", name)]
 pub struct TyUser {
     name: String,
     /// Base type for this custom type, e.g. generic record for record with known fields.
@@ -132,7 +128,7 @@ pub struct TyUser {
     id: TypeInstanceId,
     fields: TyUserFields,
     /// Set if more precise callable signature is known than `base` provides.
-    callable: Option<TyFunction>,
+    callable: Option<TyCallable>,
     /// Set if more precise index signature is known than `base` provides.
     index: Option<TyUserIndex>,
     /// Set if more precise iter item is known than `base` provides.
@@ -146,7 +142,7 @@ impl TyUser {
         base: TyStarlarkValue,
         id: TypeInstanceId,
         params: TyUserParams,
-    ) -> anyhow::Result<TyUser> {
+    ) -> crate::Result<TyUser> {
         let TyUserParams {
             supertypes,
             matcher,
@@ -157,13 +153,19 @@ impl TyUser {
             _non_exhaustive: (),
         } = params;
         if callable.is_some() && !base.is_callable() {
-            return Err(TyUserError::CallableNotCallable(name).into());
+            return Err(crate::Error::new_native(TyUserError::CallableNotCallable(
+                name,
+            )));
         }
         if index.is_some() && !base.is_indexable() {
-            return Err(TyUserError::IndexableNotIndexable(name).into());
+            return Err(crate::Error::new_native(
+                TyUserError::IndexableNotIndexable(name),
+            ));
         }
         if iter_item.is_some() && base.iter_item().is_err() {
-            return Err(TyUserError::IterableNotIterable(name).into());
+            return Err(crate::Error::new_native(TyUserError::IterableNotIterable(
+                name,
+            )));
         }
         Ok(TyUser {
             name,
@@ -211,7 +213,7 @@ impl TyCustomImpl for TyUser {
         Some(&self.name)
     }
 
-    fn attribute(&self, attr: &str) -> Result<Ty, ()> {
+    fn attribute(&self, attr: &str) -> Result<Ty, TypingNoContextError> {
         if let Ok(ty) = self.base.attr_from_methods(attr) {
             Ok(ty)
         } else {
@@ -221,25 +223,29 @@ impl TyCustomImpl for TyUser {
                     if self.fields.unknown {
                         Ok(Ty::any())
                     } else {
-                        Err(())
+                        Err(TypingNoContextError)
                     }
                 }
             }
         }
     }
 
-    fn index(&self, item: &TyBasic, ctx: &TypingOracleCtx) -> Result<Ty, ()> {
+    fn index(
+        &self,
+        item: &TyBasic,
+        ctx: &TypingOracleCtx,
+    ) -> Result<Ty, TypingNoContextOrInternalError> {
         if let Some(index) = &self.index {
-            if !ctx.intersects(&Ty::basic(item.dupe()), &index.index) {
-                return Err(());
+            if !ctx.intersects(&Ty::basic(item.dupe()), &index.index)? {
+                return Err(TypingNoContextOrInternalError::Typing);
             }
             Ok(index.result.dupe())
         } else {
-            self.base.index(item)
+            Ok(self.base.index(item)?)
         }
     }
 
-    fn iter_item(&self) -> Result<Ty, ()> {
+    fn iter_item(&self) -> Result<Ty, TypingNoContextError> {
         if let Some(iter_item) = &self.iter_item {
             Ok(iter_item.dupe())
         } else {
@@ -247,14 +253,18 @@ impl TyCustomImpl for TyUser {
         }
     }
 
-    fn is_callable(&self) -> bool {
-        self.base.is_callable()
+    fn as_callable(&self) -> Option<TyCallable> {
+        if self.base.is_callable() {
+            Some(TyCallable::any())
+        } else {
+            None
+        }
     }
 
     fn validate_call(
         &self,
         span: Span,
-        args: &[Spanned<Arg>],
+        args: &TyCallArgs,
         oracle: TypingOracleCtx,
     ) -> Result<Ty, TypingOrInternalError> {
         if let Some(callable) = &self.callable {
@@ -299,9 +309,10 @@ mod tests {
     use crate::environment::GlobalsBuilder;
     use crate::eval::Arguments;
     use crate::eval::Evaluator;
+    use crate::typing::callable::TyCallable;
     use crate::typing::user::TyUserParams;
+    use crate::typing::ParamSpec;
     use crate::typing::Ty;
-    use crate::typing::TyFunction;
     use crate::typing::TyStarlarkValue;
     use crate::typing::TyUser;
     use crate::values::starlark_value_as_type::StarlarkValueAsType;
@@ -318,7 +329,7 @@ mod tests {
         Allocative,
         NoSerialize
     )]
-    #[display(fmt = "plant")]
+    #[display("plant")]
     enum AbstractPlant {}
 
     #[starlark_value(type = "plant")]
@@ -335,7 +346,7 @@ mod tests {
         Allocative,
         NoSerialize
     )]
-    #[display(fmt = "fruit_callable")]
+    #[display("fruit_callable")]
     struct FruitCallable {
         name: String,
         ty_fruit_callable: Ty,
@@ -366,7 +377,7 @@ mod tests {
             &self,
             _me: Value<'v>,
             _args: &Arguments<'v, '_>,
-            _eval: &mut Evaluator<'v, '_>,
+            _eval: &mut Evaluator<'v, '_, '_>,
         ) -> crate::Result<Value<'v>> {
             unreachable!("not needed in tests, but typechecker requires it")
         }
@@ -398,7 +409,7 @@ mod tests {
 
     #[starlark_module]
     fn globals(globals: &mut GlobalsBuilder) {
-        fn fruit(name: String) -> anyhow::Result<FruitCallable> {
+        fn fruit(name: String) -> starlark::Result<FruitCallable> {
             let ty_fruit = Ty::custom(TyUser::new(
                 name.clone(),
                 TyStarlarkValue::new::<Fruit>(),
@@ -415,7 +426,7 @@ mod tests {
                 TyStarlarkValue::new::<FruitCallable>(),
                 TypeInstanceId::gen(),
                 TyUserParams {
-                    callable: Some(TyFunction::new(vec![], ty_fruit.clone())),
+                    callable: Some(TyCallable::new(ParamSpec::empty(), ty_fruit.clone())),
 
                     ..TyUserParams::default()
                 },

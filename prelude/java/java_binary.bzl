@@ -22,32 +22,42 @@ load(
     "get_java_packaging_info",
 )
 
-def _generate_script(generate_wrapper: bool, native_libs: dict[str, SharedLibrary]) -> bool:
+def _generate_script(generate_wrapper: bool, native_libs: list[SharedLibrary]) -> bool:
     # if `generate_wrapper` is set and no native libs then it should be a wrapper script as result,
     # otherwise fat jar will be generated (inner jar or script will be included inside a final fat jar)
     return generate_wrapper and len(native_libs) == 0
 
 def _create_fat_jar(
         ctx: AnalysisContext,
-        java_toolchain: JavaToolchainInfo,
         jars: cmd_args,
-        native_libs: dict[str, SharedLibrary],
-        do_not_create_inner_jar: bool,
-        generate_wrapper: bool) -> list[Artifact]:
+        native_libs: list[SharedLibrary] = [],
+        name_prefix: str = "",
+        concat_jars: bool = False,
+        do_not_create_inner_jar: bool = True,
+        generate_wrapper: bool = False,
+        main_class: [str, None] = None,
+        append_jar: [Artifact, None] = None) -> list[Artifact]:
+    java_toolchain = ctx.attrs._java_toolchain[JavaToolchainInfo]
     extension = "sh" if _generate_script(generate_wrapper, native_libs) else "jar"
-    output = ctx.actions.declare_output("{}.{}".format(ctx.label.name, extension))
+    output = ctx.actions.declare_output("{}{}.{}".format(name_prefix, ctx.label.name, extension))
 
     args = [
         java_toolchain.fat_jar[RunInfo],
         "--jar_builder_tool",
         cmd_args(java_toolchain.jar_builder, delimiter = " "),
+        "--zip_scrubber_tool",
+        cmd_args(java_toolchain.zip_scrubber, delimiter = " "),
         "--output",
         output.as_output(),
         "--jars_file",
-        ctx.actions.write("jars_file", jars),
+        ctx.actions.write("{}jars_file".format(name_prefix), jars),
     ]
 
-    local_only = False
+    if concat_jars:
+        args += ["--concat_jars"]
+    if append_jar:
+        args += ["--append_jar", append_jar]
+
     if native_libs:
         expect(
             java_toolchain.is_bootstrap_toolchain == False,
@@ -55,7 +65,7 @@ def _create_fat_jar(
         )
         args += [
             "--native_libs_file",
-            ctx.actions.write("native_libs", [cmd_args([so_name, native_lib.lib.output], delimiter = " ") for so_name, native_lib in native_libs.items()]),
+            ctx.actions.write("{}native_libs".format(name_prefix), [cmd_args([native_lib.soname.ensure_str(), native_lib.lib.output], delimiter = " ") for native_lib in native_libs]),
         ]
         if do_not_create_inner_jar:
             args += [
@@ -67,30 +77,25 @@ def _create_fat_jar(
                 java_toolchain.fat_jar_main_class_lib,
                 # fat jar's main class
                 "--fat_jar_main_class",
-                "com.facebook.buck.jvm.java.FatJarMain",
+                "com.facebook.buck.jvm.java.fatjar.FatJarMain",
                 # native libraries directory name. Main class expects to find libraries packed inside this directory.
                 "--fat_jar_native_libs_directory_name",
                 "nativelibs",
             ]
 
-        # TODO(T151045001) native deps are not compressed (for performance), but that can result in
-        # really large binaries. Large outputs can cause issues on RE, so we run locally instead.
-        local_only = "run_locally_if_has_native_deps" in ctx.attrs.labels
-
-    main_class = ctx.attrs.main_class
     if main_class:
-        if do_not_create_inner_jar and native_libs:
-            fail("For performance reasons, java binaries with a main class and native libs should always generate an inner jar.\
-            The reason for having inner.jar is so that we don't have to compress the native libraries, which is slow at compilation time and also at runtime (when decompressing).")
         args += ["--main_class", main_class]
 
-    manifest_file = ctx.attrs.manifest_file
-    if manifest_file:
-        args += ["--manifest", manifest_file]
+    if ctx.attrs.manifest_file:
+        args += ["--manifest", ctx.attrs.manifest_file]
 
-    blocklist = ctx.attrs.blacklist
+    build_manifest = ctx.attrs.build_manifest
+    if build_manifest:
+        args += ["--build_manifest", build_manifest]
+
+    blocklist = ctx.attrs.blocklist
     if blocklist:
-        args += ["--blocklist", ctx.actions.write("blocklist_args", blocklist)]
+        args += ["--blocklist", ctx.actions.write("{}blocklist_args".format(name_prefix), blocklist)]
 
     if ctx.attrs.meta_inf_directory:
         args += ["--meta_inf_directory", ctx.attrs.meta_inf_directory]
@@ -109,13 +114,15 @@ def _create_fat_jar(
         ]
         outputs.append(classpath_args_output)
 
-    fat_jar_cmd = cmd_args(args)
-    fat_jar_cmd.hidden(jars, [native_lib.lib.output for native_lib in native_libs.values()])
+    fat_jar_cmd = cmd_args(
+        args,
+        hidden = [jars] + [native_lib.lib.output for native_lib in native_libs],
+    )
 
     ctx.actions.run(
         fat_jar_cmd,
-        local_only = local_only,
-        category = "fat_jar",
+        local_only = False,
+        category = "{}fat_jar".format(name_prefix),
         allow_cache_upload = True,
     )
 
@@ -170,41 +177,101 @@ def java_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     )
     native_deps = traverse_shared_library_info(shared_library_info)
 
+    base_dep = ctx.attrs.base_dep
     java_toolchain = ctx.attrs._java_toolchain[JavaToolchainInfo]
+    concat_deps = ctx.attrs.concat_deps
     need_to_generate_wrapper = ctx.attrs.generate_wrapper == True
     do_not_create_inner_jar = ctx.attrs.do_not_create_inner_jar == True
     packaging_jar_args = packaging_info.packaging_deps.project_as_args("full_jar_args")
-    outputs = _create_fat_jar(ctx, java_toolchain, cmd_args(packaging_jar_args), native_deps, do_not_create_inner_jar, need_to_generate_wrapper)
+    incremental_target_prefix = ctx.attrs.incremental_target_prefix
+    main_class = ctx.attrs.main_class
 
-    main_artifact = outputs[0]
     other_outputs = []
+
+    if incremental_target_prefix:
+        base_jar = None
+        incremental_jars = []
+        dependency_jars = []
+
+        # separate jars in groups
+        for dep in packaging_jar_args.transitive_set.traverse():
+            if dep.jar:
+                # lookup for the base jar that can be used to append all other dependencies
+                if base_dep and dep.label.raw_target() == base_dep.label.raw_target():
+                    expect(
+                        base_jar == None,
+                        "JAR can only have one base JAR file.",
+                    )
+                    base_jar = dep.jar
+                elif str(dep.label.raw_target()).startswith(incremental_target_prefix):
+                    # if it's not a base jar, it can be an incremental jar or dependency only
+                    incremental_jars.append(dep.jar)
+                else:
+                    dependency_jars.append(dep.jar)
+
+        # collect incremental targets
+        expect(
+            len(incremental_jars) > 0,
+            "No incremental dependencies found that starts with {}.".format(incremental_target_prefix),
+        )
+
+        # generate intermediary jar only with dependencies
+        deps_outputs = _create_fat_jar(
+            ctx,
+            cmd_args(dependency_jars),
+            concat_jars = concat_deps,
+            name_prefix = "deps_",
+            append_jar = base_jar,
+        )
+        other_outputs = [deps_outputs[0]]
+
+        # generate final jar appending modules to the dependencies jar
+        outputs = _create_fat_jar(
+            ctx,
+            cmd_args(incremental_jars),
+            native_libs = native_deps,
+            do_not_create_inner_jar = do_not_create_inner_jar,
+            generate_wrapper = need_to_generate_wrapper,
+            main_class = main_class,
+            append_jar = deps_outputs[0],
+        )
+    else:
+        outputs = _create_fat_jar(
+            ctx,
+            cmd_args(packaging_jar_args),
+            concat_jars = concat_deps,
+            native_libs = native_deps,
+            do_not_create_inner_jar = do_not_create_inner_jar,
+            generate_wrapper = need_to_generate_wrapper,
+            main_class = main_class,
+        )
 
     run_cmd = _get_run_cmd(
         attrs = ctx.attrs,
         script_mode = _generate_script(need_to_generate_wrapper, native_deps),
-        main_artifact = main_artifact,
+        main_artifact = outputs[0],
         java_toolchain = java_toolchain,
     )
 
     if need_to_generate_wrapper:
         classpath_file = outputs[1]
-        run_cmd.hidden(
+        run_cmd.add(cmd_args(hidden = [
             java_toolchain.java[RunInfo],
             classpath_file,
             packaging_jar_args,
-        )
+        ]))
         other_outputs = [classpath_file] + [packaging_jar_args] + _get_java_tool_artifacts(java_toolchain)
 
     sub_targets = get_classpath_subtarget(ctx.actions, packaging_info)
 
-    class_to_src_map, _ = get_class_to_source_map_info(
+    class_to_src_map, _, _ = get_class_to_source_map_info(
         ctx,
         outputs = None,
         deps = ctx.attrs.deps,
     )
 
     return [
-        DefaultInfo(default_output = main_artifact, other_outputs = other_outputs, sub_targets = sub_targets),
+        DefaultInfo(default_output = outputs[0], other_outputs = other_outputs, sub_targets = sub_targets),
         RunInfo(args = run_cmd),
         create_template_info(ctx, packaging_info, first_order_libs),
         class_to_src_map,

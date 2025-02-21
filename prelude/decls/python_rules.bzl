@@ -5,6 +5,7 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//decls:test_common.bzl", "test_common")
 load(":common.bzl", "CxxRuntimeType", "CxxSourceType", "HeadersAsRawHeadersMode", "LinkableDepType", "buck", "prelude_rule")
 load(":cxx_common.bzl", "cxx_common")
 load(":native_common.bzl", "native_common")
@@ -17,8 +18,13 @@ def _typing_arg():
         "py_version_for_type_checking": attrs.option(attrs.string(), default = None, doc = """
     This option will force the type checker to perform checking under a specific version of Python interpreter.
 """),
-        "typing": attrs.bool(default = True, doc = """
-    Determines whether to perform type checking on the given target. Default is True.
+        "shard_typing": attrs.option(attrs.bool(), default = None, doc = """
+    Determines if sharding should be enabled on a given target.
+"""),
+        # NOTE(grievejia): Setting default to True here may have non-trivial impact on build memory
+        # usage (see S395002)
+        "typing": attrs.bool(default = False, doc = """
+    Determines whether to perform type checking on the given target. Default is False.
 """),
     }
 
@@ -115,7 +121,6 @@ cxx_python_extension = prelude_rule(
             "prefix_header": attrs.option(attrs.source(), default = None),
             "raw_headers": attrs.set(attrs.source(), sorted = True, default = []),
             "type_stub": attrs.option(attrs.source(), default = None),
-            "version_universe": attrs.option(attrs.string(), default = None),
         }
     ),
 )
@@ -124,7 +129,7 @@ prebuilt_python_library = prelude_rule(
     name = "prebuilt_python_library",
     docs = """
         A `prebuilt_python_library()` rule is used to include prebuilt python packages into the output of a
-        top-level `python_binary()`or `python_test()`rule.
+        top-level `python_binary()` or `python_test()` rule.
 
 
         These prebuilt libraries can either be [whl files](https://www.python.org/dev/peps/pep-0427/) or eggs
@@ -189,9 +194,21 @@ prebuilt_python_library = prelude_rule(
         {
             "compile": attrs.bool(default = False),
             "contacts": attrs.list(attrs.string(), default = []),
+            "cxx_header_dirs": attrs.option(attrs.list(attrs.string()), default = None),
+            "infer_cxx_header_dirs": attrs.bool(default = False),
             "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
             "ignore_compile_errors": attrs.bool(default = False),
             "licenses": attrs.list(attrs.source(), default = []),
+            "strip_soabi_tags": attrs.bool(
+                default = False,
+                doc = """
+                    Strip the SOABI tags from extensions in the prebuilt library.
+
+                    Note that this should be considered unsafe, as it removes builtin
+                    protections that fail fast when a potententially incompatible
+                    native extension is imported.
+                """,
+            ),
         }
     ),
 )
@@ -257,6 +274,7 @@ python_binary = prelude_rule(
                  dependencies of these rules.
             """),
         } |
+        python_common.version_selections_arg() |
         python_common.preload_deps_arg() |
         python_common.package_style_arg() |
         python_common.linker_flags_arg() |
@@ -267,7 +285,6 @@ python_binary = prelude_rule(
             "build_args": attrs.list(attrs.arg(), default = []),
             "compile": attrs.option(attrs.bool(), default = None),
             "contacts": attrs.list(attrs.string(), default = []),
-            "cxx_platform": attrs.option(attrs.string(), default = None),
             "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
             "dummy_omnibus": attrs.option(attrs.dep(), default = None),
             "extension": attrs.option(attrs.string(), default = None),
@@ -276,8 +293,9 @@ python_binary = prelude_rule(
             "platform_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "platform_linker_flags": attrs.list(attrs.tuple(attrs.regex(), attrs.list(attrs.arg(anon_target_compatible = True))), default = []),
             "platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = False)), default = []),
+            "repl_only_deps": attrs.list(attrs.dep(), default = []),
+            "repl_main": attrs.option(attrs.string(), default = None),
             "prefer_stripped_native_objects": attrs.bool(default = False),
-            "version_universe": attrs.option(attrs.string(), default = None),
             "zip_safe": attrs.option(attrs.bool(), default = None),
         } |
         buck.allow_cache_upload_arg() |
@@ -339,14 +357,12 @@ python_library = prelude_rule(
         python_common.exclude_deps_from_merged_linking_arg() |
         {
             "contacts": attrs.list(attrs.string(), default = []),
-            "cxx_platform": attrs.option(attrs.string(), default = None),
             "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
             "ignore_compile_errors": attrs.bool(default = False),
             "licenses": attrs.list(attrs.source(), default = []),
             "platform": attrs.option(attrs.string(), default = None),
             "platform_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "type_stubs": attrs.named_set(attrs.source(), sorted = True, default = []),
-            "version_universe": attrs.option(attrs.string(), default = None),
             "versioned_resources": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
             "versioned_srcs": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
             "zip_safe": attrs.option(attrs.bool(), default = None),
@@ -394,6 +410,7 @@ python_test = prelude_rule(
     further = None,
     attrs = (
         # @unsorted-dict-items
+        buck.inject_test_env_arg() |
         buck.labels_arg() |
         python_common.srcs_arg() |
         python_common.platform_srcs_arg() |
@@ -432,6 +449,7 @@ python_test = prelude_rule(
                 other rules used by the tests in this rule's sources.
             """),
         } |
+        python_common.version_selections_arg() |
         buck.test_rule_timeout_ms() |
         python_common.package_style_arg() |
         python_common.preload_deps_arg() |
@@ -444,7 +462,6 @@ python_test = prelude_rule(
             "build_args": attrs.list(attrs.arg(), default = []),
             "compile": attrs.option(attrs.bool(), default = None),
             "contacts": attrs.list(attrs.string(), default = []),
-            "cxx_platform": attrs.option(attrs.string(), default = None),
             "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
             "dummy_omnibus": attrs.option(attrs.dep(), default = None),
             "extension": attrs.option(attrs.string(), default = None),
@@ -454,15 +471,17 @@ python_test = prelude_rule(
             "platform_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = True)), default = []),
             "platform_linker_flags": attrs.list(attrs.tuple(attrs.regex(), attrs.list(attrs.arg(anon_target_compatible = True))), default = []),
             "platform_preload_deps": attrs.list(attrs.tuple(attrs.regex(), attrs.set(attrs.dep(), sorted = False)), default = []),
+            "repl_only_deps": attrs.list(attrs.dep(), default = []),
+            "repl_main": attrs.option(attrs.string(), default = None),
             "prefer_stripped_native_objects": attrs.bool(default = False),
             "runner": attrs.option(attrs.dep(), default = None),
             "specs": attrs.option(attrs.arg(json = True), default = None),
-            "version_universe": attrs.option(attrs.string(), default = None),
             "versioned_resources": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
             "versioned_srcs": attrs.option(attrs.versioned(attrs.named_set(attrs.source(), sorted = True)), default = None),
             "zip_safe": attrs.option(attrs.bool(), default = None),
         } |
-        _typing_arg()
+        _typing_arg() |
+        test_common.attributes()
     ),
 )
 

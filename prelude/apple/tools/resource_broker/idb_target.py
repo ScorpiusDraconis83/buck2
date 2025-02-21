@@ -5,6 +5,8 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+# pyre-strict
+
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -29,7 +31,20 @@ class IdbTarget:
     port: int = 0
 
 
-def managed_simulators_from_stdout(stdout: Optional[str]) -> List[IdbTarget]:
+@dataclass
+class SimulatorInfo:
+    udid: str
+    device_set_path: str
+
+
+def managed_simulator_from_stdout(stdout: Optional[str]) -> IdbTarget:
+    if not stdout:
+        return None
+    # pyre-ignore[16]: `from_dict` is dynamically provided by `dataclass_json`
+    return IdbTarget.from_dict(json.loads(stdout))
+
+
+def managed_simulators_list_from_stdout(stdout: Optional[str]) -> List[IdbTarget]:
     if not stdout:
         return []
     targets = map(

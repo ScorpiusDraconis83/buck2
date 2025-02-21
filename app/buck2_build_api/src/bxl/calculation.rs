@@ -14,10 +14,8 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
-use buck2_artifact::artifact::build_artifact::BuildArtifact;
-use buck2_core::base_deferred_key::BaseDeferredKeyDyn;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
 use buck2_util::late_binding::LateBinding;
-use dashmap::DashMap;
 use dice::DiceComputations;
 use dupe::Dupe;
 
@@ -27,16 +25,13 @@ use crate::bxl::result::BxlResult;
 pub trait BxlCalculationDyn: Debug + Send + Sync + 'static {
     async fn eval_bxl(
         &self,
-        ctx: &DiceComputations,
-        bxl: Arc<dyn BaseDeferredKeyDyn>,
-    ) -> anyhow::Result<BxlComputeResult>;
+        ctx: &mut DiceComputations<'_>,
+        bxl: BaseDeferredKeyBxl,
+    ) -> buck2_error::Result<BxlComputeResult>;
 }
 
 #[derive(Allocative, Clone, Dupe)]
-pub struct BxlComputeResult {
-    pub bxl_result: Arc<BxlResult>,
-    pub materializations: Arc<DashMap<BuildArtifact, ()>>,
-}
+pub struct BxlComputeResult(pub Arc<BxlResult>);
 
 /// Dependency injection for BXL.
 ///

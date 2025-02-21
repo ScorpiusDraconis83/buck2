@@ -15,6 +15,7 @@ def get_aapt2_link(
         android_toolchain: AndroidToolchainInfo,
         resource_infos: list[AndroidResourceInfo],
         android_manifest: Artifact,
+        manifest_entries: dict,
         includes_vector_drawables: bool,
         no_auto_version: bool,
         no_version_transitions: bool,
@@ -22,9 +23,8 @@ def get_aapt2_link(
         no_resource_removal: bool,
         should_keep_raw_values: bool,
         package_id_offset: int,
-        resource_stable_ids: [Artifact, None],
+        resource_stable_ids: Artifact | None,
         preferred_density: [str, None],
-        min_sdk: [str, None],
         filter_locales: bool,
         locales: list[str],
         compiled_resource_apks: list[Artifact],
@@ -48,8 +48,13 @@ def get_aapt2_link(
         aapt2_command.add(["--proguard", proguard_config.as_output()])
 
         # We don't need the R.java output, but aapt2 won't output R.txt unless we also request R.java.
-        r_dot_java = ctx.actions.declare_output("{}/init-rjava".format(identifier), dir = True)
+        # A drawback of this is that the directory structure for the R.java output is deep, resulting
+        # in long path issues on Windows. The structure is <path to target>/<identifier>/unused-rjava/<package>/R.java
+        # We can declare a custom dummy package to drastically shorten <package>, which is sketchy, but effective
+        r_dot_java = ctx.actions.declare_output("{}/unused-rjava".format(identifier), dir = True)
         aapt2_command.add(["--java", r_dot_java.as_output()])
+        aapt2_command.add(["--custom-package", "dummy.package"])
+
         r_dot_txt = ctx.actions.declare_output("{}/R.txt".format(identifier))
         aapt2_command.add(["--output-text-symbols", r_dot_txt.as_output()])
 
@@ -76,13 +81,27 @@ def get_aapt2_link(
             aapt2_command.add(["--stable-ids", resource_stable_ids])
         if preferred_density != None:
             aapt2_command.add(["--preferred-density", preferred_density])
-        if min_sdk != None:
-            aapt2_command.add(["--min-sdk-version", min_sdk])
-        if filter_locales and len(locales) > 0:
-            aapt2_command.add("-c")
 
-            # "NONE" means "en", update the list of locales
-            aapt2_command.add(cmd_args([locale if locale != "NONE" else "en" for locale in locales], delimiter = ","))
+        manifest_entries_min_sdk = manifest_entries.get("min_sdk_version", None)
+        if manifest_entries_min_sdk != None:
+            aapt2_command.add(["--min-sdk-version", str(manifest_entries_min_sdk)])
+        manifest_entries_target_sdk = manifest_entries.get("target_sdk_version", None)
+        if manifest_entries_target_sdk != None:
+            aapt2_command.add(["--target-sdk-version", str(manifest_entries_target_sdk)])
+        manifest_entries_version_code = manifest_entries.get("version_code", None)
+        if manifest_entries_version_code != None:
+            aapt2_command.add(["--version-code", manifest_entries_version_code])
+        manifest_entries_version_name = manifest_entries.get("version_name", None)
+        if manifest_entries_version_name != None:
+            aapt2_command.add(["--version-name", manifest_entries_version_name])
+        manifest_entries_debug_mode = str(manifest_entries.get("debug_mode", "False")).lower() == "true"
+        if manifest_entries_debug_mode:
+            aapt2_command.add(["--debug-mode"])
+
+        if filter_locales and len(locales) > 0:
+            for locale in locales:
+                # "NONE" means "en", update the list of locales
+                aapt2_command.add(["-c", locale if locale != "NONE" else "en"])
 
         for compiled_resource_apk in compiled_resource_apks:
             aapt2_command.add(["-I", compiled_resource_apk])
@@ -97,8 +116,11 @@ def get_aapt2_link(
 
         aapt2_compile_rules_args_file = ctx.actions.write("{}/aapt2_compile_rules_args_file".format(identifier), cmd_args(aapt2_compile_rules, delimiter = " "))
         aapt2_command.add("-R")
-        aapt2_command.add(cmd_args(aapt2_compile_rules_args_file, format = "@{}"))
-        aapt2_command.hidden(aapt2_compile_rules)
+        aapt2_command.add(cmd_args(
+            aapt2_compile_rules_args_file,
+            format = "@{}",
+            hidden = aapt2_compile_rules,
+        ))
 
         aapt2_command.add(additional_aapt2_params)
 

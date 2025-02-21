@@ -17,25 +17,19 @@
 
 use proc_macro2::Ident;
 use proc_macro2::TokenStream;
-use quote::format_ident;
 use quote::quote;
 use quote::quote_spanned;
 use syn::parse::ParseStream;
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::Attribute;
-use syn::Data;
-use syn::DataEnum;
-use syn::DataStruct;
 use syn::DeriveInput;
-use syn::Error;
-use syn::Fields;
 use syn::GenericParam;
-use syn::Index;
 use syn::LitStr;
 use syn::Token;
-use syn::Variant;
 use syn::WherePredicate;
+
+use crate::util::DeriveInputUtil;
 
 struct Input<'a> {
     input: &'a DeriveInput,
@@ -86,7 +80,10 @@ impl<'a> Input<'a> {
                     output_params.push(quote_spanned! { span=> 'static });
                 }
                 GenericParam::Const(_) => {
-                    return Err(Error::new_spanned(param, "const generics not supported"));
+                    return Err(syn::Error::new_spanned(
+                        param,
+                        "const generics not supported",
+                    ));
                 }
             }
         }
@@ -104,31 +101,46 @@ fn derive_freeze_impl(input: DeriveInput) -> syn::Result<syn::ItemImpl> {
 
     let name = &input.input.ident;
 
-    let opts = extract_options(&input.input.attrs)?;
-    let (impl_params, input_params, output_params) =
-        input.format_impl_generics(opts.bounds.is_some())?;
+    let FreezeDeriveOptions {
+        validator,
+        bounds,
+        identity,
+    } = extract_options(&input.input.attrs)?;
 
-    let validate_body = match opts.validator {
+    if let Some(identity) = identity {
+        return Err(syn::Error::new_spanned(
+            identity,
+            "`identity` can only be used on fields",
+        ));
+    }
+
+    let (impl_params, input_params, output_params) =
+        input.format_impl_generics(bounds.is_some())?;
+
+    let validate_body = match validator {
         Some(validator) => quote_spanned! {
             span=>
-            #validator(&frozen)?;
+            match #validator(&frozen) {
+                Ok(v) => v,
+                Err(e) => return std::result::Result::Err(FreezeError::new(e.to_string()))
+            };
         },
         None => quote_spanned! { span=> },
     };
 
-    let bounds_body = match opts.bounds {
+    let bounds_body = match bounds {
         Some(bounds) => quote_spanned! { span=> where #bounds },
         None => quote_spanned! { span=> },
     };
 
-    let body = freeze_impl(name, &input.input.data)?;
+    let body = freeze_impl(input.input)?;
 
     let gen = syn::parse_quote_spanned! {
         span=>
         impl #impl_params starlark::values::Freeze for #name #input_params #bounds_body {
             type Frozen = #name #output_params;
             #[allow(unused_variables)]
-            fn freeze(self, freezer: &starlark::values::Freezer) -> anyhow::Result<Self::Frozen> {
+            fn freeze(self, freezer: &starlark::values::Freezer) -> FreezeResult<Self::Frozen> {
                 let frozen = #body;
                 #validate_body
                 std::result::Result::Ok(frozen)
@@ -139,10 +151,16 @@ fn derive_freeze_impl(input: DeriveInput) -> syn::Result<syn::ItemImpl> {
     Ok(gen)
 }
 
+syn::custom_keyword!(identity);
+
 #[derive(Default)]
 struct FreezeDeriveOptions {
+    /// `#[freeze(validator = function)]`.
     validator: Option<Ident>,
+    /// `#[freeze(bounds = ...)]`.
     bounds: Option<WherePredicate>,
+    /// `#[freeze(identity)]`.
+    identity: Option<identity>,
 }
 
 /// Parse a #[freeze(validator = function)] annotation.
@@ -159,19 +177,30 @@ fn extract_options(attrs: &[Attribute]) -> syn::Result<FreezeDeriveOptions> {
 
         attr.parse_args_with(|input: ParseStream| {
             loop {
-                if input.parse::<validator>().is_ok() {
+                if let Some(validator) = input.parse::<Option<validator>>()? {
                     if opts.validator.is_some() {
-                        return Err(input.error("`validator` was set twice"));
+                        return Err(syn::Error::new_spanned(
+                            validator,
+                            "`validator` was set twice",
+                        ));
                     }
                     input.parse::<Token![=]>()?;
                     opts.validator = Some(input.parse()?);
-                } else if input.parse::<bounds>().is_ok() {
+                } else if let Some(bounds) = input.parse::<Option<bounds>>()? {
                     if opts.bounds.is_some() {
-                        return Err(input.error("`bounds` was set twice"));
+                        return Err(syn::Error::new_spanned(bounds, "`bounds` was set twice"));
                     }
                     input.parse::<Token![=]>()?;
                     let bounds_input = input.parse::<LitStr>()?;
                     opts.bounds = Some(bounds_input.parse()?);
+                } else if let Some(identity) = input.parse::<Option<identity>>()? {
+                    if opts.identity.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            identity,
+                            "`identity` was set twice",
+                        ));
+                    }
+                    opts.identity = Some(identity);
                 } else {
                     return Err(input.lookahead1().error());
                 }
@@ -188,154 +217,45 @@ fn extract_options(attrs: &[Attribute]) -> syn::Result<FreezeDeriveOptions> {
     Ok(opts)
 }
 
-/// Parse attribute `#[freeze(identity)]`.
-///
-/// Currently it fails on any attribute argument other than `id`.
-fn is_identity(attrs: &[Attribute]) -> syn::Result<bool> {
-    syn::custom_keyword!(identity);
+fn freeze_impl(derive_input: &DeriveInput) -> syn::Result<syn::Expr> {
+    let derive_input = DeriveInputUtil::new(derive_input)?;
+    derive_input.match_self(|struct_or_enum_variant, fields| {
+        let fields: Vec<syn::Expr> = fields
+            .iter()
+            .map(|(ident, f)| {
+                let span = ident.span();
 
-    for attr in attrs.iter() {
-        if !attr.path().is_ident("freeze") {
-            continue;
-        }
-
-        let ignore = attr.parse_args_with(|input: ParseStream| {
-            let ignore = input.parse::<Option<identity>>()?.is_some();
-            Ok(ignore)
-        })?;
-
-        if !ignore {
-            continue;
-        }
-
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-fn freeze_struct(name: &Ident, data: &DataStruct) -> syn::Result<syn::Expr> {
-    let span = name.span();
-    let res = match data.fields {
-        Fields::Named(ref fields) => {
-            let xs = fields
-                .named
-                .iter()
-                .map(|f| {
-                    let name = &f.ident;
-                    let res = if is_identity(&f.attrs)? {
-                        quote_spanned! { span=>
-                            #name: self.#name,
-                        }
-                    } else {
-                        quote_spanned! { span=>
-                            #name: starlark::values::Freeze::freeze(self.#name, freezer)?,
-                        }
-                    };
-
-                    syn::Result::Ok(res)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            syn::parse_quote_spanned! {
-                span=>
-                #name {
-                    #(#xs)*
+                let FreezeDeriveOptions {
+                    validator,
+                    bounds,
+                    identity,
+                } = extract_options(&f.attrs)?;
+                if let Some(validator) = validator {
+                    return Err(syn::Error::new_spanned(
+                        validator,
+                        "Cannot use `validator` on field",
+                    ));
                 }
-            }
-        }
-        Fields::Unnamed(ref fields) => {
-            let xs = fields
-                .unnamed
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    let i = Index::from(i);
+                if let Some(bounds) = bounds {
+                    return Err(syn::Error::new_spanned(
+                        bounds,
+                        "Cannot use `bounds` on field",
+                    ));
+                }
 
-                    let res = if is_identity(&f.attrs)? {
-                        quote_spanned! { span=>
-                            self.#i,
-                        }
-                    } else {
-                        quote_spanned! {
-                            span=>
-                            starlark::values::Freeze::freeze(self.#i, freezer)?,
-                        }
-                    };
-
-                    syn::Result::Ok(res)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            syn::parse_quote_spanned! {
-                span=>
-                #name (
-                    #(#xs)*
-                )
-            }
-        }
-        Fields::Unit => {
-            syn::parse_quote_spanned! { span=> #name }
-        }
-    };
-
-    Ok(res)
-}
-
-fn freeze_enum_variant(name: &Ident, variant: &Variant) -> syn::Result<syn::Arm> {
-    let span = variant.span();
-    let variant_name = &variant.ident;
-    match &variant.fields {
-        Fields::Unit => Ok(syn::parse_quote_spanned! {
-            span=>
-            #name::#variant_name => #name::#variant_name,
-        }),
-        Fields::Unnamed(fields) => {
-            let field_names: Vec<_> = (0..fields.unnamed.len())
-                .map(|i| format_ident!("f_{}", i))
-                .collect();
-            Ok(syn::parse_quote_spanned! {
-                span=>
-                #name::#variant_name(#(#field_names),*) => {
-                    #name::#variant_name(
-                        #(starlark::values::Freeze::freeze(#field_names, freezer)?),*
-                    )
+                if identity.is_some() {
+                    Ok(syn::parse_quote_spanned! { span=>
+                        #ident
+                    })
+                } else {
+                    Ok(syn::parse_quote_spanned! { span=>
+                        starlark::values::Freeze::freeze(#ident, freezer)?
+                    })
                 }
             })
-        }
-        Fields::Named(field) => {
-            let field_names: Vec<_> = field.named.iter().map(|f| &f.ident).collect();
-            Ok(syn::parse_quote_spanned! {
-                span=>
-                #name::#variant_name { #(#field_names),* } => {
-                    #name::#variant_name {
-                        #(#field_names: starlark::values::Freeze::freeze(#field_names, freezer)?,)*
-                    }
-                }
-            })
-        }
-    }
-}
-
-fn freeze_enum(name: &Ident, data: &DataEnum) -> syn::Result<syn::Expr> {
-    let span = name.span();
-    let variants = data
-        .variants
-        .iter()
-        .map(|v| freeze_enum_variant(name, v))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(syn::parse_quote_spanned! {
-        span=>
-        match self {
-            #(#variants)*
-        }
+            .collect::<syn::Result<_>>()?;
+        struct_or_enum_variant.construct(fields)
     })
-}
-
-fn freeze_impl(name: &Ident, data: &Data) -> syn::Result<syn::Expr> {
-    match data {
-        Data::Struct(data) => freeze_struct(name, data),
-        Data::Enum(data) => freeze_enum(name, data),
-        Data::Union(_) => Err(Error::new_spanned(name, "Can't derive freeze for unions")),
-    }
 }
 
 pub fn derive_freeze(input: proc_macro::TokenStream) -> proc_macro::TokenStream {

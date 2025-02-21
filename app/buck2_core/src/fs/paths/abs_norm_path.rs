@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use allocative::Allocative;
 use derive_more::Display;
@@ -38,7 +39,7 @@ use crate::fs::paths::forward_rel_path::ForwardRelativePathNormalizer;
 /// * TODO(nga): validate UTF-8
 /// * the path is **not** canonicalized
 #[derive(Display, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, RefCast)]
-#[display(fmt = "{}", "_0.display()")]
+#[display("{}", _0.display())]
 #[repr(transparent)]
 pub struct AbsNormPath(AbsPath);
 
@@ -46,7 +47,7 @@ pub struct AbsNormPath(AbsPath);
 #[derive(
     Clone, Display, Debug, Hash, PartialEq, Eq, Ord, PartialOrd, Allocative
 )]
-#[display(fmt = "{}", "_0.display()")]
+#[display("{}", _0.display())]
 pub struct AbsNormPathBuf(AbsPathBuf);
 
 impl AsRef<Path> for AbsNormPath {
@@ -113,7 +114,7 @@ impl AbsNormPath {
     ///     assert!(AbsNormPath::new("/foo/bar").is_ok());
     /// }
     /// ```
-    pub fn new<P: ?Sized + AsRef<Path>>(p: &P) -> anyhow::Result<&AbsNormPath> {
+    pub fn new<P: ?Sized + AsRef<Path>>(p: &P) -> buck2_error::Result<&AbsNormPath> {
         let path = AbsPath::new(p.as_ref())?;
         verify_abs_path(path)?;
         Ok(AbsNormPath::ref_cast(path))
@@ -143,18 +144,24 @@ impl AbsNormPath {
     ///             .to_string()
     ///     );
     /// }
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[allow(clippy::collapsible_else_if)]
     pub fn join<P: AsRef<ForwardRelativePath>>(&self, path: P) -> AbsNormPathBuf {
+        self.join_cow(path).into_owned()
+    }
+
+    pub fn join_cow<'a, P: AsRef<ForwardRelativePath>>(&'a self, path: P) -> Cow<'a, AbsNormPath> {
         let path = path.as_ref();
         if path.is_empty() {
-            self.to_buf()
+            Cow::Borrowed(self)
         } else {
             if cfg!(windows) {
-                AbsNormPathBuf(self.0.join(path.as_str().replace('/', "\\")))
+                Cow::Owned(AbsNormPathBuf(
+                    self.0.join(path.as_str().replace('/', "\\")),
+                ))
             } else {
-                AbsNormPathBuf(self.0.join(path.as_str()))
+                Cow::Owned(AbsNormPathBuf(self.0.join(path.as_str())))
             }
         }
     }
@@ -180,7 +187,7 @@ impl AbsNormPath {
     ///     assert_eq!(None, AbsNormPath::new("c:/")?.parent());
     /// }
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     pub fn parent(&self) -> Option<&AbsNormPath> {
         self.0.parent().map(AbsNormPath::ref_cast)
@@ -251,29 +258,32 @@ impl AbsNormPath {
     ///     );
     /// }
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     pub fn strip_prefix<P: AsRef<AbsNormPath>>(
         &self,
         base: P,
-    ) -> anyhow::Result<Cow<ForwardRelativePath>> {
+    ) -> buck2_error::Result<Cow<ForwardRelativePath>> {
         let stripped_path = self.strip_prefix_impl(base.as_ref())?;
         ForwardRelativePathNormalizer::normalize_path(stripped_path)
     }
 
     #[cfg(not(windows))]
-    fn strip_prefix_impl(&self, base: &AbsNormPath) -> anyhow::Result<&Path> {
-        self.0.strip_prefix(&base.0).map_err(anyhow::Error::from)
+    fn strip_prefix_impl(&self, base: &AbsNormPath) -> buck2_error::Result<&Path> {
+        self.0.strip_prefix(&base.0)
     }
 
     #[cfg(windows)]
-    fn strip_prefix_impl(&self, base: &AbsNormPath) -> anyhow::Result<&Path> {
+    fn strip_prefix_impl(&self, base: &AbsNormPath) -> buck2_error::Result<&Path> {
         if self.windows_prefix()? == base.windows_prefix()? {
-            self.strip_windows_prefix()?
-                .strip_prefix(base.strip_windows_prefix()?)
-                .map_err(anyhow::Error::from)
+            Ok(self
+                .strip_windows_prefix()?
+                .strip_prefix(base.strip_windows_prefix()?)?)
         } else {
-            Err(anyhow::anyhow!("Path is not a prefix"))
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Path is not a prefix"
+            ))
         }
     }
 
@@ -302,7 +312,7 @@ impl AbsNormPath {
     ///     assert!(!shared_path.starts_with(AbsNormPath::new(r"\\server\share\fo")?));
     /// }
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     pub fn starts_with<P: AsRef<AbsNormPath>>(&self, base: P) -> bool {
         self.starts_with_impl(base.as_ref())
@@ -345,7 +355,7 @@ impl AbsNormPath {
     ///     assert!(abs_path.ends_with("foo"));
     /// }
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     pub fn ends_with<P: AsRef<Path>>(&self, child: P) -> bool {
         self.0.ends_with(child.as_ref())
@@ -383,12 +393,12 @@ impl AbsNormPath {
     ///     );
     /// }
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     pub fn join_normalized<P: AsRef<RelativePath>>(
         &self,
         path: P,
-    ) -> anyhow::Result<AbsNormPathBuf> {
+    ) -> buck2_error::Result<AbsNormPathBuf> {
         let mut stack = Vec::new();
         for c in self
             .0
@@ -406,10 +416,11 @@ impl AbsNormPath {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
                     if stack.pop().is_none() {
-                        return Err(anyhow::anyhow!(PathNormalizationError::OutOfBounds(
+                        return Err(PathNormalizationError::OutOfBounds(
                             self.as_os_str().into(),
                             path.as_ref().as_str().into(),
-                        )));
+                        )
+                        .into());
                     }
                 }
             }
@@ -451,18 +462,15 @@ impl AbsNormPath {
     ///     AbsNormPath::new(r"\\.\COM42\foo\bar")?.windows_prefix()?
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
-    pub fn windows_prefix(&self) -> anyhow::Result<OsString> {
+    pub fn windows_prefix(&self) -> buck2_error::Result<OsString> {
         use std::os::windows::ffi::OsStringExt;
         use std::path::Prefix;
 
-        match self
-            .0
-            .components()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("AbsPath is empty."))?
-        {
+        match self.0.components().next().ok_or_else(|| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "AbsPath is empty.")
+        })? {
             std::path::Component::Prefix(prefix_component) => match prefix_component.kind() {
                 Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
                     Ok(OsString::from_wide(&[disk.into()]))
@@ -474,9 +482,16 @@ impl AbsNormPath {
                     Ok(server)
                 }
                 Prefix::DeviceNS(device) => Ok(device.to_owned()),
-                prefix => Err(anyhow::anyhow!("Unknown prefix kind: {:?}.", prefix)),
+                prefix => Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Unknown prefix kind: {:?}.",
+                    prefix
+                )),
             },
-            _ => Err(anyhow::anyhow!("AbsPath doesn't have prefix.")),
+            _ => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "AbsPath doesn't have prefix."
+            )),
         }
     }
 
@@ -521,19 +536,24 @@ impl AbsNormPath {
     ///     AbsNormPath::new(r"\\.\COM42\abc")?.strip_windows_prefix()?
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
-    pub fn strip_windows_prefix(&self) -> anyhow::Result<&Path> {
+    pub fn strip_windows_prefix(&self) -> buck2_error::Result<&Path> {
         let mut iter = self.0.iter();
-        let prefix = iter
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("AbsPath is empty."))?;
+        let prefix = iter.next().ok_or_else(|| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "AbsPath is empty.")
+        })?;
         let mut prefix = prefix.to_owned();
         // Strip leading path separator as well.
         if let Some(component) = iter.next() {
             prefix.push(component);
         }
         Ok(self.as_path().strip_prefix(&prefix)?)
+    }
+
+    pub fn ancestors(&self) -> impl Iterator<Item = &'_ AbsNormPath> {
+        // Taking the ancestors of an AbsNormPath gives you more AbsNormPath.
+        self.0.ancestors().map(AbsNormPath::ref_cast)
     }
 
     pub fn as_path(&self) -> &Path {
@@ -546,7 +566,7 @@ impl AbsNormPath {
 }
 
 impl AbsNormPathBuf {
-    pub fn new(path: PathBuf) -> anyhow::Result<AbsNormPathBuf> {
+    pub fn new(path: PathBuf) -> buck2_error::Result<AbsNormPathBuf> {
         let path = AbsPathBuf::try_from(path)?;
         verify_abs_path(&path)?;
         Ok(AbsNormPathBuf(path))
@@ -564,7 +584,7 @@ impl AbsNormPathBuf {
         self.0
     }
 
-    pub fn from(s: String) -> anyhow::Result<Self> {
+    pub fn from(s: String) -> buck2_error::Result<Self> {
         AbsNormPathBuf::try_from(s)
     }
 
@@ -676,9 +696,9 @@ impl AbsNormPathBuf {
     ///
     /// assert!(path.push_normalized(RelativePath::new("..")).is_err());
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
-    pub fn push_normalized<P: AsRef<RelativePath>>(&mut self, path: P) -> anyhow::Result<()> {
+    pub fn push_normalized<P: AsRef<RelativePath>>(&mut self, path: P) -> buck2_error::Result<()> {
         for c in path.as_ref().components() {
             match c {
                 relative_path::Component::Normal(s) => {
@@ -687,10 +707,11 @@ impl AbsNormPathBuf {
                 relative_path::Component::CurDir => {}
                 relative_path::Component::ParentDir => {
                     if !self.0.pop() {
-                        return Err(anyhow::anyhow!(PathNormalizationError::OutOfBounds(
+                        return Err(PathNormalizationError::OutOfBounds(
                             self.as_os_str().into(),
                             path.as_ref().as_str().into(),
-                        )));
+                        )
+                        .into());
                     }
                 }
             }
@@ -705,7 +726,7 @@ impl AbsNormPathBuf {
 }
 
 impl TryFrom<String> for AbsNormPathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -728,22 +749,22 @@ impl TryFrom<String> for AbsNormPathBuf {
     ///     assert!(AbsNormPathBuf::try_from("c:/normalize/../bar".to_owned()).is_err());
     /// }
     /// ```
-    fn try_from(s: String) -> anyhow::Result<AbsNormPathBuf> {
+    fn try_from(s: String) -> buck2_error::Result<AbsNormPathBuf> {
         AbsNormPathBuf::try_from(OsString::from(s))
     }
 }
 
 impl TryFrom<OsString> for AbsNormPathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     // no allocation
-    fn try_from(s: OsString) -> anyhow::Result<AbsNormPathBuf> {
+    fn try_from(s: OsString) -> buck2_error::Result<AbsNormPathBuf> {
         AbsNormPathBuf::try_from(PathBuf::from(s))
     }
 }
 
 impl TryFrom<PathBuf> for AbsNormPathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -767,10 +788,18 @@ impl TryFrom<PathBuf> for AbsNormPathBuf {
     ///     assert!(AbsNormPathBuf::try_from(PathBuf::from("c:/normalize/../bar")).is_err());
     /// }
     /// ```
-    fn try_from(p: PathBuf) -> anyhow::Result<AbsNormPathBuf> {
+    fn try_from(p: PathBuf) -> buck2_error::Result<AbsNormPathBuf> {
         let p = AbsPathBuf::try_from(p)?;
         verify_abs_path(&p)?;
         Ok(AbsNormPathBuf(p))
+    }
+}
+
+impl FromStr for AbsNormPathBuf {
+    type Err = buck2_error::Error;
+
+    fn from_str(s: &str) -> buck2_error::Result<Self> {
+        AbsNormPathBuf::try_from(s.to_owned())
     }
 }
 
@@ -808,13 +837,37 @@ impl Deref for AbsNormPathBuf {
     }
 }
 
+impl PartialEq<AbsNormPath> for AbsNormPathBuf {
+    fn eq(&self, other: &AbsNormPath) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl PartialEq<&'_ AbsNormPath> for AbsNormPathBuf {
+    fn eq(&self, other: &&AbsNormPath) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl PartialEq<AbsNormPathBuf> for AbsNormPath {
+    fn eq(&self, other: &AbsNormPathBuf) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<AbsNormPathBuf> for &'_ AbsNormPath {
+    fn eq(&self, other: &AbsNormPathBuf) -> bool {
+        other == self
+    }
+}
+
 // Separate function so windows path verification can be tested on Unix.
 fn verify_abs_path_windows_part(path: &str) -> bool {
     // UNC device path.
     // TODO(nga): behavior of UNC paths is under-specified in `AbsPath`.
     let path = path.strip_prefix("\\\\.\\").unwrap_or(path);
 
-    for component in path.split(|c| c == '/' || c == '\\') {
+    for component in path.split(['/', '\\']) {
         if component == "." || component == ".." {
             return false;
         }
@@ -823,8 +876,8 @@ fn verify_abs_path_windows_part(path: &str) -> bool {
     true
 }
 
-/// Verifier for AbsPath to ensure the path is absolute
-fn verify_abs_path(path: &AbsPath) -> anyhow::Result<()> {
+/// Verifier for AbsPath to ensure the path is normalized
+fn verify_abs_path(path: &AbsPath) -> buck2_error::Result<()> {
     // `Path::components` normalizes '.'s away so we cannot iterate with it.
     // TODO maybe we actually want to allow "."s and just
     //   normalize them away entirely.
@@ -837,9 +890,7 @@ fn verify_abs_path(path: &AbsPath) -> anyhow::Result<()> {
         // This is equivalent but faster to generic code below.
         for component in path.as_os_str().as_bytes().split(|c| *c == b'/') {
             if component == b"." || component == b".." {
-                return Err(anyhow::anyhow!(AbsNormPathError::PathNotNormalized(
-                    path.to_owned()
-                )));
+                return Err(AbsNormPathError::PathNotNormalized(path.to_owned()).into());
             }
         }
     }
@@ -847,9 +898,7 @@ fn verify_abs_path(path: &AbsPath) -> anyhow::Result<()> {
     if !cfg!(unix) {
         let path_str = path.to_string_lossy();
         if !verify_abs_path_windows_part(&path_str) {
-            return Err(anyhow::anyhow!(AbsNormPathError::PathNotNormalized(
-                path.to_owned()
-            )));
+            return Err(AbsNormPathError::PathNotNormalized(path.to_owned()).into());
         }
     }
 
@@ -858,6 +907,7 @@ fn verify_abs_path(path: &AbsPath) -> anyhow::Result<()> {
 
 /// Errors from 'AbsPath' creation
 #[derive(buck2_error::Error, Debug)]
+#[buck2(input)]
 enum AbsNormPathError {
     #[error("expected a normalized path, but found a non-normalized path instead: `{0}`")]
     PathNotNormalized(AbsPathBuf),
@@ -865,6 +915,7 @@ enum AbsNormPathError {
 
 /// Errors from normalizing paths
 #[derive(buck2_error::Error, Debug)]
+#[buck2(input)]
 enum PathNormalizationError {
     #[error(
         "no such path: normalizing `{}` requires the parent directory of the root of `{}`",
@@ -898,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn abs_paths_work_in_maps() -> anyhow::Result<()> {
+    fn abs_paths_work_in_maps() -> buck2_error::Result<()> {
         let mut map = HashMap::new();
         let foo_string = make_absolute("/foo");
         let bar_string = make_absolute("/bar");
@@ -914,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn abs_path_is_comparable() -> anyhow::Result<()> {
+    fn abs_path_is_comparable() -> buck2_error::Result<()> {
         let foo_string = make_absolute("/foo");
         let bar_string = make_absolute("/bar");
         let path1_buf = AbsNormPathBuf::from(foo_string.clone())?;
@@ -925,36 +976,11 @@ mod tests {
         let path2 = AbsNormPath::new(foo_string.as_str())?;
         let path3 = AbsNormPath::new(bar_string.as_str())?;
 
-        let str2 = foo_string.as_str();
-        let str3 = bar_string.as_str();
-        let str_not_abs = "ble";
-
-        let string_not_abs = "ble".to_owned();
-
         assert_eq!(path1_buf, path2_buf);
         assert_ne!(path1_buf, path3_buf);
 
         assert_eq!(path1, path2);
         assert_ne!(path1, path3);
-
-        assert_eq!(path1_buf, path2);
-        assert_ne!(path1, path3_buf);
-
-        assert_eq!(path1_buf, str2);
-        assert_ne!(path1_buf, str3);
-        assert_ne!(path1_buf, str_not_abs);
-
-        assert_eq!(path1, str2);
-        assert_ne!(path1, str3);
-        assert_ne!(path1, str_not_abs);
-
-        assert_eq!(path1_buf, foo_string);
-        assert_ne!(path1_buf, bar_string);
-        assert_ne!(path1_buf, string_not_abs);
-
-        assert_eq!(path1, foo_string);
-        assert_ne!(path1, bar_string);
-        assert_ne!(path1, string_not_abs);
 
         Ok(())
     }

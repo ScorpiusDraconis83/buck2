@@ -22,7 +22,11 @@
 //! source code will not exceed 4GiB. The `CodeMap` can look up the source file, line, and column
 //! of a `Pos` or `Span`, as well as provide source code snippets for error reporting.
 use std::cmp;
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -30,12 +34,15 @@ use std::ops::Add;
 use std::ops::AddAssign;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::ops::Sub;
 use std::ptr;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use dupe::Dupe;
 use once_cell::sync::Lazy;
+
+use crate::fast_string;
 
 /// A small, `Copy`, value representing a position in a `CodeMap`'s file.
 #[derive(
@@ -62,6 +69,13 @@ impl Add<u32> for Pos {
     }
 }
 
+impl Sub<u32> for Pos {
+    type Output = Pos;
+    fn sub(self, other: u32) -> Pos {
+        Pos(self.0 - other)
+    }
+}
+
 impl AddAssign<u32> for Pos {
     fn add_assign(&mut self, other: u32) {
         self.0 += other;
@@ -69,7 +83,9 @@ impl AddAssign<u32> for Pos {
 }
 
 /// A range of text within a CodeMap.
-#[derive(Copy, Dupe, Clone, Hash, Eq, PartialEq, Debug, Default, Allocative)]
+#[derive(
+    Copy, Dupe, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Default, Allocative
+)]
 pub struct Span {
     /// The position in the codemap representing the first byte of the span.
     begin: Pos,
@@ -125,10 +141,16 @@ impl Span {
     pub fn contains(self, pos: Pos) -> bool {
         self.begin <= pos && pos <= self.end
     }
+
+    /// Determines whether a `span` intersects with this span.
+    /// End of range is inclusive.
+    pub fn intersects(self, span: Span) -> bool {
+        self.contains(span.begin) || self.contains(span.end) || span.contains(self.begin)
+    }
 }
 
 /// Associate a Span with a value of arbitrary type (e.g. an AST node).
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
+#[derive(Clone, Copy, Dupe, PartialEq, Eq, Hash, Debug)]
 pub struct Spanned<T> {
     /// Data in the node.
     pub node: T,
@@ -169,8 +191,11 @@ impl<T> DerefMut for Spanned<T> {
 // A cheap unowned unique identifier per file/CodeMap,
 // somewhat delving into internal details.
 // Remains unique because we take a reference to the CodeMap.
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, Dupe)]
-pub struct CodeMapId(*const ());
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, Dupe, Allocative)]
+pub struct CodeMapId(#[allocative(skip)] *const ());
+
+unsafe impl Send for CodeMapId {}
+unsafe impl Sync for CodeMapId {}
 
 impl CodeMapId {
     pub const EMPTY: CodeMapId = CodeMapId(ptr::null());
@@ -186,6 +211,36 @@ enum CodeMapImpl {
 /// A data structure recording a source code file for position lookup.
 #[derive(Clone, Dupe, Allocative)]
 pub struct CodeMap(CodeMapImpl);
+
+/// Multiple [`CodeMap`].
+#[derive(Clone, Default, Debug, PartialEq, Allocative)]
+pub struct CodeMaps {
+    codemaps: HashMap<CodeMapId, CodeMap>,
+}
+
+impl CodeMaps {
+    /// Lookup by id.
+    pub fn get(&self, id: CodeMapId) -> Option<&CodeMap> {
+        self.codemaps.get(&id)
+    }
+
+    /// Add codemap if not already present.
+    pub fn add(&mut self, codemap: &CodeMap) {
+        match self.codemaps.entry(codemap.id()) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(e) => {
+                e.insert(codemap.dupe());
+            }
+        }
+    }
+
+    /// Add all codemaps.
+    pub fn add_all(&mut self, codemaps: &CodeMaps) {
+        for codemap in codemaps.codemaps.values() {
+            self.add(codemap);
+        }
+    }
+}
 
 /// A `CodeMap`'s record of a source file.
 #[derive(Allocative)]
@@ -335,9 +390,7 @@ impl CodeMap {
                 let line = self.find_line(pos);
                 let line_span = self.line_span(line);
                 let byte_col = pos.0 - line_span.begin.0;
-                let column = self.source_span(line_span)[..byte_col as usize]
-                    .chars()
-                    .count();
+                let column = fast_string::len(&self.source_span(line_span)[..byte_col as usize]).0;
 
                 ResolvedPos { line, column }
             }
@@ -367,6 +420,18 @@ impl CodeMap {
     pub fn line_span(&self, line: usize) -> Span {
         self.line_span_opt(line)
             .unwrap_or_else(|| panic!("Line {} is out of range for {:?}", line, self))
+    }
+
+    /// Trim trailing newline if any, including windows, from the line span.
+    pub fn line_span_trim_newline(&self, line: usize) -> Span {
+        let mut span = self.line_span(line);
+        if self.source_span(span).ends_with('\n') {
+            span.end.0 -= 1;
+        }
+        if self.source_span(span).ends_with('\r') {
+            span.end.0 -= 1;
+        }
+        span
     }
 
     /// Gets the span representing a line by line number.
@@ -411,7 +476,9 @@ impl CodeMap {
 }
 
 /// All are 0-based, but print out with 1-based.
-#[derive(Copy, Clone, Dupe, Hash, Eq, PartialEq, Debug, Default)]
+#[derive(
+    Copy, Clone, Dupe, Hash, Eq, PartialEq, Ord, PartialOrd, Debug, Default
+)]
 pub struct ResolvedPos {
     /// The line number within the file (0-indexed).
     pub line: usize,
@@ -448,6 +515,21 @@ pub struct FileSpanRef<'a> {
 pub struct FileSpan {
     pub file: CodeMap,
     pub span: Span,
+}
+
+impl PartialOrd for FileSpan {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FileSpan {
+    fn cmp(&self, that: &Self) -> Ordering {
+        Ord::cmp(
+            &(self.filename(), self.span, self.file.id().0 as usize),
+            &(that.filename(), that.span, that.file.id().0 as usize),
+        )
+    }
 }
 
 impl<'a> fmt::Display for FileSpanRef<'a> {
@@ -533,7 +615,9 @@ impl FileSpan {
 
 /// The locations of values within a span.
 /// All are 0-based, but print out with 1-based.
-#[derive(Debug, Dupe, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Dupe, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Default
+)]
 pub struct ResolvedSpan {
     /// Beginning of the span.
     pub begin: ResolvedPos,
@@ -607,7 +691,7 @@ impl ResolvedSpan {
 
 /// File and line number.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, derive_more::Display)]
-#[display(fmt = "{}:{}", file, "line + 1")]
+#[display("{}:{}", file, line + 1)]
 pub struct ResolvedFileLine {
     /// File name.
     pub file: String,
@@ -616,7 +700,7 @@ pub struct ResolvedFileLine {
 }
 
 /// File name and line and column pairs for a span.
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Clone)]
 pub struct ResolvedFileSpan {
     /// File name.
     pub file: String,
@@ -805,6 +889,75 @@ mod tests {
         assert!(span.contains(ResolvedPos { line: 4, column: 5 }));
         assert!(!span.contains(ResolvedPos { line: 4, column: 6 }));
         assert!(!span.contains(ResolvedPos { line: 5, column: 0 }));
+    }
+
+    #[test]
+    fn test_span_intersects() {
+        let span = Span {
+            begin: Pos(2),
+            end: Pos(4),
+        };
+        // s: |---|
+        // o:      |---|
+        assert!(!span.intersects(Span {
+            begin: Pos(5),
+            end: Pos(7),
+        }));
+
+        // s: |---|
+        // o:     |---|
+        assert!(span.intersects(Span {
+            begin: Pos(4),
+            end: Pos(6),
+        }));
+
+        // s: |---|
+        // o:    |---|
+        assert!(span.intersects(Span {
+            begin: Pos(3),
+            end: Pos(5),
+        }));
+
+        // s: |---|
+        // o: |---|
+        assert!(span.intersects(Span {
+            begin: Pos(2),
+            end: Pos(4),
+        }));
+
+        // s:   |---|
+        // o: |---|
+        assert!(span.intersects(Span {
+            begin: Pos(1),
+            end: Pos(3),
+        }));
+
+        // s:     |---|
+        // o: |---|
+        assert!(span.intersects(Span {
+            begin: Pos(0),
+            end: Pos(2),
+        }));
+
+        // s:     |---|
+        // o: |--|
+        assert!(!span.intersects(Span {
+            begin: Pos(0),
+            end: Pos(1),
+        }));
+
+        let large_span = Span {
+            begin: Pos(2),
+            end: Pos(8),
+        };
+
+        // s:  |-------|
+        // o:    |---|
+        assert!(large_span.intersects(span));
+
+        // s:    |---|
+        // o:  |-------|
+        assert!(span.intersects(large_span));
     }
 
     #[test]

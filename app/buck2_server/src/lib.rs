@@ -8,15 +8,13 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
 #![feature(try_blocks)]
 #![feature(once_cell_try)]
 #![feature(used_with_arg)]
 
 pub mod active_commands;
-pub mod builtin_docs;
 mod clean_stale;
-mod configs;
+mod cpu_usage_collector;
 mod ctx;
 pub mod daemon;
 mod dice_tracker;
@@ -32,3 +30,4 @@ pub mod profile;
 mod snapshot;
 mod subscription;
 mod trace_io;
+mod version_control_revision;

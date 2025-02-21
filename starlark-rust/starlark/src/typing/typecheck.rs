@@ -118,7 +118,7 @@ pub(crate) fn solve_bindings(
                 span: *span,
             },
             require,
-        );
+        )?;
     }
     Ok((
         ctx.errors.into_inner(),
@@ -166,6 +166,14 @@ impl TypeMap {
             )
             .collect()
     }
+
+    #[cfg(test)]
+    pub(crate) fn find_first_binding<'a>(&'a self) -> Option<&'a Ty> {
+        self.bindings
+            .entries_unordered()
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, (_, _, ty))| ty)
+    }
 }
 
 /// Typecheck a module.
@@ -200,10 +208,10 @@ impl AstModuleTypecheck for AstModule {
             loads,
             statement,
             ScopeResolverGlobals {
-                globals: Some(frozen_heap.alloc_any_display_from_debug(globals.dupe())),
+                globals: Some(frozen_heap.alloc_any(globals.dupe())),
             },
-            frozen_heap.alloc_any_display_from_debug(codemap.dupe()),
-            &Dialect::Extended,
+            frozen_heap.alloc_any(codemap.dupe()),
+            &Dialect::AllOptionsInternal,
         );
         let scope_errors = scope_errors.into_map(TypingError::from_eval_exception);
         // We don't really need to properly unpack top-level statements,

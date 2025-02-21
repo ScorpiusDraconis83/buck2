@@ -101,6 +101,7 @@ We aim to minimize the suffixing of the largest, most central layers, so we appl
    (possibly module-suffixed) library name. Each final library after the first encountered for its library name will be
    further suffixed with that library name's counter value.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -222,6 +223,7 @@ class SplitGroupKey(typing.NamedTuple):
 
 class NodeData(typing.NamedTuple):
     base_library_name: str
+    could_be_root_for: list[str]
     module: str
     merge_group: int
     is_excluded: bool
@@ -245,6 +247,7 @@ class FinalLibData(typing.NamedTuple):
     is_excluded: bool
     key: FinalLibKey
     deps: set[FinalLibKey]
+    entry_point_targets: set[str]
 
 
 class FinalLibGraph:
@@ -255,7 +258,7 @@ class FinalLibGraph:
     def __init__(self) -> None:
         self.graph = {}
 
-    def add_node(self, node_data: NodeData, deps_data: list[NodeData]) -> None:
+    def _ensure_lib_data(self, node_data: NodeData) -> FinalLibData:
         lib_key = node_data.final_lib_key
         lib_data = self.graph.get(lib_key, None)
         if not lib_data:
@@ -268,19 +271,39 @@ class FinalLibGraph:
                     is_excluded=node_data.is_excluded,
                     key=lib_key,
                     deps=set(),
+                    entry_point_targets=set(),
                 ),
             )
         else:
             assert lib_data.module == node_data.module, (lib_data, node_data)
             assert lib_data.merge_group == node_data.merge_group, (lib_data, node_data)
 
-        for dep_data in deps_data:
-            if dep_data.final_lib_key != lib_key:
-                lib_data.deps.add(dep_data.final_lib_key)
+        return lib_data
 
-    def dump_graph(self, names: dict[FinalLibKey, str]) -> dict[str, list[str]]:
+    def add_node(
+        self,
+        node_data: NodeData,
+        deps: list[str],
+        deps_data: list[NodeData],
+    ) -> None:
+        lib_data = self._ensure_lib_data(node_data)
+
+        for dep, dep_data in zip(deps, deps_data):
+            if dep_data.final_lib_key != node_data.final_lib_key:
+                lib_data.deps.add(dep_data.final_lib_key)
+                dep_lib_data = self._ensure_lib_data(dep_data)
+                dep_lib_data.entry_point_targets.add(dep)
+
+    def dump_lib_edges(self, names: dict[FinalLibKey, str]) -> dict[str, list[str]]:
         return {
             names[k]: [names[d] for d in node.deps] for k, node in self.graph.items()
+        }
+
+    def dump_entry_point_targets(
+        self, names: dict[FinalLibKey, str]
+    ) -> dict[str, list[str]]:
+        return {
+            names[k]: list(node.entry_point_targets) for k, node in self.graph.items()
         }
 
     def assign_names(
@@ -291,7 +314,9 @@ class FinalLibGraph:
             final_lib_graph[key] = list(dep_data.deps)
 
         # this topo_sort also verifies that we produced an acyclic final lib graph
-        sorted_final_lib_keys = topo_sort(final_lib_graph)
+        sorted_final_lib_keys = topo_sort(
+            final_lib_graph, lambda x: self.graph[x].module if self.graph[x] else str(x)
+        )
 
         name_counters = {}
         final_lib_names: dict[FinalLibKey, str] = {}
@@ -386,6 +411,7 @@ def get_native_linkables_by_merge_sequence(  # noqa: C901
     native_library_merge_sequence: list[MergeSequenceGroupSpec],
     native_library_merge_sequence_blocklist: list[typing.Pattern],
     apk_module_graph: ApkModuleGraph,
+    native_library_merge_non_asset_libs: bool,
 ) -> typing.Tuple[dict[Label, NodeData], dict[FinalLibKey, str], FinalLibGraph]:
     final_lib_graph = FinalLibGraph()
     node_data: dict[Label, NodeData] = {}
@@ -395,7 +421,7 @@ def get_native_linkables_by_merge_sequence(  # noqa: C901
 
     def check_is_excluded(target: Label) -> bool:
         node = graph_node_map[target]
-        if not node.can_be_asset:
+        if not native_library_merge_non_asset_libs and not node.can_be_asset:
             return True
 
         raw_target = node.raw_target
@@ -536,9 +562,7 @@ def get_native_linkables_by_merge_sequence(  # noqa: C901
                 for (
                     group,
                     entry_count,
-                ) in (
-                    dependent_in_group_data.dependent_included_split_group_entry_counts.items()
-                ):
+                ) in dependent_in_group_data.dependent_included_split_group_entry_counts.items():
                     if group == dependent_split_group and is_included_split_group_entry:
                         entry_count += 1
 
@@ -550,6 +574,7 @@ def get_native_linkables_by_merge_sequence(  # noqa: C901
 
             this_node_data = NodeData(
                 base_library_name=base_library_name,
+                could_be_root_for=list(group_roots.get(target, set())),
                 module=module,
                 merge_group=current_merge_group,
                 final_lib_key=FinalLibKey(
@@ -566,7 +591,7 @@ def get_native_linkables_by_merge_sequence(  # noqa: C901
         for target in post_ordered_targets:
             node = graph_node_map[target]
             deps_data = [node_data[dep] for dep in node.deps]
-            final_lib_graph.add_node(node_data[target], deps_data)
+            final_lib_graph.add_node(node_data[target], node.deps, deps_data)
 
     final_lib_names = final_lib_graph.assign_names(merge_group_module_constituents)
     return node_data, final_lib_names, final_lib_graph
@@ -576,7 +601,9 @@ T = typing.TypeVar("T")
 
 
 def post_order_traversal_by(
-    roots: list[T], get_nodes_to_traverse_func: typing.Callable[[T], list[T]]
+    roots: list[T],
+    get_nodes_to_traverse_func: typing.Callable[[T], list[T]],
+    get_node_str: typing.Callable[[T], str] = None,
 ) -> list[T]:
     """
     Returns the post-order sorted list of the nodes in the traversal.
@@ -605,9 +632,17 @@ def post_order_traversal_by(
                 work.append((OUTPUT, node))
                 for dep in get_nodes_to_traverse_func(node):
                     if dep in current_parents:
+                        current_parents_strs = []
+                        for k in current_parents:
+                            current_parents_strs.append(
+                                get_node_str(k) if get_node_str else str(k)
+                            )
                         raise AssertionError(
                             "detected cycle: {}".format(
-                                " -> ".join(current_parents + [dep])
+                                " -> ".join(
+                                    current_parents_strs
+                                    + [get_node_str(dep) if get_node_str else str(dep)]
+                                )
                             )
                         )
 
@@ -626,7 +661,9 @@ def is_root_module(module: str) -> bool:
     return module == ROOT_MODULE
 
 
-def topo_sort(graph: dict[T, list[T]]) -> list[T]:
+def topo_sort(
+    graph: dict[T, list[T]], get_node_str: typing.Callable[[T], str] = None
+) -> list[T]:
     """
     Topo-sort the given graph.
     """
@@ -642,7 +679,7 @@ def topo_sort(graph: dict[T, list[T]]) -> list[T]:
         if in_degree == 0:
             roots.append(node)
 
-    postordered = post_order_traversal_by(roots, lambda x: graph[x])
+    postordered = post_order_traversal_by(roots, lambda x: graph[x], get_node_str)
     postordered.reverse()
 
     return postordered
@@ -677,12 +714,14 @@ def main() -> int:  # noqa: C901
     parser.add_argument("--mergemap-input", required=True)
     parser.add_argument("--apk-module-graph")
     parser.add_argument("--output")
+    parser.add_argument("--merge-non-asset-libs", action="store_true")
     args = parser.parse_args()
 
     apk_module_graph = read_apk_module_graph(args.apk_module_graph)
 
     final_result = {}
     debug_results = {}
+    split_groups = {}
     mergemap_input = read_mergemap_input(args.mergemap_input)
     for platform, nodes in mergemap_input.nodes_by_platform.items():
         (
@@ -694,6 +733,7 @@ def main() -> int:  # noqa: C901
             mergemap_input.merge_sequence,
             mergemap_input.blocklist,
             apk_module_graph,
+            args.merge_non_asset_libs,
         )
 
         final_mapping = {}
@@ -704,12 +744,20 @@ def main() -> int:  # noqa: C901
                     final_mapping[target] = None
                 else:
                     final_mapping[target] = final_lib_names[node.final_lib_key]
+                    split_groups[final_lib_names[node.final_lib_key]] = (
+                        node.base_library_name
+                    )
             else:
                 final_mapping[target] = str(target)
         debug_results[platform] = (
+            # Target name -> various information
             {k: v.debug() for k, v in node_data.items()},
+            # Serialized FinalLibKey -> final library name
             {str(k): v for k, v in final_lib_names.items()},
-            final_lib_graph.dump_graph(final_lib_names),
+            # Final library name -> final names of direct library dependencies
+            final_lib_graph.dump_lib_edges(final_lib_names),
+            # Final library name -> entry point targets
+            final_lib_graph.dump_entry_point_targets(final_lib_names),
         )
         final_result[platform] = final_mapping
 
@@ -717,6 +765,8 @@ def main() -> int:  # noqa: C901
         pathlib.Path(args.output).mkdir(parents=True, exist_ok=True)
         with open(os.path.join(args.output, "merge.map"), "w") as outfile:
             json.dump(final_result, outfile, indent=2)
+        with open(os.path.join(args.output, "split_groups.map"), "w") as outfile:
+            json.dump(split_groups, outfile, indent=2)
 
         # When writing an output dir we also produce some debugging information.
         for platform, result in final_result.items():
