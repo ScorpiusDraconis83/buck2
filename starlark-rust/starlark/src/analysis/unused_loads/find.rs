@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 
-use anyhow::Context;
 use dupe::Dupe;
 use starlark_syntax::codemap::CodeMap;
 use starlark_syntax::codemap::FileSpanRef;
@@ -73,11 +72,11 @@ pub(crate) fn find_unused_loads(
     name: &str,
     program: &str,
 ) -> crate::Result<(CodeMap, Vec<UnusedLoad>)> {
-    let module = AstModule::parse(name, program.to_owned(), &Dialect::Extended)?;
+    let module = AstModule::parse(name, program.to_owned(), &Dialect::AllOptionsInternal)?;
     let names = MutableNames::new();
     let heap = FrozenHeap::new();
     let (codemap, statement, dialect, ..) = module.into_parts();
-    let codemap = heap.alloc_any_display_from_type_name(codemap);
+    let codemap = heap.alloc_any(codemap);
     let module_scopes = ModuleScopes::check_module_err(
         &names,
         &heap,
@@ -112,7 +111,10 @@ pub(crate) fn find_unused_loads(
             let args = load.args.try_map(|arg| {
                 anyhow::Ok(LoadSymbol {
                     arg,
-                    binding_id: arg.local.payload.context("payload is not set")?,
+                    binding_id: arg
+                        .local
+                        .payload
+                        .ok_or_else(|| anyhow::anyhow!("payload is not set"))?,
                     used: false,
                 })
             })?;
@@ -131,7 +133,7 @@ pub(crate) fn find_unused_loads(
             println!("visit ident: {:?}", ident);
             let ResolvedIdent::Slot(Slot::Module(_), binding_id) = ident
                 .payload
-                .context("ident is not resolved (internal error)")?
+                .ok_or_else(|| anyhow::anyhow!("ident is not resolved (internal error)"))?
             else {
                 return Ok(());
             };

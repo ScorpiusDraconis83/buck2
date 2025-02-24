@@ -10,11 +10,13 @@
 use std::sync::Arc;
 
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::FrozenCommandLineArg;
+use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use starlark::environment::Module;
+use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
 
 /// Result of query evaluation from queries referenced in target nodes.
@@ -42,12 +44,12 @@ pub trait AttrResolutionContext<'v> {
     fn get_dep(
         &self,
         target: &ConfiguredProvidersLabel,
-    ) -> anyhow::Result<FrozenProviderCollectionValue>;
+    ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>>;
 
     fn resolve_unkeyed_placeholder(
         &self,
         name: &str,
-    ) -> anyhow::Result<Option<FrozenCommandLineArg>>;
+    ) -> buck2_error::Result<Option<FrozenCommandLineArg>>;
 
     /// Provides the result of the query. This will only provide results for queries that are reported during the configured attr traversal.
     // TODO(cjhopman): Ideally, we wouldn't need to split query attr resolution in this way, but processing queries is an async operation and the starlark Heap cannot be used in async code.

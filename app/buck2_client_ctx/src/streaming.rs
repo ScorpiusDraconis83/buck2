@@ -9,21 +9,26 @@
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
 use dupe::Dupe;
+use tokio::sync::Mutex;
 
 use crate::client_ctx::ClientCommandContext;
+use crate::common::ui::CommonConsoleOptions;
+use crate::common::BuckArgMatches;
 use crate::common::CommonBuildConfigurationOptions;
-use crate::common::CommonConsoleOptions;
-use crate::common::CommonDaemonCommandOptions;
+use crate::common::CommonEventLogOptions;
+use crate::common::CommonStarlarkOptions;
+use crate::daemon::client::connect::connect_buckd;
 use crate::daemon::client::connect::BuckdConnectConstraints;
-use crate::daemon::client::connect::BuckdConnectOptions;
 use crate::daemon::client::connect::DaemonConstraintsRequest;
 use crate::daemon::client::connect::DesiredTraceIoState;
 use crate::daemon::client::BuckdClientConnector;
+use crate::events_ctx::EventsCtx;
 use crate::exit_result::ExitCode;
 use crate::exit_result::ExitResult;
 use crate::path_arg::PathArg;
@@ -35,11 +40,13 @@ use crate::subscribers::get::try_get_event_log_subscriber;
 use crate::subscribers::get::try_get_re_log_subscriber;
 use crate::subscribers::recorder::try_get_invocation_recorder;
 use crate::subscribers::subscriber::EventSubscriber;
+use crate::subscribers::subscribers::EventSubscribers;
 
-fn default_subscribers<'a, T: StreamingCommand>(
+fn default_subscribers<T: StreamingCommand>(
     cmd: &T,
-    ctx: &ClientCommandContext<'a>,
-) -> anyhow::Result<Vec<Box<dyn EventSubscriber + 'a>>> {
+    matches: BuckArgMatches<'_>,
+    ctx: &ClientCommandContext,
+) -> buck2_error::Result<EventSubscribers> {
     let console_opts = cmd.console_opts();
     let mut subscribers = vec![];
     let expect_spans = cmd.should_expect_spans();
@@ -48,6 +55,10 @@ fn default_subscribers<'a, T: StreamingCommand>(
     // and log it in another (invocation_recorder)
     let log_size_counter_bytes = Some(Arc::new(AtomicU64::new(0)));
 
+    let build_count_dir = match ctx.paths() {
+        Ok(paths) => Some(paths.build_count_dir()),
+        Err(_) => None,
+    };
     subscribers.push(get_console_with_root(
         ctx.trace_id.dupe(),
         console_opts.console_type,
@@ -56,6 +67,7 @@ fn default_subscribers<'a, T: StreamingCommand>(
         None,
         T::COMMAND_NAME,
         console_opts.superconsole_config(),
+        build_count_dir,
     )?);
 
     if let Some(event_log) = try_get_event_log_subscriber(cmd, ctx, log_size_counter_bytes.clone())?
@@ -71,17 +83,24 @@ fn default_subscribers<'a, T: StreamingCommand>(
     if let Some(build_graph_stats) = try_get_build_graph_stats(cmd, ctx)? {
         subscribers.push(build_graph_stats)
     }
-    let recorder = try_get_invocation_recorder(
+    let representative_config_flags = if ctx.maybe_paths()?.is_some() {
+        matches.get_representative_config_flags()?
+    } else {
+        Vec::new()
+    };
+    let mut recorder = try_get_invocation_recorder(
         ctx,
         cmd.event_log_opts(),
         cmd.logging_name(),
         cmd.sanitize_argv(ctx.argv.clone()).argv,
+        representative_config_flags,
         log_size_counter_bytes,
     )?;
+    recorder.update_metadata_from_client_metadata(&ctx.client_metadata);
     subscribers.push(recorder);
 
     subscribers.extend(cmd.extra_subscribers());
-    Ok(subscribers)
+    Ok(EventSubscribers::new(subscribers))
 }
 
 /// Trait to generalize the behavior of executable buck2 commands that rely on a server.
@@ -98,8 +117,9 @@ pub trait StreamingCommand: Sized + Send + Sync {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult;
 
     /// Should we only connect to existing servers (`true`), or spawn a new server if required (`false`).
@@ -114,9 +134,11 @@ pub trait StreamingCommand: Sized + Send + Sync {
 
     fn console_opts(&self) -> &CommonConsoleOptions;
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions;
+    fn event_log_opts(&self) -> &CommonEventLogOptions;
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions;
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions;
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions;
 
     fn extra_subscribers(&self) -> Vec<Box<dyn EventSubscriber>> {
         vec![]
@@ -145,61 +167,108 @@ pub trait StreamingCommand: Sized + Send + Sync {
 }
 
 /// Just provides a common interface for buck subcommands for us to interact with here.
+#[allow(async_fn_in_trait)]
 pub trait BuckSubcommand {
-    fn exec(self, matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult;
+    fn exec(self, matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult;
+
+    /// A version of `exec` that allows the caller to control when the runtime is entered.
+    async fn exec_async(
+        self,
+        matches: BuckArgMatches<'_>,
+        ctx: ClientCommandContext<'_>,
+    ) -> ExitResult;
 }
 
 impl<T: StreamingCommand> BuckSubcommand for T {
     /// Actual call that runs a `StreamingCommand`.
     /// Handles all of the business of setting up a runtime, server, and subscribers.
-    fn exec(self, matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
-        ctx.with_runtime(async move |mut ctx| {
-            let work = async {
-                let constraints = if T::existing_only() {
-                    BuckdConnectConstraints::ExistingOnly
-                } else {
-                    let mut req =
-                        DaemonConstraintsRequest::new(ctx.immediate_config, T::trace_io(&self))?;
-                    ctx.restarter.apply_to_constraints(&mut req);
-                    BuckdConnectConstraints::Constraints(req)
-                };
+    async fn exec_async(
+        self,
+        matches: BuckArgMatches<'_>,
+        mut ctx: ClientCommandContext<'_>,
+    ) -> ExitResult {
+        let buck_log_dir = &ctx.paths()?.log_dir();
+        let command_report_path = &self
+            .event_log_opts()
+            .command_report_path
+            .as_ref()
+            .map(|path| path.resolve(&ctx.working_dir));
 
-                let mut connect_options = BuckdConnectOptions {
-                    subscribers: default_subscribers(&self, &ctx)?,
-                    constraints,
-                };
+        let events_ctx = Arc::new(Mutex::new(EventsCtx::new(default_subscribers(
+            &self, matches, &ctx,
+        )?)));
+        let exec_events_ctx = events_ctx.dupe();
 
-                let buckd = match ctx.start_in_process_daemon.take() {
-                    None => ctx.connect_buckd(connect_options).await,
-                    Some(start_in_process_daemon) => {
-                        // Start in-process daemon, wait until it is ready to accept connections.
-                        start_in_process_daemon()?;
+        let work = async {
+            let mut constraints = if T::existing_only() {
+                BuckdConnectConstraints::ExistingOnly
+            } else {
+                let mut req =
+                    DaemonConstraintsRequest::new(ctx.immediate_config, T::trace_io(&self))?;
+                ctx.restarter.apply_to_constraints(&mut req);
+                BuckdConnectConstraints::Constraints(req)
+            };
+            let mut events_ctx = exec_events_ctx.lock().await;
+            let buckd = match ctx.start_in_process_daemon.take() {
+                None => connect_buckd(constraints, &mut events_ctx, ctx.paths()?).await,
+                Some(start_in_process_daemon) => {
+                    // Start in-process daemon, wait until it is ready to accept connections.
+                    start_in_process_daemon()?;
 
-                        // Do not attempt to spawn a daemon if connect failed.
-                        // Connect should not fail.
-                        connect_options.constraints = BuckdConnectConstraints::ExistingOnly;
+                    // Do not attempt to spawn a daemon if connect failed.
+                    // Connect should not fail.
+                    constraints = BuckdConnectConstraints::ExistingOnly;
 
-                        ctx.connect_buckd(connect_options).await
-                    }
-                };
-
-                let mut buckd = match buckd {
-                    Ok(buckd) => buckd,
-                    Err(e) => {
-                        return ExitResult::err_with_exit_code(e, ExitCode::ConnectError);
-                    }
-                };
-
-                let command_result = self.exec_impl(&mut buckd, matches, &mut ctx).await;
-
-                ctx.restarter.observe(&buckd);
-
-                command_result
+                    connect_buckd(constraints, &mut events_ctx, ctx.paths()?).await
+                }
             };
 
-            with_simple_sigint_handler(work)
-                .await
-                .unwrap_or_else(|| ExitResult::status(ExitCode::SignalInterrupt))
-        })
+            let mut buckd = match buckd {
+                Ok(buckd) => buckd,
+                Err(e) => {
+                    return ExitResult::err_with_exit_code(e, ExitCode::ConnectError);
+                }
+            };
+
+            let command_result = self
+                .exec_impl(&mut buckd, matches, &mut ctx, &mut events_ctx)
+                .await;
+
+            ctx.restarter.observe(&buckd, &events_ctx);
+
+            command_result
+        };
+
+        let result = with_simple_sigint_handler(work)
+            .await
+            .unwrap_or_else(|| ExitResult::status(ExitCode::SignalInterrupt));
+
+        let finalize_events = async {
+            let mut events_ctx = events_ctx.lock().await;
+            events_ctx.finalize().await
+        };
+
+        let logging_timeout = Duration::from_secs(30);
+        let finalizing_errors = tokio::time::timeout(logging_timeout, finalize_events)
+            .await
+            .unwrap_or_else(|_| {
+                vec![format!(
+                    "Timeout after {:?} waiting for logging cleanup",
+                    logging_timeout
+                )]
+            });
+
+        // Don't fail the command if command report fails to write. TODO(ctolliday) show a warning?
+        let _unused = result.write_command_report(
+            ctx.trace_id,
+            buck_log_dir,
+            command_report_path,
+            finalizing_errors,
+        );
+        result
+    }
+
+    fn exec(self, matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
+        ctx.with_runtime(|ctx| self.exec_async(matches, ctx))
     }
 }

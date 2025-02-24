@@ -12,19 +12,22 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
+display_container = { workspace = true }
 futures = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
+once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+allocative = { workspace = true }
 dice = { workspace = true }
 dupe = { workspace = true }
-gazebo = { workspace = true }
 host_sharing = { workspace = true }
+remote_execution = { workspace = true }
 sorted_vector_map = { workspace = true }
 starlark = { workspace = true }
 
@@ -41,6 +44,8 @@ buck2_execute = { workspace = true }
 buck2_execute_impl = { workspace = true }
 buck2_futures = { workspace = true }
 buck2_grpc = { workspace = true }
+buck2_interpreter = { workspace = true }
+buck2_interpreter_for_build = { workspace = true }
 buck2_node = { workspace = true }
 buck2_server_ctx = { workspace = true }
 buck2_test_api = { workspace = true }
@@ -51,3 +56,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 maplit = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -17,23 +18,26 @@ use buck2_audit::config::OutputFormat;
 use buck2_audit::config::ValueStyle;
 use buck2_cli_proto::ClientContext;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::configs::LegacyBuckConfigLocation;
+use buck2_common::legacy_configs::configs::LegacyBuckConfigValue;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
-use buck2_common::legacy_configs::LegacyBuckConfigLocation;
-use buck2_common::legacy_configs::LegacyBuckConfigValue;
 use buck2_core::cells::name::CellName;
+use buck2_core::cells::CellAliasResolver;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
+use buck2_server_ctx::stdout_partial_output::StdoutPartialOutput;
 use gazebo::prelude::*;
 use serde_json::json;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
 
 fn print_location_string(
     writer: &mut impl Write,
     location: &LegacyBuckConfigLocation,
     keyword: &str,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     writeln!(writer, "  ({} {})", keyword, location)?;
     Ok(())
 }
@@ -42,7 +46,7 @@ fn print_location(
     writer: &mut impl Write,
     value: &LegacyBuckConfigValue,
     style: LocationStyle,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     match style {
         LocationStyle::None => {}
         LocationStyle::Direct => {
@@ -70,7 +74,7 @@ fn print_value(
     key: &str,
     value: &LegacyBuckConfigValue,
     style: ValueStyle,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     match style {
         ValueStyle::Resolved => {
             writeln!(writer, "    {} = {}", key, value.as_str())?;
@@ -92,112 +96,287 @@ fn print_value(
     Ok(())
 }
 
+struct Match<'a> {
+    /// The original specification - important if we want to produce JSON keys.
+    /// Not present if it wasn't a key match, as then we can't express it.
+    spec: Option<&'a str>,
+    /// The cell, or otherwise require the cell passed in by the filterer.
+    cell: Option<CellName>,
+    /// The section.
+    section: &'a str,
+    /// The key. Might be optional if the user did `foo` as their match.
+    key: Option<&'a str>,
+}
+
+impl<'a> Match<'a> {
+    fn parse(resolver: &CellAliasResolver, spec: &'a str) -> buck2_error::Result<Self> {
+        let (cell, config) = match spec.split_once("//") {
+            Some((cell, config)) => (Some(resolver.resolve(cell)?), config),
+            None => (None, spec),
+        };
+        let (section, key) = config.split_once(".").unwrap_or((config, ""));
+        Ok(Self {
+            spec: if key == "" { None } else { Some(spec) },
+            cell,
+            section,
+            key: if key == "" { None } else { Some(key) },
+        })
+    }
+
+    fn filter(
+        &self,
+        default_cell: CellName,
+        cell: CellName,
+        section: &str,
+        key: &str,
+    ) -> Option<String> {
+        if cell == self.cell.unwrap_or(default_cell)
+            && section == self.section
+            && self.key.map_or(true, |k| k == key)
+        {
+            Some(
+                self.spec
+                    .map_or_else(|| format!("{section}.{key}"), str::to_owned),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+struct Matches<'a> {
+    matches: Vec<Match<'a>>,
+}
+
+impl<'a> Matches<'a> {
+    fn parse(resolver: &CellAliasResolver, specs: &'a [String]) -> buck2_error::Result<Self> {
+        Ok(Self {
+            matches: specs.try_map(|x| Match::parse(resolver, x))?,
+        })
+    }
+
+    fn filter(
+        &self,
+        default_cell: CellName,
+        cell: CellName,
+        section: &str,
+        key: &str,
+    ) -> Option<String> {
+        if self.matches.is_empty() {
+            if cell == default_cell {
+                Some(format!("{section}.{key}"))
+            } else {
+                None
+            }
+        } else {
+            self.matches
+                .iter()
+                .find_map(|x| x.filter(default_cell, cell, section, key))
+        }
+    }
+
+    fn cells(&self) -> BTreeSet<CellName> {
+        self.matches.iter().filter_map(|x| x.cell).collect()
+    }
+}
+
+trait CellConfigRenderer {
+    fn render_cell_header(&mut self, cell: CellName) -> buck2_error::Result<()>;
+    fn render_section_header(&mut self, section: &str) -> buck2_error::Result<()>;
+    fn render_config_key(
+        &mut self,
+        spec: &str,
+        cell: CellName,
+        section: &str,
+        key: &str,
+        value: LegacyBuckConfigValue<'_>,
+    ) -> buck2_error::Result<()>;
+    fn flush(&mut self) -> buck2_error::Result<()>;
+}
+
+struct SimpleCellConfigRenderer<'a> {
+    stdout: StdoutPartialOutput<'a>,
+    render_cell_headers: bool,
+    value_style: ValueStyle,
+    location_style: LocationStyle,
+}
+
+impl<'a> CellConfigRenderer for SimpleCellConfigRenderer<'a> {
+    fn render_cell_header(&mut self, cell: CellName) -> buck2_error::Result<()> {
+        if self.render_cell_headers {
+            writeln!(&mut self.stdout, "# Cell: {cell}")?;
+        }
+
+        Ok(())
+    }
+
+    fn render_section_header(&mut self, section: &str) -> buck2_error::Result<()> {
+        writeln!(&mut self.stdout, "[{section}]")?;
+
+        Ok(())
+    }
+
+    fn render_config_key(
+        &mut self,
+        _spec: &str,
+        _cell: CellName,
+        _section: &str,
+        key: &str,
+        value: LegacyBuckConfigValue<'_>,
+    ) -> buck2_error::Result<()> {
+        print_value(&mut self.stdout, key, &value, self.value_style)?;
+        print_location(&mut self.stdout, &value, self.location_style)?;
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> buck2_error::Result<()> {
+        Ok(())
+    }
+}
+
+struct JsonCellConfigRenderer<'a> {
+    stdout: StdoutPartialOutput<'a>,
+    scope_keys_to_cell: bool,
+    json_output: HashMap<String, String>,
+}
+
+impl<'a> CellConfigRenderer for JsonCellConfigRenderer<'a> {
+    fn render_cell_header(&mut self, _cell: CellName) -> buck2_error::Result<()> {
+        Ok(())
+    }
+
+    fn render_section_header(&mut self, _section: &str) -> buck2_error::Result<()> {
+        Ok(())
+    }
+
+    fn render_config_key(
+        &mut self,
+        spec: &str,
+        cell: CellName,
+        _section: &str,
+        _key: &str,
+        value: LegacyBuckConfigValue<'_>,
+    ) -> buck2_error::Result<()> {
+        let key = if self.scope_keys_to_cell && !spec.contains("//") {
+            format!("{cell}//{spec}")
+        } else {
+            spec.to_owned()
+        };
+
+        self.json_output.insert(key, value.as_str().to_owned());
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> buck2_error::Result<()> {
+        writeln!(&mut self.stdout, "{}", json!(self.json_output))?;
+
+        Ok(())
+    }
+}
+
+fn render_cell_config(
+    renderer: &mut dyn CellConfigRenderer,
+    relevant_cell: Option<CellName>,
+    cell: CellName,
+    cell_config: LegacyBuckConfig,
+    specs: &Matches<'_>,
+) -> buck2_error::Result<()> {
+    let mut rendered_cell_header = false;
+    for (section, values) in cell_config.all_sections() {
+        let mut rendered_section_header = false;
+        for (key, value) in values.iter() {
+            if let Some(spec) = specs.filter(relevant_cell.unwrap_or(cell), cell, section, key) {
+                if !rendered_cell_header {
+                    renderer.render_cell_header(cell)?;
+                    rendered_cell_header = true;
+                }
+
+                if !rendered_section_header {
+                    renderer.render_section_header(section.as_str())?;
+                    rendered_section_header = true;
+                }
+
+                renderer.render_config_key(&spec, cell, section, key, value)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
-impl AuditSubcommand for AuditConfigCommand {
+impl ServerAuditSubcommand for AuditConfigCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         _client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx
-            .with_dice_ctx(async move |server_ctx, ctx| {
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|server_ctx, mut ctx| async move {
                 let cwd = server_ctx.working_dir();
                 let cell_resolver = ctx.get_cell_resolver().await?;
+                let cell_alias_resolver = ctx.get_cell_alias_resolver_for_dir(cwd).await?;
 
-                let working_dir_cell = cell_resolver.find(cwd)?;
-                let cell_alias_resolver = cell_resolver
-                    .get(working_dir_cell)
-                    .unwrap()
-                    .cell_alias_resolver();
-
-                let relevant_cell = match &self.cell {
-                    Some(v) => v,
-                    None => "",
+                let stdout = stdout.as_writer();
+                let mut renderer: Box<dyn CellConfigRenderer + Send> = match self.output_format() {
+                    OutputFormat::Simple => Box::new(SimpleCellConfigRenderer {
+                        stdout,
+                        render_cell_headers: self.all_cells,
+                        value_style: self.value_style,
+                        location_style: self.location_style,
+                    }),
+                    OutputFormat::Json => Box::new(JsonCellConfigRenderer {
+                        stdout,
+                        scope_keys_to_cell: self.all_cells,
+                        json_output: HashMap::new(),
+                    }),
                 };
 
-                let resolved_relevant_cell = cell_alias_resolver.resolve(relevant_cell)?;
+                let specs = Matches::parse(&cell_alias_resolver, &self.specs)?;
 
-                let config = ctx.get_legacy_configs().await?;
-
-                let specs = self.specs.try_map(|v| {
-                    let (cell, config) = match v.split_once("//") {
-                        Some((cell, config)) => (cell_alias_resolver.resolve(cell)?, config),
-                        None => (resolved_relevant_cell, v.as_str()),
-                    };
-                    let (section, key) = config.split1(".");
-                    anyhow::Ok((cell, section, key, v))
-                })?;
-
-                let filter = move |cell: CellName, section: &str, key: &str| {
-                    if specs.is_empty() {
-                        if cell == resolved_relevant_cell {
-                            Some(format!("{}.{}", section, key))
-                        } else {
-                            None
-                        }
-                    } else {
-                        for (filter_cell, filter_section, filter_key, spec) in &specs {
-                            if cell == *filter_cell
-                                && &section == filter_section
-                                && (filter_key == &"" || &key == filter_key)
-                            {
-                                return if filter_key == &"" {
-                                    Some(format!("{}.{}", section, key))
-                                } else {
-                                    Some((*spec).to_owned())
-                                };
-                            }
-                        }
-                        None
+                if self.all_cells {
+                    for (cell, _) in cell_resolver.cells() {
+                        let cell_config = ctx.get_legacy_config_for_cell(cell).await?;
+                        render_cell_config(renderer.as_mut(), None, cell, cell_config, &specs)?;
                     }
-                };
+                } else {
+                    let cell =
+                        cell_alias_resolver.resolve(self.cell.as_deref().unwrap_or_default())?;
 
-                let mut stdout = stdout.as_writer();
+                    {
+                        // Render the target cell first
+                        let cell_config = ctx.get_legacy_config_for_cell(cell).await?;
+                        render_cell_config(
+                            renderer.as_mut(),
+                            Some(cell),
+                            cell,
+                            cell_config,
+                            &specs,
+                        )?;
+                    }
 
-                match self.output_format() {
-                    OutputFormat::Json => writeln!(
-                        &mut stdout,
-                        "{}",
-                        json!(
-                            config
-                                .iter()
-                                .flat_map(|(cell, cell_config)| cell_config
-                                    .all_sections()
-                                    .map(move |(section, cfg)| (cell, section, cfg)))
-                                .flat_map(|(cell, section, cfg)| {
-                                    cfg.iter()
-                                        .filter_map(|(key, value)| {
-                                            filter(cell, section, key)
-                                                .map(|spec| (spec, value.as_str().to_owned()))
-                                        })
-                                        .collect::<HashMap<String, String>>()
-                                })
-                                .collect::<HashMap<String, String>>()
-                        )
-                    )?,
-                    OutputFormat::Simple => {
-                        for (cell, cell_config) in config.iter() {
-                            for section in cell_config.sections() {
-                                let mut printed_section = false;
-                                let values = cell_config.get_section(section).unwrap();
-                                for (key, value) in values.iter() {
-                                    if filter(cell, section, key).is_some() {
-                                        if !printed_section {
-                                            writeln!(&mut stdout, "[{}]", section)?;
-                                            printed_section = true;
-                                        }
-                                        print_value(&mut stdout, key, &value, self.value_style)?;
-                                        print_location(&mut stdout, &value, self.location_style)?;
-                                    }
-                                }
-                            }
-                        }
+                    // Allow callers to specify a "cell//<foo>" spec without --all-cells
+                    let mut cells_to_render = specs.cells();
+                    cells_to_render.remove(&cell);
+                    let relevant_cell = Some(cell);
+
+                    for cell in cells_to_render {
+                        let cell_config = ctx.get_legacy_config_for_cell(cell).await?;
+                        render_cell_config(
+                            renderer.as_mut(),
+                            relevant_cell,
+                            cell,
+                            cell_config,
+                            &specs,
+                        )?;
                     }
                 }
 
-                Ok(())
+                renderer.flush()
             })
-            .await
+            .await?)
     }
 }

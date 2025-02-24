@@ -7,8 +7,6 @@
  * of this source tree.
  */
 
-#![allow(clippy::from_iter_instead_of_collect)]
-
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ops::Deref;
@@ -84,6 +82,18 @@ impl<T: Hash> Hash for ArcSlice<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // This must hash as slice because we implement `Borrow<[T]>`.
         self[..].hash(state)
+    }
+}
+
+impl<T: PartialOrd + std::cmp::Eq> PartialOrd for ArcSlice<T> {
+    fn partial_cmp(&self, other: &ArcSlice<T>) -> Option<std::cmp::Ordering> {
+        self[..].partial_cmp(&other[..])
+    }
+}
+
+impl<T: Ord> Ord for ArcSlice<T> {
+    fn cmp(&self, other: &ArcSlice<T>) -> std::cmp::Ordering {
+        self[..].cmp(&other[..])
     }
 }
 

@@ -7,8 +7,10 @@
  * of this source tree.
  */
 
-use buck2_core::directory::unordered_entry_walk;
-use buck2_core::directory::DirectoryEntry;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_directory::directory::walk::unordered_entry_walk;
 
 use crate::artifact_value::ArtifactValue;
 use crate::directory::ActionDirectory;
@@ -35,7 +37,7 @@ where
     fn calc_output_count_and_bytes(&self) -> OutputCountAndBytes {
         let mut bytes = 0;
         let mut count = 0;
-        let mut walk = unordered_entry_walk(self.as_ref());
+        let mut walk = unordered_entry_walk(self.as_ref().map_dir(|d| Directory::as_ref(d)));
         while let Some((_path, entry)) = walk.next() {
             match entry {
                 DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => {

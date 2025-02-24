@@ -3,6 +3,9 @@ id: what-ran
 title: Finding Commands That Buck2 Ran
 ---
 
+import { FbInternalOnly, OssOnly } from
+'docusaurus-plugin-internaldocs-fb/internal';
+
 Buck2 logs all the commands it runs. So, after you've run a build, you can query
 Buck2 to get access to the exact command it used.
 
@@ -66,11 +69,17 @@ The following ran on RE:
 build  fbcode//common/init:kill (cxx_compile Kill.cpp (pic))  re  97feca9d014155a80ec55fe27e6bb17f9d2f8574:94
 ```
 
+<FbInternalOnly>
 To repro, you'd run:
 
 ```bash
 frecli cas download-action 97feca9d014155a80ec55fe27e6bb17f9d2f8574:94
 ```
+
+</FbInternalOnly>
+<OssOnly>
+Reproducing this command will depend on the particular RE implementation you use.
+</OssOnly>
 
 ## Expired Digests
 

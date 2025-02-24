@@ -10,9 +10,10 @@
 use std::fmt;
 use std::fmt::Display;
 use std::iter;
+use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context as _;
+use buck2_error::BuckErrorContext;
 use display_container::display_pair;
 use display_container::fmt_container;
 use display_container::iter_display_chain;
@@ -24,8 +25,10 @@ use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
 use starlark::values::list::ListRef;
 use starlark::values::starlark_value;
+use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::Demand;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
@@ -33,11 +36,15 @@ use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
 use starlark::values::ValueOf;
+use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOfUncheckedGeneric;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::TransitiveSetProjectionKey;
+use crate::interpreter::rule_defs::cmd_args::command_line_arg_like_type::command_line_arg_like_impl;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
@@ -46,6 +53,7 @@ use crate::interpreter::rule_defs::cmd_args::CommandLineContext;
 use crate::interpreter::rule_defs::cmd_args::WriteToFileMacroVisitor;
 use crate::interpreter::rule_defs::transitive_set::traversal::TransitiveSetOrdering;
 use crate::interpreter::rule_defs::transitive_set::traversal::TransitiveSetProjectionTraversal;
+use crate::interpreter::rule_defs::transitive_set::FrozenTransitiveSet;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSet;
 
 /// TransitiveSetArgsProjection is the starlark value returned from the starlark method `transitive_set.project_as_args()`
@@ -56,8 +64,8 @@ use crate::interpreter::rule_defs::transitive_set::TransitiveSet;
 #[derive(Debug, Clone, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
 #[derive(NoSerialize)] // TODO we should probably have a serialization for transitive set
 #[repr(C)]
-pub struct TransitiveSetArgsProjectionGen<V> {
-    pub(super) transitive_set: V,
+pub struct TransitiveSetArgsProjectionGen<V: ValueLifetimeless> {
+    pub(super) transitive_set: ValueOfUncheckedGeneric<V, FrozenTransitiveSet>,
 
     /// The index of the projection. Once transitive sets are defined, their projections never
     /// change, so we can afford to just store the index here.
@@ -83,9 +91,9 @@ impl<'v, V: ValueLike<'v>> Display for TransitiveSetArgsProjectionGen<V> {
 }
 
 impl<'v, V: ValueLike<'v>> TransitiveSetArgsProjectionGen<V> {
-    fn projection_name(&self) -> anyhow::Result<&'v str> {
-        TransitiveSet::from_value(self.transitive_set.to_value())
-            .context("Invalid transitive_set")?
+    fn projection_name(&self) -> buck2_error::Result<&'v str> {
+        TransitiveSet::from_value(self.transitive_set.get().to_value())
+            .buck_error_context("Invalid transitive_set")?
             .projection_name(self.projection)
     }
 }
@@ -95,17 +103,21 @@ impl<'v, V: ValueLike<'v>> TransitiveSetArgsProjectionGen<V> {
     /// This function allows us to treat those two as the same.
     /// TODO(cjhopman): It may be better to wrap the list case in a new CommandLineArgLike impl when returned from
     /// the projection. Then we'd only have to verify the contents type once and it might be a bit simpler to use.
-    pub(super) fn as_command_line(v: V) -> anyhow::Result<impl CommandLineArgLike + 'v> {
+    pub(super) fn as_command_line(v: V) -> buck2_error::Result<impl CommandLineArgLike + 'v> {
         enum Impl<'v> {
             Item(&'v dyn CommandLineArgLike),
             List(&'v [Value<'v>]),
         }
         impl<'v> CommandLineArgLike for Impl<'v> {
+            fn register_me(&self) {
+                // No need because this is not proper implementation.
+            }
+
             fn add_to_command_line(
                 &self,
                 cli: &mut dyn CommandLineBuilder,
                 context: &mut dyn CommandLineContext,
-            ) -> anyhow::Result<()> {
+            ) -> buck2_error::Result<()> {
                 match self {
                     Impl::Item(v) => v.add_to_command_line(cli, context),
                     Impl::List(items) => {
@@ -140,7 +152,7 @@ impl<'v, V: ValueLike<'v>> TransitiveSetArgsProjectionGen<V> {
             fn visit_write_to_file_macros(
                 &self,
                 visitor: &mut dyn WriteToFileMacroVisitor,
-            ) -> anyhow::Result<()> {
+            ) -> buck2_error::Result<()> {
                 match self {
                     Impl::Item(v) => v.visit_write_to_file_macros(visitor),
                     Impl::List(items) => {
@@ -157,7 +169,7 @@ impl<'v, V: ValueLike<'v>> TransitiveSetArgsProjectionGen<V> {
             fn visit_artifacts(
                 &self,
                 visitor: &mut dyn CommandLineArtifactVisitor,
-            ) -> anyhow::Result<()> {
+            ) -> buck2_error::Result<()> {
                 match self {
                     Impl::Item(v) => v.visit_artifacts(visitor),
                     Impl::List(items) => {
@@ -189,7 +201,7 @@ impl<'v, V: ValueLike<'v>> TransitiveSetArgsProjectionGen<V> {
 starlark_complex_value!(pub TransitiveSetArgsProjection);
 
 #[starlark_value(type = "transitive_set_args_projection")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for TransitiveSetArgsProjectionGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TransitiveSetArgsProjectionGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -204,19 +216,23 @@ where
 }
 
 impl<'v, V: ValueLike<'v>> CommandLineArgLike for TransitiveSetArgsProjectionGen<V> {
+    fn register_me(&self) {
+        command_line_arg_like_impl!(TransitiveSetArgsProjection::starlark_type_repr());
+    }
+
     fn add_to_command_line(
         &self,
         builder: &mut dyn CommandLineBuilder,
         context: &mut dyn CommandLineContext,
-    ) -> anyhow::Result<()> {
-        let set = TransitiveSet::from_value(self.transitive_set.to_value())
-            .context("Invalid transitive_set")?;
+    ) -> buck2_error::Result<()> {
+        let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
+            .buck_error_context("Invalid transitive_set")?;
 
         for node in set.iter(self.ordering).values() {
             let projection = node
                 .projections
                 .get(self.projection)
-                .context("Invalid projection id")?;
+                .buck_error_context("Invalid projection id")?;
 
             TransitiveSetArgsProjection::as_command_line(*projection)?
                 .add_to_command_line(builder, context)?;
@@ -225,15 +241,18 @@ impl<'v, V: ValueLike<'v>> CommandLineArgLike for TransitiveSetArgsProjectionGen
         Ok(())
     }
 
-    fn visit_artifacts(&self, visitor: &mut dyn CommandLineArtifactVisitor) -> anyhow::Result<()> {
-        let set = TransitiveSet::from_value(self.transitive_set.to_value())
-            .context("Invalid transitive_set")?;
+    fn visit_artifacts(
+        &self,
+        visitor: &mut dyn CommandLineArtifactVisitor,
+    ) -> buck2_error::Result<()> {
+        let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
+            .buck_error_context("Invalid transitive_set")?;
 
         visitor.visit_input(
-            ArtifactGroup::TransitiveSetProjection(TransitiveSetProjectionKey {
+            ArtifactGroup::TransitiveSetProjection(Arc::new(TransitiveSetProjectionKey {
                 key: set.key().dupe(),
                 projection: self.projection,
-            }),
+            })),
             None,
         );
 
@@ -250,7 +269,7 @@ impl<'v, V: ValueLike<'v>> CommandLineArgLike for TransitiveSetArgsProjectionGen
     fn visit_write_to_file_macros(
         &self,
         _visitor: &mut dyn WriteToFileMacroVisitor,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         // TODO(cjhopman): This seems wrong, there's no verification that the projected
         // values don't have write_to_file_macros in them.
         Ok(())
@@ -262,7 +281,7 @@ fn transitive_set_args_projection_methods(builder: &mut MethodsBuilder) {
     fn traverse<'v>(
         this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
         heap: &'v Heap,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> starlark::Result<Value<'v>> {
         Ok(heap.alloc(TransitiveSetProjectionTraversal {
             transitive_set: this.typed.transitive_set,
             projection: this.typed.projection,
@@ -274,14 +293,14 @@ fn transitive_set_args_projection_methods(builder: &mut MethodsBuilder) {
     fn projection_name<'v>(
         this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
         heap: &'v Heap,
-    ) -> anyhow::Result<StringValue<'v>> {
+    ) -> starlark::Result<StringValue<'v>> {
         Ok(heap.alloc_str(this.typed.projection_name()?))
     }
 
     #[starlark(attribute)]
     fn transitive_set<'v>(
         this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> starlark::Result<ValueOfUnchecked<'v, FrozenTransitiveSet>> {
         Ok(this.typed.transitive_set)
     }
 }

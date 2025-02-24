@@ -9,7 +9,9 @@ load("@prelude//:paths.bzl", "paths")
 load("@prelude//apple:apple_toolchain_types.bzl", "AppleToolchainInfo")
 load(":apple_bundle_destination.bzl", "AppleBundleDestination")
 load(":apple_bundle_part.bzl", "AppleBundlePart", "assemble_bundle")
+load(":apple_bundle_types.bzl", "AppleBundleInfo", "AppleBundleType")
 load(":apple_info_plist.bzl", "process_info_plist")
+load(":apple_utility.bzl", "get_apple_architecture")
 
 def apple_xcuitest_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
     # The XCUITest runner app bundle copies the application from the platform
@@ -19,7 +21,7 @@ def apple_xcuitest_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
         _get_xctrunner_binary(ctx),
         _get_uitest_bundle(ctx),
     ] + _get_xctrunner_frameworks(ctx)
-    assemble_bundle(
+    bundle_result = assemble_bundle(
         ctx = ctx,
         bundle = output_bundle,
         info_plist_part = process_info_plist(ctx, override_input = None),
@@ -27,7 +29,17 @@ def apple_xcuitest_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
         swift_stdlib_args = None,
     )
 
-    return [DefaultInfo(default_output = output_bundle)]
+    return [
+        DefaultInfo(default_output = output_bundle),
+        AppleBundleInfo(
+            bundle = output_bundle,
+            bundle_type = AppleBundleType("default"),
+            binary_name = ctx.attrs.name,
+            contains_watchapp = False,
+            # The test runner binary does not contain Swift
+            skip_copying_swift_stdlib = True,
+        ),
+    ] + bundle_result.providers
 
 def _get_uitest_bundle(ctx: AnalysisContext) -> AppleBundlePart:
     return AppleBundlePart(
@@ -36,12 +48,22 @@ def _get_uitest_bundle(ctx: AnalysisContext) -> AppleBundlePart:
     )
 
 def _get_xctrunner_binary(ctx: AnalysisContext) -> AppleBundlePart:
+    arch = get_apple_architecture(ctx)
+    lipo = ctx.attrs._apple_toolchain[AppleToolchainInfo].lipo
     platform_path = ctx.attrs._apple_toolchain[AppleToolchainInfo].platform_path
-    copied_binary = ctx.actions.declare_output(ctx.attrs.name)
+    thin_binary = ctx.actions.declare_output(ctx.attrs.name)
     xctrunner_path = cmd_args(platform_path, "Developer/Library/Xcode/Agents/XCTRunner.app/XCTRunner", delimiter = "/")
-    ctx.actions.run(["cp", "-PR", xctrunner_path, copied_binary.as_output()], category = "copy_xctrunner")
+    ctx.actions.run([
+        lipo,
+        xctrunner_path,
+        "-extract",
+        arch,
+        "-output",
+        thin_binary.as_output(),
+    ], category = "copy_xctrunner")
+
     return AppleBundlePart(
-        source = copied_binary,
+        source = thin_binary,
         destination = AppleBundleDestination("executables"),
     )
 

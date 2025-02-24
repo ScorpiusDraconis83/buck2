@@ -20,7 +20,6 @@
 //! The cost of a resource is the sum of each item cost + a company specific flat fee.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -28,11 +27,10 @@ use async_trait::async_trait;
 use buck2_futures::cancellation::CancellationContext;
 use derive_more::Display;
 use dice::DiceComputations;
-use dice::DiceComputationsParallel;
-use dice::DiceResult;
 use dice::DiceTransactionUpdater;
 use dice::InjectedKey;
 use dice::Key;
+use dice_error::DiceResult;
 use dupe::Dupe;
 use futures::future::join_all;
 use futures::future::BoxFuture;
@@ -162,16 +160,15 @@ impl Setup for DiceTransactionUpdater {
             .unzip();
 
         // get the remote resources => company mapping
-        let state = self.existing_state().await;
-        let remote_resources = join_all(state
-            .compute_many(resources.iter().map(|res| {
-                higher_order_closure! {
-                    for <'x> move |ctx: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, DiceResult<Arc<Vec<LookupCompany>>>> {
-                        ctx.compute(res).boxed()
-                    }
-                }
-            })))
-            .await;
+        let mut state = self.existing_state().await;
+        let remote_resources = join_all(state.compute_many(resources.iter().map(|res| {
+            DiceComputations::declare_closure(
+                |ctx: &mut DiceComputations<'_>| -> BoxFuture<DiceResult<Arc<Vec<LookupCompany>>>> {
+                    ctx.compute(res).boxed()
+                },
+            )
+        })))
+        .await;
 
         // combine remote company list with local company list for reach resource
         let joined: Vec<_> = resources
@@ -211,13 +208,13 @@ pub trait CostUpdater {
     ) -> anyhow::Result<()>;
 }
 
-fn lookup_company_resource_cost<'a>(
-    ctx: &'a DiceComputations,
+async fn lookup_company_resource_cost(
+    ctx: &mut DiceComputations<'_>,
     company: &LookupCompany,
     resource: &Resource,
-) -> impl Future<Output = Result<Option<u16>, Arc<anyhow::Error>>> + 'a {
+) -> Result<Option<u16>, Arc<anyhow::Error>> {
     #[derive(Display, Debug, Hash, Eq, Clone, Dupe, PartialEq, Allocative)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct LookupCompanyResourceCost(LookupCompany, Resource);
     #[async_trait]
     impl Key for LookupCompanyResourceCost {
@@ -242,13 +239,11 @@ fn lookup_company_resource_cost<'a>(
             // get the unit cost for each resource needed to make item
             let mut futs : FuturesUnordered<_> =
                 ctx.compute_many(recipe.ingredients.iter().map(|(required, resource)| {
-                    higher_order_closure! {
-                        for <'x> move |ctx: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, Result<Option<u16>, Arc<anyhow::Error>>> {
+                    DiceComputations::declare_closure(|ctx: &mut DiceComputations<'_>| -> BoxFuture<Result<Option<u16>, Arc<anyhow::Error>>> {
                             ctx.resource_cost(resource).map(|res| {
                                 Ok::<_, Arc<anyhow::Error>>(res?.map(|x| x * *required as u16))
                             }).boxed()
-                        }
-                    }
+                    })
                 })).into_iter().collect();
 
             let mut sum = 0;
@@ -270,13 +265,15 @@ fn lookup_company_resource_cost<'a>(
             }
         }
     }
+    let key = LookupCompanyResourceCost(company.clone(), resource.dupe());
 
-    ctx.compute(&LookupCompanyResourceCost(company.clone(), resource.dupe()))
-        .map(|r| r.map_err(|e| Arc::new(anyhow::anyhow!(e)))?)
+    ctx.compute(&key)
+        .await
+        .map_err(|e| Arc::new(anyhow::anyhow!(e)))?
 }
 
 #[async_trait]
-impl Cost for DiceComputations {
+impl Cost for DiceComputations<'_> {
     async fn resource_cost(
         &mut self,
         resource: &Resource,
@@ -300,11 +297,11 @@ impl Cost for DiceComputations {
 
                 let costs = join_all(ctx
                     .compute_many(companies.iter().map(|company| {
-                        higher_order_closure! {
-                            for <'x> move |ctx: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, Result<Option<u16>, Arc<anyhow::Error>>> {
+                        DiceComputations::declare_closure(
+                            |ctx: &mut DiceComputations<'_>| -> BoxFuture<Result<Option<u16>, Arc<anyhow::Error>>> {
                                 lookup_company_resource_cost(ctx, company, &self.0).boxed()
                             }
-                        }
+                        )
                     })))
                     .await;
 

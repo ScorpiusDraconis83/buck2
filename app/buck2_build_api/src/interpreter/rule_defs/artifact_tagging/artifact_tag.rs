@@ -9,8 +9,8 @@
 
 use std::fmt;
 use std::hash::Hash;
-use std::hash::Hasher;
-use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
 use dupe::Dupe;
@@ -21,16 +21,17 @@ use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
-use starlark::typing::Ty;
 use starlark::values::starlark_value;
 use starlark::values::starlark_value_as_type::StarlarkValueAsType;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueLike;
+use starlark::StarlarkResultExt;
 
 use crate::interpreter::rule_defs::artifact_tagging::TaggedCommandLine;
 use crate::interpreter::rule_defs::artifact_tagging::TaggedValue;
@@ -44,6 +45,9 @@ use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 #[derive(
     Debug,
     Clone,
+    PartialEq,
+    Eq,
+    Hash,
     Dupe,
     Freeze,
     Trace,
@@ -52,35 +56,25 @@ use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
     Allocative
 )]
 pub struct ArtifactTag {
-    #[freeze(identity)]
-    identity: Arc<()>,
+    identity: u64,
 }
 
 impl ArtifactTag {
     pub fn new() -> Self {
-        Self {
-            identity: Arc::new(()),
-        }
+        static LAST: AtomicI64 = AtomicI64::new(0);
+        let identity = LAST.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let Ok(identity) = identity.try_into() else {
+            LAST.fetch_sub(1, Ordering::Relaxed);
+            panic!("i64 overflow (should never happen)");
+        };
+        ArtifactTag { identity }
     }
 }
 
 impl fmt::Display for ArtifactTag {
     fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(w, "ArtifactTag({:x})", Arc::as_ptr(&self.identity) as usize)
-    }
-}
-
-impl PartialEq for ArtifactTag {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.identity, &other.identity)
-    }
-}
-
-impl Eq for ArtifactTag {}
-
-impl Hash for ArtifactTag {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        hasher.write_usize(Arc::as_ptr(&self.identity) as usize);
+        // Do not include identity into display because it introduces non-determinism for starlark.
+        write!(w, "ArtifactTag(...)")
     }
 }
 
@@ -104,10 +98,6 @@ impl<'v> StarlarkValue<'v> for ArtifactTag {
         Hash::hash(self, hasher);
         Ok(())
     }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
-    }
 }
 
 #[starlark_module]
@@ -115,27 +105,37 @@ fn artifact_tag_methods(_: &mut MethodsBuilder) {
     fn tag_artifacts<'v>(
         this: &ArtifactTag,
         inner: Value<'v>,
-    ) -> anyhow::Result<Either<TaggedValue<'v>, TaggedCommandLine<'v>>> {
+    ) -> starlark::Result<Either<TaggedValue<'v>, TaggedCommandLine<'v>>> {
         let value = TaggedValue::new(inner, this.dupe());
 
-        Ok(if ValueAsCommandLineLike::unpack_value(inner).is_some() {
-            Either::Right(TaggedCommandLine::new(value))
-        } else {
-            Either::Left(value)
-        })
+        Ok(
+            if ValueAsCommandLineLike::unpack_value(inner)
+                .into_anyhow_result()?
+                .is_some()
+            {
+                Either::Right(TaggedCommandLine::new(value))
+            } else {
+                Either::Left(value)
+            },
+        )
     }
 
     fn tag_inputs<'v>(
         this: &ArtifactTag,
         inner: Value<'v>,
-    ) -> anyhow::Result<Either<TaggedValue<'v>, TaggedCommandLine<'v>>> {
+    ) -> starlark::Result<Either<TaggedValue<'v>, TaggedCommandLine<'v>>> {
         let value = TaggedValue::inputs_only(inner, this.dupe());
 
-        Ok(if ValueAsCommandLineLike::unpack_value(inner).is_some() {
-            Either::Right(TaggedCommandLine::new(value))
-        } else {
-            Either::Left(value)
-        })
+        Ok(
+            if ValueAsCommandLineLike::unpack_value(inner)
+                .into_anyhow_result()?
+                .is_some()
+            {
+                Either::Right(TaggedCommandLine::new(value))
+            } else {
+                Either::Left(value)
+            },
+        )
     }
 }
 

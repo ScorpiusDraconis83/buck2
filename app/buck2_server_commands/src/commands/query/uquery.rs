@@ -9,21 +9,22 @@
 
 use std::io::Write;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_build_api::query::oneshot::QUERY_FRONTEND;
 use buck2_cli_proto::UqueryRequest;
 use buck2_cli_proto::UqueryResponse;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_error::BuckErrorContext;
+use buck2_node::attrs::display::AttrDisplayWithContext;
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
 use buck2_node::attrs::fmt_context::AttrFmtContext;
 use buck2_node::attrs::serialize::AttrSerializeWithContext;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_node::nodes::unconfigured::TargetNodeData;
+use buck2_query::query::environment::AttrFmtOptions;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationResult;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::global_cfg_options_from_client_context;
 use buck2_server_ctx::template::run_server_command;
 use buck2_server_ctx::template::ServerCommandTemplate;
 use dice::DiceTransaction;
@@ -38,11 +39,12 @@ impl QueryCommandTarget for TargetNode {
         TargetNodeData::call_stack(self)
     }
 
-    fn attr_to_string_alternate(&self, attr: &Self::Attr<'_>) -> String {
+    fn attr_to_string_alternate(&self, options: AttrFmtOptions, attr: &Self::Attr<'_>) -> String {
         format!(
             "{:#}",
             attr.as_display(&AttrFmtContext {
                 package: Some(self.label().pkg().dupe()),
+                options
             })
         )
     }
@@ -55,8 +57,25 @@ impl QueryCommandTarget for TargetNode {
         attr.serialize_with_ctx(
             &AttrFmtContext {
                 package: Some(self.label().pkg().dupe()),
+                options: Default::default(),
             },
             serializer,
+        )
+    }
+
+    fn attr_fmt(
+        &self,
+        fmt: &mut std::fmt::Formatter<'_>,
+        options: AttrFmtOptions,
+        attr: &Self::Attr<'_>,
+    ) -> std::fmt::Result {
+        AttrDisplayWithContext::fmt(
+            attr,
+            &AttrFmtContext {
+                package: Some(self.label().pkg().dupe()),
+                options,
+            },
+            fmt,
         )
     }
 }
@@ -65,7 +84,7 @@ pub(crate) async fn uquery_command(
     ctx: &dyn ServerCommandContextTrait,
     partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
     req: UqueryRequest,
-) -> anyhow::Result<UqueryResponse> {
+) -> buck2_error::Result<UqueryResponse> {
     run_server_command(UqueryServerCommand { req }, ctx, partial_result_dispatcher).await
 }
 
@@ -85,7 +104,7 @@ impl ServerCommandTemplate for UqueryServerCommand {
         server_ctx: &dyn ServerCommandContextTrait,
         mut partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
         ctx: DiceTransaction,
-    ) -> anyhow::Result<Self::Response> {
+    ) -> buck2_error::Result<Self::Response> {
         uquery(
             server_ctx,
             partial_result_dispatcher.as_writer(),
@@ -105,7 +124,7 @@ async fn uquery(
     mut stdout: impl Write,
     mut ctx: DiceTransaction,
     request: &UqueryRequest,
-) -> anyhow::Result<UqueryResponse> {
+) -> buck2_error::Result<UqueryResponse> {
     let cell_resolver = ctx.get_cell_resolver().await?;
     let output_configuration = QueryResultPrinter::from_request_options(
         &cell_resolver,
@@ -120,24 +139,13 @@ async fn uquery(
         ..
     } = request;
 
-    let client_ctx = context
-        .as_ref()
-        .context("No client context (internal error)")?;
+    let client_ctx = context.as_ref().internal_error("No client context")?;
 
     let target_call_stacks = client_ctx.target_call_stacks;
 
-    let global_cfg_options =
-        global_cfg_options_from_client_context(client_ctx, server_ctx, &mut ctx).await?;
-
     let query_result = QUERY_FRONTEND
         .get()?
-        .eval_uquery(
-            &ctx,
-            server_ctx.working_dir(),
-            query,
-            query_args,
-            global_cfg_options,
-        )
+        .eval_uquery(&mut ctx, server_ctx.working_dir(), query, query_args)
         .await?;
 
     match query_result {

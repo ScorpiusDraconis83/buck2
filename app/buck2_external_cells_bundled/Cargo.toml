@@ -1,0 +1,19 @@
+[package]
+build = "build.rs"
+description = "Buck2 external cells bundled data"
+edition = "2021"
+license = { workspace = true }
+name = "buck2_external_cells_bundled"
+repository = { workspace = true }
+version = "0.1.0"
+
+[dependencies]
+async-trait = { workspace = true }
+
+buck2_common = { workspace = true }
+
+[build-dependencies]
+walkdir = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(buck_build)"] }

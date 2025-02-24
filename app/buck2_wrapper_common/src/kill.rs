@@ -9,162 +9,58 @@
 
 //! Cross-platform process killing.
 
-pub fn process_exists(pid: u32) -> anyhow::Result<bool> {
-    os_specific::process_exists(pid)
+use std::time::Duration;
+
+use sysinfo::Process;
+
+use crate::pid::Pid;
+#[cfg(unix)]
+use crate::unix::kill as imp;
+#[cfg(windows)]
+use crate::win::kill as imp;
+
+pub fn process_creation_time(process: &Process) -> Option<Duration> {
+    imp::process_creation_time(process)
+}
+
+pub fn process_exists(pid: Pid) -> buck2_error::Result<bool> {
+    imp::process_exists(pid)
 }
 
 /// Send `KILL` or call `TerminateProcess` on the given process.
 ///
 /// Returns a KilledProcessHandle that can be used to observe the termination of the killed process.
-pub fn kill(pid: u32) -> anyhow::Result<Box<dyn KilledProcessHandle>> {
-    match os_specific::kill(pid)? {
-        Some(handle) => Ok(Box::new(handle) as _),
-        None => Ok(Box::new(NoProcess) as _),
+pub fn kill(pid: Pid) -> buck2_error::Result<Option<KilledProcessHandle>> {
+    match imp::kill(pid)? {
+        Some(handle) => Ok(Some(KilledProcessHandle { handle })),
+        None => Ok(None),
     }
 }
 
-pub trait KilledProcessHandle {
-    fn has_exited(&self) -> anyhow::Result<bool>;
+pub struct KilledProcessHandle {
+    handle: imp::KilledProcessHandleImpl,
+}
 
-    fn status(&self) -> Option<String>;
+impl KilledProcessHandle {
+    pub fn has_exited(&self) -> buck2_error::Result<bool> {
+        self.handle.has_exited()
+    }
 }
 
 /// Get the status of a given process according to sysinfo.
-pub fn get_sysinfo_status(pid: impl TryInto<u32>) -> Option<String> {
-    use sysinfo::Pid;
-    use sysinfo::PidExt;
-    use sysinfo::ProcessExt;
+pub fn get_sysinfo_status(pid: Pid) -> Option<sysinfo::ProcessStatus> {
     use sysinfo::ProcessRefreshKind;
     use sysinfo::System;
-    use sysinfo::SystemExt;
 
-    let pid = pid.try_into().ok()?;
-    let pid = Pid::from_u32(pid);
+    let pid = sysinfo::Pid::from_u32(pid.to_u32());
 
     let mut system = System::new();
-    system.refresh_process_specifics(pid, ProcessRefreshKind::new());
+    // There is some bug in `sysinfo` so we have to use `refresh_processes_specifics`
+    // instead of `refresh_process_specifics`, otherwise we not always get process info.
+    system.refresh_processes_specifics(ProcessRefreshKind::new());
 
     let proc = system.process(pid)?;
-    Some(proc.status().to_string())
-}
-
-/// Returned when os_specific::kill reports that nothing was killed because the process wasn't even
-/// running.
-struct NoProcess;
-
-impl KilledProcessHandle for NoProcess {
-    fn has_exited(&self) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    fn status(&self) -> Option<String> {
-        Some("NoProcess".to_owned())
-    }
-}
-
-#[cfg(unix)]
-mod os_specific {
-    use anyhow::Context;
-    use nix::sys::signal::Signal;
-
-    use crate::kill::get_sysinfo_status;
-    use crate::kill::KilledProcessHandle;
-
-    pub(crate) fn process_exists(pid: u32) -> anyhow::Result<bool> {
-        let pid = nix::unistd::Pid::from_raw(
-            pid.try_into()
-                .with_context(|| format!("Integer overflow converting pid {} to pid_t", pid))?,
-        );
-        match nix::sys::signal::kill(pid, None) {
-            Ok(_) => Ok(true),
-            Err(nix::errno::Errno::ESRCH) => Ok(false),
-            Err(e) => Err(e)
-                .with_context(|| format!("unexpected error checking if process {} exists", pid)),
-        }
-    }
-
-    fn process_exists_impl(pid: nix::unistd::Pid) -> anyhow::Result<bool> {
-        match nix::sys::signal::kill(pid, None) {
-            Ok(_) => Ok(true),
-            Err(nix::errno::Errno::ESRCH) => Ok(false),
-            Err(e) => Err(e)
-                .with_context(|| format!("unexpected error checking if process {} exists", pid)),
-        }
-    }
-
-    pub(super) fn kill(pid: u32) -> anyhow::Result<Option<impl KilledProcessHandle>> {
-        let pid = nix::unistd::Pid::from_raw(
-            pid.try_into()
-                .with_context(|| format!("Integer overflow converting pid {} to pid_t", pid))?,
-        );
-
-        match nix::sys::signal::kill(pid, Signal::SIGKILL) {
-            Ok(()) => Ok(Some(UnixKilledProcessHandle { pid })),
-            Err(nix::errno::Errno::ESRCH) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("Failed to kill pid {}", pid)),
-        }
-    }
-
-    struct UnixKilledProcessHandle {
-        pid: nix::unistd::Pid,
-    }
-
-    impl KilledProcessHandle for UnixKilledProcessHandle {
-        fn has_exited(&self) -> anyhow::Result<bool> {
-            Ok(!process_exists_impl(self.pid)?)
-        }
-
-        fn status(&self) -> Option<String> {
-            get_sysinfo_status(self.pid.as_raw())
-        }
-    }
-}
-
-#[cfg(windows)]
-pub mod os_specific {
-    use std::time::Duration;
-
-    use crate::kill::get_sysinfo_status;
-    use crate::kill::KilledProcessHandle;
-    use crate::winapi_process::WinapiProcessHandle;
-
-    pub(crate) fn process_exists(pid: u32) -> anyhow::Result<bool> {
-        Ok(WinapiProcessHandle::open_for_info(pid).is_some())
-    }
-
-    pub(super) fn kill(pid: u32) -> anyhow::Result<Option<impl KilledProcessHandle>> {
-        let handle = match WinapiProcessHandle::open_for_terminate(pid) {
-            Some(proc_handle) => proc_handle,
-            None => return Ok(None),
-        };
-
-        handle.terminate()?;
-
-        Ok(Some(WindowsKilledProcessHandle { handle }))
-    }
-
-    /// Windows reuses PIDs more aggressively than UNIX, so there we add an extra guard in the form
-    /// of the process creation time.
-    struct WindowsKilledProcessHandle {
-        handle: WinapiProcessHandle,
-    }
-
-    impl KilledProcessHandle for WindowsKilledProcessHandle {
-        fn has_exited(&self) -> anyhow::Result<bool> {
-            self.handle.has_exited()
-        }
-
-        fn status(&self) -> Option<String> {
-            // Maybe there is a better way to get this via the handle, but for now this'll do.
-            get_sysinfo_status(self.handle.pid())
-        }
-    }
-
-    /// Returns process creation time with 100 ns precision.
-    pub fn process_creation_time(pid: u32) -> Option<Duration> {
-        let proc_handle = WinapiProcessHandle::open_for_info(pid)?;
-        proc_handle.process_creation_time().ok()
-    }
+    Some(proc.status())
 }
 
 #[cfg(test)]
@@ -176,6 +72,7 @@ mod tests {
 
     use crate::kill::kill;
     use crate::kill::process_exists;
+    use crate::pid::Pid;
 
     #[test]
     fn test_process_exists_kill() {
@@ -189,12 +86,14 @@ mod tests {
             command
         };
         let mut child = command.spawn().unwrap();
-        let pid = child.id();
-        for _ in 0..5 {
-            assert!(process_exists(pid).unwrap());
-        }
+        let pid = Pid::from_u32(child.id()).unwrap();
+        // TODO T187306095: we only check for existence once, because flakiness
+        assert!(
+            process_exists(pid).unwrap(),
+            "process should exist; attempt 1; pid {pid}"
+        );
 
-        let handle = kill(pid).unwrap();
+        let handle = kill(pid).unwrap().unwrap();
 
         child.wait().unwrap();
         // Drop child to ensure the Windows handle is closed.

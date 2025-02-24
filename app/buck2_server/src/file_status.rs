@@ -14,7 +14,7 @@ use std::path::Path;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_common::dice::file_ops::HasFileOps;
+use buck2_common::dice::file_ops::DiceFileOps;
 use buck2_common::file_ops::FileOps;
 use buck2_common::file_ops::RawPathMetadata;
 use buck2_common::file_ops::RawSymlink;
@@ -42,7 +42,7 @@ pub(crate) async fn file_status_command(
     ctx: &ServerCommandContext<'_>,
     partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
     req: buck2_cli_proto::FileStatusRequest,
-) -> anyhow::Result<buck2_cli_proto::GenericResponse> {
+) -> buck2_error::Result<buck2_cli_proto::GenericResponse> {
     run_server_command(
         FileStatusServerCommand { req },
         ctx,
@@ -75,7 +75,7 @@ impl FileStatusResult<'_> {
         path: &ProjectRelativePath,
         fs: &T,
         dice: &T,
-    ) -> anyhow::Result<()>
+    ) -> buck2_error::Result<()>
     where
         T: PartialEq + fmt::Display + ?Sized,
     {
@@ -119,14 +119,13 @@ impl ServerCommandTemplate for FileStatusServerCommand {
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<Self::PartialResult>,
-        ctx: DiceTransaction,
-    ) -> anyhow::Result<Self::Response> {
-        let file_ops = ctx.file_ops();
-        let cell_resolver = ctx.get_cell_resolver().await?;
+        mut ctx: DiceTransaction,
+    ) -> buck2_error::Result<Self::Response> {
+        let cell_resolver = &ctx.get_cell_resolver().await?;
         let project_root = server_ctx.project_root();
         let digest_config = ctx.global_data().get_digest_config();
 
-        let io = FsIoProvider::new(project_root.dupe(), digest_config.cas_digest_config());
+        let io = &FsIoProvider::new(project_root.dupe(), digest_config.cas_digest_config());
         let stdout = stdout.as_writer();
 
         let mut result = FileStatusResult {
@@ -141,10 +140,18 @@ impl ServerCommandTemplate for FileStatusServerCommand {
         for path in &self.req.paths {
             let path = project_root.relativize_any(AbsPath::new(Path::new(path))?)?;
             writeln!(&mut stderr, "Check file status: {}", path)?;
-            check_file_status(&file_ops, &cell_resolver, &io, &path, &mut result).await?;
+            let result = &mut result;
+            ctx.with_linear_recompute(|ctx| async move {
+                check_file_status(&DiceFileOps(&ctx), cell_resolver, io, &path, result).await
+            })
+            .await?;
         }
         if result.bad != 0 {
-            Err(anyhow::anyhow!("Failed with {} mismatches", result.bad))
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Failed with {} mismatches",
+                result.bad
+            ))
         } else {
             writeln!(
                 &mut stderr,
@@ -165,14 +172,14 @@ impl ServerCommandTemplate for FileStatusServerCommand {
 async fn check_file_status(
     file_ops: &dyn FileOps,
     cell_resolver: &CellResolver,
-    io: &FsIoProvider,
+    io: &dyn IoProvider,
     path: &ProjectRelativePath,
     result: &mut FileStatusResult,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     result.checking();
 
     let cell_path = cell_resolver.get_cell_path(path)?;
-    if file_ops.is_ignored(cell_path.as_ref()).await? {
+    if file_ops.is_ignored(cell_path.as_ref()).await?.is_ignored() {
         return Ok(());
     }
 
@@ -241,7 +248,7 @@ async fn check_file_status(
             // No point checking file types here, we'll do that when we inspect them.
             let mut fs_names = fs_read_dir
                 .iter()
-                .map(|f| anyhow::Ok(FileName::new(&f.file_name)?.to_owned()))
+                .map(|f| buck2_error::Ok(FileName::new(&f.file_name)?.to_owned()))
                 .collect::<Result<Vec<_>, _>>()?;
 
             let mut dice_names = dice_read_dir

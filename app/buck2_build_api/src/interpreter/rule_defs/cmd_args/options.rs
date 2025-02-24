@@ -10,7 +10,6 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Debug;
-use std::fmt::Display;
 use std::fmt::Formatter;
 
 use allocative::Allocative;
@@ -18,9 +17,10 @@ use buck2_core::fs::paths::RelativePath;
 use buck2_core::fs::paths::RelativePathBuf;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_error::BuckErrorContext;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_interpreter::types::cell_root::CellRoot;
-use buck2_interpreter::types::project_root::ProjectRoot;
+use buck2_interpreter::types::project_root::StarlarkProjectRoot;
 use buck2_interpreter::types::regex::BuckStarlarkRegex;
 use buck2_util::thin_box::ThinBoxSlice;
 use derive_more::Display;
@@ -31,23 +31,22 @@ use gazebo::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use serde::Serializer;
-use starlark::typing::Ty;
 use starlark::values::string::StarlarkStr;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Freezer;
 use starlark::values::FrozenStringValue;
-use starlark::values::FrozenValue;
+use starlark::values::FrozenValueOfUnchecked;
 use starlark::values::StringValue;
 use starlark::values::StringValueLike;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueLike;
+use starlark::values::ValueOfUnchecked;
 use static_assertions::assert_eq_size;
 
-use crate::interpreter::rule_defs::artifact::StarlarkArtifactLike;
-use crate::interpreter::rule_defs::artifact::ValueAsArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactLike;
 use crate::interpreter::rule_defs::cmd_args::regex::CmdArgsRegex;
 use crate::interpreter::rule_defs::cmd_args::regex::FrozenCmdArgsRegex;
 use crate::interpreter::rule_defs::cmd_args::shlex_quote::shlex_quote;
@@ -72,6 +71,7 @@ impl Display for QuoteStyle {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum CommandLineArgError {
     #[error("Unknown quoting style `{0}`")]
     UnknownQuotingStyle(String),
@@ -80,12 +80,10 @@ enum CommandLineArgError {
 }
 
 impl QuoteStyle {
-    pub fn parse(s: &str) -> anyhow::Result<QuoteStyle> {
+    pub fn parse(s: &str) -> buck2_error::Result<QuoteStyle> {
         match s {
             "shell" => Ok(QuoteStyle::Shell),
-            _ => Err(anyhow::anyhow!(CommandLineArgError::UnknownQuotingStyle(
-                s.to_owned()
-            ))),
+            _ => Err(CommandLineArgError::UnknownQuotingStyle(s.to_owned()).into()),
         }
     }
 }
@@ -101,8 +99,7 @@ pub(crate) trait CommandLineOptionsTrait<'v> {
 #[repr(C)]
 pub(crate) struct CommandLineOptions<'v> {
     // These impact how artifacts are rendered
-    /// The value of V must be convertible to a `RelativeOrigin`
-    pub(crate) relative_to: Option<(Value<'v>, usize)>,
+    pub(crate) relative_to: Option<(ValueOfUnchecked<'v, RelativeOrigin<'v>>, u32)>,
     pub(crate) absolute_prefix: Option<StringValue<'v>>,
     pub(crate) absolute_suffix: Option<StringValue<'v>>,
     pub(crate) parent: u32,
@@ -190,7 +187,7 @@ impl<'v, 'a> Serialize for OptionsReplacementsRef<'v, 'a> {
 #[derive(Default, Serialize)]
 pub(crate) struct CommandLineOptionsRef<'v, 'a> {
     #[serde(serialize_with = "serialize_opt_display")]
-    pub(crate) relative_to: Option<(Value<'v>, usize)>,
+    pub(crate) relative_to: Option<(ValueOfUnchecked<'v, RelativeOrigin<'v>>, u32)>,
     pub(crate) absolute_prefix: Option<StringValue<'v>>,
     pub(crate) absolute_suffix: Option<StringValue<'v>>,
     pub(crate) parent: u32,
@@ -254,7 +251,10 @@ impl<'v> CommandLineOptionsTrait<'v> for CommandLineOptions<'v> {
 
 #[derive(Debug, Allocative)]
 enum FrozenCommandLineOption {
-    RelativeTo(FrozenValue, u32),
+    RelativeTo(
+        FrozenValueOfUnchecked<'static, RelativeOrigin<'static>>,
+        u32,
+    ),
     AbsolutePrefix(FrozenStringValue),
     AbsoluteSuffix(FrozenStringValue),
     Parent(u32),
@@ -275,6 +275,12 @@ pub(crate) struct FrozenCommandLineOptions {
 }
 
 impl FrozenCommandLineOptions {
+    pub const fn empty() -> Self {
+        FrozenCommandLineOptions {
+            options: ThinBoxSlice::empty(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.options.is_empty()
     }
@@ -304,7 +310,7 @@ impl<'v> CommandLineOptionsTrait<'v> for FrozenCommandLineOptions {
         for option in &*self.options {
             match option {
                 FrozenCommandLineOption::RelativeTo(value, parent) => {
-                    options.relative_to = Some((value.to_value(), *parent as usize));
+                    options.relative_to = Some((value.to_value(), *parent));
                 }
                 FrozenCommandLineOption::AbsolutePrefix(value) => {
                     options.absolute_prefix = Some(value.to_string_value());
@@ -360,7 +366,7 @@ impl Serialize for FrozenCommandLineOptions {
 impl<'v> Freeze for CommandLineOptions<'v> {
     type Frozen = FrozenCommandLineOptions;
 
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<FrozenCommandLineOptions> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<FrozenCommandLineOptions> {
         let CommandLineOptions {
             relative_to,
             absolute_prefix,
@@ -375,10 +381,9 @@ impl<'v> Freeze for CommandLineOptions<'v> {
         } = self;
 
         let mut options = Vec::new();
-        if let Some(relative_to) = relative_to {
-            let (relative, parent) = relative_to.freeze(freezer)?;
-            let parent: u32 = parent.try_into()?;
-            options.push(FrozenCommandLineOption::RelativeTo(relative, parent));
+        if let Some((relative_to, parent)) = relative_to {
+            let relative_to = relative_to.cast().freeze(freezer)?;
+            options.push(FrozenCommandLineOption::RelativeTo(relative_to, parent));
         }
         if let Some(absolute_prefix) = absolute_prefix {
             let absolute_prefix = absolute_prefix.freeze(freezer)?;
@@ -422,7 +427,7 @@ impl<'v> Freeze for CommandLineOptions<'v> {
     }
 }
 
-fn serialize_opt_display<V: Display, S>(v: &Option<(V, usize)>, s: S) -> Result<S::Ok, S::Error>
+fn serialize_opt_display<V: Display, S>(v: &Option<(V, u32)>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -434,44 +439,16 @@ where
 
 // NOTE: This is an enum as opposed to a trait because of the `C` parameter on (which is required
 // because upcasting is not stable).
-#[derive(Display)]
+#[derive(Display, StarlarkTypeRepr, UnpackValue)]
 pub(crate) enum RelativeOrigin<'v> {
     Artifact(&'v dyn StarlarkArtifactLike),
     CellRoot(&'v CellRoot),
     /// Bit of a useless variant since this is simply the default, but we allow it for consistency.
-    ProjectRoot,
-}
-
-impl<'v> StarlarkTypeRepr for RelativeOrigin<'v> {
-    fn starlark_type_repr() -> Ty {
-        Ty::unions(vec![
-            ValueAsArtifactLike::starlark_type_repr(),
-            CellRoot::starlark_type_repr(),
-            ProjectRoot::starlark_type_repr(),
-        ])
-    }
-}
-
-impl<'v> UnpackValue<'v> for RelativeOrigin<'v> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        if let Some(v) = ValueAsArtifactLike::unpack_value(value) {
-            return Some(RelativeOrigin::Artifact(v.0));
-        }
-
-        if let Some(v) = value.downcast_ref::<CellRoot>() {
-            return Some(RelativeOrigin::CellRoot(v));
-        }
-
-        if value.downcast_ref::<ProjectRoot>().is_some() {
-            return Some(RelativeOrigin::ProjectRoot);
-        }
-
-        None
-    }
+    ProjectRoot(&'v StarlarkProjectRoot),
 }
 
 impl<'v> RelativeOrigin<'v> {
-    pub(crate) fn resolve<C>(&self, ctx: &C) -> anyhow::Result<RelativePathBuf>
+    pub(crate) fn resolve<C>(&self, ctx: &C) -> buck2_error::Result<RelativePathBuf>
     where
         C: CommandLineContext + ?Sized,
     {
@@ -483,7 +460,7 @@ impl<'v> RelativeOrigin<'v> {
                 ctx.resolve_artifact(&artifact)?
             }
             Self::CellRoot(cell_root) => ctx.resolve_cell_path(cell_root.cell_path())?,
-            Self::ProjectRoot => {
+            Self::ProjectRoot(_) => {
                 ctx.resolve_project_path(ProjectRelativePath::empty().to_owned())?
             }
         };
@@ -518,8 +495,8 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
         f: impl for<'b> FnOnce(
             &'b mut dyn CommandLineBuilder,
             &'b mut dyn CommandLineContext,
-        ) -> anyhow::Result<R>,
-    ) -> anyhow::Result<R> {
+        ) -> buck2_error::Result<R>,
+    ) -> buck2_error::Result<R> {
         struct ExtrasBuilder<'a, 'v> {
             builder: &'a mut dyn CommandLineBuilder,
             opts: &'a CommandLineOptionsRef<'v, 'a>,
@@ -539,7 +516,7 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
             fn resolve_project_path(
                 &self,
                 path: ProjectRelativePathBuf,
-            ) -> anyhow::Result<CommandLineLocation> {
+            ) -> buck2_error::Result<CommandLineLocation> {
                 let Self {
                     ctx,
                     relative_to,
@@ -586,7 +563,7 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
                 self.ctx.fs()
             }
 
-            fn next_macro_file_path(&mut self) -> anyhow::Result<RelativePathBuf> {
+            fn next_macro_file_path(&mut self) -> buck2_error::Result<RelativePathBuf> {
                 let macro_path = self.ctx.next_macro_file_path()?;
                 if let Some(relative_to_path) = &self.relative_to {
                     Ok(relative_to_path.relative(macro_path))
@@ -694,7 +671,10 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
         }
     }
 
-    pub(crate) fn relative_to_path<C>(&self, ctx: &C) -> anyhow::Result<Option<RelativePathBuf>>
+    pub(crate) fn relative_to_path<C>(
+        &self,
+        ctx: &C,
+    ) -> buck2_error::Result<Option<RelativePathBuf>>
     where
         C: CommandLineContext + ?Sized,
     {
@@ -703,17 +683,16 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
             None => return Ok(None),
         };
 
-        let origin = RelativeOrigin::unpack_value(value)
-            .expect("Must be a valid RelativeOrigin as this was checked in the setter");
+        let origin = value
+            .unpack()
+            .internal_error("Must be a valid RelativeOrigin as this was checked in the setter")?;
         let mut relative_path = origin.resolve(ctx)?;
         for _ in 0..parent {
             if !relative_path.pop() {
-                return Err(
-                    anyhow::anyhow!(CommandLineArgError::TooManyParentCalls).context(format!(
-                        "Error accessing {}-th parent of {}",
-                        parent, origin
-                    )),
-                );
+                return Err(CommandLineArgError::TooManyParentCalls).buck_error_context(format!(
+                    "Error accessing {}-th parent of {}",
+                    parent, origin
+                ));
             }
         }
 
@@ -743,11 +722,14 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
         let mut iter = Vec::new();
 
         if let Some((value, index)) = relative_to {
-            iter.push(("relative_to", CommandLineOptionsIterItem::Value(*value)));
+            iter.push((
+                "relative_to",
+                CommandLineOptionsIterItem::Value(value.get()),
+            ));
             if *index != 0 {
                 iter.push((
                     "relative_to_parent",
-                    CommandLineOptionsIterItem::Usize(*index),
+                    CommandLineOptionsIterItem::U32(*index),
                 ));
             }
         }
@@ -796,11 +778,10 @@ impl<'v, 'x> CommandLineOptionsRef<'v, 'x> {
 #[derive(derive_more::Display)]
 pub(crate) enum CommandLineOptionsIterItem<'v, 'a> {
     U32(u32),
-    Usize(usize),
     Value(Value<'v>),
     Str(&'static str),
     StringValue(StringValue<'v>),
     Replacements(OptionsReplacementsRef<'v, 'a>),
-    #[display(fmt = "\"{}\"", _0)]
+    #[display("\"{}\"", _0)]
     QuoteStyle(QuoteStyle),
 }

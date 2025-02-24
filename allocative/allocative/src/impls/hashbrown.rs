@@ -11,7 +11,7 @@
 
 use std::mem;
 
-use hashbrown::raw::RawTable;
+use hashbrown::HashTable;
 
 use crate::Allocative;
 use crate::Key;
@@ -19,7 +19,7 @@ use crate::Visitor;
 
 const CAPACITY_NAME: Key = Key::new("capacity");
 
-impl<T: Allocative> Allocative for RawTable<T> {
+impl<T: Allocative> Allocative for HashTable<T> {
     fn visit<'a, 'b: 'a>(&self, visitor: &'a mut Visitor<'b>) {
         use crate::impls::common::DATA_NAME;
         use crate::impls::hashbrown_util;
@@ -32,7 +32,7 @@ impl<T: Allocative> Allocative for RawTable<T> {
                     CAPACITY_NAME,
                     hashbrown_util::raw_table_alloc_size_for_len::<T>(self.capacity()),
                 );
-                unsafe { visitor.visit_iter(self.iter().map(|e| e.as_ref())) };
+                visitor.visit_iter::<T, _>(self.iter());
                 visitor.exit();
             }
             visitor.exit();
@@ -47,7 +47,7 @@ mod tests {
     use std::hash::Hash;
     use std::hash::Hasher;
 
-    use hashbrown::raw::RawTable;
+    use hashbrown::HashTable;
 
     use crate::golden::golden_test;
 
@@ -58,10 +58,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_table() {
-        let mut table = RawTable::with_capacity(100);
+    fn test_hash_table() {
+        let mut table = HashTable::with_capacity(100);
         for i in 0..100 {
-            table.insert(hash(&i.to_string()), i.to_string(), hash);
+            table.insert_unique(hash(&i.to_string()), i.to_string(), hash);
         }
 
         golden_test!(&table);

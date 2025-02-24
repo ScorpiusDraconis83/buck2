@@ -11,31 +11,32 @@
 //! operations of converting file content to ASTs and evaluating import and
 //! build files.
 
+use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
-use buck2_common::legacy_configs::view::LegacyBuckConfigView;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
+use buck2_core::bxl::BxlFilePath;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::build_file_cell::BuildFileCell;
 use buck2_core::cells::cell_path::CellPath;
-use buck2_core::cells::CellAliasResolver;
-use buck2_core::soft_error;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_event_observer::humanized::HumanizedBytes;
 use buck2_events::dispatch::get_dispatcher;
-use buck2_interpreter::error::BuckStarlarkError;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
 use buck2_interpreter::file_loader::InterpreterFileLoader;
 use buck2_interpreter::file_loader::LoadResolver;
 use buck2_interpreter::file_loader::LoadedModules;
 use buck2_interpreter::file_type::StarlarkFileType;
+use buck2_interpreter::from_freeze::from_freeze_error;
 use buck2_interpreter::import_paths::ImplicitImportPaths;
 use buck2_interpreter::package_imports::ImplicitImport;
 use buck2_interpreter::parse_import::parse_import;
-use buck2_interpreter::paths::bxl::BxlFilePath;
 use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
 use buck2_interpreter::paths::module::StarlarkModulePath;
 use buck2_interpreter::paths::package::PackageFilePath;
@@ -43,29 +44,36 @@ use buck2_interpreter::paths::path::OwnedStarlarkPath;
 use buck2_interpreter::paths::path::StarlarkPath;
 use buck2_interpreter::prelude_path::PreludePath;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
+use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
 use buck2_node::nodes::eval_result::EvaluationResult;
 use buck2_node::nodes::eval_result::EvaluationResultWithStats;
 use buck2_node::super_package::SuperPackage;
+use buck2_util::per_thread_instruction_counter::PerThreadInstructionCounter;
 use dupe::Dupe;
 use gazebo::prelude::*;
 use starlark::codemap::FileSpan;
 use starlark::environment::FrozenModule;
 use starlark::environment::Module;
 use starlark::syntax::AstModule;
+use starlark::values::any_complex::StarlarkAnyComplex;
 use starlark::values::OwnedFrozenRef;
 
+use crate::interpreter::buckconfig::BuckConfigsViewForStarlark;
 use crate::interpreter::build_context::BuildContext;
 use crate::interpreter::build_context::PerFileTypeContext;
 use crate::interpreter::bzl_eval_ctx::BzlEvalCtx;
 use crate::interpreter::cell_info::InterpreterCellInfo;
-use crate::interpreter::extra_value::ExtraValue;
+use crate::interpreter::extra_value::InterpreterExtraValue;
 use crate::interpreter::global_interpreter_state::GlobalInterpreterState;
 use crate::interpreter::module_internals::ModuleInternals;
 use crate::interpreter::package_file_extra::FrozenPackageFileExtra;
 use crate::super_package::eval_ctx::PackageFileEvalCtx;
 
+const DEFAULT_STARLARK_MEMORY_USAGE_LIMIT: u64 = 2 * (1 << 30);
+
 #[derive(Debug, buck2_error::Error)]
 #[error("Tabs are not allowed in Buck files: `{0}`")]
+#[buck2(input)]
 struct StarlarkTabsError(OwnedStarlarkPath);
 
 #[derive(Debug, buck2_error::Error)]
@@ -73,21 +81,9 @@ enum StarlarkPeakMemoryError {
     #[error(
         "Starlark peak memory usage for {0} is {1} which exceeds the limit {2}! Please reduce memory usage to prevent OOMs. See {3} for debugging tips."
     )]
-    #[buck2(user)]
+    #[buck2(input)]
     ExceedsThreshold(BuildFilePath, HumanizedBytes, HumanizedBytes, String),
 }
-
-#[derive(Debug, buck2_error::Error)]
-enum StarlarkPeakMemorySoftError {
-    #[error(
-        "Starlark peak memory usage for {0} is {1} which is over 50% of the limit {2}! Consider investigating what takes too much memory: {3}."
-    )]
-    CloseToThreshold(BuildFilePath, HumanizedBytes, HumanizedBytes, String),
-}
-
-#[derive(Debug, buck2_error::Error)]
-#[error("Error parsing: `{1}`")]
-pub struct ParseError(#[source] pub BuckStarlarkError, OwnedStarlarkPath);
 
 /// A ParseData includes the parsed AST and a list of the imported files.
 ///
@@ -98,19 +94,19 @@ pub struct ParseData(
     pub Arc<Vec<(Option<FileSpan>, OwnedStarlarkModulePath)>>,
 );
 
-pub type ParseResult = Result<ParseData, ParseError>;
+pub type ParseResult = Result<ParseData, buck2_error::Error>;
 
 impl ParseData {
     fn new(
         ast: AstModule,
         implicit_imports: Vec<OwnedStarlarkModulePath>,
         resolver: &dyn LoadResolver,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let mut loads = implicit_imports.into_map(|x| (None, x));
         for x in ast.loads() {
             let path = resolver
                 .resolve_load(x.module_id, Some(&x.span))
-                .with_context(|| {
+                .with_buck_error_context(|| {
                     format!(
                         "Error loading `load` of `{}` from `{}`",
                         x.module_id, x.span
@@ -147,7 +143,7 @@ pub(crate) struct InterpreterForCell {
     /// Non-cell-specific information.
     global_state: Arc<GlobalInterpreterState>,
     /// Cell-specific alias resolver.
-    cell_names: CellAliasResolver,
+    cell_info: InterpreterCellInfo,
     /// Log GC.
     verbose_gc: bool,
     /// When true, rule function creates a node with no attributes.
@@ -166,6 +162,7 @@ struct InterpreterLoadResolver {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum LoadResolutionError {
     #[error(
         "Cannot load `{0}`. Bxl loads are not allowed from within this context. bxl files can only be loaded from other bxl files."
@@ -184,11 +181,15 @@ impl LoadResolver for InterpreterLoadResolver {
         &self,
         path: &str,
         location: Option<&FileSpan>,
-    ) -> anyhow::Result<OwnedStarlarkModulePath> {
+    ) -> buck2_error::Result<OwnedStarlarkModulePath> {
         // This is to be removed when we finish migration to Buck2.
-        let path = path.trim_end_match("?v2_only");
+        let path = path.strip_suffix("?v2_only").unwrap_or(path);
 
-        let path = parse_import(&self.config.cell_names, &self.loader_path, path)?;
+        let path = parse_import(
+            &self.config.cell_info.cell_alias_resolver(),
+            &self.loader_path,
+            path,
+        )?;
 
         // check for bxl files first before checking for prelude.
         // All bxl imports are parsed the same regardless of prelude or not.
@@ -247,15 +248,22 @@ impl LoadResolver for InterpreterLoadResolver {
     }
 }
 
+struct EvalResult {
+    additional: PerFileTypeContext,
+    starlark_peak_allocated_byte_limit: OnceCell<Option<u64>>,
+    is_profiling_enabled: bool,
+    cpu_instruction_count: Option<u64>,
+}
+
 impl InterpreterForCell {
-    fn verbose_gc() -> anyhow::Result<bool> {
+    fn verbose_gc() -> buck2_error::Result<bool> {
         match std::env::var_os("BUCK2_STARLARK_VERBOSE_GC") {
             Some(val) => Ok(!val.is_empty()),
             None => Ok(false),
         }
     }
 
-    fn is_ignore_attrs_for_profiling() -> anyhow::Result<bool> {
+    fn is_ignore_attrs_for_profiling() -> buck2_error::Result<bool> {
         // If unsure, feel free to break this code or just delete it.
         // It is intended only for profiling of very specific use cases.
         let ignore_attrs_for_profiling = match std::env::var_os("BUCK2_IGNORE_ATTRS_FOR_PROFILING")
@@ -273,13 +281,13 @@ impl InterpreterForCell {
 
     //, configuror: Arc<dyn InterpreterConfigurer>
     pub(crate) fn new(
-        cell_names: CellAliasResolver,
+        cell_info: InterpreterCellInfo,
         global_state: Arc<GlobalInterpreterState>,
         implicit_import_paths: Arc<ImplicitImportPaths>,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         Ok(Self {
             global_state,
-            cell_names,
+            cell_info,
             verbose_gc: Self::verbose_gc()?,
             ignore_attrs_for_profiling: Self::is_ignore_attrs_for_profiling()?,
             implicit_import_paths,
@@ -290,16 +298,16 @@ impl InterpreterForCell {
         &self,
         starlark_path: StarlarkPath<'_>,
         loaded_modules: &LoadedModules,
-    ) -> anyhow::Result<Module> {
+    ) -> buck2_error::Result<Module> {
         let env = Module::new();
 
         if let Some(prelude_import) = self.prelude_import(starlark_path) {
             let prelude_env = loaded_modules
                 .map
                 .get(&StarlarkModulePath::LoadFile(prelude_import.import_path()))
-                .with_context(|| {
+                .with_internal_error(|| {
                     format!(
-                        "Should've had an env for the prelude import `{}` (internal error)",
+                        "Should've had an env for the prelude import `{}`",
                         prelude_import,
                     )
                 })?;
@@ -311,7 +319,10 @@ impl InterpreterForCell {
             }
         }
 
-        env.set_extra_value(env.heap().alloc_complex(ExtraValue::default()));
+        env.set_extra_value_no_overwrite(env.heap().alloc_complex(StarlarkAnyComplex {
+            value: InterpreterExtraValue::default(),
+        }))
+        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
 
         Ok(env)
     }
@@ -328,9 +339,9 @@ impl InterpreterForCell {
         super_package: SuperPackage,
         package_boundary_exception: bool,
         loaded_modules: &LoadedModules,
-    ) -> anyhow::Result<(Module, ModuleInternals)> {
+    ) -> buck2_error::Result<(Module, ModuleInternals)> {
         let internals = self.global_state.configuror.new_extra_context(
-            self.get_cell_config(build_file.build_file_cell()),
+            &self.cell_info,
             build_file.clone(),
             package_listing.dupe(),
             super_package,
@@ -344,24 +355,14 @@ impl InterpreterForCell {
             let root_env = loaded_modules
                 .map
                 .get(&StarlarkModulePath::LoadFile(&root_import))
-                .with_context(|| {
-                    format!(
-                        "Should've had an env for the root import `{}` (internal error)",
-                        root_import,
-                    )
+                .with_internal_error(|| {
+                    format!("Should've had an env for the root import `{}`", root_import,)
                 })?
                 .env();
             env.import_public_symbols(root_env);
         }
 
         Ok((env, internals))
-    }
-
-    fn get_cell_config(&self, build_file_cell: BuildFileCell) -> &InterpreterCellInfo {
-        self.global_state
-            .cell_configs
-            .get(&build_file_cell)
-            .unwrap_or_else(|| panic!("Should've had cell config for {}", build_file_cell))
     }
 
     fn load_resolver(
@@ -415,7 +416,7 @@ impl InterpreterForCell {
         self: &Arc<Self>,
         import: StarlarkPath,
         content: String,
-    ) -> anyhow::Result<ParseResult> {
+    ) -> buck2_error::Result<ParseResult> {
         // Indentation with tabs is prohibited by starlark spec and configured starlark dialect.
         // This check also prohibits tabs even where spaces are not significant,
         // for example inside parentheses in function call arguments,
@@ -437,10 +438,10 @@ impl InterpreterForCell {
         ) {
             Ok(ast) => ast,
             Err(e) => {
-                return Ok(Err(ParseError(
-                    BuckStarlarkError::new(e),
-                    OwnedStarlarkPath::new(import),
-                )));
+                return Ok(Err(buck2_error::Error::from(e).context(format!(
+                    "Error parsing: `{}`",
+                    OwnedStarlarkPath::new(import)
+                ))));
             }
         };
         let mut implicit_imports = Vec::new();
@@ -467,61 +468,72 @@ impl InterpreterForCell {
         self: &Arc<Self>,
         import: StarlarkPath<'_>,
         import_string: &str,
-    ) -> anyhow::Result<OwnedStarlarkModulePath> {
+    ) -> buck2_error::Result<OwnedStarlarkModulePath> {
         self.load_resolver(import).resolve_load(import_string, None)
     }
 
-    fn eval<'a>(
-        self: &'a Arc<Self>,
-        env: &'a Module,
+    fn eval(
+        self: &Arc<Self>,
+        env: &Module,
         ast: AstModule,
-        buckconfig: &'a dyn LegacyBuckConfigView,
-        root_buckconfig: &'a dyn LegacyBuckConfigView,
+        buckconfigs: &mut dyn BuckConfigsViewForStarlark,
         loaded_modules: LoadedModules,
         extra_context: PerFileTypeContext,
-        eval_provider: &'a mut dyn StarlarkEvaluatorProvider,
+        eval_provider: &mut dyn StarlarkEvaluatorProvider,
         unstable_typecheck: bool,
-    ) -> anyhow::Result<BuildContext<'a>> {
+    ) -> buck2_error::Result<EvalResult> {
         let import = extra_context.starlark_path();
-        let globals = self
-            .global_state
-            .globals_for_file_type(extra_context.file_type());
+        let globals = self.global_state.globals();
         let file_loader =
             InterpreterFileLoader::new(loaded_modules, Arc::new(self.load_resolver(import)));
-        let cell_info = self.get_cell_config(import.build_file_cell());
         let host_info = self.global_state.configuror.host_info();
         let extra = BuildContext::new_for_module(
             env,
-            cell_info,
-            buckconfig,
-            root_buckconfig,
+            &self.cell_info,
+            buckconfigs,
             host_info,
             extra_context,
             self.ignore_attrs_for_profiling,
         );
+        let is_profiling_enabled;
         let print = EventDispatcherPrintHandler(get_dispatcher());
-        {
-            let mut eval = eval_provider.make(env)?;
+        let cpu_instruction_count = {
+            let (mut eval, is_profiling_enabled_by_provider) = eval_provider.make(env)?;
+            is_profiling_enabled = is_profiling_enabled_by_provider;
             eval.enable_static_typechecking(unstable_typecheck);
             eval.set_print_handler(&print);
+            eval.set_soft_error_handler(&Buck2StarlarkSoftErrorHandler);
             eval.set_loader(&file_loader);
             eval.extra = Some(&extra);
             if self.verbose_gc {
                 eval.verbose_gc();
             }
+
+            // Ignore error if failed to initialize instruction counter.
+            let instruction_counter: Option<PerThreadInstructionCounter> =
+                PerThreadInstructionCounter::init().ok().unwrap_or_default();
+
             match eval.eval_module(ast, globals) {
                 Ok(_) => {
+                    let cpu_instruction_count = instruction_counter.and_then(|c| c.collect().ok());
+
                     eval_provider
                         .evaluation_complete(&mut eval)
-                        .context("Profiler finalization failed")?;
-                    eval_provider
-                        .visit_frozen_module(None)
-                        .context("Profiler heap visitation failed")?
+                        .buck_error_context("Profiler finalization failed")?;
+
+                    cpu_instruction_count
                 }
-                Err(p) => return Err(BuckStarlarkError::new(p).into()),
+                Err(p) => {
+                    return Err(p.into());
+                }
             }
         };
-        Ok(extra)
+        Ok(EvalResult {
+            additional: extra.additional,
+            is_profiling_enabled,
+            starlark_peak_allocated_byte_limit: extra.starlark_peak_allocated_byte_limit,
+            cpu_instruction_count,
+        })
     }
 
     /// Evaluates the AST for a parsed module. Loaded modules must contain the loaded
@@ -530,12 +542,11 @@ impl InterpreterForCell {
     pub(crate) fn eval_module(
         self: &Arc<Self>,
         starlark_path: StarlarkModulePath<'_>,
-        buckconfig: &dyn LegacyBuckConfigView,
-        root_buckconfig: &dyn LegacyBuckConfigView,
+        buckconfigs: &mut dyn BuckConfigsViewForStarlark,
         ast: AstModule,
         loaded_modules: LoadedModules,
         eval_provider: &mut dyn StarlarkEvaluatorProvider,
-    ) -> anyhow::Result<FrozenModule> {
+    ) -> buck2_error::Result<FrozenModule> {
         let env = self.create_env(starlark_path.into(), &loaded_modules)?;
         let extra_context = match starlark_path {
             StarlarkModulePath::LoadFile(bzl) => PerFileTypeContext::Bzl(BzlEvalCtx {
@@ -547,21 +558,21 @@ impl InterpreterForCell {
             || matches!(starlark_path, StarlarkModulePath::BxlFile(..))
             || match self.global_state.configuror.prelude_import() {
                 Some(prelude_import) => {
-                    prelude_import.prelude_cell() == self.cell_names.resolve_self()
+                    prelude_import.prelude_cell()
+                        == self.cell_info.cell_alias_resolver().resolve_self()
                 }
                 None => false,
             };
         self.eval(
             &env,
             ast,
-            buckconfig,
-            root_buckconfig,
+            buckconfigs,
             loaded_modules,
             extra_context,
             eval_provider,
             typecheck,
         )?;
-        env.freeze()
+        env.freeze().map_err(from_freeze_error)
     }
 
     pub(crate) fn eval_package_file(
@@ -569,11 +580,10 @@ impl InterpreterForCell {
         package_file_path: &PackageFilePath,
         ast: AstModule,
         parent: SuperPackage,
-        buckconfig: &dyn LegacyBuckConfigView,
-        root_buckconfig: &dyn LegacyBuckConfigView,
+        buckconfigs: &mut dyn BuckConfigsViewForStarlark,
         loaded_modules: LoadedModules,
         eval_provider: &mut dyn StarlarkEvaluatorProvider,
-    ) -> anyhow::Result<SuperPackage> {
+    ) -> buck2_error::Result<SuperPackage> {
         let env = self.create_env(
             StarlarkPath::PackageFile(package_file_path),
             &loaded_modules,
@@ -589,8 +599,7 @@ impl InterpreterForCell {
             .eval(
                 &env,
                 ast,
-                buckconfig,
-                root_buckconfig,
+                buckconfigs,
                 loaded_modules,
                 extra_context,
                 eval_provider,
@@ -599,10 +608,14 @@ impl InterpreterForCell {
             .additional;
 
         let extra: Option<OwnedFrozenRef<FrozenPackageFileExtra>> =
-            if ExtraValue::get(&env)?.package_extra.get().is_some() {
+            if InterpreterExtraValue::get(&env)?
+                .package_extra
+                .get()
+                .is_some()
+            {
                 // Only freeze if there's something to freeze, otherwise we will needlessly freeze
                 // globals. TODO(nga): add API to only freeze extra.
-                let env = env.freeze()?;
+                let env = env.freeze().map_err(from_freeze_error)?;
                 FrozenPackageFileExtra::get(&env)?
             } else {
                 None
@@ -619,8 +632,7 @@ impl InterpreterForCell {
     pub(crate) fn eval_build_file(
         self: &Arc<Self>,
         build_file: &BuildFilePath,
-        buckconfig: &dyn LegacyBuckConfigView,
-        root_buckconfig: &dyn LegacyBuckConfigView,
+        buckconfigs: &mut dyn BuckConfigsViewForStarlark,
         listing: PackageListing,
         super_package: SuperPackage,
         package_boundary_exception: bool,
@@ -628,7 +640,7 @@ impl InterpreterForCell {
         loaded_modules: LoadedModules,
         eval_provider: &mut dyn StarlarkEvaluatorProvider,
         unstable_typecheck: bool,
-    ) -> anyhow::Result<EvaluationResultWithStats> {
+    ) -> buck2_error::Result<EvaluationResultWithStats> {
         let (env, internals) = self.create_build_env(
             build_file,
             &listing,
@@ -636,27 +648,35 @@ impl InterpreterForCell {
             package_boundary_exception,
             &loaded_modules,
         )?;
-        let build_ctx = self.eval(
+        let eval_result = self.eval(
             &env,
             ast,
-            buckconfig,
-            root_buckconfig,
+            buckconfigs,
             loaded_modules,
             PerFileTypeContext::Build(internals),
             eval_provider,
             unstable_typecheck,
         )?;
 
-        let internals = build_ctx.additional.into_build()?;
+        let internals = eval_result.additional.into_build()?;
         let starlark_peak_allocated_bytes = env.heap().peak_allocated_bytes() as u64;
-        let starlark_peak_mem_check_enabled = root_buckconfig
-            .parse("buck2", "check_starlark_peak_memory")?
+        let buckconfig_key = BuckconfigKeyRef {
+            section: "buck2",
+            property: "check_starlark_peak_memory",
+        };
+        let starlark_peak_mem_check_enabled = !eval_result.is_profiling_enabled
+            && LegacyBuckConfig::parse_value(
+                buckconfig_key,
+                buckconfigs
+                    .read_root_cell_config(buckconfig_key)?
+                    .as_deref(),
+            )?
             .unwrap_or(false);
-        let default_limit = 2 * (1 << 30);
-        let starlark_mem_limit = build_ctx
+        let starlark_mem_limit = eval_result
             .starlark_peak_allocated_byte_limit
             .get()
-            .map_or(default_limit, |opt| opt.unwrap_or(default_limit));
+            .and_then(|limit| *limit)
+            .unwrap_or(DEFAULT_STARLARK_MEMORY_USAGE_LIMIT);
 
         if starlark_peak_mem_check_enabled && starlark_peak_allocated_bytes > starlark_mem_limit {
             Err(StarlarkPeakMemoryError::ExceedsThreshold(
@@ -666,27 +686,11 @@ impl InterpreterForCell {
                 get_starlark_warning_link().to_owned(),
             )
             .into())
-        } else if starlark_peak_mem_check_enabled
-            && starlark_peak_allocated_bytes > starlark_mem_limit / 2
-        {
-            soft_error!(
-                "starlark_memory_usage_over_soft_limit",
-                StarlarkPeakMemorySoftError::CloseToThreshold(
-                    build_file.clone(),
-                    HumanizedBytes::fixed_width(starlark_peak_allocated_bytes),
-                    HumanizedBytes::fixed_width(starlark_mem_limit),
-                    get_starlark_warning_link().to_owned()
-                ).into(), quiet: true
-            )?;
-
-            Ok(EvaluationResultWithStats {
-                result: EvaluationResult::from(internals),
-                starlark_peak_allocated_bytes,
-            })
         } else {
             Ok(EvaluationResultWithStats {
                 result: EvaluationResult::from(internals),
                 starlark_peak_allocated_bytes,
+                cpu_instruction_count: eval_result.cpu_instruction_count,
             })
         }
     }

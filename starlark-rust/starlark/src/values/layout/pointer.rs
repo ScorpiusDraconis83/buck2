@@ -36,10 +36,10 @@ use either::Either;
 use static_assertions::assert_eq_size;
 
 use crate::cast;
-use crate::values::int::PointerI32;
+use crate::values::int::pointer_i32::PointerI32;
 use crate::values::layout::heap::repr::AValueHeader;
 use crate::values::layout::heap::repr::AValueOrForward;
-use crate::values::types::inline_int::InlineInt;
+use crate::values::types::int::inline_int::InlineInt;
 
 /// Tagged pointer logically equivalent to `*mut AValueHeader`.
 #[derive(Clone, Copy, Dupe, PartialEq, Eq, Hash, Allocative)]
@@ -57,7 +57,12 @@ impl RawPointer {
     #[inline]
     pub(crate) unsafe fn new_unchecked(ptr: usize) -> RawPointer {
         debug_assert!(ptr != 0);
-        RawPointer(NonZeroUsize::new_unchecked(ptr))
+        let ptr = RawPointer(NonZeroUsize::new_unchecked(ptr));
+
+        // Run debug assertions.
+        let _ignore = PointerTags::from_pointer(ptr);
+
+        ptr
     }
 
     #[inline]
@@ -89,18 +94,23 @@ impl RawPointer {
     }
 
     #[inline]
+    pub(crate) fn tags(self) -> PointerTags {
+        PointerTags::from_pointer(self)
+    }
+
+    #[inline]
     pub(crate) fn is_str(self) -> bool {
-        (self.0.get() & TAG_STR) != 0
+        self.tags().is_str()
     }
 
     #[inline]
     pub(crate) fn is_int(self) -> bool {
-        (self.0.get() & TAG_INT) != 0
+        self.tags().is_int()
     }
 
     #[inline]
     pub(crate) fn is_unfrozen(self) -> bool {
-        (self.0.get() & TAG_UNFROZEN) != 0
+        self.tags().is_unfrozen()
     }
 
     #[inline]
@@ -176,6 +186,79 @@ const TAG_STR: usize = 0b100;
 // Note, an object can be changed from unfrozen to frozen, not vice versa.
 const TAG_UNFROZEN: usize = 0b001;
 
+/// All possible tag values, three least significant bits of a pointer.
+#[repr(usize)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum PointerTags {
+    Int = TAG_INT,
+    StrUnfrozen = TAG_STR | TAG_UNFROZEN,
+    StrFrozen = TAG_STR,
+    OtherUnfrozen = TAG_UNFROZEN,
+    OtherFrozen = 0,
+}
+
+impl PointerTags {
+    #[inline]
+    unsafe fn from_usize_unchecked(x: usize) -> Self {
+        debug_assert!(
+            x == PointerTags::Int as usize
+                || x == PointerTags::StrUnfrozen as usize
+                || x == PointerTags::StrFrozen as usize
+                || x == PointerTags::OtherUnfrozen as usize
+                || x == PointerTags::OtherFrozen as usize
+        );
+        unsafe { mem::transmute(x) }
+    }
+
+    #[inline]
+    fn from_pointer(ptr: RawPointer) -> Self {
+        unsafe { Self::from_usize_unchecked(ptr.0.get() & TAG_MASK) }
+    }
+
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+
+    /// String value, frozen or not.
+    #[inline]
+    fn is_str(self) -> bool {
+        self.to_usize() & TAG_STR != 0
+    }
+
+    /// Inline integer.
+    #[inline]
+    fn is_int(self) -> bool {
+        self == PointerTags::Int
+    }
+
+    /// Not frozen, not an integer.
+    #[inline]
+    fn is_unfrozen(self) -> bool {
+        self.to_usize() & TAG_UNFROZEN != 0
+    }
+}
+
+/// All possible tag values for frozen pointers, three least significant bits of a pointer.
+#[repr(usize)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum _FrozenPointerTags {
+    Int = TAG_INT,
+    Str = TAG_STR,
+    Other = 0,
+}
+
+/// `ThinBoxSliceFrozenValue` depends on all `FrozenPointer` values having the bottom bit unset.
+/// We keep a check here to ensure that remains true.
+#[allow(dead_code)] // False positive.
+const TAG_NICHE: usize = 0b1;
+
+const _: () = assert!(
+    _FrozenPointerTags::Int as usize & TAG_NICHE == 0
+        && _FrozenPointerTags::Str as usize & TAG_NICHE == 0
+        && _FrozenPointerTags::Other as usize & TAG_NICHE == 0
+);
+
 /// `InlineInt` is shift by this number of bits to the left to be stored in a pointer.
 const INT_SHIFT: usize = mem::size_of::<usize>() * 8 - InlineInt::BITS;
 const INT_DATA_MASK: usize = ((1usize << InlineInt::BITS) - 1) << INT_SHIFT;
@@ -203,7 +286,7 @@ impl<'p> Pointer<'p> {
     }
 
     #[inline]
-    pub fn new_unfrozen(x: &'p AValueHeader, is_string: bool) -> Self {
+    pub(crate) fn new_unfrozen(x: &'p AValueHeader, is_string: bool) -> Self {
         unsafe { Self::new(RawPointer::new_unfrozen(x, is_string)) }
     }
 
@@ -213,12 +296,12 @@ impl<'p> Pointer<'p> {
     }
 
     #[inline]
-    pub fn is_unfrozen(self) -> bool {
+    pub(crate) fn is_unfrozen(self) -> bool {
         self.ptr.is_unfrozen()
     }
 
     #[inline]
-    pub fn unpack(self) -> Either<&'p AValueOrForward, &'static PointerI32> {
+    pub(crate) fn unpack(self) -> Either<&'p AValueOrForward, &'static PointerI32> {
         if !self.ptr.is_int() {
             Either::Left(unsafe { self.ptr.unpack_ptr_no_int_unchecked() })
         } else {
@@ -227,15 +310,14 @@ impl<'p> Pointer<'p> {
     }
 
     #[inline]
-    pub fn unpack_int(self) -> Option<InlineInt> {
+    pub(crate) fn unpack_int(self) -> Option<InlineInt> {
         self.ptr.unpack_int()
     }
 
     #[inline]
-    pub fn unpack_ptr(self) -> Option<&'p AValueOrForward> {
-        let p = self.ptr.0.get();
-        if p & TAG_INT == 0 {
-            Some(unsafe { untag_pointer(p) })
+    pub(crate) fn unpack_ptr(self) -> Option<&'p AValueOrForward> {
+        if !self.ptr.is_int() {
+            Some(unsafe { untag_pointer(self.ptr.0.get()) })
         } else {
             None
         }
@@ -245,7 +327,7 @@ impl<'p> Pointer<'p> {
     #[inline]
     pub(crate) unsafe fn unpack_ptr_no_int_unchecked(self) -> &'p AValueOrForward {
         let p = self.ptr.0.get();
-        debug_assert!(p & TAG_INT == 0);
+        debug_assert!(!self.ptr.is_int());
         untag_pointer(p)
     }
 
@@ -256,17 +338,17 @@ impl<'p> Pointer<'p> {
     }
 
     #[inline]
-    pub fn ptr_eq(self, other: Pointer<'_>) -> bool {
+    pub(crate) fn ptr_eq(self, other: Pointer<'_>) -> bool {
         self.ptr == other.ptr
     }
 
     #[inline]
-    pub fn raw(self) -> RawPointer {
+    pub(crate) fn raw(self) -> RawPointer {
         self.ptr
     }
 
     #[inline]
-    pub unsafe fn cast_lifetime<'p2>(self) -> Pointer<'p2> {
+    pub(crate) unsafe fn cast_lifetime<'p2>(self) -> Pointer<'p2> {
         Pointer {
             ptr: self.ptr,
             _phantom: PhantomData,
@@ -290,7 +372,7 @@ impl<'p> FrozenPointer<'p> {
     }
 
     #[inline]
-    pub fn new_frozen_usize_with_str_tag(x: usize) -> Self {
+    pub(crate) fn new_frozen_usize_with_str_tag(x: usize) -> Self {
         debug_assert!((x & TAG_MASK & !TAG_STR) == 0);
         unsafe { Self::new(RawPointer::new_unchecked(x)) }
     }
@@ -302,10 +384,7 @@ impl<'p> FrozenPointer<'p> {
 
     #[inline]
     pub(crate) fn new_int(x: InlineInt) -> Self {
-        FrozenPointer {
-            ptr: RawPointer::new_int(x),
-            phantom: PhantomData,
-        }
+        unsafe { Self::new(RawPointer::new_int(x)) }
     }
 
     /// It is safe to bitcast `FrozenPointer` to `Pointer`
@@ -336,12 +415,11 @@ impl<'p> FrozenPointer<'p> {
         self.ptr.unpack_pointer_i32_unchecked()
     }
 
-    /// Unpack pointer when it is known to be not an integer, not a string, and not frozen.
+    /// Unpack pointer when it is known to be frozen, not an integer, not a string.
     #[inline]
     pub(crate) unsafe fn unpack_ptr_no_int_no_str_unchecked(self) -> &'p AValueOrForward {
-        let p = self.ptr.0.get();
-        debug_assert!(p & TAG_MASK == 0);
-        cast::usize_to_ptr(p)
+        debug_assert!(self.ptr.tags() == PointerTags::OtherFrozen);
+        cast::usize_to_ptr(self.ptr.0.get())
     }
 }
 

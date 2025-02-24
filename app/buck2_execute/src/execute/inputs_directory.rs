@@ -8,8 +8,8 @@
  */
 
 use buck2_common::file_ops::FileMetadata;
-use buck2_core::directory::DirectoryEntry;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_directory::directory::entry::DirectoryEntry;
 use dupe::Dupe;
 
 use crate::directory::ActionDirectoryBuilder;
@@ -19,7 +19,7 @@ use crate::execute::request::CommandExecutionInput;
 pub fn inputs_directory(
     inputs: &[CommandExecutionInput],
     fs: &ArtifactFs,
-) -> anyhow::Result<ActionDirectoryBuilder> {
+) -> buck2_error::Result<ActionDirectoryBuilder> {
     let mut builder = ActionDirectoryBuilder::empty();
     for input in inputs {
         match input {

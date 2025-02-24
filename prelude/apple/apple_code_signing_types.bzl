@@ -7,7 +7,7 @@
 
 # Provider which exposes a field from `apple_binary` to `apple_bundle` as it might be used during code signing.
 AppleEntitlementsInfo = provider(fields = {
-    "entitlements_file": provider_field([Artifact, None], default = None),
+    "entitlements_file": provider_field(Artifact | None, default = None),
 })
 
 CodeSignType = enum(
@@ -15,3 +15,13 @@ CodeSignType = enum(
     "adhoc",
     "distribution",
 )
+
+CodeSignConfiguration = enum(
+    "dry-run",
+    "fast-adhoc",
+    "none",
+)
+
+def get_code_signing_configuration_attr_value(ctx: AnalysisContext) -> [CodeSignConfiguration, None]:
+    configuration_value = ctx.attrs.code_signing_configuration or ctx.attrs._code_signing_configuration
+    return CodeSignConfiguration(configuration_value)

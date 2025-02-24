@@ -76,6 +76,9 @@ message StatusResponse {
   optional uint32 forkserver_pid = 11;
   optional bool supports_vpnless = 12;
   optional bool http2 = 13;
+  optional bool valid_working_directory = 14;
+  optional bool valid_buck_out_mount = 15;
+  optional string io_provider = 16;
 }
 
 message PingRequest {
@@ -88,11 +91,25 @@ message PingResponse {
   bytes payload = 2;
 }
 
+message TargetCfg {
+  /// Empty string means not specified.
+  string target_platform = 1;
+  repeated string cli_modifiers = 2;
+}
+
+message RepresentativeConfigFlag {
+  oneof source {
+    string config_flag = 1;
+    string config_file = 2;
+    string mode_file = 3;
+  }
+}
+
 message ClientContext {
+  reserved 5, 21;
+  // `AbsNormPath`.
   string working_dir = 1;
   repeated ConfigOverride config_overrides = 3;
-  /// Empty string means not specified.
-  string target_platform = 5;
   enum HostPlatformOverride {
     DEFAULT_PLATFORM = 0;
     LINUX = 1;
@@ -127,11 +144,24 @@ message ClientContext {
 
   /// Contents of `BUCK2_HARD_ERROR` environment variable.
   string buck2_hard_error = 20;
-  repeated string cli_modifiers = 21;
+
+  enum PreemptibleWhen {
+    /// Default
+    NEVER = 0;
+    ALWAYS = 1;
+    ON_DIFFERENT_STATE = 2;
+  }
+  /// Whether this invocation is preemptible. If another build attempts to start
+  // that /would/ block until this build finishes, `preemptible` determines
+  // whether the new build will preempt (ie kill) the current build and take its
+  // place.
+  PreemptibleWhen preemptible = 22;
+  // Used for logging purposes; gives the config flags needed to repro the run
+  repeated RepresentativeConfigFlag representative_config_flags = 23;
 }
 
 message TargetsRequest {
-  reserved 3 to 16, 18, 4242000;
+  reserved 2, 3 to 16, 18, 4242000;
 
   enum TargetHashFileMode {
     PATHS_ONLY = 0;
@@ -151,6 +181,12 @@ message TargetsRequest {
     JSON = 2;
     JSON_LINES = 3;
     STATS = 4;
+  }
+
+  enum Compression {
+    UNCOMPRESSED = 0;
+    GZIP = 1;
+    ZSTD = 2;
   }
 
   message ResolveAlias {}
@@ -175,7 +211,8 @@ message TargetsRequest {
   }
 
   ClientContext context = 1;
-  repeated buck.data.TargetPattern target_patterns = 2;
+  repeated string target_patterns = 102;
+  TargetCfg target_cfg = 201;
 
   optional string output = 17;
   OutputFormat output_format = 19;
@@ -185,6 +222,7 @@ message TargetsRequest {
     Other other = 21;
   }
   Concurrency concurrency = 22;
+  Compression compression = 23;
 }
 
 message TargetsResponse {
@@ -202,9 +240,10 @@ message TargetsShowOutputsResponse {
 
 // `buck2 ctargets` command
 message ConfiguredTargetsRequest {
-  reserved 10;
+  reserved 2, 10;
   ClientContext context = 1;
-  repeated buck.data.TargetPattern target_patterns = 2;
+  repeated string target_patterns = 12;
+  TargetCfg target_cfg = 201;
   bool skip_missing_targets = 11;
 }
 
@@ -217,6 +256,8 @@ enum QueryOutputFormat {
   JSON = 1;
   DOT = 2;
   DOT_COMPACT = 3;
+  STARLARK = 4;
+  HTML = 5;
 }
 
 message AqueryRequest {
@@ -225,6 +266,7 @@ message AqueryRequest {
   repeated string output_attributes = 3;
   // The literals for a repeated query (one containing `%s`).
   repeated string query_args = 4;
+  TargetCfg target_cfg = 5;
 
   // These should possibly be deleted and never become real options. Let's not
   // pollute the low ids (and then forever need a comment about them).
@@ -236,7 +278,7 @@ message AqueryResponse {
 }
 
 message UqueryRequest {
-  reserved 6;
+  reserved 5, 6;
   ClientContext context = 1;
   string query = 2;
   repeated string output_attributes = 3;
@@ -253,18 +295,19 @@ message UqueryResponse {
 }
 
 message CqueryRequest {
-  reserved 6;
+  reserved 6, 8;
   ClientContext context = 1;
   string query = 2;
   repeated string output_attributes = 3;
   // The literals for a repeated query (one containing `%s`).
   repeated string query_args = 4;
   repeated string target_universe = 5;
+  TargetCfg target_cfg = 9;
 
   bool show_providers = 7;
 
-  // Correct or deprecated owner? https://fburl.com/1mf2d2xj
-  bool correct_owner = 8;
+  optional ProfileMode profile_mode = 21;
+  optional string profile_output = 22;
 
   // These should possibly be deleted and never become real options. Let's not
   // pollute the low ids (and then forever need a comment about them).
@@ -276,7 +319,18 @@ message CqueryResponse {
 }
 
 message ConfigOverride {
-  // `override` is reserved keyword in Rust
+  // A path to a cell root. Interpretation depends on the config type:
+  //  - If its a value, then this is the cell the value should be applied to
+  //  - If its a file, then the file path is relative to this cell
+  optional string cell = 3;
+  // If the config type is a value, then this is the value passed to `--config`,
+  // verbatim.
+  //
+  // If the config type is a file, then:
+  //  - If the cell is set above, a not-necessarily-normalized relative path to
+  //    that cell root
+  //  - If the cell above is not set, this is the absolute path of the config
+  //    file
   string config_override = 1;
   enum ConfigType {
     VALUE = 0;
@@ -339,6 +393,13 @@ message CommonBuildOptions {
   /// Materializes inputs for failed actions which ran on RE.
   bool materialize_failed_inputs = 18;
 
+  /// Validations to run that are marked optional.
+  repeated string enable_optional_validations = 19;
+
+  // This will likely be deleted later and never become a real option. Adding it
+  // for now as it makes iterating easier in the beginning.
+  string unstable_materialize_failed_action_outputs = 4241000;
+
   // These should possibly be deleted and never become real options. Let's not
   // pollute the low ids (and then forever need a comment about them). The only
   // one of these that might stick around is print_build_report, it's unclear if
@@ -346,13 +407,16 @@ message CommonBuildOptions {
   bool unstable_print_build_report = 4242000;
   string unstable_build_report_filename = 4242003;
   bool unstable_include_failures_build_report = 4242004;
+  bool unstable_include_package_project_relative_paths = 4242005;
+  bool unstable_include_artifact_hash_information = 4242006;
 }
 
 message BuildRequest {
-  reserved 5, 4242001;
+  reserved 2, 5, 9, 4242001;
 
   ClientContext context = 1;
-  repeated buck.data.TargetPattern target_patterns = 2;
+  repeated string target_patterns = 10;
+  TargetCfg target_cfg = 201;
   repeated string target_universe = 8;
 
   message BuildProviders {
@@ -390,8 +454,17 @@ message BuildRequest {
   // Materialize final artifacts?
   Materializations final_artifact_materializations = 7;
 
-  // File name where built artifact hash information should be saved
-  optional string output_hashes_file = 9;
+  enum Uploads {
+    ALWAYS = 0;
+    NEVER = 1;
+  }
+  // Upload final artifacts?
+  Uploads final_artifact_uploads = 11;
+
+  // How long to build for? If the timeout is exceeded, Buck2 will exit as
+  // quickly as possible and drop in-flight builds. The exit code will be a
+  // user failure.
+  optional google.protobuf.Duration timeout = 12;
 }
 
 message TestSessionOptions {
@@ -401,10 +474,11 @@ message TestSessionOptions {
 }
 
 message TestRequest {
-  reserved 10;
+  reserved 2, 10;
 
   ClientContext context = 1;
-  repeated buck.data.TargetPattern target_patterns = 2;
+  repeated string target_patterns = 14;
+  TargetCfg target_cfg = 201;
 
   repeated string test_executor_args = 3;
 
@@ -435,6 +509,9 @@ message TestRequest {
   // cancelled. The test orchestrator will be allowed to shut down gracefully.
   // The exit code will be a user failure.
   optional google.protobuf.Duration timeout = 12;
+
+  // Should you add tests that are on the `tests` attribute of the target.
+  bool ignore_tests_attribute = 13;
 }
 
 message BxlRequest {
@@ -446,9 +523,13 @@ message BxlRequest {
 
   CommonBuildOptions build_opts = 4;
 
+  TargetCfg target_cfg = 201;
+
   BuildRequest.Materializations final_artifact_materializations = 6;
 
   bool print_stacktrace = 7;
+
+  BuildRequest.Uploads final_artifact_uploads = 8;
 }
 
 message BxlResponse {
@@ -456,11 +537,14 @@ message BxlResponse {
   // Absolute path to the repo root
   string project_root = 2;
   repeated buck.data.ErrorReport errors = 102;
+  optional string serialized_build_report = 100;
 }
 
 message InstallRequest {
+  reserved 2;
   ClientContext context = 1;
-  repeated buck.data.TargetPattern target_patterns = 2;
+  repeated string target_patterns = 12;
+  TargetCfg target_cfg = 201;
   CommonBuildOptions build_opts = 3;
   repeated string installer_run_args = 4;
   bool installer_debug = 5;
@@ -497,8 +581,10 @@ message BuildResponse {
   // Absolute path to the repo root
   string project_root = 2;
 
-  string serialized_build_report = 100;
+  optional string serialized_build_report = 100;
   repeated buck.data.ErrorReport errors = 102;
+
+  optional bool run_buck2_explain = 200;
 }
 
 message CounterWithExamples {
@@ -510,6 +596,7 @@ message CounterWithExamples {
 message TestResponse {
   reserved 101;
   optional int32 exit_code = 1;
+  optional string serialized_build_report = 100;
   repeated buck.data.ErrorReport errors = 102;
   message TestStatuses {
     reserved 1 to 6;
@@ -526,6 +613,7 @@ message TestResponse {
   // these are messages that the test executor wants to show the user at the
   // end of the run
   repeated string executor_info_messages = 6;
+  repeated string target_rule_type_names = 7;
 }
 
 message InstallResponse {}
@@ -548,39 +636,15 @@ message NewGenericResponseMessage {
   string new_generic_response = 1;
 }
 
-message UnstableCrashRequest {}
+message UnstableCrashRequest {
+  enum CrashType {
+    PANIC = 0;
+    ABORT = 2;
+  }
+  CrashType crash_type = 1;
+}
 
 message UnstableCrashResponse {}
-
-message SegfaultRequest {}
-
-message SegfaultResponse {}
-
-message UnstableDocsRequest {
-  enum Format {
-    UNKNOWN = 0;
-    JSON = 1;
-    MARKDOWN = 2;
-  }
-
-  ClientContext context = 1;
-  repeated string symbol_patterns = 2;
-  bool retrieve_builtins = 3;
-  bool retrieve_prelude = 4;
-  Format format = 5;
-  // `markdown_output_path` must be set when format is Markdown and must be
-  // unset otherwise.
-  optional string markdown_output_path = 6;
-  string markdown_native_subdir = 7;
-  string markdown_starlark_subdir = 8;
-}
-
-message UnstableDocsResponse {
-  reserved 1, 2;
-
-  // Set when requested format is JSON.
-  optional string json_output = 3;
-}
 
 message CommandError {
   reserved 1;
@@ -588,6 +652,8 @@ message CommandError {
 }
 
 message CommandResult {
+  reserved 10;
+
   oneof result {
     CommandError error = 1;
     // Ideally, this would be an Any, but tonic/prost doesn't support it yet.
@@ -599,7 +665,6 @@ message CommandResult {
     CqueryResponse cquery_response = 7;
     UqueryResponse uquery_response = 8;
     TestResponse test_response = 9;
-    UnstableDocsResponse unstable_docs_response = 10;
     ProfileResponse profile_response = 11;
     TargetsShowOutputsResponse targets_show_outputs_response = 12;
     InstallResponse install_response = 14;
@@ -678,6 +743,7 @@ message UnstableHeapDumpRequest {
   // The path to write the heap dump to. If this path is relative, it is made
   // absolute relative to the working directory of the daemon.
   string destination_path = 1;
+  optional string test_executor_destination_path = 2;
 }
 
 message UnstableHeapDumpResponse {}
@@ -735,36 +801,45 @@ message DapResponse {}
 message BxlProfile {
   string bxl_label = 1;
   repeated string bxl_args = 2;
+  TargetCfg target_cfg = 201;
 }
 
 message TargetProfile {
+  reserved 1;
+
   enum Action {
     ANALYSIS = 0;
     LOADING = 1;
   }
 
-  repeated buck.data.TargetPattern target_patterns = 1;
+  repeated string target_patterns = 4;
+  TargetCfg target_cfg = 101;
+  repeated string target_universe = 102;
   bool recursive = 2;
   Action action = 3;
 }
 
-message ProfileRequest {
-  enum Profiler {
-    HEAP_FLAME_ALLOCATED = 0;
-    HEAP_FLAME_RETAINED = 10;
-    HEAP_SUMMARY_ALLOCATED = 1;
-    HEAP_SUMMARY_RETAINED = 11;
-    TIME_FLAME = 2;
-    STATEMENT = 3;
-    BYTECODE = 4;
-    BYTECODE_PAIRS = 5;
-    TYPECHECK = 6;
-  }
+enum ProfileMode {
+  HEAP_FLAME_ALLOCATED = 0;
+  HEAP_FLAME_RETAINED = 10;
+  HEAP_ALLOCATED = 12;
+  HEAP_SUMMARY_ALLOCATED = 1;
+  HEAP_SUMMARY_RETAINED = 11;
+  HEAP_RETAINED = 13;
+  TIME_FLAME = 2;
+  STATEMENT = 3;
+  BYTECODE = 4;
+  BYTECODE_PAIRS = 5;
+  TYPECHECK = 6;
+  COVERAGE = 7;
+  NONE = 8;
+}
 
+message ProfileRequest {
   ClientContext context = 1;
 
   string destination_path = 3;
-  Profiler profiler = 4;
+  ProfileMode profile_mode = 4;
 
   oneof profile_opts {
     TargetProfile target_profile = 7;
@@ -804,7 +879,9 @@ message FileStatusRequest {
   bool show_matches = 3;
 }
 
-message FlushDepFilesRequest {}
+message FlushDepFilesRequest {
+  bool retain_locally_produced_dep_files = 1;
+}
 
 message SetLogFilterRequest {
   string log_filter = 1;
@@ -878,7 +955,6 @@ service DaemonApi {
   rpc Uquery(UqueryRequest) returns (stream MultiCommandProgress);
   rpc Audit(GenericRequest) returns (stream MultiCommandProgress);
   rpc Starlark(GenericRequest) returns (stream MultiCommandProgress);
-  rpc UnstableDocs(UnstableDocsRequest) returns (stream MultiCommandProgress);
   rpc Install(InstallRequest) returns (stream MultiCommandProgress);
   rpc CleanStale(CleanStaleRequest) returns (stream MultiCommandProgress);
   rpc FileStatus(FileStatusRequest) returns (stream MultiCommandProgress);
@@ -888,12 +964,8 @@ service DaemonApi {
       returns (stream MultiCommandProgress);
 
   // Crashes the Buck daemon. Unless you are writing tests or checking Buck2's
-  // panic behavior, you probably don't want this.
+  // behavior when it crashes, you probably don't want this.
   rpc Unstable_Crash(UnstableCrashRequest) returns (CommandResult);
-
-  // Crashes the Buck daemon with a segfault.  Unless you are writing tests or
-  // checking Buck2's segfault behavior, you probably don't want this.
-  rpc Segfault(SegfaultRequest) returns (SegfaultResponse);
 
   // Requests the daemon to perform a heap dump and save the dump to a file.
   rpc Unstable_HeapDump(UnstableHeapDumpRequest)

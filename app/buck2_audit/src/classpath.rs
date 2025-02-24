@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -20,16 +21,18 @@ use crate::AuditSubcommand;
     We will replace this command with something that can audit the entire `TemplatePlaceholderInfo` in the future."
 )]
 pub struct AuditClasspathCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
-    #[clap(name = "TARGET_PATTERNS", help = "Target patterns to audit")]
-    pub patterns: Vec<String>,
-
     /// Output in JSON format
     #[clap(long)]
     pub json: bool,
     // TODO(scottcao): Add --show-targets, --dot, and other relevant flags
+    #[clap(name = "TARGET_PATTERNS", help = "Target patterns to audit")]
+    pub patterns: Vec<String>,
+
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

@@ -1,62 +1,93 @@
 # Website
 
-This website is built using [Docusaurus 2](https://docusaurus.io/), a modern static website generator.
+This website is built using [Docusaurus 2](https://docusaurus.io/), a modern
+static website generator.
+
+## Mac Setup
+
+`yarn` and `node` are installed by default on devservers, but not on Macs. To
+work on this site on Macs, add `fbsource/xplat/third-party/node/bin` and
+`fbsource/third-party/yarn` to your `PATH`.
 
 ## Installation
 
+The very first time:
+
 ```shell
 $ yarn global add node-gyp
-$ yarn
 ```
 
-If on Eden you might get faster builds by doing `eden redirect add $PWD/node_modules bind` first.
-
-## Build
-
-To build a copy of the static content against the version of `buck2` on your path:
+And if on Eden:
 
 ```shell
-$ yarn build
+$ eden redirect add $PWD/node_modules bind
+$ eden redirect add $PWD/build bind
 ```
 
-To build a copy of the static content using `../.buck2.sh` (which builds buck2 from the repo before invoking it):
+Also on your first time, and potentially after each large rebase:
 
 ```shell
-$ yarn build_local
+$ yarn install
 ```
 
-To build a copy of the static content using Cargo to build buck2:
+## Building Generated Content
+
+Again, on your first time:
+
 ```shell
-$ yarn build_cargo
+$ yarn generate
 ```
 
-All of these commands generate static content into the `build` directory and can be served using any static contents hosting service.
+You will need to re-run this each time you want to see changes to generated
+content, primarily the API docs. You can alternatively `yarn generate_local` to
+update generated content using a built-from-source buck2.
 
 ## Local Development
+
+```shell
+$ yarn start-fb
+```
+
+This command starts a local development server, and if on Mac, opens up a local
+browser window.
+
+On a devserver, the window does not open for you, but you can head to
+https://devvmXX.foo.com:9094 in your browser. This requires lighthouse or VPN.
+
+To get your changes reflected on the local server:
+
+1.  For non-generated markdown content in the `docs/` directory, reload the
+    page.
+2.  For generated markdown content, re-run `yarn generate` as above and reload
+    the page.
+3.  For other changes to the site configuration, Ctrl+C and restart
+    `yarn start`. Then, hard-reload the page (Ctrl+Shift+R).
+
+## OSS Variants
+
+To see the external versions of the page, do:
 
 ```shell
 $ yarn start
 ```
 
-This command starts a local development server and opens up a browser window. Any changes to generated Starlark API documentation require running the build command above, but changes to the .md files that are checked into the repository should be reflected live without having to restart the server.
+If on a devserver, this will require manually setting up an SSH tunnel by
+running the following **from your mac**:
 
-### Run on devserver
-
-If developing on a devserver, you'll need to create a tunnel from your Mac to the server, so you can access it in the browser.
-
-To do that, run the following **from your mac**:
-```
+```shell
 ssh -L 3000:localhost:3000 $DEVSERVER
 ```
 
-## Internal variants
+In all cases, you'll need to be either on lighthouse or VPN for this to work.
 
-To see the internal versions of the page, do:
+## Prod Build
 
-```shell
-$ yarn build-fb
-$ yarn start-fb
-```
+You can perform a production build via `yarn build` or `yarn build-fb`. This
+generates a static site into `build/`. This site can be served via any static
+site viewer - docusaurus has one built in that you can run via `yarn serve`. As
+of Oct 2024 this only works on Macs, not on devservers.
+
+Iterating on the prod build is slower than on the local `yarn start` server.
 
 ## Deployment
 
@@ -64,4 +95,5 @@ $ yarn start-fb
 $ GIT_USER=<Your GitHub username> USE_SSH=true yarn deploy
 ```
 
-If you are using GitHub pages for hosting, this command is a convenient way to build the website and push to the `gh-pages` branch.
+If you are using GitHub pages for hosting, this command is a convenient way to
+build the website and push to the `gh-pages` branch.

@@ -12,27 +12,22 @@ use std::str::FromStr;
 use allocative::Allocative;
 use dupe::Dupe;
 use gazebo::variants::VariantName;
-use thiserror::Error;
 
 /// which dice impl to use
-#[derive(Clone, Dupe, Copy, Debug, VariantName, Allocative)]
+#[derive(Clone, Dupe, Copy, Debug, VariantName, Allocative, PartialEq)]
 pub enum WhichDice {
     Legacy,
     Modern,
 }
 
-#[derive(Error, Debug)]
-#[error("Invalid type of WhichDice: `{0}`")]
-pub struct InvalidType(String);
-
 impl FromStr for WhichDice {
-    type Err = InvalidType;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
             "MODERN" => Ok(WhichDice::Modern),
             "LEGACY" => Ok(WhichDice::Legacy),
-            _ => Err(InvalidType(s.to_owned())),
+            _ => Err(format!("Invalid type of WhichDice: `{s}`")),
         }
     }
 }

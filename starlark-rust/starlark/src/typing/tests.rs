@@ -20,6 +20,7 @@ use std::fmt::Write;
 
 use dupe::Dupe;
 use starlark_derive::starlark_module;
+use starlark_map::small_map::SmallMap;
 use starlark_syntax::golden_test_template::golden_test_template;
 
 use crate as starlark;
@@ -31,12 +32,26 @@ use crate::eval::runtime::file_loader::ReturnOwnedFileLoader;
 use crate::eval::Evaluator;
 use crate::syntax::AstModule;
 use crate::syntax::Dialect;
+use crate::tests::util::trim_rust_backtrace;
+use crate::typing::callable_param::ParamIsRequired;
 use crate::typing::interface::Interface;
 use crate::typing::AstModuleTypecheck;
+use crate::typing::ParamSpec;
+use crate::typing::Ty;
+use crate::util::ArcStr;
 use crate::values::none::NoneType;
+use crate::values::typing::StarlarkCallable;
+use crate::values::typing::StarlarkCallableParamSpec;
 use crate::values::typing::StarlarkIter;
 use crate::values::Value;
 use crate::values::ValueOfUnchecked;
+
+mod call;
+mod callable;
+mod list;
+mod special_function;
+mod tuple;
+mod types;
 
 #[derive(Default)]
 struct TypeCheck {
@@ -44,12 +59,38 @@ struct TypeCheck {
     loads: HashMap<String, (Interface, FrozenModule)>,
 }
 
+struct NamedXy;
+
+impl StarlarkCallableParamSpec for NamedXy {
+    fn params() -> ParamSpec {
+        ParamSpec::new_named_only([
+            (ArcStr::new_static("x"), ParamIsRequired::Yes, Ty::string()),
+            (ArcStr::new_static("y"), ParamIsRequired::Yes, Ty::int()),
+        ])
+        .unwrap()
+    }
+}
+
 #[starlark_module]
 fn register_typecheck_globals(globals: &mut GlobalsBuilder) {
     fn accepts_iterable<'v>(
         #[starlark(require = pos)] xs: ValueOfUnchecked<'v, StarlarkIter<Value<'v>>>,
     ) -> anyhow::Result<NoneType> {
-        let _ = xs;
+        let _ignore = xs;
+        Ok(NoneType)
+    }
+
+    fn accepts_typed_kwargs(
+        #[starlark(kwargs)] x: SmallMap<String, u32>,
+    ) -> anyhow::Result<NoneType> {
+        let _ignore = x;
+        Ok(NoneType)
+    }
+
+    fn accepts_callable_named_xy<'v>(
+        #[starlark(require = pos)] f: StarlarkCallable<'v, NamedXy, NoneType>,
+    ) -> anyhow::Result<NoneType> {
+        let _ignore = f;
         Ok(NoneType)
     }
 }
@@ -82,10 +123,9 @@ impl TypeCheck {
         let globals = GlobalsBuilder::extended()
             .with(register_typecheck_globals)
             .build();
-        // `AstModule` is not `Clone`. Parse twice.
-        let ast0 = AstModule::parse("filename", code.to_owned(), &Dialect::Extended).unwrap();
-        let ast1 = AstModule::parse("filename", code.to_owned(), &Dialect::Extended).unwrap();
-        let (errors, typemap, interface, approximations) = ast0.typecheck(
+        let ast =
+            AstModule::parse("filename", code.to_owned(), &Dialect::AllOptionsInternal).unwrap();
+        let (errors, typemap, interface, approximations) = ast.clone().typecheck(
             &globals,
             &self
                 .loads
@@ -142,15 +182,16 @@ impl TypeCheck {
             eval.set_loader(&loader);
 
             eval.enable_static_typechecking(true);
-            let eval_result = eval.eval_module(ast1, &globals);
-            match &eval_result {
-                Ok(_) => writeln!(output, "No errors.").unwrap(),
-                Err(err) => writeln!(output, "{}", err).unwrap(),
+            let eval_result = eval.eval_module(ast, &globals);
+            if eval_result.is_ok() != errors.is_empty() {
+                writeln!(output, "Compiler typechecker and eval results mismatch.").unwrap();
+                writeln!(output).unwrap();
             }
 
-            if eval_result.is_ok() != errors.is_empty() {
-                writeln!(output).unwrap();
-                writeln!(output, "Compiler typechecker and eval results mismatch.").unwrap();
+            // Additional writes must happen above this line otherwise it might be erased by trim_rust_backtrace
+            match &eval_result {
+                Ok(_) => writeln!(output, "No errors.").unwrap(),
+                Err(err) => writeln!(output, "{:?}", err).unwrap(),
             }
 
             // Help borrow checker.
@@ -159,7 +200,10 @@ impl TypeCheck {
             module.freeze().unwrap()
         };
 
-        golden_test_template(&format!("src/typing/golden/{}.golden", test_name), &output);
+        golden_test_template(
+            &format!("src/typing/tests/golden/{}.golden", test_name),
+            trim_rust_backtrace(&output),
+        );
 
         (interface, module)
     }
@@ -225,31 +269,6 @@ def test():
 }
 
 #[test]
-fn test_type_kwargs() {
-    TypeCheck::new().check(
-        "type_kwargs",
-        r#"
-def foo(**kwargs):
-    pass
-
-def bar():
-    foo(**{1: "x"})
-"#,
-    );
-}
-
-#[test]
-fn test_types_of_args_kwargs() {
-    TypeCheck::new().ty("args").ty("kwargs").check(
-        "types_of_args_kwargs",
-        r#"
-def foo(*args: str, **kwargs: int):
-    pass
-"#,
-    );
-}
-
-#[test]
 fn test_dot_type() {
     TypeCheck::new().check(
         "dot_type_0",
@@ -269,187 +288,6 @@ def foo(x: list) -> bool:
 
 def bar():
     foo(True)
-"#,
-    );
-}
-
-#[test]
-fn test_special_function_zip() {
-    TypeCheck::new().ty("x").check(
-        "zip",
-        r#"
-def test():
-    x = zip([1,2], [True, False], ["a", "b"])
-"#,
-    );
-}
-
-#[test]
-fn test_special_function_struct() {
-    TypeCheck::new().ty("x").check(
-        "struct",
-        r#"
-def test():
-    x = struct(a = 1, b = "test")
-"#,
-    );
-}
-
-#[test]
-fn test_call_callable() {
-    TypeCheck::new().check(
-        "call_callable",
-        r#"
-def foo(x: typing.Callable):
-    x()
-"#,
-    );
-}
-
-#[test]
-fn test_call_not_callable() {
-    TypeCheck::new().check(
-        "call_not_callable",
-        r#"
-def foo(x: list):
-    x()
-"#,
-    );
-}
-
-#[test]
-fn test_call_callable_or_not_callable() {
-    TypeCheck::new().check(
-        "call_callable_or_not_callable",
-        r#"
-def foo(x: [typing.Callable, str], y: [str, typing.Callable]):
-    x()
-    y()
-"#,
-    );
-}
-
-#[test]
-fn test_tuple() {
-    TypeCheck::new().check(
-        "tuple",
-        r#"
-def empty_tuple_fixed_name() -> (): return tuple()
-def empty_tuple_name_fixed() -> tuple: return ()
-"#,
-    );
-}
-
-#[test]
-fn test_tuple_ellipsis() {
-    TypeCheck::new().check(
-        "tuple_ellipsis",
-        r#"
-def f(t: tuple[int, ...]) -> int:
-    return t[0]
-
-def g():
-    # Good.
-    f((1, 2, 3))
-
-    # Bad.
-    f((1, "x"))
-"#,
-    );
-}
-
-#[test]
-fn test_test_new_syntax_without_dot_type() {
-    TypeCheck::new().check(
-        "new_syntax_without_dot_type",
-        r#"
-def foo(x: str): pass
-
-def bar():
-    # good
-    foo("test")
-
-    # bad
-    foo(1)
-"#,
-    );
-}
-
-#[test]
-fn test_calls() {
-    TypeCheck::new().check(
-        "calls",
-        r#"
-def f(y): pass
-
-def g():
-    # Extra parameter.
-    f(1, 2)
-
-    # Not enough parameters.
-    f()
-"#,
-    );
-}
-
-#[test]
-fn test_list_append() {
-    TypeCheck::new().ty("x").check(
-        "list_append",
-        r#"
-def test():
-    # Type of `x` should be inferred as list of either `int` or `str`.
-    x = []
-    x.append(1)
-    x.append("")
-"#,
-    );
-}
-
-#[test]
-fn test_list_append_bug() {
-    // TODO(nga): fix.
-    TypeCheck::new().ty("x").check(
-        "list_append_bug",
-        r#"
-def test():
-    x = []
-    x.append(x)
-"#,
-    );
-}
-
-#[test]
-fn test_list_function() {
-    TypeCheck::new().ty("x").check(
-        "list_function",
-        r#"
-def test():
-    x = list([1, 2])
-"#,
-    );
-}
-
-#[test]
-fn test_list_less() {
-    TypeCheck::new().check(
-        "list_less",
-        r#"
-def test(x: list[str], y: list[str]) -> bool:
-    return x < y
-"#,
-    );
-}
-
-#[test]
-fn test_list_bin_op() {
-    TypeCheck::new().ty("x").ty("y").ty("z").check(
-        "list_bin_op",
-        r#"
-def test(a: list[str]):
-    x = a + a
-    y = a * 3
-    z = 3 * a
 "#,
     );
 }
@@ -549,18 +387,6 @@ def test():
 }
 
 #[test]
-fn test_int_mul_list() {
-    // TODO(nga): fix.
-    TypeCheck::new().ty("x").check(
-        "int_mul_list",
-        r#"
-def test():
-    x = 1 * ["a"]
-"#,
-    );
-}
-
-#[test]
 fn test_un_op() {
     TypeCheck::new().ty("x").ty("y").ty("z").check(
         "un_op",
@@ -593,47 +419,58 @@ def func_which_returns_union(p) -> str | int:
 }
 
 #[test]
-fn test_type_alias() {
-    TypeCheck::new().ty("x").check(
-        "type_alias",
-        r#"
-MyList = list[int]
-
-def f(x: MyList):
-    pass
-"#,
-    );
-}
-
-#[test]
-fn test_incorrect_type_dot() {
-    TypeCheck::new().check(
-        "incorrect_type_dot",
-        r#"
-def foo(x: list.foo.bar):
-    pass
-"#,
-    );
-}
-
-#[test]
-fn test_never_call_bug() {
-    TypeCheck::new().ty("y").check(
-        "never_call_bug",
-        r#"
-def foo(x: typing.Never):
-    y = x(1)
-"#,
-    );
-}
-
-#[test]
 fn test_methods_work_for_ty_starlark_value() {
     TypeCheck::new().ty("x").check(
         "methods_work_for_ty_starlark_value",
         r#"
 def test(s: str):
     x = s.startswith("a")
+"#,
+    );
+}
+
+#[test]
+fn test_bit_or_return_int() {
+    TypeCheck::new().check(
+        "bit_or_return_int",
+        r#"
+test = int | 3
+
+def foo() -> test:
+    pass
+"#,
+    );
+}
+
+#[test]
+fn test_bit_or_return_list() {
+    TypeCheck::new().check(
+        "bit_or_return_list",
+        r#"
+test = int | list[3]
+
+def foo() -> test:
+    pass
+"#,
+    );
+}
+
+#[test]
+fn test_bit_or_with_load() {
+    let (interface, module) = TypeCheck::new().check(
+        "test_bit_or_with_load_foo",
+        r#"
+def foo() -> str:
+    return "test"
+"#,
+    );
+    TypeCheck::new().load("foo.bzl", interface, module).check(
+        "test_bit_or_with_load",
+        r#"
+load("foo.bzl", "foo")
+test = int | foo()
+def test() -> test:
+    pass
 "#,
     );
 }

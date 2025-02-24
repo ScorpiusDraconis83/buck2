@@ -8,14 +8,15 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
+#![feature(trait_upcasting)]
 
 pub mod calculation;
 pub mod configuration;
 pub mod nodes;
-pub mod target;
 
 pub fn init_late_bindings() {
     calculation::init_configured_target_calculation();
+    configuration::calculation::init_get_execution_platforms();
+    configuration::calculation::init_configuration_calculation();
     nodes::calculation::init_configured_target_node_calculation();
 }

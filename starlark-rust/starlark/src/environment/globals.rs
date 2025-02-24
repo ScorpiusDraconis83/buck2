@@ -23,53 +23,39 @@ use itertools::Itertools;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 
-use crate::collections::symbol_map::Symbol;
-use crate::collections::symbol_map::SymbolMap;
-use crate::collections::Hashed;
+use crate::__derive_refs::components::NativeCallableComponents;
+use crate::collections::symbol::map::SymbolMap;
 use crate::collections::SmallMap;
-use crate::docs::DocMember;
+use crate::docs::DocItem;
 use crate::docs::DocModule;
-use crate::docs::DocObject;
 use crate::docs::DocString;
 use crate::docs::DocStringKind;
+use crate::docs::DocType;
 use crate::stdlib;
 pub use crate::stdlib::LibraryExtension;
 use crate::typing::Ty;
-use crate::values::function::NativeAttribute;
-use crate::values::function::NativeCallableRawDocs;
 use crate::values::function::NativeFunc;
-use crate::values::function::NativeMeth;
 use crate::values::function::SpecialBuiltinFunction;
-use crate::values::layout::value_not_special::FrozenValueNotSpecial;
-use crate::values::structs::AllocStruct;
+use crate::values::namespace::value::MaybeDocHiddenValue;
+use crate::values::namespace::FrozenNamespace;
 use crate::values::types::function::NativeFunction;
-use crate::values::types::function::NativeMethod;
 use crate::values::AllocFrozenValue;
 use crate::values::FrozenHeap;
 use crate::values::FrozenHeapRef;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
-use crate::values::Heap;
 use crate::values::Value;
 
 /// The global values available during execution.
 #[derive(Clone, Dupe, Debug, Allocative)]
 pub struct Globals(Arc<GlobalsData>);
 
-/// Methods of an object.
-#[derive(Clone, Debug)]
-pub struct Methods {
-    /// This field holds the objects referenced in `members`.
-    #[allow(dead_code)]
-    heap: FrozenHeapRef,
-    members: SymbolMap<FrozenValueNotSpecial>,
-    docstring: Option<String>,
-}
+type GlobalValue = MaybeDocHiddenValue<'static, FrozenValue>;
 
 #[derive(Debug, Allocative)]
 struct GlobalsData {
     heap: FrozenHeapRef,
-    variables: SymbolMap<FrozenValue>,
+    variables: SymbolMap<GlobalValue>,
     variable_names: Vec<FrozenStringValue>,
     docstring: Option<String>,
 }
@@ -80,21 +66,13 @@ pub struct GlobalsBuilder {
     // The heap everything is allocated in
     heap: FrozenHeap,
     // Normal top-level variables, e.g. True/hash
-    variables: SymbolMap<FrozenValue>,
+    variables: SymbolMap<GlobalValue>,
     // The list of struct fields, pushed to the end
-    struct_fields: Vec<SmallMap<FrozenStringValue, FrozenValue>>,
-    // The raw docstring for this module
-    docstring: Option<String>,
-}
-
-/// Used to build a [`Methods`] value.
-#[derive(Debug)]
-pub struct MethodsBuilder {
-    /// The heap everything is allocated in.
-    heap: FrozenHeap,
-    /// Members, either `NativeMethod` or `NativeAttribute`.
-    members: SymbolMap<FrozenValueNotSpecial>,
-    /// The raw docstring for the main object.
+    namespace_fields: Vec<SmallMap<FrozenStringValue, GlobalValue>>,
+    /// The raw docstring for this module
+    ///
+    /// FIXME(JakobDegen): This should probably be removed. Having a docstring on a `GlobalsBuilder`
+    /// doesn't really make sense, because there's no way good way to combine multiple docstrings.
     docstring: Option<String>,
 }
 
@@ -141,7 +119,7 @@ impl Globals {
     /// This function is only safe if you first call `heap` and keep a reference to it.
     /// Therefore, don't expose it on the public API.
     pub(crate) fn get_frozen(&self, name: &str) -> Option<FrozenValue> {
-        self.0.variables.get_str(name).copied()
+        self.0.variables.get_str(name).map(|x| x.value)
     }
 
     /// Get all the names defined in this environment.
@@ -152,7 +130,7 @@ impl Globals {
     /// Iterate over all the items in this environment.
     /// Note returned values are owned by this globals.
     pub fn iter(&self) -> impl Iterator<Item = (&str, FrozenValue)> {
-        self.0.variables.iter().map(|(n, v)| (n.as_str(), *v))
+        self.0.variables.iter().map(|(n, v)| (n.as_str(), v.value))
     }
 
     pub(crate) fn heap(&self) -> &FrozenHeapRef {
@@ -164,7 +142,7 @@ impl Globals {
         self.0
             .variables
             .iter()
-            .map(|(name, val)| val.to_value().describe(name.as_str()))
+            .map(|(name, val)| val.value.to_value().describe(name.as_str()))
             .join("\n")
     }
 
@@ -175,49 +153,18 @@ impl Globals {
 
     /// Get the documentation for both the object itself, and its members.
     pub fn documentation(&self) -> DocModule {
-        let DocObject { docs, members } = common_documentation(
+        let (docs, members) = common_documentation(
             &self.0.docstring,
-            self.0.variables.iter().map(|(n, v)| (n.as_str(), *v)),
-        );
-        DocModule { docs, members }
-    }
-}
-
-impl Methods {
-    pub(crate) fn get<'v>(&'v self, name: &str) -> Option<Value<'v>> {
-        self.get_frozen(name).map(FrozenValueNotSpecial::to_value)
-    }
-
-    pub(crate) fn get_frozen(&self, name: &str) -> Option<FrozenValueNotSpecial> {
-        self.members.get_str(name).copied()
-    }
-
-    pub(crate) fn get_hashed(&self, name: Hashed<&str>) -> Option<FrozenValueNotSpecial> {
-        self.members.get_hashed_str(name).copied()
-    }
-
-    pub(crate) fn get_frozen_symbol(&self, name: &Symbol) -> Option<FrozenValueNotSpecial> {
-        self.members.get(name).copied()
-    }
-
-    pub(crate) fn names(&self) -> Vec<String> {
-        self.members.keys().map(|x| x.as_str().to_owned()).collect()
-    }
-
-    pub(crate) fn members(&self) -> impl Iterator<Item = (&str, FrozenValue)> {
-        self.members
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.to_frozen_value()))
-    }
-
-    /// Fetch the documentation.
-    pub fn documentation(&self) -> DocObject {
-        common_documentation(
-            &self.docstring,
-            self.members
+            self.0
+                .variables
                 .iter()
-                .map(|(n, v)| (n.as_str(), v.to_frozen_value())),
-        )
+                .filter(|(_, v)| !v.doc_hidden)
+                .map(|(n, v)| (n.as_str(), v.value)),
+        );
+        DocModule {
+            docs,
+            members: members.collect(),
+        }
     }
 }
 
@@ -227,7 +174,7 @@ impl GlobalsBuilder {
         Self {
             heap: FrozenHeap::new(),
             variables: SymbolMap::new(),
-            struct_fields: Vec::new(),
+            namespace_fields: Vec::new(),
             docstring: None,
         }
     }
@@ -254,13 +201,31 @@ impl GlobalsBuilder {
         res
     }
 
-    /// Add a nested struct to the builder. If `f` adds the definition `foo`,
-    /// it will end up on a struct `name`, accessible as `name.foo`.
-    pub fn struct_(&mut self, name: &str, f: impl FnOnce(&mut GlobalsBuilder)) {
-        self.struct_fields.push(SmallMap::new());
+    /// Add a nested namespace to the builder. If `f` adds the definition `foo`,
+    /// it will end up on a namespace `name`, accessible as `name.foo`.
+    pub fn namespace(&mut self, name: &str, f: impl FnOnce(&mut GlobalsBuilder)) {
+        self.namespace_inner(name, false, f)
+    }
+
+    /// Same as `namespace`, but this value will not show up in generated documentation.
+    pub fn namespace_no_docs(&mut self, name: &str, f: impl FnOnce(&mut GlobalsBuilder)) {
+        self.namespace_inner(name, true, f)
+    }
+
+    fn namespace_inner(
+        &mut self,
+        name: &str,
+        doc_hidden: bool,
+        f: impl FnOnce(&mut GlobalsBuilder),
+    ) {
+        self.namespace_fields.push(SmallMap::new());
         f(self);
-        let fields = self.struct_fields.pop().unwrap();
-        self.set(name, AllocStruct(fields));
+        let fields = self.namespace_fields.pop().unwrap();
+        self.set_inner(
+            name,
+            self.heap.alloc(FrozenNamespace::new(fields)),
+            doc_hidden,
+        );
     }
 
     /// A fluent API for modifying [`GlobalsBuilder`] and returning the result.
@@ -269,9 +234,9 @@ impl GlobalsBuilder {
         self
     }
 
-    /// A fluent API for modifying [`GlobalsBuilder`] using [`struct_`](GlobalsBuilder::struct_).
-    pub fn with_struct(mut self, name: &str, f: impl Fn(&mut GlobalsBuilder)) -> Self {
-        self.struct_(name, f);
+    /// A fluent API for modifying [`GlobalsBuilder`] using [`namespace`](GlobalsBuilder::namespace).
+    pub fn with_namespace(mut self, name: &str, f: impl Fn(&mut GlobalsBuilder)) -> Self {
+        self.namespace(name, f);
         self
     }
 
@@ -294,7 +259,16 @@ impl GlobalsBuilder {
     /// Set a value in the [`GlobalsBuilder`].
     pub fn set<'v, V: AllocFrozenValue>(&'v mut self, name: &str, value: V) {
         let value = value.alloc_frozen_value(&self.heap);
-        match self.struct_fields.last_mut() {
+        self.set_inner(name, value, false)
+    }
+
+    fn set_inner<'v>(&'v mut self, name: &str, value: FrozenValue, doc_hidden: bool) {
+        let value = MaybeDocHiddenValue {
+            value,
+            doc_hidden,
+            phantom: Default::default(),
+        };
+        match self.namespace_fields.last_mut() {
             None => {
                 // TODO(nga): do not quietly ignore redefinitions.
                 self.variables.insert(name, value)
@@ -311,9 +285,8 @@ impl GlobalsBuilder {
     pub fn set_function<F>(
         &mut self,
         name: &str,
-        speculative_exec_safe: bool,
-        raw_docs: NativeCallableRawDocs,
-        type_attr: Option<Ty>,
+        components: NativeCallableComponents,
+        as_type: Option<(Ty, DocType)>,
         ty: Option<Ty>,
         special_builtin_function: Option<SpecialBuiltinFunction>,
         f: F,
@@ -325,10 +298,16 @@ impl GlobalsBuilder {
             NativeFunction {
                 function: Box::new(f),
                 name: name.to_owned(),
-                speculative_exec_safe,
-                type_attr,
-                ty: Some(ty.unwrap_or_else(|| Ty::from_docs_function(&raw_docs.documentation()))),
-                raw_docs: Some(raw_docs),
+                speculative_exec_safe: components.speculative_exec_safe,
+                as_type: as_type.as_ref().map(|x| x.0.dupe()),
+                ty: ty.unwrap_or_else(|| {
+                    Ty::from_native_callable_components(
+                        &components,
+                        as_type.as_ref().map(|x| x.0.dupe()),
+                    )
+                    .unwrap() // TODO(nga): do not unwrap.
+                }),
+                docs: components.into_docs(as_type),
                 special_builtin_function,
             },
         )
@@ -355,143 +334,8 @@ impl GlobalsBuilder {
     }
 }
 
-impl Methods {
-    /// Create an empty [`Globals`], with no functions in scope.
-    pub fn new() -> Self {
-        MethodsBuilder::new().build()
-    }
-}
-
-impl MethodsBuilder {
-    /// Create an empty [`MethodsBuilder`], with no functions in scope.
-    pub fn new() -> Self {
-        MethodsBuilder {
-            heap: FrozenHeap::new(),
-            members: SymbolMap::new(),
-            docstring: None,
-        }
-    }
-
-    /// Called at the end to build a [`Methods`].
-    pub fn build(self) -> Methods {
-        Methods {
-            heap: self.heap.into_ref(),
-            members: self.members,
-            docstring: self.docstring,
-        }
-    }
-
-    /// A fluent API for modifying [`MethodsBuilder`] and returning the result.
-    pub fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
-        f(&mut self);
-        self
-    }
-
-    /// Set the raw docstring for this object.
-    pub fn set_docstring(&mut self, docstring: &str) {
-        self.docstring = Some(docstring.to_owned());
-    }
-
-    /// Set a constant value in the [`MethodsBuilder`] that will be suitable for use with
-    /// [`StarlarkValue::get_methods`](crate::values::StarlarkValue::get_methods).
-    pub fn set_attribute<'v, V: AllocFrozenValue>(
-        &'v mut self,
-        name: &str,
-        value: V,
-        docstring: Option<String>,
-    ) {
-        // We want to build an attribute, that ignores its self argument, and does no subsequent allocation.
-        let value = self.heap.alloc(value);
-        self.set_attribute_fn(
-            name,
-            true,
-            docstring,
-            V::starlark_type_repr(),
-            move |_, _| Ok(value.to_value()),
-        );
-    }
-
-    /// Set an attribute. This function is usually called from code
-    /// generated by `starlark_derive` and rarely needs to be called manually.
-    pub fn set_attribute_fn<F>(
-        &mut self,
-        name: &str,
-        speculative_exec_safe: bool,
-        docstring: Option<String>,
-        typ: Ty,
-        f: F,
-    ) where
-        F: for<'v> Fn(Value<'v>, &'v Heap) -> crate::Result<Value<'v>> + Send + Sync + 'static,
-    {
-        self.members.insert(
-            name,
-            FrozenValueNotSpecial::new(self.heap.alloc(NativeAttribute {
-                function: Box::new(f),
-                speculative_exec_safe,
-                docstring,
-                typ,
-            }))
-            .unwrap(),
-        );
-    }
-
-    /// Set a method. This function is usually called from code
-    /// generated by `starlark_derive` and rarely needs to be called manually.
-    pub fn set_method<F>(
-        &mut self,
-        name: &str,
-        speculative_exec_safe: bool,
-        raw_docs: NativeCallableRawDocs,
-        f: F,
-    ) where
-        F: NativeMeth,
-    {
-        let ty = Ty::from_docs_function(&raw_docs.documentation());
-
-        self.members.insert(
-            name,
-            FrozenValueNotSpecial::new(self.heap.alloc(NativeMethod {
-                function: Box::new(f),
-                name: name.to_owned(),
-                speculative_exec_safe,
-                raw_docs,
-                ty,
-            }))
-            .unwrap(),
-        );
-    }
-
-    /// Allocate a value using the same underlying heap as the [`MethodsBuilder`]
-    pub fn alloc<'v, V: AllocFrozenValue>(&'v self, value: V) -> FrozenValue {
-        value.alloc_frozen_value(&self.heap)
-    }
-}
-
-/// Used to create methods for a [`StarlarkValue`](crate::values::StarlarkValue).
-///
-/// To define a method `foo()` on your type, define
-///  usually written as:
-///
-/// ```ignore
-/// fn my_methods(builder: &mut GlobalsBuilder) {
-///     fn foo(me: ARef<Foo>) -> anyhow::Result<NoneType> {
-///         ...
-///     }
-/// }
-///
-/// impl StarlarkValue<'_> for Foo {
-///     ...
-///     fn get_methods(&self) -> Option<&'static Globals> {
-///         static RES: GlobalsStatic = GlobalsStatic::new();
-///         RES.methods(module_creator)
-///     }
-///     ...
-/// }
-/// ```
+/// Used to create globals.
 pub struct GlobalsStatic(OnceCell<Globals>);
-
-/// Similar to [`GlobalsStatic`], but for methods.
-pub struct MethodsStatic(OnceCell<Methods>);
 
 impl GlobalsStatic {
     /// Create a new [`GlobalsStatic`].
@@ -516,7 +360,7 @@ impl GlobalsStatic {
                 .join(", ")
         );
 
-        *globals.0.variables.values().next().unwrap()
+        globals.0.variables.values().next().unwrap().value
     }
 
     /// Move all the globals in this [`GlobalsBuilder`] into a new one. All variables will
@@ -524,66 +368,33 @@ impl GlobalsStatic {
     pub fn populate(&'static self, x: impl FnOnce(&mut GlobalsBuilder), out: &mut GlobalsBuilder) {
         let globals = self.globals(x);
         for (name, value) in globals.0.variables.iter() {
-            out.set(name.as_str(), *value)
+            out.set_inner(name.as_str(), value.value, value.doc_hidden)
         }
         out.docstring = globals.0.docstring.clone();
     }
 }
 
-impl MethodsStatic {
-    /// Create a new [`MethodsStatic`].
-    pub const fn new() -> Self {
-        Self(OnceCell::new())
-    }
-
-    /// Populate the globals with a builder function. Always returns `Some`, but using this API
-    /// to be a better fit for [`StarlarkValue.get_methods`](crate::values::StarlarkValue::get_methods).
-    pub fn methods(&'static self, x: impl FnOnce(&mut MethodsBuilder)) -> Option<&'static Methods> {
-        Some(self.0.get_or_init(|| MethodsBuilder::new().with(x).build()))
-    }
-
-    /// Move all the globals in this [`GlobalsBuilder`] into a new one. All variables will
-    /// only be allocated once (ensuring things like function comparison works properly).
-    pub fn populate(&'static self, x: impl FnOnce(&mut MethodsBuilder), out: &mut MethodsBuilder) {
-        let methods = self.methods(x).unwrap();
-        for (name, value) in methods.members.iter() {
-            out.members.insert(name.as_str(), *value);
-        }
-        out.docstring = methods.docstring.clone();
-    }
-}
-
-fn common_documentation<'a>(
+pub(crate) fn common_documentation<'a>(
     docstring: &Option<String>,
     members: impl IntoIterator<Item = (&'a str, FrozenValue)>,
-) -> DocObject {
+) -> (Option<DocString>, impl Iterator<Item = (String, DocItem)>) {
     let main_docs = docstring
         .as_ref()
         .and_then(|ds| DocString::from_docstring(DocStringKind::Rust, ds));
     let member_docs = members
         .into_iter()
-        .map(|(name, val)| (name.to_owned(), DocMember::from_value(val.to_value())))
-        .sorted_by(|(l, _), (r, _)| Ord::cmp(l, r))
-        .collect();
+        .map(|(name, val)| (name.to_owned(), val.to_value().documentation()))
+        .sorted_by(|(l, _), (r, _)| Ord::cmp(l, r));
 
-    DocObject {
-        docs: main_docs,
-        members: member_docs,
-    }
+    (main_docs, member_docs)
 }
 
 #[cfg(test)]
 mod tests {
-    use derive_more::Display;
-    use starlark_derive::starlark_value;
+    use starlark_derive::starlark_module;
 
     use super::*;
     use crate as starlark;
-    use crate::any::ProvidesStaticType;
-    use crate::assert::Assert;
-    use crate::starlark_simple_value;
-    use crate::values::NoSerialize;
-    use crate::values::StarlarkValue;
 
     #[test]
     fn test_send_sync()
@@ -592,30 +403,28 @@ mod tests {
     {
     }
 
-    #[test]
-    fn test_set_attribute() {
-        #[derive(Debug, Display, ProvidesStaticType, NoSerialize, Allocative)]
-        #[display(fmt = "Magic")]
-        struct Magic;
-        starlark_simple_value!(Magic);
-
-        #[starlark_value(type = "magic")]
-        impl<'v> StarlarkValue<'v> for Magic {
-            fn get_methods() -> Option<&'static Methods> {
-                static RES: MethodsStatic = MethodsStatic::new();
-                RES.methods(|x| {
-                    x.set_attribute("my_type", "magic", None);
-                    x.set_attribute("my_value", 42, None);
-                })
-            }
+    #[starlark_module]
+    fn register_foo(builder: &mut GlobalsBuilder) {
+        fn foo() -> anyhow::Result<i32> {
+            Ok(1)
         }
+    }
 
-        let mut a = Assert::new();
-        a.globals_add(|x| x.set("magic", Magic));
-        a.pass(
-            r#"
-assert_eq(magic.my_type, "magic")
-assert_eq(magic.my_value, 42)"#,
-        );
+    #[test]
+    fn test_doc_hidden() {
+        let mut globals = GlobalsBuilder::new();
+        globals.namespace_no_docs("ns_hidden", |_| {});
+        globals.namespace("ns", |globals| {
+            globals.namespace_no_docs("nested_ns_hidden", |_| {});
+            globals.set("x", FrozenValue::new_none());
+        });
+        let docs = globals.build().documentation();
+
+        let (k, v) = docs.members.into_iter().exactly_one().ok().unwrap();
+        assert_eq!(&k, "ns");
+        let DocItem::Module(docs) = v else {
+            unreachable!()
+        };
+        assert_eq!(&docs.members.into_keys().exactly_one().ok().unwrap(), "x");
     }
 }

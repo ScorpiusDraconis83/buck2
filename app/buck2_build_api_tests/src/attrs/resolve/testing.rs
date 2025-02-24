@@ -14,11 +14,13 @@ use buck2_analysis::attrs::resolve::ctx::AttrResolutionContext;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::FrozenCommandLineArg;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::template_placeholder_info::FrozenTemplatePlaceholderInfo;
 use buck2_build_api::interpreter::rule_defs::provider::callable::register_provider;
+use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::registration::register_builtin_providers;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
+use buck2_error::BuckErrorContext;
 use buck2_interpreter::types::provider::callable::ValueAsProviderCallableLike;
 use buck2_interpreter_for_build::attrs::coerce;
 use buck2_interpreter_for_build::attrs::coerce::testing;
@@ -32,6 +34,7 @@ use starlark::environment::Globals;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Module;
 use starlark::values::dict::FrozenDictRef;
+use starlark::values::FrozenValueTyped;
 use starlark_map::small_map::SmallMap;
 use starlark_map::smallmap;
 
@@ -214,17 +217,19 @@ pub(crate) fn resolution_ctx_with_providers<'v>(
         fn get_dep(
             &self,
             target: &ConfiguredProvidersLabel,
-        ) -> anyhow::Result<FrozenProviderCollectionValue> {
-            self.deps
+        ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>> {
+            Ok(self
+                .deps
                 .get(target)
                 .duped()
-                .ok_or_else(|| anyhow::anyhow!("missing dep"))
+                .buck_error_context("missing dep")?
+                .add_heap_ref(self.module.frozen_heap()))
         }
 
         fn resolve_unkeyed_placeholder(
             &self,
             name: &str,
-        ) -> anyhow::Result<Option<FrozenCommandLineArg>> {
+        ) -> buck2_error::Result<Option<FrozenCommandLineArg>> {
             for providers in self.deps.values() {
                 if let Some(placeholders) = providers
                     .provider_collection()

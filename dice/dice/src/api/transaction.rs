@@ -12,10 +12,10 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 
 use allocative::Allocative;
+use dice_error::DiceResult;
 use dupe::Dupe;
 
 use crate::api::computations::DiceComputations;
-use crate::api::error::DiceResult;
 use crate::api::key::Key;
 use crate::api::user_data::UserComputationData;
 use crate::transaction::DiceTransactionImpl;
@@ -141,7 +141,7 @@ impl DiceEquivalent for DiceEquality {
 }
 
 impl Deref for DiceTransaction {
-    type Target = DiceComputations;
+    type Target = DiceComputations<'static>;
 
     fn deref(&self) -> &Self::Target {
         self.0.as_computations()

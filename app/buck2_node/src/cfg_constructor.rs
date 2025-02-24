@@ -21,6 +21,7 @@ use dice::DiceComputations;
 use crate::metadata::key::MetadataKeyRef;
 use crate::metadata::value::MetadataValue;
 use crate::nodes::unconfigured::TargetNodeRef;
+use crate::rule_type::RuleType;
 use crate::super_package::SuperPackage;
 
 /// Trait for configuration constructor functions.
@@ -29,12 +30,13 @@ use crate::super_package::SuperPackage;
 pub trait CfgConstructorImpl: Send + Sync + Debug + Allocative {
     fn eval<'a>(
         &'a self,
-        ctx: &'a DiceComputations,
+        ctx: &'a mut DiceComputations,
         cfg: &'a ConfigurationData,
         package_cfg_modifiers: Option<&'a MetadataValue>,
         target_cfg_modifiers: Option<&'a MetadataValue>,
         cli_modifiers: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ConfigurationData>> + Send + 'a>>;
+        rule_type: &'a RuleType,
+    ) -> Pin<Box<dyn Future<Output = buck2_error::Result<ConfigurationData>> + Send + 'a>>;
 
     /// Returns the metadata key used to encode modifiers in PACKAGE values and metadata attribute
     fn key<'a>(&'a self) -> &'a MetadataKeyRef;
@@ -46,20 +48,15 @@ pub static CFG_CONSTRUCTOR_CALCULATION_IMPL: LateBinding<
 
 #[async_trait]
 pub trait CfgConstructorCalculationImpl: Send + Sync + 'static {
-    /// Loads and returns cfg constructor functions.
-    async fn get_cfg_constructor(
-        &self,
-        ctx: &DiceComputations,
-    ) -> anyhow::Result<Option<Arc<dyn CfgConstructorImpl>>>;
-
     /// Invokes starlark cfg constructors on provided configuration
     /// and returns the result.
     async fn eval_cfg_constructor(
         &self,
-        ctx: &DiceComputations,
+        ctx: &mut DiceComputations<'_>,
         target: TargetNodeRef<'_>,
         super_package: &SuperPackage,
         cfg: ConfigurationData,
         cli_modifiers: &Arc<Vec<String>>,
-    ) -> anyhow::Result<ConfigurationData>;
+        rule_name: &RuleType,
+    ) -> buck2_error::Result<ConfigurationData>;
 }

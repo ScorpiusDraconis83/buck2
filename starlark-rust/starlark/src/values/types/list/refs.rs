@@ -15,11 +15,16 @@
  * limitations under the License.
  */
 
+use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Display;
+use std::iter;
 use std::ops::Deref;
+use std::slice;
 
-use crate as starlark;
+use ref_cast::ref_cast_custom;
+use ref_cast::RefCastCustom;
+
 use crate::coerce::coerce;
 use crate::typing::Ty;
 use crate::values::list::value::display_list;
@@ -27,7 +32,6 @@ use crate::values::list::value::FrozenListData;
 use crate::values::list::value::ListGen;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::list::value::ListData;
-use crate::values::Coerce;
 use crate::values::FrozenValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
@@ -35,14 +39,14 @@ use crate::values::ValueLike;
 
 /// Reference to list content (mutable or frozen).
 #[repr(transparent)]
-#[derive(Coerce)]
+#[derive(RefCastCustom)]
 pub struct ListRef<'v> {
     pub(crate) content: [Value<'v>],
 }
 
 /// Reference to frozen list content.
 #[repr(transparent)]
-#[derive(Coerce)]
+#[derive(RefCastCustom)]
 pub struct FrozenListRef {
     pub(crate) content: [FrozenValue],
 }
@@ -51,8 +55,12 @@ impl<'v> ListRef<'v> {
     /// `type([])`, which is `"list"`.
     pub const TYPE: &'static str = ListData::TYPE;
 
-    pub(crate) fn new<'a>(slice: &'a [Value<'v>]) -> &'a ListRef<'v> {
-        coerce(slice)
+    #[ref_cast_custom]
+    pub(crate) fn new<'a>(slice: &'a [Value<'v>]) -> &'a ListRef<'v>;
+
+    /// Empty list reference.
+    pub fn empty() -> &'v ListRef<'v> {
+        ListRef::new(&[])
     }
 
     /// List elements.
@@ -61,7 +69,7 @@ impl<'v> ListRef<'v> {
     }
 
     /// Iterate over the elements in the list.
-    pub fn iter<'a>(&'a self) -> impl ExactSizeIterator<Item = Value<'v>> + 'a
+    pub fn iter<'a>(&'a self) -> iter::Copied<slice::Iter<'a, Value<'v>>>
     where
         'v: 'a,
     {
@@ -90,9 +98,8 @@ impl FrozenListRef {
     /// `type([])`, which is `"list"`.
     pub const TYPE: &'static str = ListRef::TYPE;
 
-    fn new(slice: &[FrozenValue]) -> &FrozenListRef {
-        coerce(slice)
-    }
+    #[ref_cast_custom]
+    fn new(slice: &[FrozenValue]) -> &FrozenListRef;
 
     /// Downcast to the frozen list.
     ///
@@ -140,33 +147,34 @@ impl Display for FrozenListRef {
 }
 
 impl<'v> StarlarkTypeRepr for &'v ListRef<'v> {
+    type Canonical = <Vec<Value<'v>> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Vec::<Value<'v>>::starlark_type_repr()
     }
 }
 
 impl<'v> StarlarkTypeRepr for &'v FrozenListRef {
+    type Canonical = <Vec<FrozenValue> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Vec::<FrozenValue>::starlark_type_repr()
     }
 }
 
 impl<'v> UnpackValue<'v> for &'v ListRef<'v> {
-    fn expected() -> String {
-        "list".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        ListRef::from_value(value)
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(ListRef::from_value(value))
     }
 }
 
 impl<'v> UnpackValue<'v> for &'v FrozenListRef {
-    fn expected() -> String {
-        "frozen list".to_owned()
-    }
+    type Error = crate::Error;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        FrozenListRef::from_value(value)
+    fn unpack_value_impl(value: Value<'v>) -> crate::Result<Option<Self>> {
+        // TODO(nga): error if not frozen.
+        Ok(FrozenListRef::from_value(value))
     }
 }

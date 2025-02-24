@@ -22,6 +22,10 @@ use display_container::fmt_container;
 use gazebo::prelude::VecExt;
 use indexmap::IndexSet;
 use starlark::any::ProvidesStaticType;
+use starlark::environment::Methods;
+use starlark::environment::MethodsBuilder;
+use starlark::environment::MethodsStatic;
+use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::starlark_value;
@@ -32,7 +36,7 @@ use starlark::values::StarlarkValue;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueError;
-use starlark::StarlarkDocs;
+use starlark::values::ValueLike;
 
 use crate::bxl::starlark_defs::context::BxlContextNoDice;
 
@@ -48,7 +52,10 @@ pub(crate) enum FileSetExpr<'v> {
 }
 
 impl<'a> FileSetExpr<'a> {
-    pub(crate) async fn get(self, bxl: &BxlContextNoDice<'_>) -> anyhow::Result<Cow<'a, FileSet>> {
+    pub(crate) async fn get(
+        self,
+        bxl: &BxlContextNoDice<'_>,
+    ) -> buck2_error::Result<Cow<'a, FileSet>> {
         let set = match self {
             FileSetExpr::Literal(val) => Cow::Owned(FileSet::from_iter([FileNode(
                 bxl.parse_query_file_literal(val)?,
@@ -66,9 +73,8 @@ impl<'a> FileSetExpr<'a> {
     }
 }
 
-#[derive(Debug, Display, ProvidesStaticType, Allocative, StarlarkDocs)]
+#[derive(Debug, Display, ProvidesStaticType, Allocative)]
 #[derive(NoSerialize)] // TODO maybe this should be
-#[starlark_docs(directory = "bxl")]
 pub(crate) struct StarlarkFileSet(
     /// Set of files or directories.
     pub(crate) FileSet,
@@ -99,7 +105,46 @@ impl<'v> StarlarkValue<'v> for StarlarkFileSet {
     fn length(&self) -> starlark::Result<i32> {
         i32::try_from(self.0.len()).map_err(starlark::Error::new_other)
     }
+
+    fn add(&self, other: Value<'v>, heap: &'v Heap) -> Option<starlark::Result<Value<'v>>> {
+        let other = other.downcast_ref::<Self>()?;
+        let union = self.0.union(&other.0);
+        Some(Ok(heap.alloc(Self(union))))
+    }
+
+    fn sub(&self, other: Value<'v>, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+        let Some(other) = other.downcast_ref::<Self>() else {
+            return ValueError::unsupported_with(self, "-", other);
+        };
+        let difference = self.0.difference(&other.0)?;
+        Ok(heap.alloc(Self(difference)))
+    }
+
+    fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
+        match other.downcast_ref::<StarlarkFileSet>() {
+            Some(other) => Ok(self.0 == other.0),
+            None => Ok(false),
+        }
+    }
+
+    fn bit_and(&self, other: Value<'v>, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+        let Some(other) = other.downcast_ref::<Self>() else {
+            return ValueError::unsupported_with(self, "&", other);
+        };
+        let intersect = self.0.intersect(&other.0)?;
+        Ok(heap.alloc(Self(intersect)))
+    }
+
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(register_file_set)
+    }
 }
+
+/// A set of `file_node`s. Supports the operations such as set addition/subtraction, length,
+/// iteration, equality and indexing.
+#[starlark_module]
+pub(crate) fn register_file_set(globals: &mut MethodsBuilder) {}
 
 impl From<FileSet> for StarlarkFileSet {
     fn from(v: FileSet) -> Self {
@@ -115,22 +160,38 @@ impl Deref for StarlarkFileSet {
     }
 }
 
-#[derive(Debug, Display, ProvidesStaticType, Clone, Allocative, StarlarkDocs)]
+#[derive(Debug, Display, ProvidesStaticType, Clone, Allocative)]
 #[derive(NoSerialize)]
-#[starlark_docs(directory = "bxl")]
-pub(crate) struct StarlarkFileNode(
-    /// Cell path to the file or directory.
-    pub(crate) CellPath,
-);
+pub(crate) struct StarlarkFileNode(pub(crate) CellPath);
 
 starlark_simple_value!(StarlarkFileNode);
 
-#[starlark_value(type = "file_node")]
-impl<'v> StarlarkValue<'v> for StarlarkFileNode {}
+#[starlark_value(type = "bxl.FileNode")]
+impl<'v> StarlarkValue<'v> for StarlarkFileNode {
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(file_node_methods)
+    }
+}
 
-#[derive(Debug, ProvidesStaticType, Clone, Allocative, StarlarkDocs)]
+/// Wrapper around the cell relative path to the file or directory.
+#[starlark_module]
+pub(crate) fn file_node_methods(methods: &mut MethodsBuilder) {
+    /// The cell relative path as a string.
+    #[starlark(attribute)]
+    fn path<'v>(this: &'v StarlarkFileNode) -> starlark::Result<&'v str> {
+        Ok(this.0.path().as_str())
+    }
+
+    /// The cell name for the file_node.
+    #[starlark(attribute)]
+    fn cell<'v>(this: &StarlarkFileNode) -> starlark::Result<&'v str> {
+        Ok(this.0.cell().as_str())
+    }
+}
+
+#[derive(Debug, ProvidesStaticType, Clone, Allocative)]
 #[derive(NoSerialize)]
-#[starlark_docs(directory = "bxl")]
 pub(crate) struct StarlarkReadDirSet {
     /// Cell path to the directory/files.
     pub(crate) cell_path: CellPath,
@@ -144,7 +205,7 @@ pub(crate) struct StarlarkReadDirSet {
 starlark_simple_value!(StarlarkReadDirSet);
 
 impl StarlarkReadDirSet {
-    fn children(&self) -> anyhow::Result<Vec<CellPath>> {
+    fn children(&self) -> buck2_error::Result<Vec<CellPath>> {
         let mut result: Vec<CellPath> = Vec::with_capacity(self.included.len());
         result.extend(self.included.iter().filter_map(|e| {
             if !self.dirs_only || e.file_type.is_dir() {

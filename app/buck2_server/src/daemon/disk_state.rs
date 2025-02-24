@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_common::invocation_paths::InvocationPaths;
-use buck2_common::legacy_configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::fs::fs_util;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::paths::file_name::FileName;
-use buck2_core::fs::project::ProjectRoot;
 use buck2_core::rollout_percentage::RolloutPercentage;
+use buck2_error::BuckErrorContext;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::materialize::materializer::MaterializationMethod;
@@ -39,13 +39,16 @@ impl DiskStateOptions {
     pub fn new(
         root_config: &LegacyBuckConfig,
         materialization_method: MaterializationMethod,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let sqlite_materializer_state = matches!(
             // We can only enable materializer state on sqlite if you use deferred materializer
             materialization_method,
             MaterializationMethod::Deferred | MaterializationMethod::DeferredSkipFinalArtifacts
         ) && root_config
-            .parse::<RolloutPercentage>("buck2", "sqlite_materializer_state")?
+            .parse::<RolloutPercentage>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "sqlite_materializer_state",
+            })?
             .unwrap_or_else(RolloutPercentage::never)
             .roll();
         Ok(Self {
@@ -60,15 +63,17 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
     io_executor: Arc<dyn BlockingExecutor>,
     root_config: &LegacyBuckConfig,
     deferred_materializer_configs: &DeferredMaterializerConfigs,
-    fs: ProjectRoot,
     digest_config: DigestConfig,
     init_ctx: &BuckdServerInitPreferences,
-) -> anyhow::Result<(Option<MaterializerStateSqliteDb>, Option<MaterializerState>)> {
+) -> buck2_error::Result<(Option<MaterializerStateSqliteDb>, Option<MaterializerState>)> {
     if !options.sqlite_materializer_state {
         // When sqlite materializer state is disabled, we should always delete the materializer state db.
         // Otherwise, artifacts in buck-out will diverge from the state stored in db.
         io_executor
-            .execute_io_inline(|| fs.remove_path_recursive(&paths.materializer_state_path()))
+            .execute_io_inline(|| {
+                fs_util::remove_all(&paths.materializer_state_path())
+                    .map_err(buck2_error::Error::from)
+            })
             .await?;
         return Ok((None, None));
     }
@@ -84,9 +89,10 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
                 .to_string(),
         ),
     ]);
-    if let Some(buckconfig_version) =
-        root_config.parse("buck2", "sqlite_materializer_state_version")?
-    {
+    if let Some(buckconfig_version) = root_config.parse(BuckconfigKeyRef {
+        section: "buck2",
+        property: "sqlite_materializer_state_version",
+    })? {
         versions.insert("buckconfig_version".to_owned(), buckconfig_version);
     }
     if let Some(hostname) = metadata.get("hostname") {
@@ -136,27 +142,26 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
 pub(crate) fn delete_unknown_disk_state(
     cache_dir_path: &AbsNormPath,
     known_dir_names: &[&FileName],
-    fs: ProjectRoot,
-) -> anyhow::Result<()> {
-    let res: anyhow::Result<()> = try {
+) -> buck2_error::Result<()> {
+    let res: buck2_error::Result<()> = try {
         if cache_dir_path.exists() {
             for entry in fs_util::read_dir(cache_dir_path)? {
                 let entry = entry?;
                 let filename = entry.file_name();
                 let filename = filename
                     .to_str()
-                    .context("Filename is not UTF-8")
+                    .buck_error_context("Filename is not UTF-8")
                     .and_then(FileName::new)?;
 
                 // known_dir_names is always small, so this contains isn't expensive
                 if !known_dir_names.contains(&filename) || !entry.path().is_dir() {
-                    fs.remove_path_recursive(&cache_dir_path.join(filename))?;
+                    fs_util::remove_all(&cache_dir_path.join(filename))?;
                 }
             }
         }
     };
 
-    res.with_context(|| {
+    res.with_buck_error_context(|| {
         format!(
             "deleting unrecognized caches in {} to prevent them from going stale",
             &cache_dir_path
@@ -169,7 +174,6 @@ mod tests {
     use buck2_core::fs::paths::forward_rel_path::ForwardRelativePath;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
-    use dupe::Dupe;
 
     use super::*;
 
@@ -184,12 +188,14 @@ mod tests {
         let command_hashes_db = cache_dir_path.join(ForwardRelativePath::unchecked_new(
             "command_hashes/db.sqlite",
         ));
-        fs.create_file(&materializer_state_db, false).unwrap();
-        fs.create_file(&command_hashes_db, false).unwrap();
+        fs_util::create_dir_all(materializer_state_db.parent().unwrap()).unwrap();
+        fs_util::write(&materializer_state_db, b"").unwrap();
+        fs_util::create_dir_all(command_hashes_db.parent().unwrap()).unwrap();
+        fs_util::write(&command_hashes_db, b"").unwrap();
         assert!(materializer_state_db.exists());
         assert!(command_hashes_db.exists());
 
-        delete_unknown_disk_state(&cache_dir_path, &[], fs.dupe()).unwrap();
+        delete_unknown_disk_state(&cache_dir_path, &[]).unwrap();
 
         assert!(!materializer_state_db.exists());
         assert!(!command_hashes_db.exists());
@@ -206,15 +212,16 @@ mod tests {
         let command_hashes_db = cache_dir_path.join(ForwardRelativePath::unchecked_new(
             "command_hashes/db.sqlite",
         ));
-        fs.create_file(&materializer_state_db, false).unwrap();
-        fs.create_file(&command_hashes_db, false).unwrap();
+        fs_util::create_dir_all(materializer_state_db.parent().unwrap()).unwrap();
+        fs_util::write(&materializer_state_db, b"").unwrap();
+        fs_util::create_dir_all(command_hashes_db.parent().unwrap()).unwrap();
+        fs_util::write(&command_hashes_db, b"").unwrap();
         assert!(materializer_state_db.exists());
         assert!(command_hashes_db.exists());
 
         delete_unknown_disk_state(
             &cache_dir_path,
             &[FileName::unchecked_new("materializer_state")],
-            fs.dupe(),
         )
         .unwrap();
 

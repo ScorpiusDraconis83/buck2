@@ -41,8 +41,10 @@ use crate::typing::Ty;
 use crate::values::enumeration::enum_type::EnumType;
 use crate::values::enumeration::enum_type::FrozenEnumType;
 use crate::values::types::type_instance_id::TypeInstanceId;
+use crate::values::FreezeResult;
 use crate::values::StarlarkValue;
 use crate::values::Value;
+use crate::values::ValueLifetimeless;
 use crate::values::ValueLike;
 
 /// A value from an enumeration.
@@ -57,7 +59,7 @@ use crate::values::ValueLike;
 )]
 #[repr(C)]
 #[derivative(Debug)]
-pub struct EnumValueGen<V> {
+pub struct EnumValueGen<V: ValueLifetimeless> {
     // Must ignore value.typ or type.elements, since they are circular
     #[derivative(Debug = "ignore")]
     pub(crate) typ: V, // Must be EnumType it points back to (so it can get the type)
@@ -66,7 +68,7 @@ pub struct EnumValueGen<V> {
     pub(crate) id: TypeInstanceId,
 }
 
-impl<'v, V: ValueLike<'v> + 'v> Display for EnumValueGen<V> {
+impl<'v, V: ValueLike<'v>> Display for EnumValueGen<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ty_enum_data = match self.get_enum_type() {
             Either::Left(x) => x.ty_enum_data(),
@@ -108,24 +110,10 @@ impl<'v, V: ValueLike<'v>> EnumValueGen<V> {
 }
 
 #[starlark_value(type = EnumValue::TYPE)]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for EnumValueGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for EnumValueGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn matches_type(&self, ty: &str) -> bool {
-        if ty == EnumValue::TYPE {
-            return true;
-        }
-        let ty_enum_data = match self.get_enum_type() {
-            Either::Left(x) => x.ty_enum_data(),
-            Either::Right(x) => x.ty_enum_data(),
-        };
-        match ty_enum_data {
-            Some(ty_enum_data) => ty_enum_data.name == ty,
-            None => false,
-        }
-    }
-
     fn write_hash(&self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
         self.value.write_hash(hasher)
     }
@@ -159,12 +147,12 @@ impl<'v, V: ValueLike<'v>> serde::Serialize for EnumValueGen<V> {
 #[starlark_module]
 fn enum_value_methods(methods: &mut MethodsBuilder) {
     #[starlark(attribute)]
-    fn index(this: &EnumValue) -> anyhow::Result<i32> {
+    fn index(this: &EnumValue) -> starlark::Result<i32> {
         Ok(this.index)
     }
 
     #[starlark(attribute)]
-    fn value<'v>(this: &EnumValue<'v>) -> anyhow::Result<Value<'v>> {
+    fn value<'v>(this: &EnumValue<'v>) -> starlark::Result<Value<'v>> {
         Ok(this.value.to_value())
     }
 }

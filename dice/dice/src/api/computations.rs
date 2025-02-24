@@ -8,19 +8,22 @@
  */
 
 use std::future::Future;
-use std::marker::PhantomData;
-use std::ops::Deref;
-use std::ops::DerefMut;
+use std::sync::Arc;
 
 use allocative::Allocative;
+use async_trait::async_trait;
+use buck2_futures::cancellation::CancellationContext;
+use dice_error::DiceResult;
 use futures::future::BoxFuture;
 
 use crate::api::data::DiceData;
-use crate::api::error::DiceResult;
 use crate::api::key::Key;
 use crate::api::opaque::OpaqueValue;
 use crate::api::user_data::UserComputationData;
 use crate::ctx::DiceComputationsImpl;
+use crate::ctx::LinearRecomputeDiceComputationsImpl;
+use crate::DiceKeyTrackedInvalidationPaths;
+use crate::ProjectionKey;
 use crate::UserCycleDetectorGuard;
 
 /// The context for computations to register themselves, and request for additional dependencies.
@@ -32,20 +35,19 @@ use crate::UserCycleDetectorGuard;
 /// The context is valid only for the duration of the computation of a single key, and cannot be
 /// owned.
 #[derive(Allocative)]
-#[repr(transparent)]
-pub struct DiceComputations(pub(crate) DiceComputationsImpl);
+pub struct DiceComputations<'a>(pub(crate) DiceComputationsImpl<'a>);
 
 fn _test_computations_sync_send() {
     fn _assert_sync_send<T: Sync + Send>() {}
     _assert_sync_send::<DiceComputations>();
 }
 
-impl DiceComputations {
+impl<'d> DiceComputations<'d> {
     /// Gets the result of the given computation key.
     /// Record dependencies of the current computation for which this
     /// context is for.
     pub fn compute<'a, K>(
-        &'a self,
+        &'a mut self,
         key: &K,
     ) -> impl Future<Output = DiceResult<<K as Key>::Value>> + 'a
     where
@@ -61,30 +63,223 @@ impl DiceComputations {
     pub fn compute_opaque<'a, K>(
         &'a self,
         key: &K,
-    ) -> impl Future<Output = DiceResult<OpaqueValue<'a, K>>> + 'a
+    ) -> impl Future<Output = DiceResult<OpaqueValue<K>>> + 'a
     where
         K: Key,
     {
         self.0.compute_opaque(key)
     }
 
-    /// Computes all the given tasks in parallel, returning an unordered Stream
+    pub fn projection<'a, K: Key, P: ProjectionKey<DeriveFromKey = K>>(
+        &'a mut self,
+        derive_from: &OpaqueValue<K>,
+        projection_key: &P,
+    ) -> DiceResult<P::Value> {
+        self.0.projection(derive_from, projection_key)
+    }
+
+    pub fn opaque_into_value<'a, K: Key>(
+        &'a mut self,
+        derive_from: OpaqueValue<K>,
+    ) -> DiceResult<K::Value> {
+        self.0.opaque_into_value(derive_from)
+    }
+
+    /// DiceComputations &mut-based api can make some computations much more complex to express, but without it
+    /// the data dependencies between different compute requests are impossible to track. with_linear_recompute()
+    /// is an escape hatch in the case where we are willing to sacrifice recompute performance for easier expression
+    /// of a computation. It should not be used lightly, it can be difficult to attribute performance regressions to its use.
+    ///
+    /// Withing the with_linear_recompute(), all deps will be recorded as accessed sequentially and so recomputation
+    /// will not trigger them in parallel. This will apply to calls on DiceComputations returned by .ctx() and by the ones received
+    /// in closures from compute_many and friends. It will not apply to the other deps from which the linear recompute was created.
+    ///
+    /// For example:
+    ///
+    /// ```ignore
+    /// let mut ctx = something();
+    /// let keys1 = vec![Key(10), Key(11)];
+    /// let keys2 = vec![Key(20), Key(21)];
+    /// let keys3 = vec![Key(30), Key(31)];
+    /// let keys4 = vec![Key(40), Key(41)]
+    /// ctx.compute_join(keys1, |ctx, key1| ctx.compute(key1).boxed()).await;
+    /// ctx.with_linear_recompute(|mut linear| {
+    ///     linear.ctx().compute_join(keys2, |ctx, key2| async move {
+    ///         ctx.compute2(
+    ///             |ctx| ctx.compute(key2).boxed(),
+    ///             |ctx| ctx.compute_join(keys3, |ctx, key3| ctx.compute(key3).boxed()).boxed()
+    ///         ).await;
+    ///     }.boxed()
+    /// ).await
+    /// ctx.compute_join(keys4, |ctx, key4| ctx.compute(key4).boxed()).await;
+    /// });
+    /// ```
+    ///
+    /// In this example, the recomputation of all of keys2 and keys3 would be done linearly, but keys1 and keys4 would be recomputed in parallel.
+    pub fn with_linear_recompute<'a, T, Fut: Future<Output = T> + 'a>(
+        &'a mut self,
+        func: impl FnOnce(LinearRecomputeDiceComputations<'a>) -> Fut + 'a,
+    ) -> impl Future<Output = T> + 'a {
+        self.0.with_linear_recompute(func)
+    }
+
+    /// Creates computation Futures for all the given tasks.
+    ///
+    /// ```ignore
+    /// let mut ctx: &'a DiceComputations = ctx();
+    /// let data: String = data();
+    /// let keys : Vec<Key> = keys();
+    /// let futs = ctx.compute_many(keys.into_iter().map(|k|
+    ///   DiceComputations::declare_closure(
+    ///     |dice: &mut DiceComputations| -> BoxFuture<String> {
+    ///       async move {
+    ///         dice.compute(k).await + data
+    ///       }.boxed()
+    ///     }
+    ///   )
+    /// ));
+    /// futures::future::join_all(futs).await;
+    /// ```
     pub fn compute_many<'a, T: 'a>(
-        &'a self,
+        &'a mut self,
         computes: impl IntoIterator<
-            Item = impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
+            Item = impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
         >,
     ) -> Vec<impl Future<Output = T> + 'a> {
         self.0.compute_many(computes)
     }
 
-    /// Computes all the given tasks in parallel, returning an unordered Stream
+    /// Maps the items into computation futures and joins on them.
+    ///
+    /// ```ignore
+    /// let mut ctx: &'a DiceComputations = ctx();
+    /// let data: String = data();
+    /// let keys : Vec<Key> = keys();
+    /// // When defined inplance, there's no need to use a declare helper.
+    /// ctx.compute_join(keys, |dice: &mut DiceComputations, k: &Key| {
+    ///     async move {
+    ///       dice.compute(k).await + data
+    ///     }
+    ///   }).await;
+    ///
+    /// // If the closure is going to be declared outside the compute_many itself, you need to use
+    /// // declare_join_closure for it to get the right lifetime bounds.
+    /// let compute_one = DiceComputations::declare_join_closure(
+    ///   |dice: &mut DiceComputations, k: &Key| {
+    ///     async move {
+    ///       dice.compute(k).await + data
+    ///     }
+    ///   }
+    /// );
+    /// ctx.compute_join(keys, compute_one).await;
+    /// ````
+    pub fn compute_join<'a, T: Send, R: 'a>(
+        &'a mut self,
+        items: impl IntoIterator<Item = T>,
+        mapper: (
+            impl for<'x> FnOnce(&'x mut DiceComputations<'a>, T) -> BoxFuture<'x, R> + Send + Sync + Copy
+        ),
+    ) -> impl Future<Output = Vec<R>> + 'a {
+        let futs = self.compute_many(items.into_iter().map(move |v| {
+            DiceComputations::declare_closure(move |ctx: &mut DiceComputations| -> BoxFuture<R> {
+                mapper(ctx, v)
+            })
+        }));
+        futures::future::join_all(futs)
+    }
+
+    /// Maps the items into computations futures and then returns a future which represents either a
+    /// collection of the results or an error.
+    pub fn try_compute_join<'a, T: Send, R: 'a, E: 'a>(
+        &'a mut self,
+        items: impl IntoIterator<Item = T>,
+        mapper: (
+            impl for<'x> FnOnce(&'x mut DiceComputations<'a>, T) -> BoxFuture<'x, Result<R, E>>
+            + Send
+            + Sync
+            + Copy
+        ),
+    ) -> impl Future<Output = Result<Vec<R>, E>> + 'a {
+        let futs = self.compute_many(items.into_iter().map(move |v| {
+            DiceComputations::declare_closure(
+                move |ctx: &mut DiceComputations| -> BoxFuture<Result<R, E>> { mapper(ctx, v) },
+            )
+        }));
+        crate::future::try_join_all(futs)
+    }
+
+    /// Computes all the given tasks in parallel.
+    ///
+    /// If the closures are defined out of the compute2 call, you need to use declare_closure() to get the right lifetimes.
     pub fn compute2<'a, T: 'a, U: 'a>(
-        &'a self,
-        compute1: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        compute2: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, U> + Send,
-    ) -> (impl Future<Output = T> + 'a, impl Future<Output = U> + 'a) {
-        self.0.compute2(compute1, compute2)
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, U> + Send,
+    ) -> impl Future<Output = (T, U)> + 'a {
+        let (t, u) = self.0.compute2(compute1, compute2);
+        futures::future::join(t, u)
+    }
+
+    /// Compute all the given tasks in parallel.
+    pub fn try_compute2<'a, T: 'a, U: 'a, E: 'a>(
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, Result<T, E>>
+        + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, Result<U, E>>
+        + Send,
+    ) -> impl Future<Output = Result<(T, U), E>> + 'a {
+        let (t, u) = self.0.compute2(compute1, compute2);
+        futures::future::try_join(t, u)
+    }
+
+    /// Computes all the given tasks in parallel.
+    ///
+    /// If the closures are defined out of the compute3 call, you need to use declare_closure() to get the right lifetimes.
+    pub fn compute3<'a, T: 'a, U: 'a, V: 'a>(
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, U> + Send,
+        compute3: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, V> + Send,
+    ) -> impl Future<Output = (T, U, V)> + 'a {
+        let (t, u, v) = self.0.compute3(compute1, compute2, compute3);
+        futures::future::join3(t, u, v)
+    }
+
+    /// Compute all the given tasks in parallel.
+    pub fn try_compute3<'a, T: 'a, U: 'a, V: 'a, E: 'a>(
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, Result<T, E>>
+        + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, Result<U, E>>
+        + Send,
+        compute3: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, Result<V, E>>
+        + Send,
+    ) -> impl Future<Output = Result<(T, U, V), E>> + 'a {
+        let (t, u, v) = self.0.compute3(compute1, compute2, compute3);
+        futures::future::try_join3(t, u, v)
+    }
+
+    /// Used to declare a higher order closure for compute_join and try_compute_join.
+    ///
+    /// We need to use BoxFuture here to express that the future captures the 'x lifetime.
+    pub fn declare_join_closure<'a, T, R, Closure>(closure: Closure) -> Closure
+    where
+        Closure: for<'x> FnOnce(&'x mut DiceComputations<'a>, T) -> BoxFuture<'x, R>
+            + Send
+            + Sync
+            + Copy,
+    {
+        closure
+    }
+
+    /// Used to declare a higher order closure for compute2 and compute_many.
+    ///
+    /// We need to use BoxFuture here to express that the future captures the 'x lifetime.
+    pub fn declare_closure<'a, R, Closure>(closure: Closure) -> Closure
+    where
+        Closure: for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, R>,
+    {
+        closure
     }
 
     /// Data that is static per the entire lifetime of Dice. These data are initialized at the
@@ -102,7 +297,7 @@ impl DiceComputations {
     }
 
     /// Gets the current cycle guard if its set. If it's set but a different type, an error will be returned.
-    pub fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<&T>> {
+    pub fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<Arc<T>>> {
         self.0.cycle_guard()
     }
 
@@ -111,131 +306,51 @@ impl DiceComputations {
     pub fn store_evaluation_data<T: Send + Sync + 'static>(&self, value: T) -> DiceResult<()> {
         self.0.store_evaluation_data(value)
     }
-}
 
-/// For a `compute_many` and `compute2` request, the DiceComputations provided to each lambda
-/// is a reference that's only available for some specific lifetime `'x`. This is express as a
-/// higher rank lifetime bound `for <'x>` in rust. However, `for <'x>` bounds do not have constraints
-/// on them so rust infers them to be any lifetime, including 'static, which is wrong. So, we
-/// introduce an extra lifetime here which forces rust compiler to infer additional bounds on
-/// the `for <'x>` as a `&'x DiceComputationParallel<'a>` cannot live more than `'a`, so using this
-/// type as the argument to the closure forces the correct lifetime bounds to be inferred by rust.
-pub struct DiceComputationsParallel<'a>(pub(crate) DiceComputations, PhantomData<&'a ()>);
-
-impl<'a> DiceComputationsParallel<'a> {
-    pub(crate) fn new(ctx: DiceComputations) -> Self {
-        Self(ctx, PhantomData)
+    /// Returns the current tracked invalidation paths for this computation node.
+    pub fn get_invalidation_paths(&mut self) -> DiceKeyTrackedInvalidationPaths {
+        self.0.get_invalidation_paths()
     }
 }
 
-impl<'a> Deref for DiceComputationsParallel<'a> {
-    type Target = DiceComputations;
+pub struct LinearRecomputeDiceComputations<'a>(pub(crate) LinearRecomputeDiceComputationsImpl<'a>);
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl LinearRecomputeDiceComputations<'_> {
+    pub fn get(&self) -> DiceComputations<'_> {
+        self.0.get()
     }
 }
 
-impl<'a> DerefMut for DiceComputationsParallel<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use allocative::Allocative;
-    use derive_more::Display;
-    use dupe::Dupe;
-    use indexmap::indexset;
-
-    use crate::api::cycles::DetectCycles;
-    use crate::api::error::DiceErrorImpl;
-    use crate::api::storage_type::StorageType;
-    use crate::api::user_data::UserComputationData;
-    use crate::legacy::ctx::ComputationData;
-    use crate::legacy::cycles::RequestedKey;
-    use crate::legacy::incremental::graph::storage_properties::StorageProperties;
-
-    #[derive(Clone, Dupe, Display, Debug, PartialEq, Eq, Hash, Allocative)]
-    struct K(usize);
-    impl StorageProperties for K {
-        type Key = K;
-
-        type Value = ();
-
-        fn key_type_name() -> &'static str {
-            unreachable!()
-        }
-
-        fn to_key_any(key: &Self::Key) -> &dyn std::any::Any {
-            key
-        }
-
-        fn storage_type(&self) -> StorageType {
-            unreachable!()
-        }
-
-        fn equality(&self, _x: &Self::Value, _y: &Self::Value) -> bool {
-            unreachable!()
-        }
-
-        fn validity(&self, _x: &Self::Value) -> bool {
-            unreachable!()
+// This assertion assures we don't unknowingly regress the size of this critical future.
+// TODO(cjhopman): We should be able to wrap this in a convenient assertion macro.
+#[allow(unused, clippy::diverging_sub_expression)]
+fn _assert_dice_compute_future_sizes() {
+    let ctx: DiceComputations = panic!();
+    #[derive(Allocative, Debug, Clone, PartialEq, Eq, Hash)]
+    struct K(u64);
+    impl std::fmt::Display for K {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            panic!()
         }
     }
+    #[async_trait]
+    impl Key for K {
+        type Value = Arc<String>;
 
-    #[test]
-    fn cycle_detection_when_no_cycles() -> anyhow::Result<()> {
-        let ctx = ComputationData::new(UserComputationData::new(), DetectCycles::Enabled);
-        let ctx = ctx.subrequest::<K>(&K(1))?;
-        let ctx = ctx.subrequest::<K>(&K(2))?;
-        let ctx = ctx.subrequest::<K>(&K(3))?;
-        let _ctx = ctx.subrequest::<K>(&K(4))?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn cycle_detection_when_cycles() -> anyhow::Result<()> {
-        let ctx = ComputationData::new(UserComputationData::new(), DetectCycles::Enabled);
-        let ctx = ctx.subrequest::<K>(&K(1))?;
-        let ctx = ctx.subrequest::<K>(&K(2))?;
-        let ctx = ctx.subrequest::<K>(&K(3))?;
-        let ctx = ctx.subrequest::<K>(&K(4))?;
-        match ctx.subrequest::<K>(&K(1)) {
-            Ok(_) => {
-                panic!("should have cycle error")
-            }
-            Err(e) => match &*e.0 {
-                DiceErrorImpl::Cycle {
-                    trigger,
-                    cyclic_keys,
-                } => {
-                    assert!(
-                        (**trigger).get_key_equality() == K(1).get_key_equality(),
-                        "expected trigger key to be `{}` but was `{}`",
-                        K(1),
-                        trigger
-                    );
-                    assert_eq!(
-                        cyclic_keys,
-                        &indexset![
-                            Arc::new(K(1)) as Arc<dyn RequestedKey>,
-                            Arc::new(K(2)) as Arc<dyn RequestedKey>,
-                            Arc::new(K(3)) as Arc<dyn RequestedKey>,
-                            Arc::new(K(4)) as Arc<dyn RequestedKey>
-                        ]
-                    )
-                }
-                _ => {
-                    panic!("wrong error type")
-                }
-            },
+        async fn compute(
+            &self,
+            ctx: &mut DiceComputations,
+            cancellations: &CancellationContext,
+        ) -> Self::Value {
+            panic!()
         }
 
-        Ok(())
+        fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+            panic!()
+        }
     }
+    let k: K = panic!();
+    let v = ctx.compute(&k);
+    let e = [0u8; 704 / 8];
+    static_assertions::assert_eq_size_ptr!(&v, &e);
 }

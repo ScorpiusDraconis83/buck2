@@ -11,14 +11,13 @@ use buck2_build_api::analysis::registry::AnalysisRegistry;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisContext;
 use buck2_build_api::interpreter::rule_defs::plugins::AnalysisPlugins;
 use buck2_build_api::interpreter::rule_defs::register_rule_defs;
-use buck2_core::base_deferred_key::BaseDeferredKey;
 use buck2_core::configuration::data::ConfigurationData;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
-use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::provider::label::ProvidersName;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_execute::digest_config::DigestConfig;
-use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
+use buck2_interpreter::file_type::StarlarkFileType;
+use buck2_interpreter::from_freeze::from_freeze_error;
 use dupe::Dupe;
 use indoc::indoc;
 use maplit::hashmap;
@@ -28,15 +27,14 @@ use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use starlark::eval::ReturnFileLoader;
 use starlark::syntax::AstModule;
-use starlark::syntax::Dialect;
 use starlark::values::structs::AllocStruct;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 
 fn run_ctx_test(
     content: &str,
-    result_handler: impl FnOnce(anyhow::Result<Value>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    result_handler: impl FnOnce(starlark::Result<Value>) -> buck2_error::Result<()>,
+) -> buck2_error::Result<()> {
     let func_mod = Module::new();
     let globals = GlobalsBuilder::standard().with(register_rule_defs).build();
     let prelude = indoc!(
@@ -50,10 +48,15 @@ fn run_ctx_test(
 
     {
         let mut eval = Evaluator::new(&func_mod);
-        let ast = AstModule::parse("foo.bzl", full_content, &Dialect::Extended).unwrap();
+        let ast = AstModule::parse(
+            "foo.bzl",
+            full_content,
+            &StarlarkFileType::Bzl.dialect(false),
+        )
+        .unwrap();
         eval.eval_module(ast, &globals).unwrap();
     };
-    let frozen_func_mod = func_mod.freeze()?;
+    let frozen_func_mod = func_mod.freeze().map_err(from_freeze_error)?;
     let test_function = frozen_func_mod.get("test").unwrap();
 
     let modules = hashmap!["func_mod" => &frozen_func_mod];
@@ -69,34 +72,30 @@ fn run_ctx_test(
         BaseDeferredKey::TargetLabel(label.dupe()),
         ExecutionPlatformResolution::unspecified(),
     )?;
-    let attributes = eval.heap().alloc(AllocStruct([("name", "some_name")]));
+    let attributes = eval
+        .heap()
+        .alloc_typed_unchecked(AllocStruct([("name", "some_name")]))
+        .cast();
     let plugins = eval
         .heap()
         .alloc_typed(AnalysisPlugins::new(SmallMap::new()))
         .into();
 
-    let ctx = eval.heap().alloc(AnalysisContext::new(
+    let ctx = eval.heap().alloc(AnalysisContext::prepare(
         eval.heap(),
-        attributes,
-        Some(
-            eval.heap()
-                .alloc_typed(StarlarkConfiguredProvidersLabel::new(
-                    ConfiguredProvidersLabel::new(label, ProvidersName::Default),
-                )),
-        ),
-        plugins,
+        Some(attributes),
+        Some(label),
+        Some(plugins),
         registry,
         DigestConfig::testing_default(),
     ));
 
-    let returned = eval
-        .eval_function(test_function, &[ctx], &[])
-        .map_err(starlark::Error::into_anyhow);
+    let returned = eval.eval_function(test_function, &[ctx], &[]);
     result_handler(returned)
 }
 
 #[test]
-fn ctx_instantiates() -> anyhow::Result<()> {
+fn ctx_instantiates() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(ctx):
@@ -113,7 +112,7 @@ fn ctx_instantiates() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_declares_outputs() -> anyhow::Result<()> {
+fn declare_output_declares_outputs() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):
@@ -123,7 +122,7 @@ fn declare_output_declares_outputs() -> anyhow::Result<()> {
     );
 
     run_ctx_test(content, |ret| {
-        let a = <(&str, &str)>::unpack_value(ret.unwrap()).unwrap();
+        let a = <(&str, &str)>::unpack_value(ret.unwrap()).unwrap().unwrap();
         assert_eq!("bar.cpp", a.0);
         assert_eq!("foo/bar.cpp", a.1);
         Ok(())
@@ -131,7 +130,7 @@ fn declare_output_declares_outputs() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_with_prefix() -> anyhow::Result<()> {
+fn declare_output_with_prefix() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):
@@ -141,7 +140,7 @@ fn declare_output_with_prefix() -> anyhow::Result<()> {
     );
 
     run_ctx_test(content, |ret| {
-        let a = <(&str, &str)>::unpack_value(ret.unwrap()).unwrap();
+        let a = <(&str, &str)>::unpack_value(ret.unwrap()).unwrap().unwrap();
         assert_eq!("bar.cpp", a.0);
         assert_eq!("foo/bar.cpp", a.1);
         Ok(())
@@ -149,7 +148,7 @@ fn declare_output_with_prefix() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_dot() -> anyhow::Result<()> {
+fn declare_output_dot() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):
@@ -168,7 +167,7 @@ fn declare_output_dot() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_dot_bad() -> anyhow::Result<()> {
+fn declare_output_dot_bad() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):
@@ -187,7 +186,7 @@ fn declare_output_dot_bad() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_dotdot() -> anyhow::Result<()> {
+fn declare_output_dotdot() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):
@@ -206,7 +205,7 @@ fn declare_output_dotdot() -> anyhow::Result<()> {
 }
 
 #[test]
-fn declare_output_require_bound() -> anyhow::Result<()> {
+fn declare_output_require_bound() -> buck2_error::Result<()> {
     let content = indoc!(
         r#"
          def test(c):

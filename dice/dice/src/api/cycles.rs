@@ -15,7 +15,6 @@ use std::str::FromStr;
 use allocative::Allocative;
 use dupe::Dupe;
 use gazebo::variants::VariantName;
-use thiserror::Error;
 
 #[derive(Clone, Dupe, Copy, Debug, VariantName, Allocative)]
 pub enum DetectCycles {
@@ -23,18 +22,45 @@ pub enum DetectCycles {
     Disabled,
 }
 
-#[derive(Error, Debug)]
-#[error("Invalid type of DetectCycles: `{0}`")]
-pub struct InvalidType(String);
-
 impl FromStr for DetectCycles {
-    type Err = InvalidType;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
-            "ENABLED" => Ok(DetectCycles::Enabled),
-            "DISABLED" => Ok(DetectCycles::Disabled),
-            _ => Err(InvalidType(s.to_owned())),
+        if s.eq_ignore_ascii_case("ENABLED") {
+            Ok(DetectCycles::Enabled)
+        } else if s.eq_ignore_ascii_case("DISABLED") {
+            Ok(DetectCycles::Disabled)
+        } else {
+            Err(format!("Invalid type of DetectCycles: `{s}`"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+
+    use super::*;
+
+    #[test]
+    fn parse() {
+        assert_matches!("enabled".parse::<DetectCycles>(), Ok(DetectCycles::Enabled));
+        assert_matches!("ENABLED".parse::<DetectCycles>(), Ok(DetectCycles::Enabled));
+        assert_matches!(
+            "disabled".parse::<DetectCycles>(),
+            Ok(DetectCycles::Disabled)
+        );
+        assert_matches!(
+            "DISABLED".parse::<DetectCycles>(),
+            Ok(DetectCycles::Disabled)
+        );
+
+        let invalid = "foo".parse::<DetectCycles>();
+        assert!(invalid.is_err());
+        assert!(
+            invalid
+                .unwrap_err()
+                .contains("Invalid type of DetectCycles: `foo`")
+        );
     }
 }

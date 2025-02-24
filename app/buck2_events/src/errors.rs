@@ -10,27 +10,40 @@
 use gazebo::prelude::SliceExt;
 
 pub fn create_error_report(err: &buck2_error::Error) -> buck2_data::ErrorReport {
-    // Infra error by default if no category tag is set
-    let category = err.get_category().map(|c| match c {
-        buck2_error::Category::User => buck2_data::error::ErrorCategory::User,
-        buck2_error::Category::Infra => buck2_data::error::ErrorCategory::Infra,
-    });
-    let typ = err.get_error_type().map(|c| c as i32);
-
     let (message, telemetry_message) = if let Some(f) = err.is_emitted() {
         (format!("{:?}", f), Some(format!("{:?}", err)))
     } else {
         (format!("{:?}", err), None)
     };
 
-    let source_location = err.source_location().map(ToOwned::to_owned);
+    let source_location = Some(err.source_location().to_string());
+    let category_key = err.category_key();
+
+    let sub_error_categories = if let Some(error_diagnostics) = err
+        .action_error()
+        .and_then(|e| e.error_diagnostics.as_ref())
+    {
+        if let Some(buck2_data::action_error_diagnostics::Data::SubErrors(sub_errors)) =
+            &error_diagnostics.data
+        {
+            sub_errors
+                .sub_errors
+                .iter()
+                .map(|s| s.category.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
 
     buck2_data::ErrorReport {
-        category: category.map(|c| c as i32),
-        typ,
         message,
         telemetry_message,
         source_location,
-        tags: err.get_tags().map(|t| *t as i32),
+        tags: err.tags().map(|t| *t as i32),
+        sub_error_categories,
+        category_key: Some(category_key),
     }
 }

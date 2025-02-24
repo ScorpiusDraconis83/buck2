@@ -8,8 +8,8 @@
  */
 
 use allocative::Allocative;
+use buck2_util::hash::BuckHasher;
 use dupe::Dupe;
-use fnv::FnvHasher;
 use once_cell::sync::Lazy;
 use static_interner::Intern;
 use static_interner::Interner;
@@ -17,6 +17,7 @@ use static_interner::Interner;
 use crate::configuration::data::ConfigurationData;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum ConfigurationError {
     #[error("`ConfigurationPair` has unexpected `exec_cfg`")]
     HasExecCfg,
@@ -34,7 +35,7 @@ struct ConfigurationPairData {
 #[derive(Debug, Clone, Dupe, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative)]
 pub struct Configuration(Intern<ConfigurationPairData>);
 
-static INTERNER: Interner<ConfigurationPairData, FnvHasher> = Interner::new();
+static INTERNER: Interner<ConfigurationPairData, BuckHasher> = Interner::new();
 
 impl Configuration {
     #[inline]
@@ -53,7 +54,7 @@ impl Configuration {
     }
 
     #[inline]
-    pub fn check_no_exec_cfg(&self) -> anyhow::Result<ConfigurationNoExec> {
+    pub fn check_no_exec_cfg(&self) -> buck2_error::Result<ConfigurationNoExec> {
         if self.exec_cfg().is_some() {
             return Err(ConfigurationError::HasExecCfg.into());
         }
@@ -74,7 +75,7 @@ impl Configuration {
     Allocative,
     derive_more::Display
 )]
-#[display(fmt = "{}", "self.cfg()")]
+#[display("{}", self.cfg())]
 pub struct ConfigurationNoExec(Configuration);
 
 impl ConfigurationNoExec {

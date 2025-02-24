@@ -11,13 +11,14 @@ use std::fmt::Debug;
 use std::fmt::Display;
 
 use allocative::Allocative;
-use buck2_core::buck_path::path::BuckPathRef;
+use buck2_core::package::source_path::SourcePathRef;
 use buck2_core::package::PackageLabel;
 use buck2_core::plugins::PluginKind;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_error::buck2_error;
+use buck2_error::internal_error;
 use buck2_util::arc_str::ArcStr;
-use dupe::Dupe;
 use serde::Serialize;
 use serde::Serializer;
 use starlark_map::ordered_map::OrderedMap;
@@ -30,6 +31,7 @@ use crate::attrs::attr_type::configured_dep::ConfiguredExplicitConfiguredDep;
 use crate::attrs::attr_type::dep::DepAttr;
 use crate::attrs::attr_type::dict::DictLiteral;
 use crate::attrs::attr_type::list::ListLiteral;
+use crate::attrs::attr_type::one_of::OneOfAttrType;
 use crate::attrs::attr_type::query::QueryAttr;
 use crate::attrs::attr_type::split_transition_dep::ConfiguredSplitTransitionDep;
 use crate::attrs::attr_type::string::StringLiteral;
@@ -43,32 +45,11 @@ use crate::attrs::display::AttrDisplayWithContextExt;
 use crate::attrs::fmt_context::AttrFmtContext;
 use crate::attrs::json::ToJsonWithContext;
 use crate::attrs::serialize::AttrSerializeWithContext;
+use crate::attrs::values::TargetModifiersValue;
+use crate::configuration::resolved::ConfigurationSettingKey;
 use crate::metadata::map::MetadataMap;
 use crate::visibility::VisibilitySpecification;
 use crate::visibility::WithinViewSpecification;
-
-#[derive(Debug, buck2_error::Error)]
-enum ConfiguredAttrError {
-    #[error("addition not supported for this attribute type `{0}`.")]
-    ConcatNotSupported(String),
-    #[error("addition not supported for these attribute type `{0}` and value `{1}`.")]
-    ConcatNotSupportedValues(&'static str, String),
-    #[error("got same key in both sides of dictionary concat (key `{0}`).")]
-    DictConcatDuplicateKeys(String),
-    #[error(
-        "Cannot concatenate values coerced/configured to different oneof variants: `{0}` and `{1}`"
-    )]
-    ConcatDifferentOneofVariants(AttrType, AttrType),
-    #[error("while concat, LHS is oneof, expecting RHS to also be oneof (internal error)")]
-    LhsOneOfRhsNotOneOf,
-    #[error("expecting a list, got `{0}`")]
-    ExpectingList(String),
-    #[error("expecting configuration dep, got `{0}`")]
-    ExpectingConfigurationDep(String),
-    #[error("Inconsistent attr value (`{}`) and attr type (`{}`) (internal error)",
-            _0.as_display_no_ctx(), _1)]
-    InconsistentAttrValueAndAttrType(ConfiguredAttr, AttrType),
-}
 
 #[derive(Eq, PartialEq, Hash, Clone, Allocative, Debug)]
 pub enum ConfiguredAttr {
@@ -100,20 +81,25 @@ pub enum ConfiguredAttr {
     WithinView(WithinViewSpecification),
     ExplicitConfiguredDep(Box<ConfiguredExplicitConfiguredDep>),
     SplitTransitionDep(Box<ConfiguredSplitTransitionDep>),
-    ConfigurationDep(Box<TargetLabel>),
+    ConfigurationDep(ConfigurationSettingKey),
     // Note: Despite being named `PluginDep`, this doesn't really act like a dep but rather like a
     // label
-    PluginDep(Box<(TargetLabel, PluginKind)>),
+    PluginDep(TargetLabel, PluginKind),
     Dep(Box<DepAttr<ConfiguredProvidersLabel>>),
-    SourceLabel(Box<ConfiguredProvidersLabel>),
+    SourceLabel(ConfiguredProvidersLabel),
     // NOTE: unlike deps, labels are not traversed, as they are typically used in lieu of deps in
     // cases that would cause cycles.
-    Label(Box<ConfiguredProvidersLabel>),
+    Label(ConfiguredProvidersLabel),
     Arg(ConfiguredStringWithMacros),
     Query(Box<QueryAttr<ConfiguredProvidersLabel>>),
     SourceFile(CoercedPath),
     Metadata(MetadataMap),
+    TargetModifiers(TargetModifiersValue),
 }
+
+// For `ConfiguredAttr` size is not as important as for `CoercedAttr`,
+// yet we should keep it reasonable.
+static_assertions::assert_eq_size!(ConfiguredAttr, [usize; 4]);
 
 impl AttrSerializeWithContext for ConfiguredAttr {
     fn serialize_with_ctx<S>(&self, ctx: &AttrFmtContext, s: S) -> Result<S::Ok, S::Error>
@@ -136,7 +122,9 @@ impl AttrDisplayWithContext for ConfiguredAttr {
             ConfiguredAttr::Int(v) => {
                 write!(f, "{}", v)
             }
-            ConfiguredAttr::String(v) | ConfiguredAttr::EnumVariant(v) => Display::fmt(v, f),
+            ConfiguredAttr::String(v) | ConfiguredAttr::EnumVariant(v) => {
+                AttrDisplayWithContext::fmt(v, ctx, f)
+            }
             ConfiguredAttr::List(list) => AttrDisplayWithContext::fmt(list, ctx, f),
             ConfiguredAttr::Tuple(v) => AttrDisplayWithContext::fmt(v, ctx, f),
             ConfiguredAttr::Dict(v) => AttrDisplayWithContext::fmt(v, ctx, f),
@@ -147,7 +135,7 @@ impl AttrDisplayWithContext for ConfiguredAttr {
             ConfiguredAttr::ExplicitConfiguredDep(e) => Display::fmt(e, f),
             ConfiguredAttr::SplitTransitionDep(e) => Display::fmt(e, f),
             ConfiguredAttr::ConfigurationDep(e) => write!(f, "\"{}\"", e),
-            ConfiguredAttr::PluginDep(e) => write!(f, "\"{}\"", e.0),
+            ConfiguredAttr::PluginDep(e, _) => write!(f, "\"{}\"", e),
             ConfiguredAttr::Dep(e) => write!(f, "\"{}\"", e),
             ConfiguredAttr::SourceLabel(e) => write!(f, "\"{}\"", e),
             ConfiguredAttr::Label(e) => write!(f, "\"{}\"", e),
@@ -155,6 +143,7 @@ impl AttrDisplayWithContext for ConfiguredAttr {
             ConfiguredAttr::Query(e) => write!(f, "\"{}\"", e.query.query),
             ConfiguredAttr::SourceFile(e) => write!(f, "\"{}\"", source_file_display(ctx, e)),
             ConfiguredAttr::Metadata(m) => write!(f, "{}", m),
+            ConfiguredAttr::TargetModifiers(m) => write!(f, "{}", m),
         }
     }
 }
@@ -165,7 +154,7 @@ impl ConfiguredAttr {
         &'a self,
         pkg: PackageLabel,
         traversal: &mut dyn ConfiguredAttrTraversal,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         match self {
             ConfiguredAttr::Bool(_) => Ok(()),
             ConfiguredAttr::Int(_) => Ok(()),
@@ -173,20 +162,20 @@ impl ConfiguredAttr {
             ConfiguredAttr::EnumVariant(_) => Ok(()),
             ConfiguredAttr::List(list) => {
                 for v in list.iter() {
-                    v.traverse(pkg.dupe(), traversal)?;
+                    v.traverse(pkg, traversal)?;
                 }
                 Ok(())
             }
             ConfiguredAttr::Tuple(list) => {
                 for v in list.iter() {
-                    v.traverse(pkg.dupe(), traversal)?;
+                    v.traverse(pkg, traversal)?;
                 }
                 Ok(())
             }
             ConfiguredAttr::Dict(dict) => {
                 for (k, v) in dict.iter() {
-                    k.traverse(pkg.dupe(), traversal)?;
-                    v.traverse(pkg.dupe(), traversal)?;
+                    k.traverse(pkg, traversal)?;
+                    v.traverse(pkg, traversal)?;
                 }
                 Ok(())
             }
@@ -201,21 +190,68 @@ impl ConfiguredAttr {
                 }
                 Ok(())
             }
-            ConfiguredAttr::ConfigurationDep(dep) => traversal.configuration_dep(dep),
-            ConfiguredAttr::PluginDep(dep) => traversal.plugin_dep(&dep.0, &dep.1),
+            ConfiguredAttr::ConfigurationDep(dep) => traversal.configuration_dep(&dep.0),
+            ConfiguredAttr::PluginDep(dep, kind) => traversal.plugin_dep(dep, kind),
             ConfiguredAttr::Dep(dep) => dep.traverse(traversal),
             ConfiguredAttr::SourceLabel(dep) => traversal.dep(dep),
             ConfiguredAttr::Label(label) => traversal.label(label),
-            ConfiguredAttr::Arg(arg) => arg.string_with_macros.traverse(traversal, &pkg),
+            ConfiguredAttr::Arg(arg) => arg.string_with_macros.traverse(traversal, pkg),
             ConfiguredAttr::Query(query) => query.traverse(traversal),
             ConfiguredAttr::SourceFile(source) => {
                 for x in source.inputs() {
-                    traversal.input(BuckPathRef::new(pkg.dupe(), x))?;
+                    traversal.input(SourcePathRef::new(pkg, x))?;
                 }
                 Ok(())
             }
             ConfiguredAttr::Metadata(..) => Ok(()),
+            ConfiguredAttr::TargetModifiers(..) => Ok(()),
         }
+    }
+
+    fn concat_not_supported(&self, attr_ty: &'static str) -> buck2_error::Error {
+        buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "addition not supported for these attribute type `{}` and value `{}`",
+            attr_ty,
+            self.as_display_no_ctx()
+        )
+    }
+
+    fn unpack_oneof(self) -> buck2_error::Result<(Self, u32)> {
+        match self {
+            ConfiguredAttr::OneOf(first, first_i) => Ok((*first, first_i)),
+            t => Err(internal_error!(
+                "expecting oneof variant, got: {}`",
+                t.as_display_no_ctx(),
+            )),
+        }
+    }
+
+    fn unpack_oneof_i(self, expected_i: u32, oneof: &OneOfAttrType) -> buck2_error::Result<Self> {
+        let (first, i) = self.unpack_oneof()?;
+        if i != expected_i {
+            let first_t = oneof.get(expected_i)?;
+            let next_t = oneof.get(i)?;
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Cannot concatenate values coerced/configured \
+                to different oneof variants: `{first_t}` and `{next_t}`"
+            ));
+        }
+        Ok(first)
+    }
+
+    fn concat_oneof(
+        self,
+        items: &mut dyn Iterator<Item = buck2_error::Result<Self>>,
+        oneof: &OneOfAttrType,
+    ) -> buck2_error::Result<Self> {
+        let (first, first_i) = self.unpack_oneof()?;
+        let attr = first.concat(
+            &oneof.xs[first_i as usize],
+            &mut items.map(|v| v?.unpack_oneof_i(first_i, oneof)),
+        )?;
+        Ok(ConfiguredAttr::OneOf(Box::new(attr), first_i))
     }
 
     /// Used for concatting the configured result of concatted selects. For most types this isn't allowed (it
@@ -224,137 +260,103 @@ impl ConfiguredAttr {
     pub(crate) fn concat(
         self,
         attr_type: &AttrType,
-        items: &mut dyn Iterator<Item = anyhow::Result<Self>>,
-    ) -> anyhow::Result<Self> {
-        let mismatch = |ty, attr: ConfiguredAttr| {
-            Err(ConfiguredAttrError::ConcatNotSupportedValues(
-                ty,
-                attr.as_display_no_ctx().to_string(),
-            )
-            .into())
-        };
-
-        match self {
-            ConfiguredAttr::OneOf(box first, first_i) => {
-                // Becaise if attr type if `option(oneof([list(string), ...])`,
+        items: &mut dyn Iterator<Item = buck2_error::Result<Self>>,
+    ) -> buck2_error::Result<Self> {
+        match &attr_type.0.inner {
+            AttrTypeInner::OneOf(xs) => self.concat_oneof(items, xs),
+            AttrTypeInner::Option(opt) => {
+                // Because if attr type is `option(oneof([list(string), ...])`,
                 // value type is `oneof(list(...))`, without indication it is an option.
-                let attr_type = attr_type.unwrap_if_option();
-
-                let oneof_type = match &attr_type.0.inner {
-                    AttrTypeInner::OneOf(oneof_type) => oneof_type,
-                    _ => {
-                        return Err(ConfiguredAttrError::InconsistentAttrValueAndAttrType(
-                            ConfiguredAttr::OneOf(Box::new(first), first_i),
-                            attr_type.dupe(),
-                        )
-                        .into());
-                    }
-                };
-
-                let first_t = oneof_type.get(first_i)?;
-
-                first.concat(
-                    first_t,
-                    &mut items.map(|next| match next? {
-                        ConfiguredAttr::OneOf(box next, next_i) => {
-                            let next_t = oneof_type.get(next_i)?;
-                            if first_i != next_i {
-                                return Err(ConfiguredAttrError::ConcatDifferentOneofVariants(
-                                    first_t.dupe(),
-                                    next_t.dupe(),
-                                )
-                                .into());
+                self.concat(&opt.inner, items)
+            }
+            _ => match self {
+                ConfiguredAttr::OneOf(..) => Err(internal_error!(
+                    "Inconsistent attr value (`{}`) and attr type (`{}`)",
+                    self.as_display_no_ctx(),
+                    attr_type
+                )),
+                ConfiguredAttr::List(list) => {
+                    let mut res = list.to_vec();
+                    for x in items {
+                        match x? {
+                            ConfiguredAttr::List(list2) => {
+                                res.extend(list2.iter().cloned());
                             }
-                            Ok(next)
+                            attr => return Err(attr.concat_not_supported("list")),
                         }
-                        _ => Err(ConfiguredAttrError::LhsOneOfRhsNotOneOf.into()),
-                    }),
-                )
-            }
-            ConfiguredAttr::List(list) => {
-                let mut res = list.to_vec();
-                for x in items {
-                    match x? {
-                        ConfiguredAttr::List(list2) => {
-                            res.extend(list2.iter().cloned());
-                        }
-                        attr => return mismatch("list", attr),
                     }
+                    Ok(ConfiguredAttr::List(ListLiteral(res.into())))
                 }
-                Ok(ConfiguredAttr::List(ListLiteral(res.into())))
-            }
-            ConfiguredAttr::Dict(left) => {
-                let mut res = OrderedMap::new();
-                for (k, v) in left.iter().cloned() {
-                    res.insert(k, v);
-                }
-                for x in items {
-                    match x? {
-                        ConfiguredAttr::Dict(right) => {
-                            for (k, v) in right.iter().cloned() {
-                                match res.entry(k) {
-                                    small_map::Entry::Vacant(e) => {
-                                        e.insert(v);
-                                    }
-                                    small_map::Entry::Occupied(e) => {
-                                        return Err(ConfiguredAttrError::DictConcatDuplicateKeys(
-                                            e.key().as_display_no_ctx().to_string(),
-                                        )
-                                        .into());
+                ConfiguredAttr::Dict(left) => {
+                    let mut res = OrderedMap::new();
+                    for (k, v) in left.iter().cloned() {
+                        res.insert(k, v);
+                    }
+                    for x in items {
+                        match x? {
+                            ConfiguredAttr::Dict(right) => {
+                                for (k, v) in right.iter().cloned() {
+                                    match res.entry(k) {
+                                        small_map::Entry::Vacant(e) => {
+                                            e.insert(v);
+                                        }
+                                        small_map::Entry::Occupied(e) => {
+                                            return Err(buck2_error!(
+                                                buck2_error::ErrorTag::Input,
+                                                "got same key in both sides of dictionary concat (key `{}`)",
+                                                e.key().as_display_no_ctx()
+                                            ));
+                                        }
                                     }
                                 }
                             }
-                        }
-                        attr => return mismatch("dict", attr),
-                    }
-                }
-                Ok(ConfiguredAttr::Dict(res.into_iter().collect()))
-            }
-            ConfiguredAttr::String(res) => {
-                let mut items = items.peekable();
-                if items.peek().is_none() {
-                    Ok(ConfiguredAttr::String(res))
-                } else {
-                    let mut res = str::to_owned(&res.0);
-                    for x in items {
-                        match x? {
-                            ConfiguredAttr::String(right) => res.push_str(&right.0),
-                            attr => return mismatch("string", attr),
+                            attr => return Err(attr.concat_not_supported("dict")),
                         }
                     }
-                    Ok(ConfiguredAttr::String(StringLiteral(ArcStr::from(res))))
+                    Ok(ConfiguredAttr::Dict(res.into_iter().collect()))
                 }
-            }
-            ConfiguredAttr::Arg(left) => {
-                let res = left.string_with_macros.concat(items.map(|x| {
-                    match x? {
+                ConfiguredAttr::String(res) => {
+                    let mut items = items.peekable();
+                    if items.peek().is_none() {
+                        Ok(ConfiguredAttr::String(res))
+                    } else {
+                        let mut res = str::to_owned(&res.0);
+                        for x in items {
+                            match x? {
+                                ConfiguredAttr::String(right) => res.push_str(&right.0),
+                                attr => return Err(attr.concat_not_supported("string")),
+                            }
+                        }
+                        Ok(ConfiguredAttr::String(StringLiteral(ArcStr::from(res))))
+                    }
+                }
+                ConfiguredAttr::Arg(left) => {
+                    let res = left.string_with_macros.concat(items.map(|x| match x? {
                         ConfiguredAttr::Arg(x) => Ok(x.string_with_macros),
-                        attr => Err(ConfiguredAttrError::ConcatNotSupportedValues(
-                            "arg",
-                            attr.as_display_no_ctx().to_string(),
-                        )
-                        .into()),
-                    }
-                }))?;
-                Ok(ConfiguredAttr::Arg(ConfiguredStringWithMacros {
-                    string_with_macros: res,
-                    anon_target_compatible: left.anon_target_compatible,
-                }))
-            }
-            val => Err(ConfiguredAttrError::ConcatNotSupported(
-                val.as_display_no_ctx().to_string(),
-            )
-            .into()),
+                        attr => Err(attr.concat_not_supported("arg")),
+                    }))?;
+                    Ok(ConfiguredAttr::Arg(ConfiguredStringWithMacros {
+                        string_with_macros: res,
+                        anon_target_compatible: left.anon_target_compatible,
+                    }))
+                }
+                val => Err(buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "addition not supported for this attribute type `{}`",
+                    val.as_display_no_ctx()
+                )),
+            },
         }
     }
 
-    pub(crate) fn try_into_configuration_dep(self) -> anyhow::Result<TargetLabel> {
+    pub(crate) fn try_into_configuration_dep(self) -> buck2_error::Result<ConfigurationSettingKey> {
         match self {
-            ConfiguredAttr::ConfigurationDep(d) => Ok(*d),
-            a => Err(ConfiguredAttrError::ExpectingConfigurationDep(
-                a.as_display_no_ctx().to_string(),
-            )
-            .into()),
+            ConfiguredAttr::ConfigurationDep(d) => Ok(d),
+            s => Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "expecting configuration dep, got `{0}`",
+                s.as_display_no_ctx()
+            )),
         }
     }
 
@@ -365,10 +367,14 @@ impl ConfiguredAttr {
         }
     }
 
-    pub(crate) fn try_into_list(self) -> anyhow::Result<Vec<ConfiguredAttr>> {
+    pub(crate) fn try_into_list(self) -> buck2_error::Result<Vec<ConfiguredAttr>> {
         match self {
             ConfiguredAttr::List(list) => Ok(list.to_vec()),
-            a => Err(ConfiguredAttrError::ExpectingList(a.as_display_no_ctx().to_string()).into()),
+            a => Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "expecting a list, got `{0}`",
+                a.as_display_no_ctx()
+            )),
         }
     }
 }

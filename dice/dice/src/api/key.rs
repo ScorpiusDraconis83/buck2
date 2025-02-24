@@ -19,6 +19,7 @@ use dupe::Dupe;
 use crate::api::computations::DiceComputations;
 use crate::api::storage_type::StorageType;
 use crate::introspection::graph::short_type_name;
+use crate::Demand;
 
 /// The computation Key that maps to a value. The key will be used as an index
 /// for caching the computed values.
@@ -63,6 +64,32 @@ pub trait Key: Allocative + Debug + Display + Clone + Eq + Hash + Send + Sync + 
     }
 
     fn storage_type() -> StorageType {
-        StorageType::LastN(1)
+        StorageType::Normal
     }
+
+    /// Machinery to provide. Default implementation is no-op.
+    ///
+    /// Provided value can be obtained with [`DynKey`](crate::DynKey).
+    fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
+        let _ignore = demand;
+    }
+
+    fn invalidation_source_priority() -> InvalidationSourcePriority {
+        InvalidationSourcePriority::Normal
+    }
+}
+
+/// Dice tracks up to two invalidation paths for each node, a normal priority and a
+/// high priority one. The high priority one considers root invalidated Keys that have a High priority,
+/// the normal priority one will consider both Normal and High. The InvalidationSourcePriority
+/// is used only for the priority of the Key as a source of invalidation, all nodes participate
+/// in both normal and high for propagating invalidations.
+#[derive(Allocative, Debug, Clone, Copy, Dupe, PartialEq, Eq)]
+pub enum InvalidationSourcePriority {
+    /// The key will be ignored for invalidation source tracking.
+    Ignored,
+    /// The key can be an invalidation source only for the "normal" invalidation source path.
+    Normal,
+    /// The key can be an invalidation source for both the "normal" and "high" invalidation source paths.
+    High,
 }

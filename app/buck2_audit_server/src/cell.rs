@@ -14,32 +14,33 @@ use buck2_audit::cell::AuditCellCommand;
 use buck2_build_api::audit_cell::AUDIT_CELL;
 use buck2_cli_proto::ClientContext;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_core::cells::CellResolver;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
+use dice::DiceComputations;
+use futures::FutureExt;
 use indexmap::IndexMap;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
 
 #[async_trait]
-impl AuditSubcommand for AuditCellCommand {
+impl ServerAuditSubcommand for AuditCellCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         _client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx
-            .with_dice_ctx(async move |server_ctx, ctx| {
-                let cells = ctx.get_cell_resolver().await?;
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|server_ctx, mut ctx| async move {
                 let fs = server_ctx.project_root();
                 let cwd = server_ctx.working_dir();
 
-                let mappings = audit_cell(&self.aliases_to_resolve, self.aliases, &cells, cwd, fs)?;
+                let mappings =
+                    audit_cell(&mut ctx, &self.aliases_to_resolve, self.aliases, cwd, fs).await?;
 
                 let mut stdout = stdout.as_writer();
                 if self.paths_only {
@@ -61,23 +62,23 @@ impl AuditSubcommand for AuditCellCommand {
 
                 Ok(())
             })
-            .await
+            .await?)
     }
 }
 
-pub(crate) fn audit_cell(
-    aliases_to_resolve: &Vec<String>,
+pub(crate) async fn audit_cell(
+    ctx: &mut DiceComputations<'_>,
+    aliases_to_resolve: &[String],
     aliases: bool,
-    cells: &CellResolver,
     cwd: &ProjectRelativePath,
     fs: &ProjectRoot,
-) -> anyhow::Result<IndexMap<String, AbsNormPathBuf>> {
-    let this_cell = cells.get(cells.find(cwd)?).unwrap();
+) -> buck2_error::Result<IndexMap<String, AbsNormPathBuf>> {
+    let cells = ctx.get_cell_resolver().await?;
+    let this_resolver = ctx.get_cell_alias_resolver_for_dir(cwd).await?;
     let mappings: IndexMap<_, _> = {
         if aliases_to_resolve.is_empty() {
             if aliases {
-                this_cell
-                    .cell_alias_resolver()
+                this_resolver
                     .mappings()
                     .map(|(alias, cell_name)| {
                         (
@@ -104,7 +105,6 @@ pub(crate) fn audit_cell(
                     .collect()
             }
         } else {
-            let cell_alias_resolver = this_cell.cell_alias_resolver();
             aliases_to_resolve
                 .iter()
                 .map(|alias| {
@@ -112,21 +112,21 @@ pub(crate) fn audit_cell(
                         alias.to_owned(),
                         fs.resolve(
                             cells
-                                .get(cell_alias_resolver.resolve(alias)?)
+                                .get(this_resolver.resolve(alias)?)
                                 .unwrap()
                                 .path()
                                 .as_project_relative_path(),
                         ),
                     ))
                 })
-                .collect::<anyhow::Result<_>>()?
+                .collect::<buck2_error::Result<_>>()?
         }
     };
     Ok(mappings)
 }
 
 pub(crate) fn init_audit_cell() {
-    AUDIT_CELL.init(|aliases_to_resolve, aliases, cells, cwd, fs| {
-        audit_cell(aliases_to_resolve, aliases, cells, cwd, fs)
+    AUDIT_CELL.init(|ctx, aliases_to_resolve, aliases, cwd, fs| {
+        audit_cell(ctx, aliases_to_resolve, aliases, cwd, fs).boxed()
     });
 }

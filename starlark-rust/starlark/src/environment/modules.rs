@@ -33,6 +33,7 @@ use starlark_syntax::syntax::ast::Visibility;
 
 use crate::cast::transmute;
 use crate::collections::Hashed;
+use crate::docs::DocItem;
 use crate::docs::DocMember;
 use crate::docs::DocModule;
 use crate::docs::DocString;
@@ -51,6 +52,7 @@ use crate::values::layout::heap::heap_type::HeapKind;
 use crate::values::layout::heap::profile::aggregated::AggregateHeapProfileInfo;
 use crate::values::layout::heap::profile::aggregated::RetainedHeapProfile;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenHeap;
 use crate::values::FrozenHeapRef;
@@ -67,6 +69,8 @@ use crate::values::Value;
 enum ModuleError {
     #[error("Retained memory profiling is not enabled")]
     RetainedMemoryProfileNotEnabled,
+    #[error("Extra value already set to a value of type `{}`", .0)]
+    ExtraValueAlreadySet(&'static str),
 }
 
 /// The result of freezing a [`Module`], making it and its contained values immutable.
@@ -136,7 +140,7 @@ impl FrozenModule {
     ///
     /// This function does not return an error,
     /// but we prefer not to panic if there's some high level logic error.
-    pub fn from_globals(globals: &Globals) -> anyhow::Result<FrozenModule> {
+    pub fn from_globals(globals: &Globals) -> FreezeResult<FrozenModule> {
         let module = Module::new();
 
         module.frozen_heap.add_reference(globals.heap());
@@ -231,21 +235,23 @@ impl FrozenModule {
     pub fn documentation(&self) -> DocModule {
         let members = self
             .all_items()
-            .filter(|n| Module::default_visibility(n.0.as_str()) == Visibility::Public)
-            .map(|(k, v)| (k.as_str().to_owned(), DocMember::from_value(v.to_value())))
+            .filter(|n| {
+                // We only want to show public symbols in the documentation
+                self.get_any_visibility_option(n.0.as_str())
+                    .map_or(false, |(_, vis)| vis == Visibility::Public)
+            })
+            // FIXME(JakobDegen): Throws out information
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    DocItem::Member(DocMember::from_value(v.to_value())),
+                )
+            })
             .collect();
 
         DocModule {
             docs: self.module.documentation(),
             members,
-        }
-    }
-
-    /// Retained memory info, or error if not enabled.
-    pub fn aggregated_heap_profile_info(&self) -> anyhow::Result<&AggregateHeapProfileInfo> {
-        match &self.module.heap_profile {
-            None => Err(ModuleError::RetainedMemoryProfileNotEnabled.into()),
-            Some(p) => Ok(&p.info),
         }
     }
 
@@ -335,7 +341,7 @@ impl Module {
         }
     }
 
-    pub(crate) fn enable_heap_profile(&self, mode: RetainedHeapProfileMode) {
+    pub(crate) fn enable_retained_heap_profile(&self, mode: RetainedHeapProfileMode) {
         self.heap_profile_on_freeze.set(Some(mode));
     }
 
@@ -405,7 +411,7 @@ impl Module {
     }
 
     /// Freeze the environment, all its value will become immutable afterwards.
-    pub fn freeze(self) -> anyhow::Result<FrozenModule> {
+    pub fn freeze(self) -> FreezeResult<FrozenModule> {
         let Module {
             names,
             slots,
@@ -441,21 +447,13 @@ impl Module {
             docstring: docstring.into_inner(),
             heap_profile: stacks,
         };
-        let frozen_module_ref = freezer.heap.alloc_any_display_from_debug(rest);
+        let frozen_module_ref = freezer.heap.alloc_any(rest);
         for frozen_def in freezer.frozen_defs.borrow().as_slice() {
             frozen_def.post_freeze(frozen_module_ref, &heap, &freezer.heap);
         }
         // The values MUST be alive up until this point (as the above line uses them),
         // but can now be dropped
         mem::drop(heap);
-
-        if let Some(stacks) = &frozen_module_ref.heap_profile {
-            assert_eq!(stacks.info.unused_capacity.get(), 0, "sanity check");
-            stacks
-                .info
-                .unused_capacity
-                .set(freezer.heap.unused_capacity());
-        }
 
         Ok(FrozenModule {
             heap: freezer.into_ref(),
@@ -508,15 +506,17 @@ impl Module {
         &'v self,
         module: &FrozenModule,
         symbol: &str,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> crate::Result<Value<'v>> {
         if Self::default_visibility(symbol) != Visibility::Public {
-            return Err(EnvironmentError::CannotImportPrivateSymbol(symbol.to_owned()).into());
+            return Err(crate::Error::new_other(
+                EnvironmentError::CannotImportPrivateSymbol(symbol.to_owned()),
+            ));
         }
         match module.get_any_visibility(symbol)? {
             (v, Visibility::Public) => Ok(v.owned_value(self.frozen_heap())),
-            (_, Visibility::Private) => {
-                Err(EnvironmentError::ModuleSymbolIsNotExported(symbol.to_owned()).into())
-            }
+            (_, Visibility::Private) => Err(crate::Error::new_other(
+                EnvironmentError::ModuleSymbolIsNotExported(symbol.to_owned()),
+            )),
         }
     }
 
@@ -524,6 +524,7 @@ impl Module {
         self.docstring.replace(Some(docstring));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_eval_duration(&self, duration: Duration) {
         self.eval_duration.set(self.eval_duration.get() + duration);
     }
@@ -536,6 +537,8 @@ impl Module {
             extra_value.trace(tracer);
             self.set_extra_value(extra_value);
         }
+
+        self.heap().trace_interner(tracer);
     }
 
     /// Field that can be used for any purpose you want.
@@ -543,6 +546,15 @@ impl Module {
         // Cast lifetime.
         let v = unsafe { transmute!(Value, Value, v) };
         self.extra_value.set(Some(v));
+    }
+
+    /// Set extra value, but fail if it's already set.
+    pub fn set_extra_value_no_overwrite<'v>(&'v self, v: Value<'v>) -> anyhow::Result<()> {
+        if let Some(existing) = self.extra_value() {
+            return Err(ModuleError::ExtraValueAlreadySet(existing.get_type()).into());
+        }
+        self.set_extra_value(v);
+        Ok(())
     }
 
     /// Field that can be used for any purpose you want.
@@ -568,8 +580,8 @@ mod tests {
     use crate::environment::Globals;
     use crate::environment::GlobalsBuilder;
     use crate::environment::Module;
+    use crate::eval::runtime::profile::mode::ProfileMode;
     use crate::eval::Evaluator;
-    use crate::eval::ProfileMode;
     use crate::syntax::AstModule;
     use crate::syntax::Dialect;
     use crate::values::list::ListRef;
@@ -591,7 +603,7 @@ def f(x):
 x = f(1)
 "
                     .to_owned(),
-                    &Dialect::Extended,
+                    &Dialect::AllOptionsInternal,
                 )
                 .unwrap(),
                 &Globals::standard(),
@@ -599,10 +611,8 @@ x = f(1)
             .unwrap();
         }
         let module = module.freeze().unwrap();
-        let profile_info = module.aggregated_heap_profile_info().unwrap();
-        let heap_summary = profile_info.gen_summary_csv();
+        let heap_summary = module.heap_profile().unwrap().gen_csv().unwrap();
         // Smoke test.
-        assert!(profile_info.unused_capacity.get() > 0);
         assert!(heap_summary.contains("\"x.star.f\""), "{:?}", heap_summary);
     }
 

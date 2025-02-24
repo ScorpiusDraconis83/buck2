@@ -13,8 +13,9 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 
-use anyhow::Context;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_util::process::background_command;
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -25,13 +26,14 @@ pub async fn launch_forkserver(
     exe: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
     state_dir: &AbsNormPath,
-) -> anyhow::Result<ForkserverClient> {
+    resource_control_arg: String,
+) -> buck2_error::Result<ForkserverClient> {
     let (client_io, server_io) =
-        UnixStream::pair().context("Failed to create fork server channel")?;
+        UnixStream::pair().buck_error_context("Failed to create fork server channel")?;
 
     let server_io = server_io
         .into_std()
-        .context("Failed to convert server_io to std")?;
+        .buck_error_context("Failed to convert server_io to std")?;
 
     let exe = exe.as_ref();
 
@@ -45,7 +47,9 @@ pub async fn launch_forkserver(
         .arg("--fd")
         .arg(server_io.as_raw_fd().to_string())
         .arg("--state-dir")
-        .arg(state_dir.as_path());
+        .arg(state_dir.as_path())
+        .arg("--resource-control")
+        .arg(resource_control_arg);
 
     let fds = [server_io.as_raw_fd()];
 
@@ -70,13 +74,14 @@ pub async fn launch_forkserver(
         });
     }
 
-    let child = Command::from(command)
-        .spawn()
-        .with_context(|| format!("Failed to start Forkserver `{}`", exe.to_string_lossy()))?;
+    let child = Command::from(command).spawn().with_buck_error_context(|| {
+        format!("Failed to start Forkserver `{}`", exe.to_string_lossy())
+    })?;
 
     let channel = buck2_grpc::make_channel(client_io, "forkserver")
         .await
-        .context("Error connecting to Forkserver")?;
+        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+        .buck_error_context("Error connecting to Forkserver")?;
 
     Ok(ForkserverClient::new(child, channel))
 }

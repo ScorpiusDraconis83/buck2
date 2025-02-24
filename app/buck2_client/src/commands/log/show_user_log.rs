@@ -8,6 +8,7 @@
  */
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::stdio;
 use buck2_event_log::user_event_types::try_get_user_event_for_read;
@@ -23,10 +24,10 @@ pub struct ShowUserLogCommand {
 }
 
 impl ShowUserLogCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self { event_log } = self;
 
-        ctx.with_runtime(async move |ctx| {
+        ctx.instant_command_no_log("log-show-user", |ctx| async move {
             let log_path = event_log.get(&ctx).await?;
 
             let (invocation, mut events) = log_path.unpack_stream().await?;
@@ -47,8 +48,8 @@ impl ShowUserLogCommand {
                 }
             }
 
-            anyhow::Ok(())
-        })?;
-        ExitResult::success()
+            buck2_error::Ok(())
+        })
+        .into()
     }
 }

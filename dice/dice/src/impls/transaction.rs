@@ -11,16 +11,15 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use derivative::Derivative;
+use dice_error::DiceError;
+use dice_error::DiceResult;
 use dupe::Dupe;
-use tokio::sync::oneshot;
 
-use crate::api::error::DiceError;
-use crate::api::error::DiceResult;
+use crate::api::key::InvalidationSourcePriority;
 use crate::api::key::Key;
 use crate::api::storage_type::StorageType;
 use crate::api::user_data::UserComputationData;
 use crate::impls::core::state::CoreStateHandle;
-use crate::impls::core::state::StateRequest;
 use crate::impls::ctx::BaseComputeCtx;
 use crate::impls::ctx::SharedLiveTransactionCtx;
 use crate::impls::key::DiceKey;
@@ -90,7 +89,7 @@ impl TransactionUpdater {
     }
 
     /// Commit the changes registered via 'changed' and 'changed_to' to the current newest version.
-    pub(crate) async fn commit(self) -> BaseComputeCtx {
+    pub(crate) async fn commit<'a>(self) -> BaseComputeCtx {
         let user_data = self.user_data.dupe();
         let dice = self.dice.dupe();
 
@@ -110,47 +109,32 @@ impl TransactionUpdater {
     }
 
     pub(crate) async fn existing_state(&self) -> BaseComputeCtx {
-        let (tx, rx) = oneshot::channel();
-        self.dice
-            .state_handle
-            .request(StateRequest::CurrentVersion { resp: tx });
-
-        let v = rx.await.unwrap();
+        let v = self.dice.state_handle.current_version().await;
         let guard = ActiveTransactionGuard::new(v, self.dice.state_handle.dupe());
-        let (tx, rx) = oneshot::channel();
-        self.dice.state_handle.request(StateRequest::CtxAtVersion {
-            version: v,
-            guard,
-            resp: tx,
-        });
-
-        let (transaction, guard) = rx.await.unwrap();
+        let (transaction, guard) = self.dice.state_handle.ctx_at_version(v, guard).await;
         BaseComputeCtx::new(transaction, self.user_data.dupe(), self.dice.dupe(), guard)
     }
 
     pub(crate) fn unstable_take(&self) {
-        self.dice
-            .state_handle
-            .request(StateRequest::UnstableDropEverything)
+        self.dice.state_handle.unstable_drop_everything()
     }
 
     async fn commit_to_state(self) -> (SharedLiveTransactionCtx, ActiveTransactionGuard) {
-        let (tx, rx) = oneshot::channel();
-        self.dice.state_handle.request(StateRequest::UpdateState {
-            changes: self.scheduled_changes.changes.into_iter().collect(),
-            resp: tx,
-        });
+        let v = self
+            .dice
+            .state_handle
+            .update_state(
+                self.scheduled_changes
+                    .changes
+                    .into_iter()
+                    .map(|(k, (t, p))| (k, t, p))
+                    .collect(),
+            )
+            .await;
 
-        let v = rx.await.unwrap();
         let guard = ActiveTransactionGuard::new(v, self.dice.state_handle.dupe());
-        let (tx, rx) = oneshot::channel();
-        self.dice.state_handle.request(StateRequest::CtxAtVersion {
-            guard,
-            version: v,
-            resp: tx,
-        });
 
-        rx.await.unwrap()
+        self.dice.state_handle.ctx_at_version(v, guard).await
     }
 }
 
@@ -174,14 +158,13 @@ pub(crate) struct ActiveTransactionGuardInner {
 
 impl Drop for ActiveTransactionGuardInner {
     fn drop(&mut self) {
-        self.state_handle
-            .request(StateRequest::DropCtxAtVersion { version: self.v })
+        self.state_handle.drop_ctx_at_version(self.v)
     }
 }
 
 #[derive(Allocative)]
 struct Changes {
-    changes: HashMap<DiceKey, ChangeType>,
+    changes: HashMap<DiceKey, (ChangeType, InvalidationSourcePriority)>,
     dice: Arc<DiceModern>,
 }
 
@@ -194,13 +177,24 @@ impl Changes {
     }
 
     pub(crate) fn change<K: Key>(&mut self, key: K, change: ChangeType) -> DiceResult<()> {
-        let key = self.dice.key_index.index_key(key);
-        if self.changes.insert(key, change).is_some() {
-            Err(DiceError::duplicate(
-                self.dice.key_index.get(key).dupe().downcast::<K>().unwrap(),
-            ))
-        } else {
-            Ok(())
+        match (change, K::storage_type()) {
+            (ChangeType::Invalidate, StorageType::Injected) => {
+                Err(DiceError::injected_key_invalidated(Arc::new(key)))
+            }
+            (change, _) => {
+                let key = self.dice.key_index.index_key(key);
+                if self
+                    .changes
+                    .insert(key, (change, K::invalidation_source_priority()))
+                    .is_some()
+                {
+                    Err(DiceError::duplicate(
+                        self.dice.key_index.get(key).dupe().downcast::<K>().unwrap(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -213,6 +207,11 @@ pub(crate) enum ChangeType {
     UpdateValue(DiceValidValue, StorageType),
     #[cfg(test)]
     /// testing only, set as recheck but not required to rerun
+    /// TODO(cjhopman): Delete this, it's really hard to use correctly and
+    /// it causes VersionedGraph to need to deal with flows of invalidations
+    /// that it otherwise wouldn't.
+    /// The right way to get a "soft-dirty", would be to have a dep and do a
+    /// normal ChangeType::Invalidate on the dep.
     TestingSoftDirty,
 }
 
@@ -227,6 +226,7 @@ mod tests {
 
     use crate::api::computations::DiceComputations;
     use crate::api::data::DiceData;
+    use crate::api::key::InvalidationSourcePriority;
     use crate::api::key::Key;
     use crate::impls::dice::DiceModern;
     use crate::impls::key::CowDiceKeyHashed;
@@ -267,14 +267,14 @@ mod tests {
                 .scheduled_changes
                 .changes
                 .get(&dice.key_index.index(CowDiceKeyHashed::key(K(1)))),
-            Some(ChangeType::Invalidate)
+            Some((ChangeType::Invalidate, InvalidationSourcePriority::Normal))
         );
         assert_matches!(
             updater
                 .scheduled_changes
                 .changes
                 .get(&dice.key_index.index(CowDiceKeyHashed::key(K(2)))),
-            Some(ChangeType::Invalidate)
+            Some((ChangeType::Invalidate, InvalidationSourcePriority::Normal))
         );
 
         assert_matches!(
@@ -282,7 +282,7 @@ mod tests {
             .scheduled_changes
             .changes
             .get(&dice.key_index.index(CowDiceKeyHashed::key(K(3)))),
-        Some(ChangeType::UpdateValue(x, _)) if *x.downcast_ref::<usize>().unwrap() == 3
+        Some((ChangeType::UpdateValue(x, _), _)) if *x.downcast_ref::<usize>().unwrap() == 3
             );
 
         assert_matches!(
@@ -290,7 +290,7 @@ mod tests {
             .scheduled_changes
             .changes
             .get(&dice.key_index.index(CowDiceKeyHashed::key(K(4)))),
-        Some(ChangeType::UpdateValue(x, _)) if *x.downcast_ref::<usize>().unwrap() == 4
+        Some((ChangeType::UpdateValue(x, _), _)) if *x.downcast_ref::<usize>().unwrap() == 4
             );
 
         assert!(updater.changed(vec![K(1)]).is_err());

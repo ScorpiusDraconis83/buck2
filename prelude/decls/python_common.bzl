@@ -27,7 +27,7 @@ def _platform_srcs_arg():
      regex against which the platform name is matched, and the second element
      is a list of source files. The regex should use `java.util.regex.Pattern` syntax.
      The platform name is a Python platform *flavor* defined in
-     the buckconfig#`python`section of `.buckconfig`.
+     the buckconfig#`python` section of `.buckconfig`.
 """),
     }
 
@@ -49,7 +49,7 @@ def _platform_resources_arg():
      regex against which the platform name is matched, and the second element
      is a list of resource files. The regex should use `java.util.regex.Pattern` syntax.
      The platform name is a Python platform *flavor* defined in
-     the buckconfig#`python`section of `.buckconfig`.
+     the buckconfig#`python `section of `.buckconfig`.
 """),
     }
 
@@ -75,9 +75,9 @@ def _linker_flags_arg():
         "linker_flags": attrs.list(attrs.arg(anon_target_compatible = True), default = [], doc = """
     Additional linker flags that should be applied to any linking which is specific to this rule.
      Note that whether these flags are used is dependent on the native link strategy selected in
-     `.buckconfig` and currently applies only to the `merged` ``.buckconfig``;
+     `.buckconfig` and currently applies only to the merged `.buckconfig`;
      the `separate` link strategy pulls in shared libraries that are linked in the
-     context of the rules that own them, such as `cxx\\_library()`.
+     context of the rules that own them, such as `cxx_library()`.
 """),
     }
 
@@ -118,6 +118,17 @@ def _deduplicate_merged_link_roots():
 """),
     }
 
+def _version_selections_arg():
+    return {
+        "version_selections": attrs.dict(
+            key = attrs.string(),
+            value = attrs.string(),
+            default = {},
+            doc = """A mapping from library name to desired version. Versioned dependencies from the entire dependency tree with the given name will be used at the specified version, if available.
+            Versioned libraries that are unspecified will be used at their respective default version.""",
+        ),
+    }
+
 python_common = struct(
     srcs_arg = _srcs_arg,
     platform_srcs_arg = _platform_srcs_arg,
@@ -130,4 +141,5 @@ python_common = struct(
     preload_deps_arg = _preload_deps_arg,
     exclude_deps_from_merged_linking_arg = _exclude_deps_from_merged_linking_arg,
     deduplicate_merged_link_roots = _deduplicate_merged_link_roots,
+    version_selections_arg = _version_selections_arg,
 )

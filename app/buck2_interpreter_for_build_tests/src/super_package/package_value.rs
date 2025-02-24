@@ -12,7 +12,6 @@
 use buck2_core::cells::build_file_cell::BuildFileCell;
 use buck2_core::fs::project::ProjectRootTemp;
 use buck2_core::package::PackageLabel;
-use buck2_interpreter::starlark_profiler::StarlarkProfilerOrInstrumentation;
 use buck2_interpreter_for_build::interpreter::dice_calculation_delegate::HasCalculationDelegate;
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
@@ -53,18 +52,16 @@ async fn test_package_value_same_dir_package_file() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
 
     let result = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//headphones"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
+        .eval_build_file(PackageLabel::testing_parse("root//headphones"))
         .await
+        .1
         .unwrap();
 
     let target_nodes: Vec<_> = result.targets().values().collect();
@@ -76,6 +73,7 @@ async fn test_package_value_same_dir_package_file() {
             .attr("value", AttrInspectOptions::DefinedOnly)
             .unwrap()
             .unwrap()
+            .value
             .as_display_no_ctx()
             .to_string()
     );
@@ -100,18 +98,16 @@ async fn test_package_value_parent_dir_package_file() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
 
     let result = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//trackpad"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
+        .eval_build_file(PackageLabel::testing_parse("root//trackpad"))
         .await
+        .1
         .unwrap();
 
     let target_nodes: Vec<_> = result.targets().values().collect();
@@ -123,6 +119,7 @@ async fn test_package_value_parent_dir_package_file() {
             .attr("value", AttrInspectOptions::DefinedOnly)
             .unwrap()
             .unwrap()
+            .value
             .as_display_no_ctx()
             .to_string()
     );
@@ -136,17 +133,15 @@ async fn test_overwrite_package_value_not_allowed_without_overwrite_flag() {
     fs.write_file("foo/PACKAGE", "write_package_value('aaa.bbb', 'ccc')");
     fs.write_file("foo/BUCK", "");
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
     let err = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//foo"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
-        .await;
+        .eval_build_file(PackageLabel::testing_parse("root//foo"))
+        .await
+        .1;
     assert!(
         format!("{:?}", err)
             .contains("key set in parent `PACKAGE` file, and overwrite flag is not set"),
@@ -178,7 +173,7 @@ async fn test_overwrite_package_value_with_flag() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
+    let mut ctx = calculation(&fs).await;
     let result = ctx
         .get_interpreter_results(PackageLabel::testing_parse("root//foo"))
         .await
@@ -193,6 +188,7 @@ async fn test_overwrite_package_value_with_flag() {
             .attr("value", AttrInspectOptions::DefinedOnly)
             .unwrap()
             .unwrap()
+            .value
             .as_display_no_ctx()
             .to_string()
     );
@@ -221,18 +217,16 @@ async fn test_read_parent_package_value() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
 
     let result = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//foo"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
+        .eval_build_file(PackageLabel::testing_parse("root//foo"))
         .await
+        .1
         .unwrap();
 
     let target_nodes: Vec<_> = result.targets().values().collect();
@@ -244,6 +238,7 @@ async fn test_read_parent_package_value() {
             .attr("value", AttrInspectOptions::DefinedOnly)
             .unwrap()
             .unwrap()
+            .value
             .as_display_no_ctx()
             .to_string()
     );
@@ -286,18 +281,16 @@ async fn test_read_parent_package_value_from_bzl() {
         ),
     );
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
 
     let result = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//foo"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
+        .eval_build_file(PackageLabel::testing_parse("root//foo"))
         .await
+        .1
         .unwrap();
 
     let target_nodes: Vec<_> = result.targets().values().collect();
@@ -309,6 +302,7 @@ async fn test_read_parent_package_value_from_bzl() {
             .attr("value", AttrInspectOptions::DefinedOnly)
             .unwrap()
             .unwrap()
+            .value
             .as_display_no_ctx()
             .to_string()
     );
@@ -322,17 +316,15 @@ async fn test_read_parent_package_value_is_suggested_in_package_file() {
     fs.write_file("foo/PACKAGE", "read_package_value('aaa.bbb')");
     fs.write_file("foo/BUCK", "");
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
     let err = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//foo"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
-        .await;
+        .eval_build_file(PackageLabel::testing_parse("root//foo"))
+        .await
+        .1;
     assert!(
         format!("{:?}", err)
             .contains("In a Package context, consider using `read_parent_package_value`"),
@@ -366,16 +358,13 @@ async fn test_read_parent_package_value_is_suggested_in_bzl_file() {
     );
     fs.write_file("foo/BUCK", "");
 
-    let ctx = calculation(&fs).await;
-    let interpreter = ctx
+    let mut ctx = calculation(&fs).await;
+    let mut interpreter = ctx
         .get_interpreter_calculator(root_cell(), BuildFileCell::new(root_cell()))
         .await
         .unwrap();
     let err = interpreter
-        .eval_build_file(
-            PackageLabel::testing_parse("root//foo"),
-            &mut StarlarkProfilerOrInstrumentation::disabled(),
-        )
+        .eval_build_file(PackageLabel::testing_parse("root//foo"))
         .await;
     assert!(
         format!("{:?}", err)

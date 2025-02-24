@@ -183,9 +183,7 @@ impl SuperConsoleOutput for NonBlockingSuperConsoleOutput {
 }
 
 #[cfg(test)]
-mod test {
-    use crossbeam_channel::Receiver;
-
+mod tests {
     use super::*;
 
     /// A test writer that just sends into a channel. Lets us block / unblock the output to test
@@ -245,7 +243,7 @@ mod test {
         }
 
         // Likewise, we expect that sending output and finalizing wold fail.
-        assert!(output.output(vec![]).is_err());
+        assert!(output.output(Vec::new()).is_err());
         assert!(Box::new(output).finalize().is_err());
 
         Ok(())

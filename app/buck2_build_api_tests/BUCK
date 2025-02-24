@@ -1,12 +1,11 @@
-load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
+load("@fbcode_macros//build_defs:rust_unittest.bzl", "rust_unittest")
 
 oncall("build_infra")
 
-rust_library(
+rust_unittest(
     name = "buck2_build_api_tests",
     srcs = glob(["src/**/*.rs"]),
-    test_deps = [
+    deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:assert_matches",
         "fbsource//third-party/rust:async-trait",
@@ -19,6 +18,7 @@ rust_library(
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tokio",
         "//buck2/allocative/allocative:allocative",
+        "//buck2/app/buck2_action_impl:buck2_action_impl",
         "//buck2/app/buck2_analysis:buck2_analysis",
         "//buck2/app/buck2_anon_target:buck2_anon_target",
         "//buck2/app/buck2_artifact:buck2_artifact",
@@ -27,6 +27,7 @@ rust_library(
         "//buck2/app/buck2_configured:buck2_configured",
         "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_data:buck2_data",
+        "//buck2/app/buck2_directory:buck2_directory",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_events:buck2_events",
         "//buck2/app/buck2_execute:buck2_execute",
@@ -35,11 +36,11 @@ rust_library(
         "//buck2/app/buck2_interpreter:buck2_interpreter",
         "//buck2/app/buck2_interpreter_for_build:buck2_interpreter_for_build",
         "//buck2/app/buck2_node:buck2_node",
+        "//buck2/app/buck2_transition:buck2_transition",
         "//buck2/app/buck2_util:buck2_util",
         "//buck2/dice/dice:dice",
         "//buck2/gazebo/dupe:dupe",
         "//buck2/gazebo/gazebo:gazebo",
-        "//buck2/shed/provider:provider",
         "//buck2/starlark-rust/starlark:starlark",
         "//buck2/starlark-rust/starlark_map:starlark_map",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",

@@ -30,7 +30,7 @@ use crate::interpreter::rule_defs::cmd_args::testing;
 pub(crate) fn inputs_helper(builder: &mut GlobalsBuilder) {
     fn make_inputs<'v>(
         values: UnpackListOrTuple<Value<'v>>,
-    ) -> anyhow::Result<StarlarkCommandLineInputs> {
+    ) -> starlark::Result<StarlarkCommandLineInputs> {
         let mut visitor = SimpleCommandLineArtifactVisitor::new();
         for v in values {
             let cli = ValueAsCommandLineLike::unpack_value_err(v)?.0;
@@ -43,7 +43,7 @@ pub(crate) fn inputs_helper(builder: &mut GlobalsBuilder) {
     }
 }
 
-fn tester() -> anyhow::Result<Tester> {
+fn tester() -> buck2_error::Result<Tester> {
     let mut tester = Tester::new()?;
     tester.additional_globals(testing::command_line_stringifier);
     tester.additional_globals(inputs_helper);
@@ -95,7 +95,7 @@ fn stringifies_correctly() -> buck2_error::Result<()> {
     expect_error(
         tester.run_starlark_bzl_test(contents),
         contents,
-        "value implementing CommandLineArgLike",
+        "Expected `CellPath | artifact",
     );
 
     Ok(())
@@ -107,12 +107,11 @@ fn displays_correctly() -> buck2_error::Result<()> {
     tester.run_starlark_bzl_test(indoc!(
         r#"
         def test():
-            cli = cmd_args(format="x{}y", quote="shell")
+            cli = cmd_args(format="x{}y", quote="shell", hidden="bar")
             cli.add("foo")
-            cli.hidden("bar")
             # TODO(nga): fix options formatting.
             assert_eq('cmd_args("foo", hidden=["bar"], format="x{}y", quote="shell")', str(cli))
-            assert_eq('cmd_args(\n  "foo",\n  hidden=[ "bar" ],\n  format="x{}y",\n  quote="shell"\n)', pprint_str(cli))
+            assert_eq('cmd_args(\n  "foo",\n  hidden=[ "bar" ],\n  format="x{}y",\n  quote="shell"\n)', prepr(cli))
         "#
     ))?;
 
@@ -126,8 +125,7 @@ fn displays_correctly_replace_regex() {
         .run_starlark_bzl_test(indoc!(
             r#"
         def test():
-            cli = cmd_args()
-            cli.replace_regex(regex("foo"), "bar")
+            cli = cmd_args(replace_regex=(regex("foo"), "bar"))
             assert_eq('cmd_args(replacements=[("foo", "bar")])', str(cli))
         "#
         ))
@@ -254,30 +252,27 @@ fn command_line_builder() -> buck2_error::Result<()> {
     expect_error(
         tester.run_starlark_bzl_test(content_invalid_type_1),
         content_invalid_type_1,
-        "value implementing CommandLineArgLike",
+        "Expected `CellPath | artifact",
     );
     expect_error(
         tester.run_starlark_bzl_test(content_invalid_type_3),
         content_invalid_type_3,
-        "value implementing CommandLineArgLike",
+        "Expected `CellPath | artifact",
     );
 
     Ok(())
 }
 
 #[test]
-fn test_relative_absolute() -> anyhow::Result<()> {
+fn test_relative_absolute_old() -> anyhow::Result<()> {
     let mut tester = tester()?;
     let contents = indoc!(
         r#"
         def test():
-            args = cmd_args()
+            args = cmd_args(absolute_prefix="$ABSOLUTE/", absolute_suffix="!")
             args.add(source_artifact("foo","bar/baz/qux.h"))
             args.relative_to(source_artifact("foo", "bar/foo"))
-            args.absolute_prefix("$ABSOLUTE/")
-            assert_eq(get_args(args), ["$ABSOLUTE/../baz/qux.h"])
 
-            args.absolute_suffix("!")
             assert_eq(get_args(args), ["$ABSOLUTE/../baz/qux.h!"])
 
             args = cmd_args()
@@ -291,14 +286,77 @@ fn test_relative_absolute() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_relative_absolute() -> anyhow::Result<()> {
+    let mut tester = tester()?;
+    let contents = indoc!(
+        r#"
+        def test():
+            args = cmd_args(absolute_prefix="$ABSOLUTE/", absolute_suffix="!", relative_to=source_artifact("foo", "bar/foo"))
+            args.add(source_artifact("foo","bar/baz/qux.h"))
+
+            assert_eq(get_args(args), ["$ABSOLUTE/../baz/qux.h!"])
+
+            args = cmd_args(relative_to=(source_artifact("foo", "bar/baz"), 1))
+            args.add(source_artifact("foo","bar/baz/qux.h"))
+            assert_eq(get_args(args), ["baz/qux.h"])
+            "#
+    );
+    tester.run_starlark_bzl_test(contents)?;
+    Ok(())
+}
+
+#[test]
+fn test_relative_to_propagated_up_and_down() -> anyhow::Result<()> {
+    let mut tester = tester()?;
+    let contents = indoc!(
+        r#"
+        def test():
+            args = cmd_args(source_artifact("foo", "bar.h"))
+            # Self check
+            assert_eq(get_args(args), ["foo/bar.h"])
+
+            # `relative_to` is propagated down to `args`
+            args2 = cmd_args(args, relative_to=(source_artifact("foo", "baz.c"), 1))
+            assert_eq(get_args(args2), ["./bar.h"])
+
+            # `relative_to` is propagated up to `args3`
+            args3 = cmd_args(args2)
+            assert_eq(get_args(args3), ["./bar.h"])
+        "#
+    );
+    tester.run_starlark_bzl_test(contents)?;
+    Ok(())
+}
+
+#[test]
+fn test_relative_to_does_not_affect_new_artifacts() -> anyhow::Result<()> {
+    let mut tester = tester().unwrap();
+    let content = indoc!(
+        r#"
+        def test():
+            args = cmd_args(
+                source_artifact("foo", "bar.h"),
+                relative_to=(source_artifact("foo", "baz.c"), 1),
+            )
+            # Self check
+            assert_eq(get_args(args), ["./bar.h"])
+
+            args2 = cmd_args(args, source_artifact("foo", "bar2.h"))
+            assert_eq(get_args(args2), ["./bar.h", "foo/bar2.h"])
+        "#
+    );
+    tester.run_starlark_bzl_test(content)?;
+    Ok(())
+}
+
+#[test]
 fn test_parent() -> anyhow::Result<()> {
     let mut tester = tester()?;
     let contents = indoc!(
         r#"
         def test():
-            args = cmd_args()
+            args = cmd_args(absolute_suffix="!", parent=1)
             args.add(source_artifact("foo","bar/baz/qux.h"))
-            args.parent().absolute_suffix("!")
             assert_eq(get_args(args), ["foo/bar/baz!"])
         "#
     );
@@ -307,9 +365,8 @@ fn test_parent() -> anyhow::Result<()> {
     let too_many_parent_calls = indoc!(
         r#"
         def test():
-            args = cmd_args()
+            args = cmd_args(parent=3)
             args.add(source_artifact("foo","qux.h"))
-            args.parent().parent().parent()
             get_args(args)
         "#
     );
@@ -328,20 +385,30 @@ fn test_parent_n() -> anyhow::Result<()> {
     let contents = indoc!(
         r#"
         def test():
-            args = cmd_args()
-            args.add(source_artifact("foo","bar/baz/qux.h"))
-            args.parent(2).absolute_suffix("!")
+            args = cmd_args(
+                source_artifact("foo","bar/baz/qux.h"),
+                absolute_suffix="!",
+                parent=2,
+            )
             assert_eq(get_args(args), ["foo/bar!"])
         "#
     );
     tester.run_starlark_bzl_test(contents)?;
 
+    Ok(())
+}
+
+#[test]
+fn test_parent_n_too_many_parents() -> anyhow::Result<()> {
+    let mut tester = tester()?;
+
     let too_many_parent_calls = indoc!(
         r#"
         def test():
-            args = cmd_args()
-            args.add(source_artifact("foo","qux.h"))
-            args.parent(3)
+            args = cmd_args(
+                source_artifact("foo","qux.h"),
+                parent=3,
+            )
             get_args(args)
         "#
     );
@@ -351,19 +418,27 @@ fn test_parent_n() -> anyhow::Result<()> {
         "too many .parent() calls",
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_parent_n_parent_type() -> anyhow::Result<()> {
+    let mut tester = tester()?;
+
     let bad_count = indoc!(
         r#"
         def test():
-            args = cmd_args()
-            args.add(source_artifact("foo","qux.h"))
-            args.parent(-12)
+            args = cmd_args(
+                source_artifact("foo","qux.h"),
+                parent=-12,
+            )
             get_args(args)
         "#
     );
     expect_error(
         tester.run_starlark_bzl_test(bad_count),
         bad_count,
-        "Type of parameter `count` doesn't match",
+        "Integer value is too big to fit in u32",
     );
 
     Ok(())
@@ -450,11 +525,10 @@ fn test_inputs_outputs() -> anyhow::Result<()> {
             artifact4 = bound_artifact("//:dep2", "dir/quz.h")
             artifact5 = declared_artifact("declared")
 
-            cli = cmd_args()
+            cli = cmd_args(hidden=artifact1)
             cli.add(artifact3)
             cli.add("just a string")
             cli.add(artifact4)
-            cli.hidden(artifact1)
             cli.add(artifact5.as_output())
 
             assert_eq(make_inputs([artifact3, artifact4, artifact1]), cli.inputs)
@@ -477,9 +551,8 @@ fn test_ignore_artifacts() -> anyhow::Result<()> {
         def test():
             artifact = bound_artifact("//:dep2", "dir/quz.h")
 
-            cli = cmd_args()
+            cli = cmd_args(ignore_artifacts=True)
             cli.add(artifact)
-            cli.ignore_artifacts()
 
             assert_eq(make_inputs([]), cli.inputs)
             assert_eq([], cli.outputs)
@@ -612,13 +685,45 @@ fn test_replace_regex() -> anyhow::Result<()> {
     let contents = indoc!(
         r#"
         def test():
-            args = cmd_args("$OUT", "$OUTPUT", "$SRCS", format="$OUT: {}")
-            args.replace_regex("\\$OUT\\b", "%OUT%")
-            args.replace_regex("\\$SRCS\\b", "%SRCS%")
+            args = cmd_args(
+                "$OUT",
+                "$OUTPUT",
+                "$SRCS",
+                format="$OUT: {}",
+                replace_regex=[("\\$OUT\\b", "%OUT%"), ("\\$SRCS\\b", "%SRCS%")],
+            )
             assert_eq(["$OUT: %OUT%", "$OUT: $OUTPUT", "$OUT: %SRCS%"], get_args(args))
 
-            args = cmd_args("\\n\n")
-            args.replace_regex("\\\\n", "\\\n").replace_regex("\\n", "\\n")
+            args = cmd_args(
+                "\\n\n",
+                replace_regex=[("\\\\n", "\\\n"), ("\\n", "\\n")],
+            )
+            assert_eq(["\\\\n\\n"], get_args(args))
+        "#
+    );
+    tester.run_starlark_bzl_test(contents)?;
+    Ok(())
+}
+
+#[test]
+fn test_replace_regex_old() -> anyhow::Result<()> {
+    let mut tester = tester()?;
+    let contents = indoc!(
+        r#"
+        def test():
+            args = cmd_args(
+                "$OUT",
+                "$OUTPUT",
+                "$SRCS",
+                format="$OUT: {}",
+                replace_regex=[("\\$OUT\\b", "%OUT%"), ("\\$SRCS\\b", "%SRCS%")],
+            )
+            assert_eq(["$OUT: %OUT%", "$OUT: $OUTPUT", "$OUT: %SRCS%"], get_args(args))
+
+            args = cmd_args(
+                "\\n\n",
+                replace_regex=[("\\\\n", "\\\n"), ("\\n", "\\n")],
+            )
             assert_eq(["\\\\n\\n"], get_args(args))
         "#
     );
@@ -632,13 +737,12 @@ fn test_replace_regex_regex() -> anyhow::Result<()> {
     let contents = indoc!(
         r#"
         def test():
-            args = cmd_args("$OUT", "$OUTPUT", "$SRCS", format="$OUT: {}")
-            args.replace_regex(regex("\\$OUT\\b"), "%OUT%")
-            args.replace_regex(regex("\\$SRCS\\b"), "%SRCS%")
+            args = cmd_args("$OUT", "$OUTPUT", "$SRCS", format="$OUT: {}",
+                replace_regex=[(regex("\\$OUT\\b"), "%OUT%"), (regex("\\$SRCS\\b"), "%SRCS%")])
             assert_eq(["$OUT: %OUT%", "$OUT: $OUTPUT", "$OUT: %SRCS%"], get_args(args))
 
-            args = cmd_args("\\n\n")
-            args.replace_regex(regex("\\\\n"), "\\\n").replace_regex("\\n", "\\n")
+            args = cmd_args("\\n\n",
+                replace_regex = [(regex("\\\\n"), "\\\n"), ("\\n", "\\n")])
             assert_eq(["\\\\n\\n"], get_args(args))
         "#
     );

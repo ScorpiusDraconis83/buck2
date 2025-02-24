@@ -22,6 +22,12 @@ pub struct ShardedLockFreeRawTable<T: AtomicValue, const SHARDS: usize> {
     shards: [LockFreeRawTable<T>; SHARDS],
 }
 
+impl<T: AtomicValue, const SHARDS: usize> Default for ShardedLockFreeRawTable<T, SHARDS> {
+    fn default() -> Self {
+        ShardedLockFreeRawTable::new()
+    }
+}
+
 impl<T: AtomicValue, const SHARDS: usize> ShardedLockFreeRawTable<T, SHARDS> {
     const _ASSERTIONS: () = assert!(SHARDS.is_power_of_two());
 
@@ -49,7 +55,7 @@ impl<T: AtomicValue, const SHARDS: usize> ShardedLockFreeRawTable<T, SHARDS> {
 
     /// Find an entry.
     #[inline]
-    pub fn lookup<'a>(&'a self, hash: u64, eq: impl Fn(T::Ref<'_>) -> bool) -> Option<T::Ref<'_>> {
+    pub fn lookup<'a>(&'a self, hash: u64, eq: impl Fn(T::Ref<'_>) -> bool) -> Option<T::Ref<'a>> {
         self.table_for_hash(hash).lookup(hash, eq)
     }
 

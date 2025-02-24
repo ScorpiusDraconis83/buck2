@@ -18,16 +18,16 @@ use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use itertools::Itertools;
 
-use crate::AuditSubcommand;
+use crate::ServerAuditSubcommand;
 
 #[async_trait]
-impl AuditSubcommand for AuditConfigurationsCommand {
+impl ServerAuditSubcommand for AuditConfigurationsCommand {
     async fn server_execute(
         &self,
         _server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         _client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let mut stdout = stdout.as_writer();
 
         if self.configs.is_empty() {
@@ -49,7 +49,7 @@ impl AuditSubcommand for AuditConfigurationsCommand {
     }
 }
 
-fn print_cfg(stdout: &mut impl Write, cfg: &ConfigurationData) -> anyhow::Result<()> {
+fn print_cfg(stdout: &mut impl Write, cfg: &ConfigurationData) -> buck2_error::Result<()> {
     writeln!(stdout, "{}:", cfg.full_name())?;
     let data = cfg.data()?;
     for (constraint_key, constraint_value) in data

@@ -10,6 +10,7 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 use dupe::Dupe;
 
@@ -20,9 +21,11 @@ use crate::AuditSubcommand;
     Dupe,
     Clone,
     Copy,
+    PartialEq,
+    Eq,
     serde::Serialize,
     serde::Deserialize,
-    clap::ArgEnum
+    clap::ValueEnum
 )]
 #[clap(rename_all = "snake_case")]
 pub enum OutputFormat {
@@ -30,7 +33,15 @@ pub enum OutputFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, Dupe, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Dupe,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum
+)]
 pub enum LocationStyle {
     None,
     Direct,
@@ -49,7 +60,15 @@ impl FromStr for LocationStyle {
     }
 }
 
-#[derive(Debug, Clone, Copy, Dupe, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Dupe,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum
+)]
 pub enum ValueStyle {
     Resolved,
     Raw,
@@ -71,22 +90,33 @@ impl FromStr for ValueStyle {
 #[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize)]
 #[clap(name = "audit-config", about = "buck audit config")]
 pub struct AuditConfigCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     #[clap(long = "cell")]
     pub cell: Option<String>,
 
-    #[clap(long, alias = "style", ignore_case = true, arg_enum)]
+    /// Produce information for all cells that Buck2 knows about.
+    #[clap(long, conflicts_with = "cell")]
+    pub all_cells: bool,
+
+    #[clap(long, alias = "style", ignore_case = true, value_enum)]
     pub output_format: Option<OutputFormat>,
 
     #[clap(long)]
     pub json: bool,
 
-    #[clap(long = "location", default_value = "none", possible_values=&["none", "direct", "extended"])]
+    #[clap(
+        long = "location",
+        default_value = "none",
+        ignore_case = true,
+        value_enum
+    )]
     pub location_style: LocationStyle,
 
-    #[clap(long = "value", default_value = "resolved", possible_values=&["resolved", "raw", "both"])]
+    #[clap(
+        long = "value",
+        default_value = "resolved",
+        ignore_case = true,
+        value_enum
+    )]
     pub value_style: ValueStyle,
 
     /// config section/key specs of the form `section` or `section.key`.
@@ -94,6 +124,13 @@ pub struct AuditConfigCommand {
     /// (section headers will be printed only for sections with a key matching the spec).
     #[clap(name = "SPECS")]
     pub specs: Vec<String>,
+
+    /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
+    #[clap(flatten)]
+    _target_cfg: TargetCfgUnusedOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 impl AuditConfigCommand {

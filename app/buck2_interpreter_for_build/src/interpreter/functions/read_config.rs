@@ -18,7 +18,7 @@ use starlark::values::Value;
 use crate::interpreter::build_context::BuildContext;
 
 #[starlark_module]
-pub fn register_read_config(globals: &mut GlobalsBuilder) {
+pub(crate) fn register_read_config(globals: &mut GlobalsBuilder) {
     /// Read a configuration from the nearest enclosing `.buckconfig`
     /// of the `BUCK` file that started evaluation of this code.
     ///
@@ -44,10 +44,10 @@ pub fn register_read_config(globals: &mut GlobalsBuilder) {
         section: StringValue,
         key: StringValue,
         default: Option<Value<'v>>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<Value<'v>> {
-        let buckconfig = &BuildContext::from_context(eval)?.buckconfig;
-        match buckconfig.get(section, key)? {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let buckconfigs = &BuildContext::from_context(eval)?.buckconfigs;
+        match buckconfigs.current_cell_get(section, key)? {
             Some(v) => Ok(v.to_value()),
             None => Ok(default.unwrap_or_else(Value::new_none)),
         }
@@ -61,10 +61,10 @@ pub fn register_read_config(globals: &mut GlobalsBuilder) {
         #[starlark(require = pos)] key: StringValue,
         // Unlike `read_config` we only allow string or `None` as default.
         #[starlark(require = pos, default = NoneOr::None)] default: NoneOr<StringValue<'v>>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<NoneOr<StringValue<'v>>> {
-        let buckconfig = &BuildContext::from_context(eval)?.root_buckconfig;
-        match buckconfig.get(section, key)? {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneOr<StringValue<'v>>> {
+        let buckconfigs = &BuildContext::from_context(eval)?.buckconfigs;
+        match buckconfigs.root_cell_get(section, key)? {
             Some(v) => Ok(NoneOr::Other(v.to_string_value())),
             None => Ok(default),
         }

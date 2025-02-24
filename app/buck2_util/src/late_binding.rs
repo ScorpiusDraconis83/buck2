@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::Context;
+use buck2_error::BuckErrorContext;
 
 /// Value (typically a function pointer or a trait pointer) that is initialized at program start.
 ///
@@ -47,7 +47,7 @@ use anyhow::Context;
 /// Suppose you have a function `fn foo()` initialized with `LateBinding`.
 /// The convention is this:
 /// * in the interface crate define a static variable
-///  `static FOO: LateBinding<fn()> = LateBinding::new("FOO");`
+///   `static FOO: LateBinding<fn()> = LateBinding::new("FOO");`
 ///   ([example](https://fburl.com/code/rvxqbf4f)).
 /// * in the implementation crate define an implementation like `fn foo() { ... }`,
 ///   and next to the implementation, define a function like `fn init_foo() { FOO.init(foo); }`
@@ -110,9 +110,9 @@ impl<T> LateBinding<T> {
     }
 
     #[inline]
-    pub fn get(&self) -> anyhow::Result<&T> {
+    pub fn get(&self) -> buck2_error::Result<&T> {
         self.symbol
             .get()
-            .with_context(|| format!("{} not set (internal error)", self.name))
+            .with_internal_error(|| format!("{} not set", self.name))
     }
 }

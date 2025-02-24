@@ -12,24 +12,39 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Context;
 use buck2_cli_proto::daemon_api_client::DaemonApiClient;
 use buck2_cli_proto::DaemonProcessInfo;
 use buck2_common::buckd_connection::ConnectionType;
 use buck2_common::buckd_connection::BUCK_AUTH_TOKEN_HEADER;
 use buck2_common::client_utils::get_channel_tcp;
 use buck2_common::client_utils::get_channel_uds;
+use buck2_common::client_utils::retrying;
+use buck2_common::client_utils::RetryError;
 use buck2_common::daemon_dir::DaemonDir;
+use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_paths::InvocationPaths;
-use buck2_common::legacy_configs::init::DaemonStartupConfig;
+use buck2_common::systemd::replace_unit_delimiter;
+use buck2_common::systemd::ParentSlice;
+use buck2_common::systemd::SystemdRunner;
+use buck2_common::systemd::SystemdRunnerConfig;
 use buck2_core::buck2_env;
+use buck2_data::DaemonWasStartedReason;
+use buck2_error::buck2_error;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::source_location::SourceLocation;
+use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use buck2_util::process::async_background_command;
 use buck2_util::truncate::truncate;
+use buck2_wrapper_common::kill::process_exists;
+use buck2_wrapper_common::pid::Pid;
 use dupe::Dupe;
 use futures::future::try_join3;
-use thiserror::Error;
+use futures::FutureExt;
+use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tonic::codegen::InterceptedService;
@@ -41,37 +56,85 @@ use tonic::Status;
 
 use crate::command_outcome::CommandOutcome;
 use crate::daemon::client::kill;
+use crate::daemon::client::kill::hard_kill_until;
 use crate::daemon::client::BuckdClient;
 use crate::daemon::client::BuckdClientConnector;
 use crate::daemon::client::BuckdLifecycleLock;
 use crate::daemon::daemon_windows::spawn_background_process_on_windows;
 use crate::daemon_constraints;
+use crate::daemon_constraints::get_possibly_nested_invocation_daemon_uuid;
 use crate::events_ctx::EventsCtx;
 use crate::immediate_config::ImmediateConfigContext;
 use crate::startup_deadline::StartupDeadline;
+use crate::subscribers::classify_server_stderr::classify_server_stderr;
 use crate::subscribers::stdout_stderr_forwarder::StdoutStderrForwarder;
-use crate::subscribers::subscriber::EventSubscriber;
+use crate::subscribers::subscribers::EventSubscribers;
 
 /// The client side matcher for DaemonConstraints.
 #[derive(Clone, Debug)]
 pub struct DaemonConstraintsRequest {
+    /// The version of buck2.
     version: String,
+    /// Sandcastle id.
     user_version: Option<String>,
     desired_trace_io_state: DesiredTraceIoState,
+    nested_invocation_daemon_uuid: Option<String>,
     pub reject_daemon: Option<String>,
     pub reject_materializer_state: Option<String>,
     pub daemon_startup_config: DaemonStartupConfig,
+}
+
+#[derive(Debug, derive_more::Display)]
+pub(crate) enum ConstraintUnsatisfiedReason {
+    #[display("Version mismatch")]
+    Version,
+    #[display("User version mismatch")]
+    UserVersion,
+    #[display("Startup config mismatch")]
+    StartupConfig,
+    #[display("Reject daemon id")]
+    RejectDaemonId,
+    #[display("Trace IO mismatch")]
+    TraceIo,
+    #[display("Materializer state identity mismatch")]
+    MaterializerStateIdentity,
+}
+
+impl ConstraintUnsatisfiedReason {
+    pub(crate) fn to_daemon_was_started_reason(&self) -> buck2_data::DaemonWasStartedReason {
+        match self {
+            ConstraintUnsatisfiedReason::Version => {
+                buck2_data::DaemonWasStartedReason::ConstraintMismatchVersion
+            }
+            ConstraintUnsatisfiedReason::UserVersion => {
+                buck2_data::DaemonWasStartedReason::ConstraintMismatchUserVersion
+            }
+            ConstraintUnsatisfiedReason::StartupConfig => {
+                buck2_data::DaemonWasStartedReason::ConstraintMismatchStartupConfig
+            }
+            ConstraintUnsatisfiedReason::RejectDaemonId => {
+                buck2_data::DaemonWasStartedReason::ConstraintRejectDaemonId
+            }
+            ConstraintUnsatisfiedReason::TraceIo => {
+                buck2_data::DaemonWasStartedReason::ConstraintMismatchTraceIo
+            }
+            ConstraintUnsatisfiedReason::MaterializerStateIdentity => {
+                buck2_data::DaemonWasStartedReason::ConstraintMismatchMaterializerStateIdentity
+            }
+        }
+    }
 }
 
 impl DaemonConstraintsRequest {
     pub fn new(
         immediate_config: &ImmediateConfigContext<'_>,
         desired_trace_io_state: DesiredTraceIoState,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         Ok(Self {
             version: daemon_constraints::version(),
             user_version: daemon_constraints::user_version()?,
             desired_trace_io_state,
+            nested_invocation_daemon_uuid: get_possibly_nested_invocation_daemon_uuid(),
             reject_daemon: None,
             reject_materializer_state: None,
             daemon_startup_config: immediate_config.daemon_startup_config()?.clone(),
@@ -82,13 +145,18 @@ impl DaemonConstraintsRequest {
         matches!(self.desired_trace_io_state, DesiredTraceIoState::Enabled)
     }
 
-    fn satisfied(&self, daemon: &buck2_cli_proto::DaemonConstraints) -> bool {
+    fn satisfied(
+        &self,
+        daemon: &buck2_cli_proto::DaemonConstraints,
+    ) -> Result<(), ConstraintUnsatisfiedReason> {
         if self.version != daemon.version {
-            return false;
+            return Err(ConstraintUnsatisfiedReason::Version);
         }
 
-        if self.user_version != daemon.user_version {
-            return false;
+        if !is_nested_invocation(self.nested_invocation_daemon_uuid.as_ref(), daemon)
+            && self.user_version != daemon.user_version
+        {
+            return Err(ConstraintUnsatisfiedReason::UserVersion);
         }
 
         let server_daemon_startup_config = daemon.daemon_startup_config.as_ref().and_then(|c| {
@@ -100,12 +168,12 @@ impl DaemonConstraintsRequest {
         });
 
         if Some(&self.daemon_startup_config) != server_daemon_startup_config.as_ref() {
-            return false;
+            return Err(ConstraintUnsatisfiedReason::StartupConfig);
         }
 
         if let Some(r) = &self.reject_daemon {
             if *r == daemon.daemon_id {
-                return false;
+                return Err(ConstraintUnsatisfiedReason::RejectDaemonId);
             }
         }
 
@@ -114,12 +182,16 @@ impl DaemonConstraintsRequest {
 
         let extra = match &daemon.extra {
             Some(e) => e,
-            None => return true,
+            None => return Ok(()),
         };
 
         match (self.desired_trace_io_state, extra.trace_io_enabled) {
-            (DesiredTraceIoState::Enabled, false) => return false,
-            (DesiredTraceIoState::Disabled, true) => return false,
+            (DesiredTraceIoState::Enabled, false) => {
+                return Err(ConstraintUnsatisfiedReason::TraceIo);
+            }
+            (DesiredTraceIoState::Disabled, true) => {
+                return Err(ConstraintUnsatisfiedReason::TraceIo);
+            }
             _ => {}
         }
 
@@ -129,11 +201,11 @@ impl DaemonConstraintsRequest {
                 .as_ref()
                 .map_or(false, |i| i == r)
             {
-                return false;
+                return Err(ConstraintUnsatisfiedReason::MaterializerStateIdentity);
             }
         }
 
-        true
+        Ok(())
     }
 }
 
@@ -151,19 +223,15 @@ pub enum BuckdConnectConstraints {
     Constraints(DaemonConstraintsRequest),
 }
 
-fn buckd_startup_timeout_var() -> anyhow::Result<Option<u64>> {
-    buck2_env!("BUCKD_STARTUP_TIMEOUT", type=u64)
-}
-
 async fn get_channel(
     endpoint: ConnectionType,
     change_to_parent_dir: bool,
-) -> anyhow::Result<Channel> {
+) -> buck2_error::Result<Channel> {
     match endpoint {
         ConnectionType::Uds { unix_socket } => {
-            get_channel_uds(&unix_socket, change_to_parent_dir).await
+            Ok(get_channel_uds(&unix_socket, change_to_parent_dir).await?)
         }
-        ConnectionType::Tcp { port } => get_channel_tcp(Ipv4Addr::LOCALHOST, port).await,
+        ConnectionType::Tcp { port } => Ok(get_channel_tcp(Ipv4Addr::LOCALHOST, port).await?),
     }
 }
 
@@ -184,21 +252,29 @@ impl Interceptor for BuckAddAuthTokenInterceptor {
 pub async fn new_daemon_api_client(
     endpoint: ConnectionType,
     auth_token: String,
-) -> anyhow::Result<DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>> {
+) -> buck2_error::Result<DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>>
+{
     let channel = get_channel(endpoint, true).await?;
     Ok(DaemonApiClient::with_interceptor(
         channel,
         BuckAddAuthTokenInterceptor {
-            auth_token: AsciiMetadataValue::try_from(auth_token)?,
+            auth_token: AsciiMetadataValue::try_from(auth_token)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?,
         },
     )
     .max_encoding_message_size(usize::MAX)
     .max_decoding_message_size(usize::MAX))
 }
 
-pub fn buckd_startup_timeout() -> anyhow::Result<Duration> {
+pub fn buckd_startup_timeout() -> buck2_error::Result<Duration> {
     Ok(Duration::from_secs(
-        buckd_startup_timeout_var()?.unwrap_or(10),
+        buck2_env!("BUCKD_STARTUP_TIMEOUT", type=u64)?.unwrap_or(10),
+    ))
+}
+
+pub fn buckd_startup_init_timeout() -> buck2_error::Result<Duration> {
+    Ok(Duration::from_secs(
+        buck2_env!("BUCKD_STARTUP_INIT_TIMEOUT", type=u64)?.unwrap_or(90),
     ))
 }
 
@@ -215,7 +291,7 @@ impl<'a> BuckdLifecycle<'a> {
         paths: &'a InvocationPaths,
         deadline: StartupDeadline,
         constraints: &'a DaemonConstraintsRequest,
-    ) -> anyhow::Result<BuckdLifecycle<'a>> {
+    ) -> buck2_error::Result<BuckdLifecycle<'a>> {
         Ok(BuckdLifecycle::<'a> {
             paths,
             lock: BuckdLifecycleLock::lock_with_timeout(paths.daemon_dir()?, deadline).await?,
@@ -223,12 +299,12 @@ impl<'a> BuckdLifecycle<'a> {
         })
     }
 
-    fn clean_daemon_dir(&self) -> anyhow::Result<()> {
+    fn clean_daemon_dir(&self) -> buck2_error::Result<()> {
         self.lock.clean_daemon_dir()
     }
 
-    async fn start_server(&self) -> anyhow::Result<()> {
-        let mut args = vec!["--isolation-dir", self.paths.isolation.as_str()];
+    async fn start_server(&self) -> buck2_error::Result<()> {
+        let mut args = vec!["--isolation-dir", self.paths.isolation.as_str(), "daemon"];
 
         if self.constraints.is_trace_io_requested() {
             args.push("--enable-trace-io");
@@ -287,12 +363,12 @@ impl<'a> BuckdLifecycle<'a> {
         mut args: Vec<&str>,
         daemon_env_vars: &[(&OsStr, &OsStr)],
         daemon_startup_config: &DaemonStartupConfig,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let daemon_startup_config = daemon_startup_config.serialize()?;
-        args.extend(["daemon", "--dont-daemonize"]);
+        args.extend(["--dont-daemonize"]);
         spawn_background_process_on_windows(
             self.paths.project_root().root(),
-            &env::current_exe()?,
+            &get_daemon_exe()?,
             args.into_iter()
                 .chain(std::iter::once(daemon_startup_config.as_str())),
             daemon_env_vars,
@@ -304,21 +380,34 @@ impl<'a> BuckdLifecycle<'a> {
         args: Vec<&str>,
         daemon_env_vars: &[(&OsStr, &OsStr)],
         daemon_startup_config: &DaemonStartupConfig,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let project_dir = self.paths.project_root();
-        let timeout_secs = Duration::from_secs(env::var("BUCKD_STARTUP_TIMEOUT").map_or(10, |t| {
-            t.parse::<u64>()
-                .unwrap_or_else(|_| panic!("Cannot convert {} to int", t))
-        }));
+        let timeout_secs = buckd_startup_timeout()?;
 
-        let mut cmd =
-            async_background_command(std::env::current_exe().context("Failed to get current exe")?);
+        let daemon_exe = get_daemon_exe()?;
+        let slice_name = format!(
+            "buck2-daemon.{}.{}",
+            replace_unit_delimiter(project_dir.name().unwrap_or("unknown_project")),
+            replace_unit_delimiter(self.paths.isolation.as_str())
+        );
+        let systemd_runner =
+            SystemdRunner::create_if_enabled(&SystemdRunnerConfig::daemon_runner_config(
+                &daemon_startup_config.resource_control,
+                ParentSlice::Root(slice_name.clone()),
+            ))?;
+        let mut cmd = if let Some(systemd_runner) = &systemd_runner {
+            systemd_runner
+                .background_command_linux(daemon_exe, &slice_name, &project_dir.root())
+                .into()
+        } else {
+            async_background_command(daemon_exe)
+        };
+
         cmd.current_dir(project_dir.root())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .args(args);
 
-        cmd.arg("daemon");
         cmd.arg(daemon_startup_config.serialize()?);
 
         if buck2_env!("BUCK_DAEMON_LOG_TO_FILE", type=u8)? == Some(1) {
@@ -348,12 +437,12 @@ impl<'a> BuckdLifecycle<'a> {
         let mut stdout_taken = child
             .stdout
             .take()
-            .context("Child should have its stdout piped")
+            .buck_error_context("Child should have its stdout piped")
             .unwrap();
         let mut stderr_taken = child
             .stderr
             .take()
-            .context("Child should have its stderr piped")
+            .buck_error_context("Child should have its stderr piped")
             .unwrap();
 
         let status_fut = async {
@@ -361,15 +450,14 @@ impl<'a> BuckdLifecycle<'a> {
             match result {
                 Err(_elapsed) => {
                     // The command has timed out, kill the process and wait
-                    child
-                        .kill()
-                        .await
-                        .context("Error killing process after buck2 daemon launch timing out")?;
+                    child.kill().await.buck_error_context(
+                        "Error killing process after buck2 daemon launch timing out",
+                    )?;
                     // This should return immediately as kill() waits for the process to end. We wait here again to fetch the ExitStatus
                     // Signal termination is not considered a success, so wait() results in an appropriate ExitStatus
-                    Ok(child.wait().await?)
+                    buck2_error::Ok(child.wait().await?)
                 }
-                Ok(result) => result.map_err(|e| anyhow::anyhow!(e)),
+                Ok(result) => result.map_err(|e| buck2_error::Error::from(e).into()),
             }
         };
         let stdout_fut = async {
@@ -377,7 +465,7 @@ impl<'a> BuckdLifecycle<'a> {
             stdout_taken
                 .read_to_end(&mut buf)
                 .await
-                .context("Error reading stdout of child")?;
+                .buck_error_context("Error reading stdout of child")?;
             Ok(buf)
         };
         let stderr_fut = async {
@@ -385,7 +473,7 @@ impl<'a> BuckdLifecycle<'a> {
             stderr_taken
                 .read_to_end(&mut buf)
                 .await
-                .context("Error reading stderr of child")?;
+                .buck_error_context("Error reading stderr of child")?;
             Ok(buf)
         };
 
@@ -410,6 +498,13 @@ impl<'a> BuckdLifecycle<'a> {
                     }
                     .into())
                 } else {
+                    if let Some(systemd_runner) = systemd_runner {
+                        // set memory limits to buck2 daemon slice to control
+                        // the buck memory including daemon, fork-server and all actions
+                        systemd_runner
+                            .set_slice_memory_limit(&format!("{}.slice", slice_name))
+                            .await?;
+                    }
                     Ok(())
                 }
             }
@@ -428,7 +523,7 @@ pub struct BuckdChannel {
 
 impl BuckdChannel {
     /// Upgrade this BuckdChannel to a BootstrapBuckdClient.
-    pub async fn upgrade(self) -> anyhow::Result<BootstrapBuckdClient> {
+    pub async fn upgrade(self) -> buck2_error::Result<BootstrapBuckdClient> {
         let Self {
             info,
             daemon_dir,
@@ -437,7 +532,7 @@ impl BuckdChannel {
 
         let constraints = get_constraints(&mut client)
             .await
-            .context("Error obtaining daemon constraints")?;
+            .buck_error_context("Error obtaining daemon constraints")?;
 
         Ok(BootstrapBuckdClient {
             info,
@@ -462,56 +557,48 @@ impl BootstrapBuckdClient {
     pub async fn connect(
         paths: &InvocationPaths,
         constraints: BuckdConnectConstraints,
-    ) -> anyhow::Result<Self> {
+        event_subscribers: &mut EventSubscribers,
+    ) -> buck2_error::Result<Self> {
         let daemon_dir = paths.daemon_dir()?;
 
         buck2_core::fs::fs_util::create_dir_all(&daemon_dir.path)
-            .with_context(|| format!("Error creating daemon dir: {}", daemon_dir))?;
+            .with_buck_error_context(|| format!("Error creating daemon dir: {}", daemon_dir))?;
 
-        let delete_commad = if cfg!(windows) {
-            "rmdir /s /q %USERPROFILE%\\.buck\\buckd"
-        } else {
-            "rm -rf ~/.buck/buckd"
-        };
-        let error_message = format!(
-            "Failed to connect to buck daemon.
-        Try running `buck2 kill` and your command afterwards.
-        Alternatively, try running `{}` and your command afterwards",
-            delete_commad
-        );
-
-        match constraints {
+        let res = match constraints {
             BuckdConnectConstraints::ExistingOnly => {
                 establish_connection_existing(&daemon_dir).await
             }
             BuckdConnectConstraints::Constraints(constraints) => {
-                establish_connection(paths, constraints).await
+                establish_connection(paths, constraints, event_subscribers).await
             }
+        };
+
+        if let Err(e) = res {
+            Err(daemon_connect_error(e, paths)
+                .await
+                .tag([ErrorTag::DaemonConnect]))
+        } else {
+            res
         }
-        .with_context(|| daemon_connect_error(paths))
-        .context(error_message)
     }
 
-    pub fn with_subscribers<'a>(
-        self,
-        subscribers: Vec<Box<dyn EventSubscriber + 'a>>,
-    ) -> BuckdClientConnector<'a> {
+    pub fn to_connector(self) -> BuckdClientConnector {
         BuckdClientConnector {
             client: BuckdClient {
                 daemon_dir: self.daemon_dir,
                 client: self.client,
                 constraints: self.constraints,
-                events_ctx: EventsCtx::new(subscribers),
                 tailers: None,
             },
         }
     }
 
-    pub async fn kill(&mut self, reason: &str) -> anyhow::Result<kill::KillResponse> {
-        kill::kill(&mut self.client, &self.info, reason).await
+    pub(crate) async fn kill(&mut self, reason: &str) -> buck2_error::Result<Pid> {
+        kill::kill(&mut self.client, &self.info, reason).await?;
+        Pid::from_i64(self.info.pid)
     }
 
-    async fn kill_for_constraints_mismatch(&mut self) -> anyhow::Result<kill::KillResponse> {
+    async fn kill_for_constraints_mismatch(&mut self) -> buck2_error::Result<Pid> {
         self.kill("client expected different buckd constraints")
             .await
     }
@@ -521,52 +608,31 @@ impl BootstrapBuckdClient {
     }
 }
 
-/// The settings prior to connecting to the Buck daemon.
-/// By default, attempts to connect to a daemon that can satisfy specified constraints.
+/// Attempt to connect to a daemon that can satisfy specified constraints.
 /// If the daemon does not match constraints (different version or does not enable I/O tracing),
 /// it will kill it and restart it with the correct constraints.
-/// This behavior can be overridden by calling the `existing_only` method.
-/// If the `existing_only` method is called, then any existing buck daemon (regardless of constraint) is accepted.
-///
-/// The default set of subscribers is *not* empty, but rather forwards stdout and stderr, which captures panics, for example.
-pub struct BuckdConnectOptions<'a> {
-    /// Subscribers manage the way that incoming events from the server are handled.
-    /// The client will forward events and stderr/stdout output from the server to each subscriber.
-    /// By default, this list is set to a single subscriber that notifies the user of basic output from the server.
-    pub(crate) subscribers: Vec<Box<dyn EventSubscriber + 'a>>,
-    pub constraints: BuckdConnectConstraints,
-}
-
-impl<'a> BuckdConnectOptions<'a> {
-    pub fn existing_only_no_console() -> Self {
-        Self {
-            constraints: BuckdConnectConstraints::ExistingOnly,
-            subscribers: vec![Box::new(StdoutStderrForwarder)],
-        }
-    }
-
-    pub async fn connect(
-        self,
-        paths: &InvocationPaths,
-    ) -> anyhow::Result<BuckdClientConnector<'a>> {
-        match BootstrapBuckdClient::connect(paths, self.constraints)
-            .await
-            .map_err(buck2_error::Error::from)
-        {
-            Ok(client) => Ok(client.with_subscribers(self.subscribers)),
-            Err(e) => {
-                self.subscribers
-                    .into_iter()
-                    .for_each(|mut s| s.handle_daemon_connection_failure(&e));
-                Err(e.into())
-            }
+/// This behavior can be overridden by passing `BuckdConnectConstraints::ExistingOnly`.
+/// In that case, then any existing buck daemon (regardless of constraint) is accepted.
+pub async fn connect_buckd(
+    constraints: BuckdConnectConstraints,
+    events_ctx: &mut EventsCtx,
+    paths: &InvocationPaths,
+) -> buck2_error::Result<BuckdClientConnector> {
+    match BootstrapBuckdClient::connect(paths, constraints, &mut events_ctx.subscribers)
+        .await
+        .map_err(buck2_error::Error::from)
+    {
+        Ok(client) => Ok(client.to_connector()),
+        Err(e) => {
+            events_ctx.subscribers.handle_daemon_connection_failure(&e);
+            Err(e.into())
         }
     }
 }
 
 pub async fn establish_connection_existing(
     daemon_dir: &DaemonDir,
-) -> anyhow::Result<BootstrapBuckdClient> {
+) -> buck2_error::Result<BootstrapBuckdClient> {
     let deadline = StartupDeadline::duration_from_now(buckd_startup_timeout()?)?;
     deadline
         .run(
@@ -580,40 +646,70 @@ pub async fn establish_connection_existing(
             },
         )
         .await
+        .map_err(buck2_error::Error::from)
 }
 
 async fn establish_connection(
     paths: &InvocationPaths,
     constraints: DaemonConstraintsRequest,
-) -> anyhow::Result<BootstrapBuckdClient> {
+    event_subscribers: &mut EventSubscribers,
+) -> buck2_error::Result<BootstrapBuckdClient> {
     // There are many places where `establish_connection_inner` may hang.
     // If it does, better print something to the user instead of hanging quietly forever.
-    let timeout = buckd_startup_timeout()? * 9;
+    let timeout = buckd_startup_init_timeout()?;
     let deadline = StartupDeadline::duration_from_now(timeout)?;
     deadline
         .down(
             "establishing connection to Buck daemon or start a daemon",
-            |timeout| establish_connection_inner(paths, constraints, timeout),
+            |timeout| establish_connection_inner(paths, constraints, timeout, event_subscribers),
         )
         .await
+        .map_err(buck2_error::Error::from)
 }
 
+fn explain_failed_to_connect_reason(reason: buck2_data::DaemonWasStartedReason) -> &'static str {
+    match reason {
+        DaemonWasStartedReason::UnknownReason => "Unknown reason",
+        DaemonWasStartedReason::ConstraintMismatchVersion => "Version mismatch",
+        DaemonWasStartedReason::ConstraintMismatchUserVersion => "User version mismatch",
+        DaemonWasStartedReason::ConstraintMismatchStartupConfig => "Startup config mismatch",
+        DaemonWasStartedReason::ConstraintRejectDaemonId => "Reject daemon id",
+        DaemonWasStartedReason::ConstraintMismatchTraceIo => "Trace IO mismatch",
+        DaemonWasStartedReason::ConstraintMismatchMaterializerStateIdentity => {
+            "Materializer state identity mismatch"
+        }
+        DaemonWasStartedReason::CouldNotConnectToDaemon => {
+            // TODO(nga): get rid of this variant.
+            "Could not connect to daemon"
+        }
+        DaemonWasStartedReason::TimedOutConnectingToDaemon => "Timed out connecting to daemon",
+        DaemonWasStartedReason::TimeoutCalculationError => "Timeout calculation error",
+        DaemonWasStartedReason::NoBuckdInfo => "No buckd.info",
+        DaemonWasStartedReason::CouldNotLoadBuckdInfo => "Could not load buckd.info",
+        DaemonWasStartedReason::NoDaemonProcess => "buck2 daemon is not running",
+    }
+}
+
+#[allow(clippy::collapsible_match)]
 async fn establish_connection_inner(
     paths: &InvocationPaths,
     constraints: DaemonConstraintsRequest,
     deadline: StartupDeadline,
-) -> anyhow::Result<BootstrapBuckdClient> {
+    event_subscribers: &mut EventSubscribers,
+) -> buck2_error::Result<BootstrapBuckdClient> {
     let daemon_dir = paths.daemon_dir()?;
-    let connect_before_restart = deadline
+
+    let res = deadline
         .half()?
         .run("connecting to existing buck daemon", {
-            try_connect_existing_before_daemon_restart(&daemon_dir, &constraints)
+            try_connect_existing_before_acquiring_lifecycle_lock(&daemon_dir, &constraints).map(Ok)
         })
-        .await?;
-
-    if let ConnectBeforeRestart::Accepted(client) = connect_before_restart {
-        return Ok(client);
-    };
+        .await;
+    if let Ok(connect_before_restart) = res {
+        if let ConnectBeforeRestart::Accepted(client) = connect_before_restart {
+            return Ok(client);
+        };
+    }
 
     // At this point, we've either failed to connect to buckd or buckd had the wrong constraints.
     // Get the lifecycle lock to ensure we don't have races with other processes as we check and change things.
@@ -625,26 +721,123 @@ async fn establish_connection_inner(
 
     // Even if we didn't connect before, it's possible that we just raced with another invocation
     // starting the server, so we try to connect again while holding the lock.
-    if let Ok(channel) = try_connect_existing(&daemon_dir, &deadline).await {
-        let mut client = channel.upgrade().await?;
-        if constraints.satisfied(&client.constraints) {
-            return Ok(client);
-        }
-        deadline
-            .run(
-                "sending kill command to the Buck daemon",
-                client.kill_for_constraints_mismatch(),
-            )
-            .await?;
-    }
+    let daemon_was_started_reason = {
+        match BuckdProcessInfo::load_if_exists(&daemon_dir) {
+            Ok(Some(buckd_info)) => {
+                match try_connect_existing(&buckd_info, &deadline, &lifecycle_lock).await {
+                    Ok(channel) => {
+                        let mut client = channel.upgrade().await?;
 
+                        let reason = match constraints.satisfied(&client.constraints) {
+                            Ok(()) => return Ok(client),
+                            Err(reason) => reason,
+                        };
+
+                        if is_nested_invocation(
+                            get_possibly_nested_invocation_daemon_uuid().as_ref(),
+                            &client.constraints,
+                        ) {
+                            match reason {
+                                ConstraintUnsatisfiedReason::TraceIo
+                                | ConstraintUnsatisfiedReason::StartupConfig => {
+                                    return Err(BuckdConnectError::NestedConstraintMismatch {
+                                        reason,
+                                    }
+                                    .into());
+                                }
+                                _ => (),
+                            }
+                        }
+
+                        event_subscribers
+                            .eprintln(&format!(
+                                "buck2 daemon constraint mismatch: {reason}; killing daemon..."
+                            ))
+                            .await?;
+
+                        deadline
+                            .run(
+                                "sending kill command to the Buck daemon",
+                                client.kill_for_constraints_mismatch(),
+                            )
+                            .await?;
+
+                        event_subscribers
+                            .eprintln("Starting new buck2 daemon...")
+                            .await?;
+
+                        reason.to_daemon_was_started_reason()
+                    }
+                    Err(reason) => {
+                        // TODO(nga): should print some proper message here.
+                        hard_kill_until(&buckd_info.info, deadline.down_deadline()?.deadline())
+                            .await?;
+
+                        event_subscribers
+                            .eprintln(&format!(
+                                "Could not connect to buck2 daemon ({}), starting a new one...",
+                                explain_failed_to_connect_reason(reason)
+                            ))
+                            .await?;
+
+                        reason
+                    }
+                }
+            }
+            Ok(None) => {
+                event_subscribers
+                    .eprintln("Starting new buck2 daemon...")
+                    .await?;
+
+                buck2_data::DaemonWasStartedReason::NoBuckdInfo
+            }
+            Err(e) => {
+                event_subscribers
+                    .eprintln(&format!(
+                        "Could not load buckd.info: {}, starting new buck2 daemon...",
+                        e
+                    ))
+                    .await?;
+
+                buck2_data::DaemonWasStartedReason::CouldNotLoadBuckdInfo
+            }
+        }
+    };
+
+    deadline
+        .down(
+            &format!(
+                "starting new buck2 daemon for reason: {}",
+                explain_failed_to_connect_reason(daemon_was_started_reason)
+            ),
+            |deadline| {
+                start_new_buckd_and_connect(
+                    deadline,
+                    &lifecycle_lock,
+                    paths,
+                    &constraints,
+                    event_subscribers,
+                    daemon_was_started_reason,
+                )
+            },
+        )
+        .await
+}
+
+async fn start_new_buckd_and_connect(
+    deadline: StartupDeadline,
+    lifecycle_lock: &BuckdLifecycle<'_>,
+    paths: &InvocationPaths,
+    constraints: &DaemonConstraintsRequest,
+    event_subscribers: &mut EventSubscribers,
+    daemon_was_started_reason: buck2_data::DaemonWasStartedReason,
+) -> buck2_error::Result<BootstrapBuckdClient> {
     // Daemon dir may be corrupted. Safer to delete it.
     lifecycle_lock
         .clean_daemon_dir()
-        .context("Cleaning daemon dir")?;
+        .buck_error_context("Cleaning daemon dir")?;
 
     // Now there's definitely no server that can be connected to
-    // TODO(cjhopman): a non-responsive buckd process may be somehow lingering around and we should probably kill it off here.
     lifecycle_lock.start_server().await?;
     // It might take a little bit for the daemon server to start up. We could wait for the buckd.info
     // file to appear, but it's just as easy to just retry the connection itself.
@@ -660,13 +853,20 @@ async fn establish_connection_inner(
 
     let client = channel.upgrade().await?;
 
-    if !constraints.satisfied(&client.constraints) {
+    if let Err(reason) = constraints.satisfied(&client.constraints) {
         return Err(BuckdConnectError::BuckDaemonConstraintWrongAfterStart {
+            reason,
             expected: constraints.clone(),
             actual: client.constraints,
         }
         .into());
     }
+
+    event_subscribers.handle_daemon_started(daemon_was_started_reason);
+
+    event_subscribers
+        .eprintln("Connected to new buck2 daemon.")
+        .await?;
 
     Ok(client)
 }
@@ -683,56 +883,97 @@ enum ConnectBeforeRestart {
 /// * `Ok(Some(client))` if we connected to an existing buckd
 /// * `Ok(None)` if we failed to connect and should restart buckd
 /// * `Err` if we failed to connect and should abandon startup
-async fn try_connect_existing_before_daemon_restart(
+async fn try_connect_existing_before_acquiring_lifecycle_lock(
     daemon_dir: &DaemonDir,
     constraints: &DaemonConstraintsRequest,
-) -> anyhow::Result<ConnectBeforeRestart> {
+) -> ConnectBeforeRestart {
     match BuckdProcessInfo::load_and_create_channel(daemon_dir).await {
         Ok(channel) => {
-            let client = channel.upgrade().await?;
-            if constraints.satisfied(&client.constraints) {
-                Ok(ConnectBeforeRestart::Accepted(client))
+            let Ok(client) = channel.upgrade().await else {
+                return ConnectBeforeRestart::Rejected;
+            };
+            if constraints.satisfied(&client.constraints).is_ok() {
+                ConnectBeforeRestart::Accepted(client)
             } else {
-                Ok(ConnectBeforeRestart::Rejected)
+                ConnectBeforeRestart::Rejected
             }
         }
         Err(e) => {
             tracing::debug!("Connect failed: {:#}", e);
-            Ok(ConnectBeforeRestart::Rejected)
+            ConnectBeforeRestart::Rejected
         }
     }
 }
 
 async fn try_connect_existing(
-    daemon_dir: &DaemonDir,
+    buckd_info: &BuckdProcessInfo<'_>,
     timeout: &StartupDeadline,
-) -> anyhow::Result<BuckdChannel> {
-    timeout
-        .min(buckd_startup_timeout()?)?
-        .run(
-            "connect existing buckd",
-            BuckdProcessInfo::load_and_create_channel(daemon_dir),
-        )
-        .await
+    _lock: &BuckdLifecycle<'_>,
+) -> Result<BuckdChannel, buck2_data::DaemonWasStartedReason> {
+    let timeout: buck2_error::Result<_> = try { timeout.min(buckd_startup_timeout()?)? };
+    let Ok(timeout) = timeout else {
+        return Err(buck2_data::DaemonWasStartedReason::TimeoutCalculationError);
+    };
+    let Ok(rem_duration) = timeout.rem_duration("connect existing buckd") else {
+        return Err(buck2_data::DaemonWasStartedReason::TimedOutConnectingToDaemon);
+    };
+    match tokio::time::timeout(rem_duration, buckd_info.create_channel()).await {
+        Ok(Ok(channel)) => Ok(channel),
+        Ok(Err(_)) => {
+            let Ok(pid) = buckd_info.pid() else {
+                return Err(buck2_data::DaemonWasStartedReason::CouldNotLoadBuckdInfo);
+            };
+            let buckd_process_exists = process_exists(pid).unwrap_or(true);
+            if !buckd_process_exists {
+                // We don't delete the `buckd.info` file, and if we failed to connect,
+                // the most likely reason is that the daemon process doesn't exist.
+                Err(buck2_data::DaemonWasStartedReason::NoDaemonProcess)
+            } else {
+                Err(buck2_data::DaemonWasStartedReason::CouldNotConnectToDaemon)
+            }
+        }
+        Err(e) => {
+            let _assert_type: tokio::time::error::Elapsed = e;
+            Err(buck2_data::DaemonWasStartedReason::TimedOutConnectingToDaemon)
+        }
+    }
 }
 
 pub struct BuckdProcessInfo<'a> {
-    info: DaemonProcessInfo,
+    pub(crate) info: DaemonProcessInfo,
     daemon_dir: &'a DaemonDir,
 }
 
 impl<'a> BuckdProcessInfo<'a> {
     /// Utility method for places that want to match on the overall result of those two operations.
-    async fn load_and_create_channel(daemon_dir: &'a DaemonDir) -> anyhow::Result<BuckdChannel> {
+    async fn load_and_create_channel(
+        daemon_dir: &'a DaemonDir,
+    ) -> buck2_error::Result<BuckdChannel> {
         Self::load(daemon_dir)?.create_channel().await
     }
 
-    pub fn load(daemon_dir: &'a DaemonDir) -> anyhow::Result<Self> {
+    pub fn load(daemon_dir: &'a DaemonDir) -> buck2_error::Result<Self> {
+        Self::load_if_exists(daemon_dir)?.with_buck_error_context(|| {
+            format!(
+                "buckd info {} does not exist",
+                daemon_dir.buckd_info().display()
+            )
+        })
+    }
+
+    pub fn load_if_exists(daemon_dir: &'a DaemonDir) -> buck2_error::Result<Option<Self>> {
         let location = daemon_dir.buckd_info();
-        let file = File::open(&location)
-            .with_context(|| format!("Trying to open buckd info, `{}`", location.display()))?;
+        let file = match File::open(&location) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_buck_error_context(|| {
+                    format!("Trying to open buckd info, `{}`", location.display())
+                });
+            }
+        };
         let reader = BufReader::new(file);
-        let info =serde_json::from_reader(reader).with_context(|| {
+        let info = serde_json::from_reader(reader).with_buck_error_context(|| {
             format!(
                 "Error parsing daemon info in `{}`. \
                 Try deleting that file and running `buck2 killall` before running your command again",
@@ -740,16 +981,16 @@ impl<'a> BuckdProcessInfo<'a> {
             )
         })?;
 
-        Ok(Self { info, daemon_dir })
+        Ok(Some(BuckdProcessInfo { info, daemon_dir }))
     }
 
-    pub async fn create_channel(&self) -> anyhow::Result<BuckdChannel> {
+    pub async fn create_channel(&self) -> buck2_error::Result<BuckdChannel> {
         tracing::debug!("Creating channel to: {}", self.info.endpoint);
         let connection_type = ConnectionType::parse(&self.info.endpoint)?;
 
         let client = new_daemon_api_client(connection_type, self.info.auth_token.clone())
             .await
-            .context("Error connecting")?;
+            .buck_error_context("Error connecting")?;
 
         Ok(BuckdChannel {
             info: self.info.clone(),
@@ -758,21 +999,21 @@ impl<'a> BuckdProcessInfo<'a> {
         })
     }
 
-    pub async fn hard_kill(&self) -> anyhow::Result<kill::KillResponse> {
+    pub async fn hard_kill(&self) -> buck2_error::Result<()> {
         kill::hard_kill(&self.info).await
     }
 
-    pub fn pid(&self) -> i64 {
-        self.info.pid
+    pub fn pid(&self) -> buck2_error::Result<Pid> {
+        Pid::from_i64(self.info.pid)
     }
 }
 
 async fn get_constraints(
     client: &mut DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>,
-) -> anyhow::Result<buck2_cli_proto::DaemonConstraints> {
+) -> buck2_error::Result<buck2_cli_proto::DaemonConstraints> {
     // NOTE: No tailers in bootstrap client, we capture logs if we fail to connect, but
     // otherwise we leave them alone.
-    let status = EventsCtx::new(vec![Box::new(StdoutStderrForwarder)])
+    let status = EventsCtx::new(EventSubscribers::new(vec![Box::new(StdoutStderrForwarder)]))
         .unpack_oneshot(None, {
             client.status(tonic::Request::new(buck2_cli_proto::StatusRequest {
                 snapshot: false,
@@ -782,16 +1023,31 @@ async fn get_constraints(
 
     let status: buck2_cli_proto::StatusResponse = match status {
         CommandOutcome::Success(r) => Ok(r),
-        CommandOutcome::Failure(_) => {
-            Err(anyhow::anyhow!("Unexpected failure message in status()"))
-        }
+        CommandOutcome::Failure(_) => Err(buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "Unexpected failure message in status()"
+        )),
     }?;
 
     Ok(status.daemon_constraints.unwrap_or_default())
 }
 
-#[derive(Debug, Error)]
+pub fn get_daemon_exe() -> buck2_error::Result<PathBuf> {
+    let exe = env::current_exe().buck_error_context("Failed to get current exe")?;
+    if buck2_core::client_only::is_client_only()? {
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        Ok(exe
+            .parent()
+            .buck_error_context("Expected current exe to be in a directory")?
+            .join(format!("buck2-daemon{}", ext)))
+    } else {
+        Ok(exe)
+    }
+}
+
+#[derive(Debug, buck2_error::Error)]
 #[allow(clippy::large_enum_variant)]
+#[buck2(tag = DaemonConnect)]
 enum BuckdConnectError {
     #[error(
         "buck daemon startup failed with exit code {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -802,28 +1058,98 @@ enum BuckdConnectError {
         stderr: String,
     },
     #[error(
-        "during buck daemon startup, the started process did not match constraints.\nexpected: {expected:?}\nactual: {actual:?}"
+        "during buck daemon startup, the started process did not match constraints ({reason}).\nexpected: {expected:?}\nactual: {actual:?}"
     )]
     BuckDaemonConstraintWrongAfterStart {
+        reason: ConstraintUnsatisfiedReason,
         expected: DaemonConstraintsRequest,
         actual: buck2_cli_proto::DaemonConstraints,
     },
-    #[error("Error connecting to the daemon, daemon stderr follows:\n{stderr}")]
-    ConnectError { stderr: String },
+    #[error("buck2 daemon constraint mismatch during nested invocation: {reason}")]
+    NestedConstraintMismatch { reason: ConstraintUnsatisfiedReason },
 }
 
-fn daemon_connect_error(paths: &InvocationPaths) -> BuckdConnectError {
-    let stderr = paths
-        .daemon_dir()
-        .and_then(|dir| {
-            let stderr = std::fs::read(dir.buckd_stderr())?;
-            Ok(String::from_utf8_lossy(&stderr).into_owned())
-        })
-        .unwrap_or_else(|_| "<none>".to_owned());
+async fn daemon_connect_error(
+    error: buck2_error::Error,
+    paths: &InvocationPaths,
+) -> buck2_error::Error {
+    let error_report: Result<buck2_data::ErrorReport, RetryError<buck2_error::Error>> = retrying(
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+        || async {
+            let daemon_dir = paths.daemon_dir()?;
+            let error_log = std::fs::read(daemon_dir.buckd_error_log())?;
 
-    BuckdConnectError::ConnectError {
-        stderr: truncate(&stderr, 64000),
-    }
+            let error_report = buck2_data::ErrorReport::deserialize(
+                &mut serde_json::Deserializer::from_slice(&error_log),
+            )?;
+            Ok(error_report)
+        },
+    )
+    .await;
+
+    let error = if let Ok(error_report) = error_report {
+        // Daemon wrote an error and most likely quit.
+        // (note: not using tags() as a workaround for likely false positive ASAN failure)
+        let tags: Vec<ErrorTag> = error_report
+            .tags
+            .into_iter()
+            .filter_map(buck2_error::ErrorTag::from_i32)
+            .collect();
+        let daemon_error = buck2_error::Error::new(
+            error_report.message.clone(),
+            *tags.first().unwrap_or(&ErrorTag::Tier0),
+            SourceLocation::new(file!()),
+            None,
+        )
+        .tag(tags);
+        if daemon_error.has_tag(ErrorTag::DaemonStateInitFailed) {
+            // If error is in this stage of daemon init, exclude connection error details/workaround message.
+            // TODO(ctolliday) always hide connection error details/workaround message if there is a structured error from daemon.
+            return daemon_error;
+        }
+        daemon_error
+    } else {
+        // Daemon crashed or panicked, or is still running but can't be connected to.
+        let stderr = paths
+            .daemon_dir()
+            .and_then(|dir| {
+                let stderr = std::fs::read(dir.buckd_stderr())?;
+                Ok(String::from_utf8_lossy(&stderr).into_owned())
+            })
+            .unwrap_or_else(|_| "<none>".to_owned());
+
+        let stderr = truncate(&stderr, 64000);
+        let error = error
+            .context(format!(
+                "Error connecting to the daemon, daemon stderr follows:\n{}",
+                stderr
+            ))
+            .tag([ErrorTag::DaemonConnect]);
+
+        classify_server_stderr(error, &stderr)
+    };
+    let delete_commad = if cfg!(windows) {
+        "rmdir /s /q %USERPROFILE%\\.buck\\buckd"
+    } else {
+        "rm -rf ~/.buck/buckd"
+    };
+    // FIXME(ctolliday) we should check if the pid at daemon_dir.buckd_pid is still running before suggesting buck2 kill.
+    let error_message = format!(
+        "Failed to connect to buck daemon.
+    Try running `buck2 kill` and your command afterwards.
+    Alternatively, try running `{}` and your command afterwards",
+        delete_commad
+    );
+    error.context(error_message)
+}
+
+fn is_nested_invocation(
+    buck2_daemon_uuid: Option<&String>,
+    daemon: &buck2_cli_proto::DaemonConstraints,
+) -> bool {
+    buck2_daemon_uuid.map_or(false, |uuid| uuid == &daemon.daemon_id)
 }
 
 #[cfg(test)]
@@ -850,6 +1176,7 @@ mod tests {
             version: "version".to_owned(),
             user_version: Some("test".to_owned()),
             desired_trace_io_state,
+            nested_invocation_daemon_uuid: None,
             reject_daemon: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
@@ -860,21 +1187,21 @@ mod tests {
     fn test_constraints_equal_for_same_constraints() {
         let req = request(DesiredTraceIoState::Enabled);
         let daemon = constraints(true);
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
     }
 
     #[test]
     fn test_constraints_equal_for_trace_io_existing() {
         let req = request(DesiredTraceIoState::Existing);
         let daemon = constraints(true);
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
     }
 
     #[test]
     fn test_constraints_unequal_for_trace_io() {
         let req = request(DesiredTraceIoState::Disabled);
         let daemon = constraints(true);
-        assert!(!req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_err());
     }
 
     #[test]
@@ -893,6 +1220,7 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
+            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -907,11 +1235,11 @@ mod tests {
             ),
         };
 
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
         req.reject_daemon = Some("zzz".to_owned());
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
         req.reject_daemon = Some("ddd".to_owned());
-        assert!(!req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_err());
     }
 
     #[test]
@@ -921,6 +1249,7 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
+            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -938,11 +1267,11 @@ mod tests {
             ),
         };
 
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
         req.reject_materializer_state = Some("zzz".to_owned());
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
         req.reject_materializer_state = Some("mmm".to_owned());
-        assert!(!req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_err());
     }
 
     #[test]
@@ -952,6 +1281,7 @@ mod tests {
             user_version: None,
             desired_trace_io_state: DesiredTraceIoState::Existing,
             reject_daemon: None,
+            nested_invocation_daemon_uuid: None,
             reject_materializer_state: None,
             daemon_startup_config: DaemonStartupConfig::testing_empty(),
         };
@@ -969,8 +1299,39 @@ mod tests {
             ),
         };
 
-        assert!(req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_ok());
         req.daemon_startup_config.daemon_buster = Some("1".to_owned());
-        assert!(!req.satisfied(&daemon));
+        assert!(req.satisfied(&daemon).is_err());
+    }
+
+    #[test]
+    fn test_constraints_nested_invocation_diff_user_version() {
+        let mut req = DaemonConstraintsRequest {
+            version: "foo".to_owned(),
+            user_version: Some("fake_version_1".to_owned()),
+            desired_trace_io_state: DesiredTraceIoState::Existing,
+            nested_invocation_daemon_uuid: None,
+            reject_daemon: None,
+            reject_materializer_state: None,
+            daemon_startup_config: DaemonStartupConfig::testing_empty(),
+        };
+
+        let daemon = buck2_cli_proto::DaemonConstraints {
+            version: "foo".to_owned(),
+            user_version: Some("fake_version_2".to_owned()),
+            daemon_id: "ddd".to_owned(),
+            extra: Some(buck2_cli_proto::ExtraDaemonConstraints {
+                trace_io_enabled: false,
+                materializer_state_identity: Some("mmm".to_owned()),
+            }),
+            daemon_startup_config: Some(
+                serde_json::to_string(&DaemonStartupConfig::testing_empty()).unwrap(),
+            ),
+        };
+
+        assert!(req.satisfied(&daemon).is_err());
+
+        req.nested_invocation_daemon_uuid = Some("ddd".to_owned());
+        assert!(req.satisfied(&daemon).is_ok());
     }
 }

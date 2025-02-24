@@ -1,4 +1,6 @@
-load("//test_utils.bzl", "assert_output")
+load("//:test_utils.bzl", "assert_output")
+
+_SUPPORTED = not host_info().os.is_windows
 
 # buildifier: disable=no-effect
 ocaml_library(
@@ -7,7 +9,7 @@ ocaml_library(
     deps = [
         "//third-party/ocaml:ppxlib",
     ],
-) if not host_info().os.is_windows else None
+) if _SUPPORTED else None
 
 # buildifier: disable=no-effect
 ocaml_binary(
@@ -15,15 +17,11 @@ ocaml_binary(
     srcs = ["ppx_driver.ml"],
     compiler_flags = [
         "-linkall",
-        "-cclib",
-        "-L/opt/homebrew/lib",
-        "-cclib",
-        "-lzstd",
     ],
     deps = [
         ":ppx-record-selectors",
     ],
-) if not host_info().os.is_windows else None
+) if _SUPPORTED else None
 
 # buildifier: disable=no-effect
 ocaml_binary(
@@ -33,7 +31,7 @@ ocaml_binary(
         "-ppx",
         "$(exe_target :ppx) --as-ppx",
     ],
-) if not host_info().os.is_windows else None
+) if _SUPPORTED else None
 
 # [Note: Use the 'expand' sub-target to see the effects of
 #  preprocessor expansion]
@@ -57,4 +55,4 @@ assert_output(
     name = "ppx-record-selectors-test-check",
     command = "$(exe_target :ppx-record-selectors-test)",
     output = "4 quux",
-) if not host_info().os.is_windows else None
+) if _SUPPORTED else None

@@ -7,11 +7,9 @@
  * of this source tree.
  */
 
-use std::sync::Arc;
-
-use buck2_build_api::actions::RegisteredAction;
-use buck2_build_signals::CriticalPathBackendName;
-use buck2_build_signals::NodeDuration;
+use buck2_build_api::actions::calculation::ActionWithExtraData;
+use buck2_build_signals::env::CriticalPathBackendName;
+use buck2_build_signals::env::NodeDuration;
 use buck2_events::span::SpanId;
 use smallvec::SmallVec;
 
@@ -22,7 +20,7 @@ pub(crate) trait BuildListenerBackend {
     fn process_node(
         &mut self,
         key: NodeKey,
-        value: Option<Arc<RegisteredAction>>,
+        value: Option<ActionWithExtraData>,
         duration: NodeDuration,
         dep_keys: impl IntoIterator<Item = NodeKey>,
         span_ids: SmallVec<[SpanId; 1]>,
@@ -34,7 +32,7 @@ pub(crate) trait BuildListenerBackend {
         artifacts: impl IntoIterator<Item = NodeKey>,
     );
 
-    fn finish(self) -> anyhow::Result<BuildInfo>;
+    fn finish(self) -> buck2_error::Result<BuildInfo>;
 
     fn name() -> CriticalPathBackendName;
 }

@@ -16,9 +16,10 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
     _exe: &Path,
     _args: impl IntoIterator<Item = &'a str>,
     _daemon_env_vars: &[(&OsStr, &OsStr)],
-) -> anyhow::Result<()> {
-    #[derive(Debug, thiserror::Error)]
+) -> buck2_error::Result<()> {
+    #[derive(Debug, buck2_error::Error)]
     #[error("not Windows")]
+    #[buck2(tag = Tier0)]
     struct NotWindows;
 
     Err(NotWindows.into())
@@ -30,17 +31,18 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
     exe: &Path,
     args: impl IntoIterator<Item = &'a str>,
     daemon_env_vars: &[(&OsStr, &OsStr)],
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ffi::OsString;
     use std::io;
-    use std::iter;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
-    use anyhow::Context;
+    use buck2_error::buck2_error;
+    use buck2_error::BuckErrorContext;
+    use buck2_util::os::win::os_str::os_str_to_wide_null_term;
     use winapi::shared::minwindef::DWORD;
     use winapi::shared::minwindef::FALSE;
     use winapi::um::handleapi::CloseHandle;
@@ -54,10 +56,6 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
     // We have to call CreateProcessW manually because std::process::Command
     // doesn't allow to set 'bInheritHandles' to false. Without this waiting on
     // parent process will also wait on inherited handles of daemon process.
-
-    fn to_nullterm(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(iter::once(0)).collect()
-    }
 
     // Translated from ArgvQuote at http://tinyurl.com/zmgtnls
     fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
@@ -120,18 +118,21 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
     }
 
     // Inspiration from rust stdlib at `std/src/sys/windows/process.rs`
-    fn ensure_no_nuls(s: &OsStr) -> anyhow::Result<&OsStr> {
+    fn ensure_no_nuls(s: &OsStr) -> buck2_error::Result<&OsStr> {
         if s.encode_wide().any(|b| b == 0) {
-            Err(anyhow::anyhow!(format!(
-                "nul byte found in provided data: {:?}",
-                s
-            )))
+            Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "{}",
+                format!("null byte found in provided data: {:?}", s)
+            ))
         } else {
             Ok(s)
         }
     }
 
-    fn make_envp(extra_env_vars: &[(&OsStr, &OsStr)]) -> anyhow::Result<(*mut c_void, Box<[u16]>)> {
+    fn make_envp(
+        extra_env_vars: &[(&OsStr, &OsStr)],
+    ) -> buck2_error::Result<(*mut c_void, Box<[u16]>)> {
         if extra_env_vars.is_empty() {
             Ok((ptr::null_mut(), Box::new([])))
         } else {
@@ -147,13 +148,15 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
             for (k, v) in env.into_iter() {
                 blk.extend(
                     ensure_no_nuls(&k)
-                        .with_context(|| format!("Reading environment variable {:?}", k))?
+                        .with_buck_error_context(|| {
+                            format!("Reading environment variable {:?}", k)
+                        })?
                         .encode_wide(),
                 );
                 blk.push('=' as u16);
                 blk.extend(
                     ensure_no_nuls(&v)
-                        .with_context(|| {
+                        .with_buck_error_context(|| {
                             format!("Reading value {:?} of environment variable {:?}", v, k)
                         })?
                         .encode_wide(),
@@ -162,7 +165,8 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
             }
             blk.push(0);
 
-            Ok((blk.as_mut_ptr() as *mut c_void, blk.into_boxed_slice()))
+            let mut blk = blk.into_boxed_slice();
+            Ok((blk.as_mut_ptr() as *mut c_void, blk))
         }
     }
 
@@ -180,20 +184,20 @@ pub(crate) fn spawn_background_process_on_windows<'a>(
 
     let status = unsafe {
         CreateProcessW(
-            to_nullterm(program).as_ptr(), // lpApplicationName
-            cmd.as_mut_ptr(),              // lpCommandLine
-            ptr::null_mut(),               // lpProcessAttributes
-            ptr::null_mut(),               // lpThreadAttributes
-            FALSE,                         // bInheritHandles
-            creation_flags,                // dwCreationFlags
-            envp,                          // lpEnvironment
-            to_nullterm(cwd).as_ptr(),     // lpCurrentDirectory
+            os_str_to_wide_null_term(program).as_ptr(), // lpApplicationName
+            cmd.as_mut_ptr(),                           // lpCommandLine
+            ptr::null_mut(),                            // lpProcessAttributes
+            ptr::null_mut(),                            // lpThreadAttributes
+            FALSE,                                      // bInheritHandles
+            creation_flags,                             // dwCreationFlags
+            envp,                                       // lpEnvironment
+            os_str_to_wide_null_term(cwd).as_ptr(),     // lpCurrentDirectory
             &mut sinfo,
             &mut pinfo,
         )
     };
     if status == 0 {
-        return Err(anyhow::anyhow!(io::Error::last_os_error()));
+        return Err(buck2_error::Error::from(io::Error::last_os_error()));
     }
     unsafe { CloseHandle(pinfo.hThread) };
     unsafe { CloseHandle(pinfo.hProcess) };

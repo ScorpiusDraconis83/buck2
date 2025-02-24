@@ -5,15 +5,16 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//:paths.bzl", "paths")
 load("@prelude//android:android_providers.bzl", "DexFilesInfo", "ExopackageDexInfo")
 load("@prelude//android:android_toolchain.bzl", "AndroidToolchainInfo")
 load("@prelude//android:voltron.bzl", "ROOT_MODULE", "get_apk_module_graph_info", "get_root_module_only_apk_module_graph_info", "is_root_module")
 load("@prelude//java:dex.bzl", "DexLibraryInfo", "get_dex_produced_from_java_library")
 load("@prelude//java:dex_toolchain.bzl", "DexToolchainInfo")
 load("@prelude//java:java_library.bzl", "compile_to_jar")
+load("@prelude//utils:argfile.bzl", "argfile", "at_argfile")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "flatten")
-load("@prelude//paths.bzl", "paths")
 
 # Android builds use a tool called `d8` to compile Java bytecode is DEX (Dalvik EXecutable)
 # bytecode that runs on Android devices. Our Android builds have two distinct ways of
@@ -102,18 +103,18 @@ def get_single_primary_dex(
     output_dex_file = ctx.actions.declare_output("classes.dex")
     d8_cmd.add(["--output-dex-file", output_dex_file.as_output()])
 
-    jar_to_dex_file = ctx.actions.write("jar_to_dex_file.txt", java_library_jars)
+    jar_to_dex_file = argfile(actions = ctx.actions, name = "jar_to_dex_file.txt", args = java_library_jars)
     d8_cmd.add(["--files-to-dex-list", jar_to_dex_file])
-    d8_cmd.hidden(java_library_jars)
 
     d8_cmd.add(["--android-jar", android_toolchain.android_jar])
     if not is_optimized:
         d8_cmd.add("--no-optimize")
 
-    ctx.actions.run(d8_cmd, category = "d8", identifier = "{}:{}".format(ctx.label.package, ctx.label.name))
+    ctx.actions.run(d8_cmd, category = "get_single_primary_dex", identifier = "{}:{}".format(ctx.label.package, ctx.label.name))
 
     return DexFilesInfo(
         primary_dex = output_dex_file,
+        root_module_bootstrap_dex_dirs = [],
         root_module_secondary_dex_dirs = [],
         non_root_module_secondary_dex_dirs = [],
         secondary_dex_exopackage_info = None,
@@ -126,10 +127,11 @@ def get_multi_dex(
         android_toolchain: AndroidToolchainInfo,
         java_library_jars_to_owners: dict[Artifact, TargetLabel],
         primary_dex_patterns: list[str],
-        proguard_configuration_output_file: [Artifact, None] = None,
-        proguard_mapping_output_file: [Artifact, None] = None,
+        proguard_configuration_output_file: Artifact | None = None,
+        proguard_mapping_output_file: Artifact | None = None,
         is_optimized: bool = False,
-        apk_module_graph_file: [Artifact, None] = None) -> DexFilesInfo:
+        apk_module_graph_file: Artifact | None = None,
+        enable_bootstrap_dexes = False) -> DexFilesInfo:
     expect(
         not _is_exopackage_enabled_for_secondary_dex(ctx),
         "secondary dex exopackage can only be enabled on pre-dexed builds!",
@@ -143,6 +145,10 @@ def get_multi_dex(
     # so just create an empty input.
     inputs = [apk_module_graph_file] if apk_module_graph_file else [ctx.actions.write("empty_artifact_for_multi_dex_dynamic_action", [])]
     outputs = [primary_dex_file, primary_dex_class_names, root_module_secondary_dex_output_dir, secondary_dex_dir]
+    root_module_bootstrap_dex_output_dir = None
+    if enable_bootstrap_dexes:
+        root_module_bootstrap_dex_output_dir = ctx.actions.declare_output("root_module_bootstrap_dex_output_dir", dir = True)
+        outputs.append(root_module_bootstrap_dex_output_dir)
 
     def do_multi_dex(ctx: AnalysisContext, artifacts, outputs):
         apk_module_graph_info = get_apk_module_graph_info(ctx, apk_module_graph_file, artifacts) if apk_module_graph_file else get_root_module_only_apk_module_graph_info()
@@ -154,7 +160,7 @@ def get_multi_dex(
 
         secondary_dex_dir_srcs = {}
         all_jars = flatten(module_to_jars.values())
-        all_jars_list = ctx.actions.write("all_jars_classpath.txt", all_jars)
+        all_jars_list = argfile(actions = ctx.actions, name = "all_jars_classpath.txt", args = all_jars)
         for module, jars in module_to_jars.items():
             multi_dex_cmd = cmd_args(android_toolchain.multi_dex_command[RunInfo])
             secondary_dex_compression_cmd = cmd_args(android_toolchain.secondary_dex_compression_command[RunInfo])
@@ -164,7 +170,8 @@ def get_multi_dex(
             secondary_dex_compression_cmd.add("--raw-secondary-dexes-dir", uncompressed_secondary_dex_output_dir)
             if is_root_module(module):
                 primary_dex_patterns_file = ctx.actions.write("primary_dex_patterns", primary_dex_patterns)
-                if getattr(ctx.attrs, "minimize_primary_dex_size", False):
+
+                if getattr(ctx.attrs, "minimize_primary_dex_size", False) or enable_bootstrap_dexes:
                     primary_dex_jars, jars_to_dex = _get_primary_dex_and_secondary_dex_jars(
                         ctx,
                         jars,
@@ -175,10 +182,15 @@ def get_multi_dex(
                         android_toolchain,
                     )
 
-                    primary_dex_jar_to_dex_file = ctx.actions.write("primary_dex_jars_to_dex_file_for_root_module.txt", primary_dex_jars)
+                    primary_dex_jar_to_dex_file = argfile(actions = ctx.actions, name = "primary_dex_jars_to_dex_file_for_root_module.txt", args = primary_dex_jars)
                     multi_dex_cmd.add("--primary-dex-files-to-dex-list", primary_dex_jar_to_dex_file)
-                    multi_dex_cmd.hidden(primary_dex_jars)
                     multi_dex_cmd.add("--minimize-primary-dex")
+
+                    # Tells the multidex command to allow primary dex pattern matches to be spread across several dex files if needed
+                    if enable_bootstrap_dexes:
+                        multi_dex_cmd.add("--enable-bootstrap-dexes")
+                        multi_dex_cmd.add("--bootstrap-dex-output-dir", outputs[root_module_bootstrap_dex_output_dir].as_output())
+                        secondary_dex_compression_cmd.add("--bootstrap-dexes-dir", outputs[root_module_bootstrap_dex_output_dir])
                 else:
                     jars_to_dex = jars
                     multi_dex_cmd.add("--primary-dex-patterns-path", primary_dex_patterns_file)
@@ -194,16 +206,14 @@ def get_multi_dex(
                 secondary_dex_compression_cmd.add("--secondary-dex-output-dir", secondary_dex_dir_for_module.as_output())
                 jars_to_dex = jars
                 multi_dex_cmd.add("--classpath-files", all_jars_list)
-                multi_dex_cmd.hidden(all_jars)
 
             multi_dex_cmd.add("--module", module)
             multi_dex_cmd.add("--canary-class-name", apk_module_graph_info.module_to_canary_class_name_function(module))
             secondary_dex_compression_cmd.add("--module", module)
             secondary_dex_compression_cmd.add("--canary-class-name", apk_module_graph_info.module_to_canary_class_name_function(module))
 
-            jar_to_dex_file = ctx.actions.write("jars_to_dex_file_for_module_{}.txt".format(module), jars_to_dex)
+            jar_to_dex_file = argfile(actions = ctx.actions, name = "jars_to_dex_file_for_module_{}.txt".format(module), args = jars_to_dex)
             multi_dex_cmd.add("--files-to-dex-list", jar_to_dex_file)
-            multi_dex_cmd.hidden(jars_to_dex)
 
             multi_dex_cmd.add("--android-jar", android_toolchain.android_jar)
             if not is_optimized:
@@ -222,10 +232,11 @@ def get_multi_dex(
 
         ctx.actions.symlinked_dir(outputs[secondary_dex_dir], secondary_dex_dir_srcs)
 
-    ctx.actions.dynamic_output(dynamic = inputs, inputs = [], outputs = outputs, f = do_multi_dex)
+    ctx.actions.dynamic_output(dynamic = inputs, inputs = [], outputs = [o.as_output() for o in outputs], f = do_multi_dex)
 
     return DexFilesInfo(
         primary_dex = primary_dex_file,
+        root_module_bootstrap_dex_dirs = [root_module_bootstrap_dex_output_dir] if root_module_bootstrap_dex_output_dir else [],
         root_module_secondary_dex_dirs = [root_module_secondary_dex_output_dir],
         non_root_module_secondary_dex_dirs = [secondary_dex_dir],
         secondary_dex_exopackage_info = None,
@@ -238,8 +249,8 @@ def _get_primary_dex_and_secondary_dex_jars(
         jars: list[Artifact],
         java_library_jars_to_owners: dict[Artifact, TargetLabel],
         primary_dex_patterns_file: Artifact,
-        proguard_configuration_output_file: [Artifact, None],
-        proguard_mapping_output_file: [Artifact, None],
+        proguard_configuration_output_file: Artifact | None,
+        proguard_mapping_output_file: Artifact | None,
         android_toolchain: AndroidToolchainInfo) -> (list[Artifact], list[Artifact]):
     primary_dex_jars = []
     secondary_dex_jars = []
@@ -285,6 +296,7 @@ def merge_to_single_dex(
 
     return DexFilesInfo(
         primary_dex = output_dex_file,
+        root_module_bootstrap_dex_dirs = [],
         root_module_secondary_dex_dirs = [],
         non_root_module_secondary_dex_dirs = [],
         secondary_dex_exopackage_info = None,
@@ -321,7 +333,7 @@ DexInputsWithClassNamesAndWeightEstimatesFile = record(
 SecondaryDexMetadataConfig = record(
     secondary_dex_compression = str,
     secondary_dex_metadata_path = [str, None],
-    secondary_dex_metadata_file = [Artifact, None],
+    secondary_dex_metadata_file = Artifact | None,
     secondary_dex_metadata_line = Artifact,
     secondary_dex_canary_class_name = str,
 )
@@ -365,8 +377,7 @@ def _filter_pre_dexed_libs(
         batch_number: int) -> DexInputsWithClassNamesAndWeightEstimatesFile:
     weight_estimate_and_filtered_class_names_file = actions.declare_output("class_names_and_weight_estimates_for_batch_{}".format(batch_number))
 
-    filter_dex_cmd = cmd_args([
-        android_toolchain.filter_dex_class_names[RunInfo],
+    filter_dex_cmd_args = cmd_args([
         "--primary-dex-patterns",
         primary_dex_patterns_file,
         "--dex-target-identifiers",
@@ -378,13 +389,22 @@ def _filter_pre_dexed_libs(
         "--output",
         weight_estimate_and_filtered_class_names_file.as_output(),
     ])
+
+    filter_dex_cmd = cmd_args([
+        android_toolchain.filter_dex_class_names[RunInfo],
+        at_argfile(
+            actions = actions,
+            name = "filter_dex_cmd_args_{}".format(batch_number),
+            args = filter_dex_cmd_args,
+        ),
+    ])
     actions.run(filter_dex_cmd, category = "filter_dex", identifier = "batch_{}".format(batch_number))
 
     return DexInputsWithClassNamesAndWeightEstimatesFile(libs = pre_dexed_libs, weight_estimate_and_filtered_class_names_file = weight_estimate_and_filtered_class_names_file)
 
 _SortedPreDexedInputs = record(
     module = str,
-    primary_dex_inputs = list[DexInputWithSpecifiedClasses],
+    primary_dex_inputs = list[list[DexInputWithSpecifiedClasses]],
     secondary_dex_inputs = list[list[DexInputWithSpecifiedClasses]],
 )
 
@@ -393,12 +413,14 @@ def merge_to_split_dex(
         android_toolchain: AndroidToolchainInfo,
         pre_dexed_libs: list[DexLibraryInfo],
         split_dex_merge_config: SplitDexMergeConfig,
-        apk_module_graph_file: [Artifact, None] = None) -> DexFilesInfo:
+        apk_module_graph_file: Artifact | None = None,
+        enable_bootstrap_dexes: bool = False) -> DexFilesInfo:
     is_exopackage_enabled_for_secondary_dex = _is_exopackage_enabled_for_secondary_dex(ctx)
     if is_exopackage_enabled_for_secondary_dex:
+        supported_dex_compression = ["jar", "raw"]
         expect(
-            split_dex_merge_config.dex_compression == "jar",
-            "Exopackage can only be enabled for secondary dexes when the dex compression is 'jar', but the dex compression is '{}'".format(split_dex_merge_config.dex_compression),
+            split_dex_merge_config.dex_compression in supported_dex_compression,
+            "Exopackage can only be enabled for secondary dexes when the dex compression is {}, but the dex compression is '{}'".format(supported_dex_compression, split_dex_merge_config.dex_compression),
         )
     primary_dex_patterns_file = ctx.actions.write("primary_dex_patterns_file", split_dex_merge_config.primary_dex_patterns)
 
@@ -424,12 +446,13 @@ def merge_to_split_dex(
     primary_dex_artifact_list = ctx.actions.declare_output("pre_dexed_artifacts_for_primary_dex.txt")
     primary_dex_output = ctx.actions.declare_output("classes.dex")
     primary_dex_class_names_list = ctx.actions.declare_output("primary_dex_class_names_list.txt")
+    root_module_bootstrap_dexes_dir = ctx.actions.declare_output("root_module_bootstrap_dexes_dir", dir = True)
     root_module_secondary_dexes_dir = ctx.actions.declare_output("root_module_secondary_dexes_dir", dir = True)
     root_module_secondary_dexes_subdir = root_module_secondary_dexes_dir.project(_get_secondary_dex_subdir(ROOT_MODULE))
     root_module_secondary_dexes_metadata = root_module_secondary_dexes_dir.project(paths.join(_get_secondary_dex_subdir(ROOT_MODULE), "metadata.txt"))
     non_root_module_secondary_dexes_dir = ctx.actions.declare_output("non_root_module_secondary_dexes_dir", dir = True)
 
-    outputs = [primary_dex_output, primary_dex_artifact_list, primary_dex_class_names_list, root_module_secondary_dexes_dir, non_root_module_secondary_dexes_dir]
+    outputs = [primary_dex_output, primary_dex_artifact_list, primary_dex_class_names_list, root_module_bootstrap_dexes_dir, root_module_secondary_dexes_dir, non_root_module_secondary_dexes_dir]
 
     def merge_pre_dexed_libs(ctx: AnalysisContext, artifacts, outputs):
         apk_module_graph_info = get_apk_module_graph_info(ctx, apk_module_graph_file, artifacts) if apk_module_graph_file else get_root_module_only_apk_module_graph_info()
@@ -439,19 +462,25 @@ def merge_to_split_dex(
             artifacts,
             pre_dexed_libs_with_class_names_and_weight_estimates_files,
             split_dex_merge_config,
+            enable_bootstrap_dexes,
             get_module_from_target = apk_module_graph_info.target_to_module_mapping_function,
             module_to_canary_class_name_function = module_to_canary_class_name_function,
         )
 
         root_module_secondary_dexes_for_symlinking = {}
+        root_module_bootstrap_dexes_for_symlinking = {}
         non_root_module_secondary_dexes_for_symlinking = {}
         metadata_line_artifacts_by_module = {}
         metadata_dot_txt_files_by_module = {}
+        base_apk_dex_files_count = 0
 
         for sorted_pre_dexed_input in sorted_pre_dexed_inputs:
             module = sorted_pre_dexed_input.module
             secondary_dexes_for_symlinking = root_module_secondary_dexes_for_symlinking if is_root_module(module) else non_root_module_secondary_dexes_for_symlinking
-            primary_dex_inputs = sorted_pre_dexed_input.primary_dex_inputs
+
+            # Unpack since primary_dex_inputs is a list of lists (which may be a single list for status-quo behaviors)
+            primary_dex_inputs = sorted_pre_dexed_input.primary_dex_inputs[0] if sorted_pre_dexed_input.primary_dex_inputs else []
+            additional_base_apk_dex_inputs = sorted_pre_dexed_input.primary_dex_inputs[1:]
             pre_dexed_artifacts = [primary_dex_input.lib.dex for primary_dex_input in primary_dex_inputs if primary_dex_input.lib.dex]
             if pre_dexed_artifacts:
                 expect(is_root_module(module), "module {} should not have a primary dex!".format(module))
@@ -468,6 +497,33 @@ def merge_to_split_dex(
                     outputs[primary_dex_artifact_list],
                     class_names_to_include = primary_dex_class_names_list,
                 )
+                base_apk_dex_files_count += 1
+
+                # If primary dex classes were spread to many based on weight, merge additional dex files here.
+                for bootstrap_dex_input_list in additional_base_apk_dex_inputs:
+                    this_dex_number = base_apk_dex_files_count + 1
+                    bootstrap_dex_class_list = ctx.actions.write(
+                        "class_list_for_bootstrap_dex_{}.txt".format(this_dex_number),
+                        flatten([bootstrap_dex_input.dex_class_names for bootstrap_dex_input in bootstrap_dex_input_list]),
+                    )
+
+                    # Figure out the name of this file and prepare its location for symlinking in final output dir.
+                    dex_file_name = "classes{}.dex".format(this_dex_number)
+                    bootstrap_dex_artifact_list = ctx.actions.declare_output("pre_dexed_artifacts_for_bootstrap_dex_{}.txt".format(this_dex_number))
+                    bootstrap_dex_output = ctx.actions.declare_output(dex_file_name)
+                    root_module_bootstrap_dexes_for_symlinking[dex_file_name] = bootstrap_dex_output
+                    bootstrap_dex_artifacts = [bootstrap_dex_input.lib.dex for bootstrap_dex_input in bootstrap_dex_input_list]
+
+                    _merge_dexes(
+                        ctx,
+                        android_toolchain,
+                        bootstrap_dex_output,
+                        bootstrap_dex_artifacts,
+                        bootstrap_dex_artifact_list,
+                        class_names_to_include = bootstrap_dex_class_list,
+                    )
+                    base_apk_dex_files_count += 1
+
             else:
                 expect(
                     not is_root_module(module),
@@ -479,25 +535,26 @@ def merge_to_split_dex(
             for i in range(len(secondary_dex_inputs)):
                 if split_dex_merge_config.dex_compression == "jar" or split_dex_merge_config.dex_compression == "raw":
                     if split_dex_merge_config.dex_compression == "jar":
-                        secondary_dex_path = _get_jar_secondary_dex_path(i, module)
+                        secondary_dex_path = _get_secondary_dex_subdir_path(i, module)
                         secondary_dex_metadata_config = _get_secondary_dex_jar_metadata_config(ctx.actions, secondary_dex_path, module, module_to_canary_class_name_function, i)
                         secondary_dexes_for_symlinking[secondary_dex_metadata_config.secondary_dex_metadata_path] = secondary_dex_metadata_config.secondary_dex_metadata_file
                     else:
-                        secondary_dex_path = _get_raw_secondary_dex_path(i, module)
+                        secondary_dex_path = _get_raw_secondary_dex_path(i, module, base_apk_dex_files_count, is_exopackage_enabled_for_secondary_dex)
                         secondary_dex_metadata_config = _get_secondary_dex_raw_metadata_config(ctx.actions, module, module_to_canary_class_name_function, i)
 
                     secondary_dex_output = ctx.actions.declare_output(secondary_dex_path)
                     secondary_dexes_for_symlinking[secondary_dex_path] = secondary_dex_output
                     metadata_line_artifacts_by_module.setdefault(module, []).append(secondary_dex_metadata_config.secondary_dex_metadata_line)
                 else:
-                    secondary_dex_name = _get_raw_secondary_dex_name(i, module)
+                    secondary_dex_name = _get_raw_secondary_dex_name(i, module, base_apk_dex_files_count)
                     secondary_dex_output = ctx.actions.declare_output("{}/{}".format(module, secondary_dex_name))
                     raw_secondary_dexes_for_compressing[secondary_dex_name] = secondary_dex_output
                     secondary_dex_metadata_config = None
 
-                secondary_dex_artifact_list = ctx.actions.declare_output("pre_dexed_artifacts_for_secondary_dex_{}_for_module_{}.txt".format(i + 2, module))
+                this_dex_number = i + (base_apk_dex_files_count + 1 if is_root_module(module) else 2)
+                secondary_dex_artifact_list = ctx.actions.declare_output("pre_dexed_artifacts_for_secondary_dex_{}_for_module_{}.txt".format(this_dex_number, module))
                 secondary_dex_class_list = ctx.actions.write(
-                    "class_list_for_secondary_dex_{}_for_module_{}.txt".format(i + 2, module),
+                    "class_list_for_secondary_dex_{}_for_module_{}.txt".format(this_dex_number, module),
                     flatten([secondary_dex_input.dex_class_names for secondary_dex_input in secondary_dex_inputs[i]]),
                 )
                 pre_dexed_artifacts = [secondary_dex_input.lib.dex for secondary_dex_input in secondary_dex_inputs[i] if secondary_dex_input.lib.dex]
@@ -543,24 +600,28 @@ def merge_to_split_dex(
 
                     metadata_lines = [".id {}".format(voltron_module)]
                     metadata_lines.extend([".requires {}".format(module_dep) for module_dep in apk_module_graph_info.module_to_module_deps_function(voltron_module)])
-                    if split_dex_merge_config.dex_compression == "raw" and is_root_module(voltron_module):
+                    if split_dex_merge_config.dex_compression == "raw" and is_root_module(voltron_module) and not is_exopackage_enabled_for_secondary_dex:
                         metadata_lines.append(".root_relative")
                     for metadata_line_artifact in metadata_line_artifacts:
                         metadata_lines.append(artifacts[metadata_line_artifact].read_string().strip())
                     ctx.actions.write(outputs[metadata_dot_txt], metadata_lines)
 
-            ctx.actions.dynamic_output(dynamic = flatten(metadata_line_artifacts_by_module.values()), inputs = [], outputs = metadata_dot_txt_files_by_module.values(), f = write_metadata_dot_txts)
+            ctx.actions.dynamic_output(dynamic = flatten(metadata_line_artifacts_by_module.values()), inputs = [], outputs = [o.as_output() for o in metadata_dot_txt_files_by_module.values()], f = write_metadata_dot_txts)
 
         ctx.actions.symlinked_dir(
             outputs[root_module_secondary_dexes_dir],
             root_module_secondary_dexes_for_symlinking,
         )
         ctx.actions.symlinked_dir(
+            outputs[root_module_bootstrap_dexes_dir],
+            root_module_bootstrap_dexes_for_symlinking,
+        )
+        ctx.actions.symlinked_dir(
             outputs[non_root_module_secondary_dexes_dir],
             non_root_module_secondary_dexes_for_symlinking,
         )
 
-    ctx.actions.dynamic_output(dynamic = input_artifacts, inputs = [], outputs = outputs, f = merge_pre_dexed_libs)
+    ctx.actions.dynamic_output(dynamic = input_artifacts, inputs = [], outputs = [o.as_output() for o in outputs], f = merge_pre_dexed_libs)
 
     if is_exopackage_enabled_for_secondary_dex:
         root_module_secondary_dex_dirs = []
@@ -574,6 +635,7 @@ def merge_to_split_dex(
 
     return DexFilesInfo(
         primary_dex = primary_dex_output,
+        root_module_bootstrap_dex_dirs = [root_module_bootstrap_dexes_dir],
         root_module_secondary_dex_dirs = root_module_secondary_dex_dirs,
         non_root_module_secondary_dex_dirs = [non_root_module_secondary_dexes_dir],
         secondary_dex_exopackage_info = secondary_dex_exopackage_info,
@@ -587,15 +649,14 @@ def _merge_dexes(
         output_dex_file: Artifact,
         pre_dexed_artifacts: list[Artifact],
         pre_dexed_artifacts_file: Artifact,
-        class_names_to_include: [Artifact, None] = None,
-        secondary_output_dex_file: [Artifact, None] = None,
+        class_names_to_include: Artifact | None = None,
+        secondary_output_dex_file: Artifact | None = None,
         secondary_dex_metadata_config: [SecondaryDexMetadataConfig, None] = None):
     d8_cmd = cmd_args(android_toolchain.d8_command[RunInfo])
     d8_cmd.add(["--output-dex-file", output_dex_file.as_output()])
 
-    pre_dexed_artifacts_to_dex_file = ctx.actions.write(pre_dexed_artifacts_file.as_output(), pre_dexed_artifacts)
+    pre_dexed_artifacts_to_dex_file = argfile(actions = ctx.actions, name = pre_dexed_artifacts_file, args = pre_dexed_artifacts)
     d8_cmd.add(["--files-to-dex-list", pre_dexed_artifacts_to_dex_file])
-    d8_cmd.hidden(pre_dexed_artifacts)
 
     d8_cmd.add(["--android-jar", android_toolchain.android_jar])
     d8_cmd.add(_DEX_MERGE_OPTIONS)
@@ -615,7 +676,7 @@ def _merge_dexes(
 
     ctx.actions.run(
         d8_cmd,
-        category = "d8",
+        category = "merge_dexes",
         identifier = "{}:{} {}".format(ctx.label.package, ctx.label.name, output_dex_file.short_path),
     )
 
@@ -624,19 +685,114 @@ def _sort_pre_dexed_files(
         artifacts,
         pre_dexed_libs_with_class_names_and_weight_estimates_files: list[DexInputsWithClassNamesAndWeightEstimatesFile],
         split_dex_merge_config: SplitDexMergeConfig,
+        enable_bootstrap_dexes: bool,
         get_module_from_target: typing.Callable,
         module_to_canary_class_name_function: typing.Callable) -> list[_SortedPreDexedInputs]:
     sorted_pre_dexed_inputs_map = {}
+
+    # Tracking for when to spill over to another dex file based on weight estimate.
+    # Note that depending on given options, primary dex classes may be spread over N dex files
+    # (when minSdkVerion is high enough).
+    current_primary_dex_size_map = {}
+    current_primary_dex_inputs_map = {}
     current_secondary_dex_size_map = {}
     current_secondary_dex_inputs_map = {}
+
+    def assign_pre_dexed_classes_to_secondary_dex(
+            dest: list[list[DexInputWithSpecifiedClasses]],
+            module: str,
+            lib: DexLibraryInfo,
+            weight_estimate: int,
+            dex_class_names: list[str],
+            current_dex_size_map: dict[str, int],  # module to size
+            current_dex_inputs_map: dict[str, list[DexInputWithSpecifiedClasses]],  # module to dex file that is being built up
+            emit_canaries: bool,
+            dex_weight_limit_bytes: int | None):
+        if len(dex_class_names) == 0:
+            return
+
+        current_dex_size = current_dex_size_map.get(module, 0)
+        if dex_weight_limit_bytes != None and current_dex_size + weight_estimate > dex_weight_limit_bytes:
+            current_dex_size = 0
+            current_dex_inputs_map[module] = []
+
+        current_dex_inputs = current_dex_inputs_map.setdefault(module, [])
+        if len(current_dex_inputs) == 0:
+            if emit_canaries:
+                canary_class_dex_input = _create_canary_class(
+                    ctx,
+                    len(dest) + 1,
+                    module,
+                    module_to_canary_class_name_function,
+                    ctx.attrs._dex_toolchain[DexToolchainInfo],
+                )
+                current_dex_inputs.append(canary_class_dex_input)
+            dest.append(current_dex_inputs)
+
+        current_dex_size_map[module] = current_dex_size + weight_estimate
+        current_dex_inputs.append(
+            DexInputWithSpecifiedClasses(lib = lib, dex_class_names = dex_class_names),
+        )
+
+    def organize_pre_dexed_lib(
+            dest: list[list[DexInputWithSpecifiedClasses]],
+            module: str,
+            lib: DexLibraryInfo,
+            weight_estimate: int,
+            dex_class_names: list[str],
+            current_dex_size_map: dict[str, int],
+            current_dex_inputs_map: dict[str, list[DexInputWithSpecifiedClasses]],
+            emit_canaries: bool,
+            dex_weight_limit_bytes: int | None):
+        if len(dex_class_names) == 0:
+            return
+
+        if dex_weight_limit_bytes != None and weight_estimate > dex_weight_limit_bytes:
+            # Given library is beyond the configured weight; subdivide it into
+            # many dex files to lessen the likelihood of overflowing a dex.
+            num_classes = len(dex_class_names)
+            chunks = weight_estimate / dex_weight_limit_bytes
+            chunk_size = max(1, int(num_classes // chunks))
+            for start_index in range(0, num_classes, chunk_size):
+                end_index = min(start_index + chunk_size, num_classes)
+                chunked_dex_class_names = dex_class_names[start_index:end_index]
+
+                # Note: the original weight_estimate will be reused for the
+                # chunk since individual class sizes are not exposed
+                # (be pessimistic).
+                assign_pre_dexed_classes_to_secondary_dex(
+                    dest,
+                    module,
+                    lib,
+                    weight_estimate,
+                    chunked_dex_class_names,
+                    current_dex_size_map,
+                    current_dex_inputs_map,
+                    emit_canaries,
+                    dex_weight_limit_bytes,
+                )
+        else:
+            # No need to further divide
+            assign_pre_dexed_classes_to_secondary_dex(
+                dest,
+                module,
+                lib,
+                weight_estimate,
+                dex_class_names,
+                current_dex_size_map,
+                current_dex_inputs_map,
+                emit_canaries,
+                dex_weight_limit_bytes,
+            )
+
     for pre_dexed_libs_with_class_names_and_weight_estimates in pre_dexed_libs_with_class_names_and_weight_estimates_files:
         class_names_and_weight_estimates_json = artifacts[pre_dexed_libs_with_class_names_and_weight_estimates.weight_estimate_and_filtered_class_names_file].read_json()
         for pre_dexed_lib in pre_dexed_libs_with_class_names_and_weight_estimates.libs:
             module = get_module_from_target(str(pre_dexed_lib.dex.owner.raw_target()))
             pre_dexed_lib_info = class_names_and_weight_estimates_json[pre_dexed_lib.identifier]
-            weight_estimate_string = pre_dexed_lib_info["weight_estimate"]
             primary_dex_class_names = pre_dexed_lib_info["primary_dex_class_names"]
             secondary_dex_class_names = pre_dexed_lib_info["secondary_dex_class_names"]
+            weight_estimate = int(pre_dexed_lib_info["weight_estimate"])
 
             module_pre_dexed_inputs = sorted_pre_dexed_inputs_map.setdefault(module, _SortedPreDexedInputs(
                 module = module,
@@ -646,71 +802,72 @@ def _sort_pre_dexed_files(
             primary_dex_inputs = module_pre_dexed_inputs.primary_dex_inputs
             secondary_dex_inputs = module_pre_dexed_inputs.secondary_dex_inputs
 
-            if len(primary_dex_class_names) > 0:
-                if is_root_module(module):
-                    primary_dex_inputs.append(
-                        DexInputWithSpecifiedClasses(lib = pre_dexed_lib, dex_class_names = primary_dex_class_names),
-                    )
-                else:
-                    # TODO(T148680617) We shouldn't allow classes that are specified to be in the
-                    # primary dex to end up in a non-root module, but buck1 allows it and there are
-                    # Voltron configs that rely on this, so we allow it too for migration purposes.
-                    # fail("Non-root modules should not have anything that belongs in the primary dex, " +
-                    #     "but {} is assigned to module {} and has the following class names in the primary dex: {}\n".format(
-                    #         pre_dexed_lib.dex.owner,
-                    #         module,
-                    #         "\n".join(primary_dex_class_names),
-                    #     ),
-                    # )
-                    secondary_dex_class_names.extend(primary_dex_class_names)
+            if len(primary_dex_class_names) > 0 and not is_root_module(module):
+                # TODO(T148680617) We shouldn't allow classes that are specified to be in the
+                # primary dex to end up in a non-root module, but buck1 allows it and there are
+                # Voltron configs that rely on this, so we allow it too for migration purposes.
+                # fail("Non-root modules should not have anything that belongs in the primary dex, " +
+                #     "but {} is assigned to module {} and has the following class names in the primary dex: {}\n".format(
+                #         pre_dexed_lib.dex.owner,
+                #         module,
+                #         "\n".join(primary_dex_class_names),
+                #     ),
+                # )
+                secondary_dex_class_names.extend(primary_dex_class_names)
+                primary_dex_class_names = []
 
-            if len(secondary_dex_class_names) > 0:
-                weight_estimate = int(weight_estimate_string)
-                current_secondary_dex_size = current_secondary_dex_size_map.get(module, 0)
-                if current_secondary_dex_size + weight_estimate > split_dex_merge_config.secondary_dex_weight_limit_bytes:
-                    current_secondary_dex_size = 0
-                    current_secondary_dex_inputs_map[module] = []
+            # Organize primary dex classes into logical dex file(s)
+            organize_pre_dexed_lib(
+                primary_dex_inputs,
+                module,
+                pre_dexed_lib,
+                weight_estimate,
+                primary_dex_class_names,
+                current_primary_dex_size_map,
+                current_primary_dex_inputs_map,
+                False,
+                split_dex_merge_config.secondary_dex_weight_limit_bytes if enable_bootstrap_dexes else None,
+            )
 
-                current_secondary_dex_inputs = current_secondary_dex_inputs_map.setdefault(module, [])
-                if len(current_secondary_dex_inputs) == 0:
-                    canary_class_dex_input = _create_canary_class(
-                        ctx,
-                        len(secondary_dex_inputs) + 1,
-                        module,
-                        module_to_canary_class_name_function,
-                        ctx.attrs._dex_toolchain[DexToolchainInfo],
-                    )
-                    current_secondary_dex_inputs.append(canary_class_dex_input)
-                    secondary_dex_inputs.append(current_secondary_dex_inputs)
-
-                current_secondary_dex_size_map[module] = current_secondary_dex_size + weight_estimate
-                current_secondary_dex_inputs.append(
-                    DexInputWithSpecifiedClasses(lib = pre_dexed_lib, dex_class_names = secondary_dex_class_names),
-                )
+            # Organize secondary dex classes into logical dex file(s)
+            organize_pre_dexed_lib(
+                secondary_dex_inputs,
+                module,
+                pre_dexed_lib,
+                weight_estimate,
+                secondary_dex_class_names,
+                current_secondary_dex_size_map,
+                current_secondary_dex_inputs_map,
+                True,
+                split_dex_merge_config.secondary_dex_weight_limit_bytes,
+            )
 
     return sorted_pre_dexed_inputs_map.values()
 
-def _get_raw_secondary_dex_name(index: int, module: str) -> str:
+def _get_raw_secondary_dex_name(index: int, module: str, base_apk_dex_count: int) -> str:
     # Root module begins at 2 (primary classes.dex is 1)
     # Non-root module begins at 1 (classes.dex)
     if is_root_module(module):
-        return "classes{}.dex".format(index + 2)
+        return "classes{}.dex".format(index + base_apk_dex_count + 1)
     elif index == 0:
         return "classes.dex"
     else:
         return "classes{}.dex".format(index + 1)
 
-def _get_raw_secondary_dex_path(index: int, module: str):
+def _get_raw_secondary_dex_path(index: int, module: str, base_apk_dex_count: int, is_exopackage_enabled_for_secondary_dex: bool):
     if is_root_module(module):
-        return _get_raw_secondary_dex_name(index, module)
+        if is_exopackage_enabled_for_secondary_dex:
+            return _get_secondary_dex_subdir_path(index, module, "dex")
+        return _get_raw_secondary_dex_name(index, module, base_apk_dex_count)
     else:
-        return "assets/{}/{}".format(module, _get_raw_secondary_dex_name(index, module))
+        return "assets/{}/{}".format(module, _get_raw_secondary_dex_name(index, module, base_apk_dex_count))
 
-def _get_jar_secondary_dex_path(index: int, module: str):
-    return "{}/{}-{}.dex.jar".format(
+def _get_secondary_dex_subdir_path(index: int, module: str, suffix: str = "dex.jar"):
+    return "{}/{}-{}.{}".format(
         _get_secondary_dex_subdir(module),
         "secondary" if is_root_module(module) else module,
         index + 1,
+        suffix,
     )
 
 def _get_secondary_dex_subdir(module: str):

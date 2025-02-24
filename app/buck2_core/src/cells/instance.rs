@@ -15,20 +15,24 @@ use dupe::Dupe;
 
 use crate::cells::cell_root_path::CellRootPath;
 use crate::cells::cell_root_path::CellRootPathBuf;
+use crate::cells::external::ExternalCellOrigin;
 use crate::cells::name::CellName;
 use crate::cells::nested::NestedCells;
-use crate::cells::CellAliasResolver;
-use crate::fs::paths::file_name::FileNameBuf;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum CellInstanceError {
-    #[error("Inconsistent cell name: `{0}` in instance, but `{1}` in alias resolver")]
-    InconsistentCellName(CellName, CellName),
+    #[error(
+        "Attempted to refer to cell `{0}`; however, this is an external cell which cannot be used from `{1}`"
+    )]
+    ExpectedNonExternalCell(CellName, &'static str),
+    #[error("External cell `{0}` cannot have a nested cell `{1}`")]
+    NestedInExternalCell(CellName, CellName),
 }
 
 /// A 'CellInstance', contains a 'CellName' and a path for that cell.
 #[derive(Clone, Debug, derive_more::Display, Dupe, PartialEq, Eq, Allocative)]
-#[display(fmt = "{}", "_0.name")]
+#[display("{}", _0.name)]
 pub struct CellInstance(Arc<CellData>);
 
 #[derive(Derivative, PartialEq, Eq, Allocative)]
@@ -38,32 +42,26 @@ struct CellData {
     name: CellName,
     /// the project relative path to this 'CellInstance'
     path: CellRootPathBuf,
-    /// a list of potential buildfile names for this cell (e.g. 'BUCK', 'TARGETS',
-    /// 'TARGET.v2'). The candidates are listed in priority order, buck will use
-    /// the first one it encounters in a directory.
-    buildfiles: Vec<FileNameBuf>,
-    #[derivative(Debug = "ignore")]
-    /// the aliases of this specific cell
-    aliases: CellAliasResolver,
+    external: Option<ExternalCellOrigin>,
     nested_cells: NestedCells,
 }
 
 impl CellInstance {
-    pub(crate) fn new(
+    pub fn new(
         name: CellName,
         path: CellRootPathBuf,
-        buildfiles: Vec<FileNameBuf>,
-        aliases: CellAliasResolver,
+        external: Option<ExternalCellOrigin>,
         nested_cells: NestedCells,
-    ) -> anyhow::Result<CellInstance> {
-        if name != aliases.current {
-            return Err(CellInstanceError::InconsistentCellName(name, aliases.current).into());
+    ) -> buck2_error::Result<CellInstance> {
+        if external.is_some()
+            && let Some(nested) = nested_cells.check_empty()
+        {
+            return Err(CellInstanceError::NestedInExternalCell(name, nested).into());
         }
         Ok(CellInstance(Arc::new(CellData {
             name,
             path,
-            buildfiles,
-            aliases,
+            external,
             nested_cells,
         })))
     }
@@ -80,19 +78,21 @@ impl CellInstance {
         &self.0.path
     }
 
-    // Get the name of build files for the cell.
-    #[inline]
-    pub fn buildfiles(&self) -> &[FileNameBuf] {
-        &self.0.buildfiles
-    }
-
-    #[inline]
-    pub fn cell_alias_resolver(&self) -> &CellAliasResolver {
-        &self.0.aliases
-    }
-
     #[inline]
     pub fn nested_cells(&self) -> &NestedCells {
         &self.0.nested_cells
+    }
+
+    #[inline]
+    pub fn external(&self) -> Option<&ExternalCellOrigin> {
+        self.0.external.as_ref()
+    }
+
+    #[inline]
+    pub fn expect_non_external(&self, context: &'static str) -> buck2_error::Result<()> {
+        match self.0.external {
+            Some(_) => Err(CellInstanceError::ExpectedNonExternalCell(self.name(), context).into()),
+            None => Ok(()),
+        }
     }
 }

@@ -30,7 +30,7 @@ use crate::environment::GlobalsBuilder;
 use crate::typing::Ty;
 use crate::values::dict::AllocDict;
 use crate::values::type_repr::StarlarkTypeRepr;
-use crate::values::types::int_or_big::StarlarkInt;
+use crate::values::types::int::int_or_big::StarlarkInt;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
@@ -39,12 +39,16 @@ use crate::values::Heap;
 use crate::values::Value;
 
 impl StarlarkTypeRepr for serde_json::Number {
+    type Canonical = Either<i32, f64>;
+
     fn starlark_type_repr() -> Ty {
         Either::<i32, f64>::starlark_type_repr()
     }
 }
 
 impl<'a> StarlarkTypeRepr for &'a serde_json::Number {
+    type Canonical = serde_json::Number;
+
     fn starlark_type_repr() -> Ty {
         serde_json::Number::starlark_type_repr()
     }
@@ -99,12 +103,16 @@ impl AllocFrozenValue for serde_json::Number {
 }
 
 impl<'a, K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for &'a serde_json::Map<K, V> {
+    type Canonical = <serde_json::Map<K, V> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         AllocDict::<SmallMap<K, V>>::starlark_type_repr()
     }
 }
 
 impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for serde_json::Map<K, V> {
+    type Canonical = <SmallMap<K, V> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         AllocDict::<SmallMap<K, V>>::starlark_type_repr()
     }
@@ -141,6 +149,8 @@ impl AllocFrozenValue for serde_json::Map<String, serde_json::Value> {
 }
 
 impl<'a> StarlarkTypeRepr for &'a serde_json::Value {
+    type Canonical = <serde_json::Value as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         // Any.
         Value::starlark_type_repr()
@@ -148,6 +158,8 @@ impl<'a> StarlarkTypeRepr for &'a serde_json::Value {
 }
 
 impl StarlarkTypeRepr for serde_json::Value {
+    type Canonical = <FrozenValue as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         // Any.
         Value::starlark_type_repr()
@@ -214,7 +226,7 @@ pub(crate) fn json(globals: &mut GlobalsBuilder) {
     // Copying Bazel's json module: https://bazel.build/rules/lib/json
     // or starlark-go json module:
     // https://github.com/google/starlark-go/blob/d1966c6b9fcd6631f48f5155f47afcd7adcc78c2/lib/json/json.go#L28
-    globals.struct_("json", json_members);
+    globals.namespace("json", json_members);
 }
 
 #[cfg(test)]

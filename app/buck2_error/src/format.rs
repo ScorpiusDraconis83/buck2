@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use dupe::Dupe;
 
+use crate::__for_macro::ContextValue;
+use crate::context_value::StarlarkContext;
 use crate::error::ErrorKind;
 use crate::DynLateFormat;
 
@@ -39,7 +41,7 @@ pub(crate) fn into_anyhow_for_format(
                 break AnyhowWrapperForFormat::Root(root.description().to_owned());
             }
             ErrorKind::WithContext(context, inner) => {
-                context_stack.extend(context.as_display());
+                context_stack.push(context);
                 error = inner;
             }
             ErrorKind::Emitted(late_format, inner) => {
@@ -52,12 +54,33 @@ pub(crate) fn into_anyhow_for_format(
         }
     };
 
+    let mut starlark_error: Option<StarlarkContext> = None;
     let mut out: anyhow::Error = base.into();
     for context in context_stack.into_iter().rev() {
-        out = out.context(context);
+        if let ContextValue::StarlarkError(ctx) = context {
+            // Because context_stack is reversed, the right ordering would be first error last to preserve stack ordering
+            starlark_error = Some(ctx.concat(starlark_error));
+            continue;
+        }
+        if let Some(ctx) = starlark_error {
+            out = out.context(format!("{}", ctx));
+            starlark_error = None;
+        }
+        if context.should_display() {
+            out = out.context(format!("{}", context));
+        }
+    }
+
+    if let Some(ctx) = starlark_error {
+        out = out.context(format!("{}", ctx));
     }
     (out, was_late_formatted)
 }
+
+// Keep 3 variables
+// backtrace string which just continuously concatenates
+// error message which is the first error message since stack is reversed so first error is the right one
+// span which is the same as error message
 
 impl fmt::Debug for crate::Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -97,93 +120,5 @@ impl fmt::Display for AnyhowWrapperForFormat {
 impl StdError for AnyhowWrapperForFormat {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate as buck2_error;
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("test error")]
-    struct TestError;
-
-    fn trim_rust_backtrace(error: &str) -> &str {
-        match error.find("\nStack backtrace:") {
-            Some(pos) => error[..pos].trim_end(),
-            None => error.trim_end(),
-        }
-    }
-
-    fn assert_eq_no_backtrace<T: AsRef<str>, U: AsRef<str>>(a: T, b: U) {
-        assert_eq!(
-            trim_rust_backtrace(a.as_ref()),
-            trim_rust_backtrace(b.as_ref())
-        );
-    }
-
-    #[test]
-    fn test_shows_context() {
-        let e = buck2_error::Error::from(TestError)
-            .context("context 1")
-            .context("context 2");
-        assert_eq_no_backtrace(
-            format!("{:?}", e),
-            r#"context 2
-
-Caused by:
-    0: context 1
-    1: test error"#,
-        );
-        assert_eq_no_backtrace(format!("{:#}", e), r#"context 2: context 1: test error"#);
-    }
-
-    #[test]
-    fn test_shows_anyhow_context() {
-        // This context can't be understood by `buck2_error`
-        let e = anyhow::Error::from(TestError).context("context 1");
-        let e = buck2_error::Error::from(e).context("context 2");
-        assert_eq_no_backtrace(
-            format!("{:?}", e),
-            r#"context 2
-
-Caused by:
-    0: context 1
-    1: test error"#,
-        );
-    }
-
-    #[test]
-    fn test_after_anyhow_conversion() {
-        let e = buck2_error::Error::from(TestError).context("context");
-        let e2 = anyhow::Error::from(e.clone());
-        assert_eq_no_backtrace(format!("{}", e), format!("{}", e2));
-        assert_eq_no_backtrace(format!("{:?}", e), format!("{:?}", e2));
-        assert_eq_no_backtrace(format!("{:#}", e), format!("{:#}", e2));
-
-        let e3 = buck2_error::Error::from(e2);
-        assert_eq_no_backtrace(format!("{}", e), format!("{}", e3));
-        assert_eq_no_backtrace(format!("{:?}", e), format!("{:?}", e3));
-        assert_eq_no_backtrace(format!("{:#}", e), format!("{:#}", e3));
-    }
-
-    #[test]
-    fn test_with_context_from_source() {
-        #[derive(buck2_error::Error, Debug)]
-        #[error("with source")]
-        struct E(#[source] TestError);
-
-        let e = buck2_error::Error::from(E(TestError)).context("context");
-
-        assert_eq_no_backtrace(
-            format!("{:?}", e),
-            r#"context
-
-Caused by:
-    0: with source
-    1: test error"#,
-        );
-        assert_eq_no_backtrace(format!("{:#}", e), r#"context: with source: test error"#);
-        assert_eq_no_backtrace(format!("{}", e), r#"context"#);
     }
 }

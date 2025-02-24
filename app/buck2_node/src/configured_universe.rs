@@ -9,22 +9,29 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 
 use allocative::Allocative;
 use buck2_common::pattern::resolve::ResolvedPattern;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::PackageSpec;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::PackageSpec;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::name::TargetNameRef;
 use buck2_events::dispatch::span;
 use buck2_query::query::syntax::simple::eval::label_indexed::LabelIndexed;
 use buck2_query::query::syntax::simple::eval::set::TargetSet;
+use buck2_util::late_binding::LateBinding;
 use buck2_util::self_ref::RefData;
 use buck2_util::self_ref::SelfRef;
+use dice::DiceComputations;
 use dupe::Dupe;
 use either::Either;
 use itertools::Itertools;
@@ -32,6 +39,17 @@ use itertools::Itertools;
 use crate::nodes::configured::ConfiguredTargetNode;
 use crate::nodes::configured::ConfiguredTargetNodeRef;
 use crate::nodes::configured_node_visit_all_deps::configured_node_visit_all_deps;
+use crate::rule_type::RuleType;
+
+pub static UNIVERSE_FROM_LITERALS: LateBinding<
+    for<'c> fn(
+        &'c mut DiceComputations<'_>,
+        &'c ProjectRelativePath,
+        &'c [String],
+        GlobalCfgOptions,
+    )
+        -> Pin<Box<dyn Future<Output = buck2_error::Result<CqueryUniverse>> + Send + 'c>>,
+> = LateBinding::new("UNIVERSE_FROM_LITERALS");
 
 #[derive(Debug)]
 struct CqueryUniverseInner<'a> {
@@ -67,7 +85,7 @@ impl<'a> CqueryUniverseInner<'a> {
 
     fn build_inner(
         universe: &'a TargetSet<ConfiguredTargetNode>,
-    ) -> anyhow::Result<CqueryUniverseInner<'a>> {
+    ) -> buck2_error::Result<CqueryUniverseInner<'a>> {
         let mut targets: BTreeMap<
             PackageLabel,
             BTreeMap<&TargetNameRef, BTreeSet<LabelIndexed<ConfiguredTargetNodeRef>>>,
@@ -104,7 +122,17 @@ impl CqueryUniverse {
             .sum()
     }
 
-    pub fn build(universe: &TargetSet<ConfiguredTargetNode>) -> anyhow::Result<CqueryUniverse> {
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = ConfiguredTargetNodeRef<'a>> {
+        self.data
+            .data()
+            .targets
+            .values()
+            .flat_map(|map| map.values().flat_map(|set| set.iter().map(|node| node.0)))
+    }
+
+    pub fn build(
+        universe: &TargetSet<ConfiguredTargetNode>,
+    ) -> buck2_error::Result<CqueryUniverse> {
         span(buck2_data::CqueryUniverseBuildStart {}, || {
             let r = SelfRef::try_new(universe.clone(), |universe| {
                 CqueryUniverseInner::build_inner(universe)
@@ -152,18 +180,37 @@ impl CqueryUniverse {
         configured_nodes
     }
 
+    pub fn get_target_label(&self, label: &TargetLabel) -> Vec<ConfiguredTargetLabel> {
+        self.get_from_package(
+            label.pkg(),
+            &PackageSpec::Targets(vec![(label.name().to_owned(), TargetPatternExtra)]),
+        )
+        .into_iter()
+        .map(|(node, _extra)| node.label().dupe())
+        .collect()
+    }
+
+    pub fn contains(&self, label: &ConfiguredTargetLabel) -> bool {
+        self.get_target_label(label.unconfigured())
+            .iter()
+            .any(|t| t == label)
+    }
+
     pub fn get_provider_labels<P: PatternType>(
         &self,
         resolved_pattern: &ResolvedPattern<P>,
     ) -> Vec<ConfiguredProvidersLabel> {
         let mut targets = Vec::new();
         for (package, spec) in &resolved_pattern.specs {
-            targets.extend(
-                self.get_from_package(package.dupe(), spec)
-                    .map(|(node, extra)| {
-                        ConfiguredProvidersLabel::new(node.label().dupe(), extra.into_providers())
-                    }),
-            );
+            targets.extend(self.get_from_package(package.dupe(), spec).filter_map(
+                |(node, extra)| match node.rule_type() {
+                    RuleType::Forward => None,
+                    RuleType::Starlark(..) => Some(ConfiguredProvidersLabel::new(
+                        node.label().dupe(),
+                        extra.into_providers(),
+                    )),
+                },
+            ));
         }
         targets
     }
@@ -238,10 +285,11 @@ mod tests {
     use buck2_core::configuration::bound_label::BoundConfigurationLabel;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::configuration::hash::ConfigurationHash;
+    use buck2_core::execution_types::execution::ExecutionPlatformResolution;
     use buck2_core::package::PackageLabel;
+    use buck2_core::pattern::pattern::PackageSpec;
     use buck2_core::pattern::pattern_type::ConfigurationPredicate;
     use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
-    use buck2_core::pattern::PackageSpec;
     use buck2_core::provider::label::ConfiguredProvidersLabel;
     use buck2_core::provider::label::NonDefaultProvidersName;
     use buck2_core::provider::label::ProviderName;
@@ -258,9 +306,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_from_package_by_configured_provider_pattern() {
         fn providers_name() -> ProvidersName {
-            ProvidersName::NonDefault(Box::new(NonDefaultProvidersName::Named(Box::new([
-                ProviderName::new("P".to_owned()).unwrap(),
-            ]))))
+            ProvidersName::NonDefault(triomphe::Arc::new(NonDefaultProvidersName::Named(
+                buck2_util::arc_str::ArcSlice::new([ProviderName::new("P".to_owned()).unwrap()]),
+            )))
         }
 
         fn resolved_pattern(
@@ -270,7 +318,7 @@ mod tests {
                 specs: IndexMap::from_iter([(
                     PackageLabel::testing_parse("foo//bar"),
                     PackageSpec::Targets(Vec::from_iter([(
-                        TargetName::unchecked_new("baz"),
+                        TargetName::testing_new("baz"),
                         ConfiguredProvidersPatternExtra {
                             providers: providers_name(),
                             cfg,
@@ -286,18 +334,22 @@ mod tests {
             CqueryUniverse::build(&TargetSet::from_iter([ConfiguredTargetNode::testing_new(
                 target_label.dupe(),
                 "idris_library",
+                ExecutionPlatformResolution::new(None, Vec::new()),
+                vec![],
+                vec![],
+                None,
             )]))
             .unwrap();
         let provider_label = ConfiguredProvidersLabel::new(target_label, providers_name());
 
         // Any configuration.
         assert_eq!(
-            Vec::from_iter([provider_label.clone()]),
+            Vec::from_iter([provider_label.dupe()]),
             universe.get_provider_labels(&resolved_pattern(ConfigurationPredicate::Any))
         );
         // Configuration label.
         assert_eq!(
-            Vec::from_iter([provider_label.clone()]),
+            Vec::from_iter([provider_label.dupe()]),
             universe.get_provider_labels(&resolved_pattern(ConfigurationPredicate::Bound(
                 BoundConfigurationLabel::new(
                     ConfigurationData::testing_new().label().unwrap().to_owned()

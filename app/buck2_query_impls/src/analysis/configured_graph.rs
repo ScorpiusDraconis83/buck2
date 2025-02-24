@@ -23,6 +23,7 @@ use buck2_query::query::syntax::simple::eval::set::TargetSet;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
+use dice::LinearRecomputeDiceComputations;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use dupe::OptionDupedExt;
@@ -32,37 +33,37 @@ use indexmap::IndexMap;
 use crate::analysis::environment::get_from_template_placeholder_info;
 use crate::analysis::environment::ConfiguredGraphQueryEnvironmentDelegate;
 
-pub(crate) struct AnalysisDiceQueryDelegate<'c> {
-    pub(crate) ctx: &'c DiceComputations,
+pub(crate) struct AnalysisDiceQueryDelegate<'c, 'd> {
+    pub(crate) ctx: &'c LinearRecomputeDiceComputations<'d>,
 }
 
-impl<'c> AnalysisDiceQueryDelegate<'c> {
-    pub(crate) fn ctx(&self) -> &DiceComputations {
-        self.ctx
+impl AnalysisDiceQueryDelegate<'_, '_> {
+    pub(crate) fn ctx<'d>(&'d self) -> DiceComputations<'d> {
+        self.ctx.get()
     }
 }
 
-pub(crate) struct AnalysisConfiguredGraphQueryDelegate<'a> {
-    pub(crate) dice_query_delegate: Arc<AnalysisDiceQueryDelegate<'a>>,
+pub(crate) struct AnalysisConfiguredGraphQueryDelegate<'a, 'd> {
+    pub(crate) dice_query_delegate: Arc<AnalysisDiceQueryDelegate<'a, 'd>>,
     pub(crate) resolved_literals: HashMap<String, ConfiguredTargetNode>,
 }
 
 #[async_trait]
-impl<'a> ConfiguredGraphQueryEnvironmentDelegate for AnalysisConfiguredGraphQueryDelegate<'a> {
-    fn eval_literal(&self, literal: &str) -> anyhow::Result<ConfiguredTargetNode> {
+impl ConfiguredGraphQueryEnvironmentDelegate for AnalysisConfiguredGraphQueryDelegate<'_, '_> {
+    fn eval_literal(&self, literal: &str) -> buck2_error::Result<ConfiguredTargetNode> {
         self.resolved_literals
             .get(literal)
             .duped()
-            .ok_or_else(|| anyhow::anyhow!(""))
+            .ok_or_else(|| buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, ""))
     }
 
     async fn get_targets_from_template_placeholder_info(
         &self,
         template_name: &'static str,
         targets: TargetSet<ConfiguredGraphNodeRef>,
-    ) -> anyhow::Result<TargetSet<ConfiguredGraphNodeRef>> {
+    ) -> buck2_error::Result<TargetSet<ConfiguredGraphNodeRef>> {
         #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-        #[display(fmt = "template_placeholder_info_query({})", template_name)]
+        #[display("template_placeholder_info_query({})", template_name)]
         struct TemplatePlaceholderInfoQueryKey {
             template_name: &'static str,
             // Use `ConfiguredTargetLabel` instead of `ConfiguredGraphNodeRef` here because `ConfiguredGraphNodeRef`
@@ -80,18 +81,36 @@ impl<'a> ConfiguredGraphQueryEnvironmentDelegate for AnalysisConfiguredGraphQuer
                 ctx: &mut DiceComputations,
                 _cancellation: &CancellationContext,
             ) -> Self::Value {
-                let (targets, label_to_artifact) = futures::future::try_join(
-                    futures::future::try_join_all(self.targets.iter().map(|target| {
-                        ctx.get_configured_target_node(target)
-                            .map(|res| res?.require_compatible())
-                    })),
-                    get_from_template_placeholder_info(
-                        ctx,
-                        self.template_name,
-                        self.targets.iter().duped(),
-                    ),
-                )
-                .await?;
+                let (targets, label_to_artifact) = {
+                    ctx.try_compute2(
+                        |ctx| {
+                            async move {
+                                ctx.try_compute_join(self.targets.iter(), |ctx, target| {
+                                    async move {
+                                        ctx.get_configured_target_node(target)
+                                            .await?
+                                            .require_compatible()
+                                    }
+                                    .boxed()
+                                })
+                                .await
+                            }
+                            .boxed()
+                        },
+                        |ctx| {
+                            async move {
+                                get_from_template_placeholder_info(
+                                    ctx,
+                                    self.template_name,
+                                    self.targets.iter().duped(),
+                                )
+                                .await
+                            }
+                            .boxed()
+                        },
+                    )
+                    .await?
+                };
 
                 let targets: TargetSet<_> = targets
                     .into_iter()
@@ -136,7 +155,7 @@ impl<'a> ConfiguredGraphQueryEnvironmentDelegate for AnalysisConfiguredGraphQuer
 fn find_target_nodes(
     targets: TargetSet<ConfiguredGraphNodeRef>,
     label_to_artifact: IndexMap<ConfiguredTargetLabel, Artifact>,
-) -> anyhow::Result<TargetSet<ConfiguredGraphNodeRef>> {
+) -> buck2_error::Result<TargetSet<ConfiguredGraphNodeRef>> {
     let mut queue: VecDeque<_> = targets.iter().duped().collect();
     let mut seen = targets;
     let mut result = TargetSet::new();

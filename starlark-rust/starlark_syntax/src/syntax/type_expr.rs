@@ -34,6 +34,8 @@ pub enum TypeExprUnpackError {
     EmptyListInType,
     #[error("Only dot expression of form `ident.ident` is allowed in type expression")]
     DotInType,
+    #[error("Expecting path like `a.b.c`")]
+    ExpectingPath,
     #[error(r#"`{0}.type` is not allowed in type expression, use `{0}` instead"#)]
     DotTypeBan(String),
 }
@@ -50,47 +52,46 @@ pub fn type_str_literal_is_wildcard(s: &str) -> bool {
     s == "" || s.starts_with('_')
 }
 
+/// Path component of type.
+#[derive(Debug)]
+pub struct TypePathP<'a, P: AstPayload> {
+    pub first: &'a AstIdentP<P>,
+    pub rem: Vec<Spanned<&'a str>>,
+}
+
 /// This type should be used instead of `TypeExprP`, but a lot of code needs to be updated.
 #[derive(Debug)]
 pub enum TypeExprUnpackP<'a, P: AstPayload> {
-    Path(&'a AstIdentP<P>, Vec<Spanned<&'a str>>),
+    Ellipsis,
+    Path(TypePathP<'a, P>),
     /// `list[str]`.
     Index(&'a AstIdentP<P>, Box<Spanned<TypeExprUnpackP<'a, P>>>),
-    /// `dict[str, int]`.
+    /// `dict[str, int]` or `typing.Callable[[int], str]`.
     Index2(
-        &'a AstIdentP<P>,
+        Spanned<TypePathP<'a, P>>,
         Box<Spanned<TypeExprUnpackP<'a, P>>>,
         Box<Spanned<TypeExprUnpackP<'a, P>>>,
     ),
-    /// `tuple[str, ...]`.
-    Index2Ellipsis(&'a AstIdentP<P>, Box<Spanned<TypeExprUnpackP<'a, P>>>),
+    /// List argument in `typing.Callable[[int], str]`.
+    List(Vec<Spanned<TypeExprUnpackP<'a, P>>>),
     Union(Vec<Spanned<TypeExprUnpackP<'a, P>>>),
     Tuple(Vec<Spanned<TypeExprUnpackP<'a, P>>>),
-    Literal(Spanned<&'a str>),
 }
 
 impl<'a, P: AstPayload> TypeExprUnpackP<'a, P> {
-    pub fn unpack(
+    fn unpack_path(
         expr: &'a AstExprP<P>,
         codemap: &CodeMap,
-    ) -> Result<Spanned<TypeExprUnpackP<'a, P>>, WithDiagnostic<TypeExprUnpackError>> {
+    ) -> Result<Spanned<TypePathP<'a, P>>, WithDiagnostic<TypeExprUnpackError>> {
         let span = expr.span;
-        let err = |t| {
-            Err(WithDiagnostic::new_spanned(
-                TypeExprUnpackError::InvalidType(t),
-                expr.span,
-                codemap,
-            ))
-        };
-
         match &expr.node {
-            ExprP::Tuple(xs) => {
-                let xs = xs.try_map(|x| TypeExprUnpackP::unpack(x, codemap))?;
-                Ok(Spanned {
-                    span,
-                    node: TypeExprUnpackP::Tuple(xs),
-                })
-            }
+            ExprP::Identifier(ident) => Ok(Spanned {
+                span,
+                node: TypePathP {
+                    first: ident,
+                    rem: Vec::new(),
+                },
+            }),
             ExprP::Dot(object, field) => {
                 let mut current: &AstExprP<P> = object;
                 let mut rem: Vec<Spanned<_>> = vec![field.as_ref().map(|x| x.as_str())];
@@ -119,7 +120,7 @@ impl<'a, P: AstPayload> TypeExprUnpackP<'a, P> {
                             }
                             return Ok(Spanned {
                                 span,
-                                node: TypeExprUnpackP::Path(i, rem),
+                                node: TypePathP { first: i, rem },
                             });
                         }
                         _ => {
@@ -131,10 +132,59 @@ impl<'a, P: AstPayload> TypeExprUnpackP<'a, P> {
                         }
                     }
                 }
-                // We would also want to ban expressions like `x.y` where `x` is not `type`,
-                // or `x.y.z` but these are used now.
-                // Try `xbgs metalos.ProvisioningConfig`.
-                // That expression has type string which is the type name.
+            }
+            _ => Err(WithDiagnostic::new_spanned(
+                TypeExprUnpackError::ExpectingPath,
+                expr.span,
+                codemap,
+            )),
+        }
+    }
+
+    fn unpack_argument(
+        expr: &'a AstExprP<P>,
+        codemap: &CodeMap,
+    ) -> Result<Spanned<TypeExprUnpackP<'a, P>>, WithDiagnostic<TypeExprUnpackError>> {
+        let span = expr.span;
+        match &expr.node {
+            ExprP::List(items) => {
+                let items = items.try_map(|x| TypeExprUnpackP::unpack_argument(x, codemap))?;
+                Ok(Spanned {
+                    span,
+                    node: TypeExprUnpackP::List(items),
+                })
+            }
+            _ => TypeExprUnpackP::unpack(expr, codemap),
+        }
+    }
+
+    pub fn unpack(
+        expr: &'a AstExprP<P>,
+        codemap: &CodeMap,
+    ) -> Result<Spanned<TypeExprUnpackP<'a, P>>, WithDiagnostic<TypeExprUnpackError>> {
+        let span = expr.span;
+        let err = |t| {
+            Err(WithDiagnostic::new_spanned(
+                TypeExprUnpackError::InvalidType(t),
+                expr.span,
+                codemap,
+            ))
+        };
+
+        match &expr.node {
+            ExprP::Tuple(xs) => {
+                let xs = xs.try_map(|x| TypeExprUnpackP::unpack(x, codemap))?;
+                Ok(Spanned {
+                    span,
+                    node: TypeExprUnpackP::Tuple(xs),
+                })
+            }
+            ExprP::Dot(..) => {
+                let path = Self::unpack_path(expr, codemap)?;
+                Ok(Spanned {
+                    span,
+                    node: TypeExprUnpackP::Path(path.node),
+                })
             }
             ExprP::Call(..) => err("call"),
             ExprP::Index(a_i) => {
@@ -152,34 +202,34 @@ impl<'a, P: AstPayload> TypeExprUnpackP<'a, P> {
             }
             ExprP::Index2(a_i0_i1) => {
                 let (a, i0, i1) = &**a_i0_i1;
-                let ExprP::Identifier(ident) = &a.node else {
-                    return err("array indirection 2 where array is not an identifier");
-                };
-                if let ExprP::Literal(AstLiteral::Ellipsis) = &i1.node {
-                    let i0 = TypeExprUnpackP::unpack(i0, codemap)?;
-                    Ok(Spanned {
-                        span,
-                        node: TypeExprUnpackP::Index2Ellipsis(ident, Box::new(i0)),
-                    })
-                } else {
-                    let i0 = TypeExprUnpackP::unpack(i0, codemap)?;
-                    let i1 = TypeExprUnpackP::unpack(i1, codemap)?;
-                    Ok(Spanned {
-                        span,
-                        node: TypeExprUnpackP::Index2(ident, Box::new(i0), Box::new(i1)),
-                    })
-                }
+                let path = Self::unpack_path(a, codemap)?;
+                let i0 = TypeExprUnpackP::unpack_argument(i0, codemap)?;
+                let i1 = TypeExprUnpackP::unpack_argument(i1, codemap)?;
+                Ok(Spanned {
+                    span,
+                    node: TypeExprUnpackP::Index2(path, Box::new(i0), Box::new(i1)),
+                })
             }
             ExprP::Slice(..) => err("slice"),
-            ExprP::Identifier(ident) => Ok(Spanned {
-                span,
-                node: TypeExprUnpackP::Path(ident, Vec::new()),
-            }),
+            ExprP::Identifier(..) => {
+                let path = Self::unpack_path(expr, codemap)?;
+                Ok(Spanned {
+                    span,
+                    node: TypeExprUnpackP::Path(path.node),
+                })
+            }
             ExprP::Lambda(..) => err("lambda"),
-            ExprP::Literal(AstLiteral::String(_)) => err("string literal"),
+            ExprP::Literal(AstLiteral::String(_)) => {
+                // TODO(nga): eventually this should be allowed for self-referential types:
+                //   https://www.internalfb.com/tasks/?t=184482361
+                err("string literal")
+            }
             ExprP::Literal(AstLiteral::Int(_)) => err("int"),
             ExprP::Literal(AstLiteral::Float(_)) => err("float"),
-            ExprP::Literal(AstLiteral::Ellipsis) => err("ellipsis"),
+            ExprP::Literal(AstLiteral::Ellipsis) => Ok(Spanned {
+                span,
+                node: TypeExprUnpackP::Ellipsis,
+            }),
             ExprP::Not(..) => err("not"),
             ExprP::Minus(..) => err("minus"),
             ExprP::Plus(..) => err("plus"),

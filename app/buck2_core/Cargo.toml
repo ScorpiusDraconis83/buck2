@@ -6,21 +6,18 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dependencies]
-anyhow = { workspace = true }
 arc-swap = { workspace = true }
 blake3 = { workspace = true }
 compact_str = { workspace = true }
-dashmap = { workspace = true }
 derivative = { workspace = true }
 derive_more = { workspace = true }
 dunce = { workspace = true }
-either = { workspace = true }
 equivalent = { workspace = true }
-fnv = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
 indent_write = { workspace = true }
 itertools = { workspace = true }
+libc = { workspace = true }
 linkme = { workspace = true }
 memchr = { workspace = true }
 once_cell = { workspace = true }
@@ -45,8 +42,8 @@ allocative = { workspace = true }
 cmp_any = { workspace = true }
 dupe = { workspace = true }
 gazebo = { workspace = true }
-sorted_vector_map = { workspace = true }
-static_interner = { path = "../../shed/static_interner" }
+lock_free_hashtable = { workspace = true }
+static_interner = { workspace = true }
 
 buck2_data = { workspace = true }
 buck2_error = { workspace = true }
@@ -57,9 +54,12 @@ nix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 common-path = { workspace = true }
+winapi = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
-maplit = { workspace = true }
 serde_json = { workspace = true }
 test-case = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

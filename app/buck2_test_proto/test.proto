@@ -21,7 +21,7 @@ message Testing {
   repeated string testcases = 2;
 }
 
-message DisplayMetadata {
+message TestStage {
   message Listing {
     string suite = 1;
   }
@@ -113,6 +113,7 @@ message TestResult {
   ConfiguredTargetHandle target = 6; // Required
   google.protobuf.Duration duration = 7; // Optional
   string details = 8; // Required
+  optional uint64 max_memory_used_bytes = 9;
 }
 
 message ReportTestResultRequest {
@@ -179,7 +180,7 @@ message ExternalRunnerSpecValue {
 
 message TestExecutable {
   reserved 4;
-  DisplayMetadata ui_prints = 1;
+  TestStage stage = 1;
   ConfiguredTargetHandle target = 2;
   repeated ArgValue cmd = 3;
   repeated DeclaredOutput pre_create_dirs = 5;
@@ -205,6 +206,7 @@ message ExecuteRequest2 {
 
 message PrepareForLocalExecutionRequest {
   TestExecutable test_executable = 1;
+  repeated LocalResourceType required_local_resources = 2;
 }
 
 message ArgValue {
@@ -225,22 +227,73 @@ message ArgFormat {
 message ArgValueContent {
   oneof value {
     ExternalRunnerSpecValue spec_value = 1;
-    DeclaredOutput declared_output = 2;
+    OutputName declared_output = 2;
   }
+}
+
+// This message should be compatible with the prefix of DeclaredOutput for
+// backwards compatibility
+message OutputName {
+  string name = 1;
+  reserved 2;
+}
+
+message TtlConfig {
+  // Specifies a custom TTL in seconds for blobs in the output.
+  int64 ttl_seconds = 1;
+  // Specifies a custom use-case to use for managing the blobs in CAS.
+  string use_case = 2;
 }
 
 message DeclaredOutput {
   string name = 1;
+  // Flags that a consumer supports *remote* output, in which case it's not
+  // necessary to materialize this output.
+  bool supports_remote = 2;
+  optional TtlConfig ttl_config = 3;
+}
+
+// Copy of Digest from Remote Execution API:
+// https://github.com/facebook/buck2/blob/main/remote_execution/oss/re_grpc_proto/proto/build/bazel/remote/execution/v2/remote_execution.proto#L936-L943
+message CasDigest {
+  // The hash. In the case of SHA-256, it will always be a lowercase hex string
+  // exactly 64 characters long.
+  string hash = 1;
+
+  // The size of the blob, in bytes.
+  int64 size_bytes = 2;
+}
+
+// TODO(arr): consider using remote_execution.proto later on. The API surface
+// there is larger but consolidation may be worth it.
+message RemoteFileNode {
+  string name = 1;
+}
+
+message RemoteDirNode {
+  string name = 1;
+  repeated RemoteObject children = 2;
+}
+
+message RemoteObject {
+  CasDigest digest = 1;
+  oneof node {
+    RemoteFileNode file = 2;
+    RemoteDirNode dir = 3;
+  }
 }
 
 message Output {
+  // TODO(arr): replace this oneof with just it's fields when we start uploading
+  // results of local executions to CAS
   oneof value {
     string local_path = 1;
+    RemoteObject remote_object = 2;
   }
 }
 
 message OutputEntry {
-  DeclaredOutput declared_output = 1;
+  OutputName declared_output = 1;
   Output output = 2;
 }
 
@@ -252,6 +305,7 @@ message ExecutionResult2 {
   google.protobuf.Duration start_time = 5; // Duration since the epoch
   google.protobuf.Duration execution_time = 6;
   ExecutionDetails execution_details = 7;
+  optional uint64 max_memory_used_bytes = 8;
 }
 
 message ExecutionDetails {
@@ -274,6 +328,12 @@ message PrepareForLocalExecutionResult {
   repeated VerbatimEnvironmentVariable env = 4;
 }
 
+message SetupLocalResourceLocalExecutionCommand {
+  repeated string cmd = 1;
+  string cwd = 2;
+  repeated VerbatimEnvironmentVariable env = 3;
+}
+
 message VerbatimEnvironmentVariable {
   string key = 1;
   string value = 2;
@@ -281,11 +341,20 @@ message VerbatimEnvironmentVariable {
 
 message PrepareForLocalExecutionResponse {
   PrepareForLocalExecutionResult result = 1;
+  repeated SetupLocalResourceLocalExecutionCommand
+      setup_local_resource_commands = 2;
 }
 
 message AttachInfoMessageRequest {
   string message = 1;
 }
+
+message UnstableHeapDumpRequest {
+  // The path to write the heap dump to. If this path is relative, it is made
+  // absolute relative to the working directory of the daemon.
+  string destination_path = 1;
+}
+message UnstableHeapDumpResponse {}
 
 service TestOrchestrator {
   rpc EndOfTestResults(EndOfTestResultsRequest) returns (Empty);
@@ -301,4 +370,8 @@ service TestOrchestrator {
 service TestExecutor {
   rpc ExternalRunnerSpec(ExternalRunnerSpecRequest) returns (Empty);
   rpc EndOfTestRequests(Empty) returns (Empty);
+  // Requests the test server to perform a heap dump and save the dump to a
+  // file.
+  rpc Unstable_HeapDump(UnstableHeapDumpRequest)
+      returns (UnstableHeapDumpResponse);
 }

@@ -9,8 +9,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
-use buck2_core::configuration::config_setting::ConfigSettingData;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::pair::ConfigurationNoExec;
 use buck2_core::configuration::pair::ConfigurationWithExec;
@@ -18,15 +16,17 @@ use buck2_core::configuration::transition::applied::TransitionApplied;
 use buck2_core::configuration::transition::id::TransitionId;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::ProvidersLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_error::BuckErrorContext;
 use dupe::Dupe;
 use starlark_map::ordered_map::OrderedMap;
 use starlark_map::sorted_map::SortedMap;
 
-use crate::configuration::resolved::ConfigurationSettingKeyRef;
 use crate::configuration::resolved::ResolvedConfiguration;
+use crate::configuration::resolved::ResolvedConfigurationSettings;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 pub enum PlatformConfigurationError {
     #[error("Could not find configuration for platform target `{0}`")]
     UnknownPlatformTarget(TargetLabel),
@@ -35,28 +35,32 @@ pub enum PlatformConfigurationError {
 /// The context for attribute configuration. Contains information about the
 /// configuration.
 pub trait AttrConfigurationContext {
-    /// Return the content of the resolved `config_setting` on match.
-    fn matches<'a>(&'a self, label: &TargetLabel) -> Option<&'a ConfigSettingData>;
+    fn resolved_cfg_settings(&self) -> &ResolvedConfigurationSettings;
 
     fn cfg(&self) -> ConfigurationNoExec;
 
-    fn exec_cfg(&self) -> ConfigurationNoExec;
+    fn exec_cfg(&self) -> buck2_error::Result<ConfigurationNoExec>;
 
     /// Must be equal to `(cfg, Some(exec_cfg))`.
     fn toolchain_cfg(&self) -> ConfigurationWithExec;
 
-    fn platform_cfg(&self, label: &TargetLabel) -> anyhow::Result<ConfigurationData>;
+    fn platform_cfg(&self, label: &TargetLabel) -> buck2_error::Result<ConfigurationData>;
 
     /// Map of transition ids resolved to configurations
     /// using current node configuration as input.
-    fn resolved_transitions(&self) -> &OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>>;
+    fn resolved_transitions(
+        &self,
+    ) -> buck2_error::Result<&OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>>>;
 
     fn configure_target(&self, label: &ProvidersLabel) -> ConfiguredProvidersLabel {
         label.configure_pair(self.cfg().cfg_pair().dupe())
     }
 
-    fn configure_exec_target(&self, label: &ProvidersLabel) -> ConfiguredProvidersLabel {
-        label.configure_pair(self.exec_cfg().cfg_pair().dupe())
+    fn configure_exec_target(
+        &self,
+        label: &ProvidersLabel,
+    ) -> buck2_error::Result<ConfiguredProvidersLabel> {
+        Ok(label.configure_pair(self.exec_cfg()?.cfg_pair().dupe()))
     }
 
     fn configure_toolchain_target(&self, label: &ProvidersLabel) -> ConfiguredProvidersLabel {
@@ -71,11 +75,11 @@ pub trait AttrConfigurationContext {
         &self,
         label: &ProvidersLabel,
         tr: &TransitionId,
-    ) -> anyhow::Result<ConfiguredProvidersLabel> {
+    ) -> buck2_error::Result<ConfiguredProvidersLabel> {
         let cfg = self
-            .resolved_transitions()
+            .resolved_transitions()?
             .get(tr)
-            .context("internal error: no resolved transition")?;
+            .buck_error_context("internal error: no resolved transition")?;
         Ok(label.configure(cfg.single()?.dupe()))
     }
 
@@ -83,11 +87,11 @@ pub trait AttrConfigurationContext {
         &self,
         label: &ProvidersLabel,
         tr: &TransitionId,
-    ) -> anyhow::Result<SortedMap<String, ConfiguredProvidersLabel>> {
+    ) -> buck2_error::Result<SortedMap<String, ConfiguredProvidersLabel>> {
         let cfg = self
-            .resolved_transitions()
+            .resolved_transitions()?
             .get(tr)
-            .context("internal error: no resolved transition")?;
+            .buck_error_context("internal error: no resolved transition")?;
         let split = cfg.split()?;
         Ok(split
             .iter()
@@ -123,33 +127,32 @@ impl<'b> AttrConfigurationContextImpl<'b> {
 }
 
 impl<'b> AttrConfigurationContext for AttrConfigurationContextImpl<'b> {
-    fn matches<'a>(&'a self, label: &TargetLabel) -> Option<&'a ConfigSettingData> {
-        self.resolved_cfg
-            .setting_matches(ConfigurationSettingKeyRef(label))
+    fn resolved_cfg_settings(&self) -> &ResolvedConfigurationSettings {
+        self.resolved_cfg.settings()
     }
 
     fn cfg(&self) -> ConfigurationNoExec {
         self.resolved_cfg.cfg().dupe()
     }
 
-    fn exec_cfg(&self) -> ConfigurationNoExec {
-        self.exec_cfg.dupe()
+    fn exec_cfg(&self) -> buck2_error::Result<ConfigurationNoExec> {
+        Ok(self.exec_cfg.dupe())
     }
 
     fn toolchain_cfg(&self) -> ConfigurationWithExec {
         self.toolchain_cfg.dupe()
     }
 
-    fn platform_cfg(&self, label: &TargetLabel) -> anyhow::Result<ConfigurationData> {
+    fn platform_cfg(&self, label: &TargetLabel) -> buck2_error::Result<ConfigurationData> {
         match self.platform_cfgs.get(label) {
             Some(configuration) => Ok(configuration.dupe()),
-            None => Err(anyhow::anyhow!(
-                PlatformConfigurationError::UnknownPlatformTarget(label.dupe())
-            )),
+            None => Err(PlatformConfigurationError::UnknownPlatformTarget(label.dupe()).into()),
         }
     }
 
-    fn resolved_transitions(&self) -> &OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>> {
-        self.resolved_transitions
+    fn resolved_transitions(
+        &self,
+    ) -> buck2_error::Result<&OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>>> {
+        Ok(self.resolved_transitions)
     }
 }

@@ -12,11 +12,15 @@
 //! place, and should usually just be propagated in order to lead to a quick exit.
 
 use std::fmt::Arguments;
+use std::fs::File;
 use std::io;
+use std::io::LineWriter;
+use std::io::Stdout;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use buck2_error::internal_error;
 use superconsole::Line;
 
 use crate::exit_result::ClientIoError;
@@ -27,9 +31,14 @@ pub fn has_written_to_stdout() -> bool {
     HAS_WRITTEN_TO_STDOUT.load(Ordering::Relaxed)
 }
 
-fn stdout() -> io::Stdout {
+static STDOUT_LOCKED: AtomicBool = AtomicBool::new(false);
+
+fn stdout() -> buck2_error::Result<io::Stdout> {
+    if STDOUT_LOCKED.load(Ordering::Relaxed) {
+        return Err(internal_error!("stdout is already locked"));
+    }
     HAS_WRITTEN_TO_STDOUT.store(true, Ordering::Relaxed);
-    io::stdout()
+    Ok(io::stdout())
 }
 
 #[macro_export]
@@ -78,49 +87,82 @@ macro_rules! eprintln {
     };
 }
 
-pub fn _print(fmt: Arguments) -> anyhow::Result<()> {
-    stdout()
+pub fn _print(fmt: Arguments) -> buck2_error::Result<()> {
+    stdout()?
         .lock()
         .write_fmt(fmt)
-        .map_err(|e| ClientIoError(e).into())
+        .map_err(|e| ClientIoError::from(e).into())
 }
 
-pub fn _eprint(fmt: Arguments) -> anyhow::Result<()> {
+pub fn _eprint(fmt: Arguments) -> buck2_error::Result<()> {
     io::stderr()
         .lock()
         .write_fmt(fmt)
-        .map_err(|e| ClientIoError(e).into())
+        .map_err(|e| ClientIoError::from(e).into())
 }
 
-pub fn print_bytes(bytes: &[u8]) -> anyhow::Result<()> {
-    stdout()
+pub fn print_bytes(bytes: &[u8]) -> buck2_error::Result<()> {
+    stdout()?
         .lock()
         .write_all(bytes)
-        .map_err(|e| ClientIoError(e).into())
+        .map_err(|e| ClientIoError::from(e).into())
 }
 
-pub fn eprint_line(line: &Line) -> anyhow::Result<()> {
+pub fn eprint_line(line: &Line) -> buck2_error::Result<()> {
     let line = line.render();
     crate::eprintln!("{}", line)
 }
 
-pub fn flush() -> anyhow::Result<()> {
-    stdout().flush().map_err(|e| ClientIoError(e).into())
+pub fn flush() -> buck2_error::Result<()> {
+    stdout()?.flush().map_err(|e| ClientIoError::from(e).into())
 }
 
-pub fn print_with_writer<E, F>(f: F) -> anyhow::Result<()>
+fn stdout_to_file(stdout: &Stdout) -> buck2_error::Result<File> {
+    #[cfg(not(windows))]
+    {
+        use std::os::fd::AsFd;
+        Ok(File::from(stdout.as_fd().try_clone_to_owned()?))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        Ok(File::from(stdout.as_handle().try_clone_to_owned()?))
+    }
+}
+
+pub fn print_with_writer<E, F>(f: F) -> buck2_error::Result<()>
 where
-    E: Into<anyhow::Error>,
-    F: FnOnce(&mut dyn Write) -> Result<(), E>,
+    E: Into<buck2_error::Error>,
+    F: FnOnce(&mut (dyn Write + Send)) -> Result<(), E>,
 {
-    match f(&mut stdout().lock()) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            let e: anyhow::Error = e.into();
-            match e.downcast::<io::Error>() {
-                Ok(io_error) => Err(ClientIoError(io_error).into()),
-                Err(e) => Err(e),
-            }
+    let stdout = stdout()?;
+
+    struct StdoutLockedGuard;
+
+    impl Drop for StdoutLockedGuard {
+        fn drop(&mut self) {
+            assert!(
+                STDOUT_LOCKED
+                    .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            );
         }
     }
+
+    assert!(
+        STDOUT_LOCKED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    );
+    let _guard = StdoutLockedGuard;
+
+    let _guard = stdout.lock();
+    let file = stdout_to_file(&stdout)?;
+    let mut w = LineWriter::new(file);
+    match f(&mut w) {
+        Ok(()) => {}
+        Err(e) => return Err(e.into()),
+    }
+    w.flush()?;
+    Ok(())
 }

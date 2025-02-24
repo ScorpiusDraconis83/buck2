@@ -59,7 +59,7 @@ mod tests {
     use buck2_events::dispatch::EventDispatcher;
     use buck2_events::source::ChannelEventSource;
     use buck2_events::BuckEvent;
-    use buck2_futures::spawn::spawn_dropcancel_with_preamble;
+    use buck2_futures::spawn::spawn_dropcancel;
     use buck2_wrapper_common::invocation_id::TraceId;
     use dice::DiceData;
     use dice::UserComputationData;
@@ -154,20 +154,8 @@ mod tests {
         }
         .boxed();
 
-        let (_, poll1) = spawn_dropcancel_with_preamble(
-            task1,
-            futures::future::ready(()),
-            sp.as_ref(),
-            &ctx1,
-            tracing::debug_span!("test"),
-        );
-        let (_, poll2) = spawn_dropcancel_with_preamble(
-            task2,
-            futures::future::ready(()),
-            sp.as_ref(),
-            &ctx2,
-            tracing::debug_span!("test"),
-        );
+        let poll1 = spawn_dropcancel(|_| task1.boxed(), sp.as_ref(), &ctx1);
+        let poll2 = spawn_dropcancel(|_| task2.boxed(), sp.as_ref(), &ctx2);
         let joins = vec![poll1, poll2];
 
         assert_eq!(futures::future::join_all(joins).await, ["Hello!", "World!"]);

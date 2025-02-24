@@ -9,10 +9,13 @@
 
 use async_trait::async_trait;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 
@@ -27,10 +30,11 @@ impl StreamingCommand for ServerCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        _matches: &clap::ArgMatches,
+        _matches: BuckArgMatches<'_>,
         _ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        let status = buckd.with_flushing().status(false).await?;
+        let status = buckd.with_flushing().status(events_ctx, false).await?;
         buck2_client_ctx::println!("buckd.endpoint={}", status.process_info.unwrap().endpoint)?;
         ExitResult::success()
     }
@@ -39,11 +43,15 @@ impl StreamingCommand for ServerCommand {
         CommonConsoleOptions::simple_ref()
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
-        CommonDaemonCommandOptions::default_ref()
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
+        CommonEventLogOptions::default_ref()
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         CommonBuildConfigurationOptions::default_ref()
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        CommonStarlarkOptions::default_ref()
     }
 }

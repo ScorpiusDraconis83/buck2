@@ -9,6 +9,7 @@
 
 #![allow(clippy::drop_non_drop)] // FIXME?
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::io::Write;
@@ -20,6 +21,7 @@ use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProvide
 use buck2_cli_proto::QueryOutputFormat;
 use buck2_core::cells::CellResolver;
 use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_query::query::environment::AttrFmtOptions;
 use buck2_query::query::environment::QueryTarget;
 use buck2_query::query::environment::QueryTargets;
 use buck2_query::query::syntax::simple::eval::file_set::FileSet;
@@ -32,6 +34,7 @@ use dupe::Copy_;
 use dupe::Dupe_;
 use gazebo::variants::UnpackVariants;
 use indent_write::fmt::IndentWriter;
+use indent_write::io::IndentWriter as IoIndentWriter;
 use regex::RegexSet;
 use serde::ser::SerializeMap;
 use serde::ser::SerializeSeq;
@@ -43,17 +46,20 @@ use crate::commands::query::QueryCommandError;
 use crate::dot::targets::DotTargetGraph;
 use crate::dot::Dot;
 use crate::dot::DotCompact;
+use crate::html::Html;
 
 #[derive(Copy_, Dupe_, Clone_, UnpackVariants)]
-pub enum ShouldPrintProviders<'a, T> {
+pub(crate) enum ShouldPrintProviders<'a, T> {
     No,
     Yes(&'a dyn ProviderLookUp<T>),
 }
 
 #[async_trait]
-pub trait ProviderLookUp<T: QueryTarget>: Send + Sync {
-    async fn lookup(&self, t: &T)
-    -> anyhow::Result<MaybeCompatible<FrozenProviderCollectionValue>>;
+pub(crate) trait ProviderLookUp<T: QueryTarget>: Send + Sync {
+    async fn lookup(
+        &self,
+        t: &T,
+    ) -> buck2_error::Result<MaybeCompatible<FrozenProviderCollectionValue>>;
 }
 
 #[derive(Debug)]
@@ -74,7 +80,7 @@ impl<'a, T: QueryTarget> TargetSetJsonPrinter<'a, T> {
         print_providers: ShouldPrintProviders<'a, T>,
         attributes: &'a Option<RegexSet>,
         targets: &'a TargetSet<T>,
-    ) -> anyhow::Result<TargetSetJsonPrinter<'a, T>> {
+    ) -> buck2_error::Result<TargetSetJsonPrinter<'a, T>> {
         Ok(TargetSetJsonPrinter {
             value: printable_targets(targets, print_providers, attributes, target_call_stacks)
                 .await?,
@@ -221,7 +227,7 @@ impl<'a> QueryResultPrinter<'a> {
         resolver: &'a CellResolver,
         attributes: &[String],
         output_format: i32,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         Self::from_options(
             resolver,
             attributes,
@@ -234,7 +240,7 @@ impl<'a> QueryResultPrinter<'a> {
         resolver: &'a CellResolver,
         attributes: &[String],
         output_format: QueryOutputFormat,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let output_format = match (output_format, attributes.is_empty()) {
             // following buck1's behavior, if any attributes are requested we use json output instead of list output
             (QueryOutputFormat::Default, false) => QueryOutputFormat::Json,
@@ -260,7 +266,7 @@ impl<'a> QueryResultPrinter<'a> {
         multi_result: MultiQueryResult<T>,
         target_call_stacks: bool,
         print_providers: ShouldPrintProviders<'b, T>,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         match (self.output_format, &self.attributes) {
             // A multi-query only has interesting output with --json output. For non-json output it gets merged together.
             // TODO(cjhopman): buck1 does this really odd thing that a multi-query that requests any attributes
@@ -306,7 +312,7 @@ impl<'a> QueryResultPrinter<'a> {
                 std::mem::drop(ser);
                 // need to add a newline to flush the output.
                 writeln!(&mut output)?;
-                captured_error
+                Ok(captured_error?)
             }
             _ => {
                 self.print_single_output(
@@ -326,7 +332,7 @@ impl<'a> QueryResultPrinter<'a> {
         result: QueryEvaluationValue<T>,
         call_stack: bool,
         print_providers: ShouldPrintProviders<'b, T>,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         match result {
             QueryEvaluationValue::TargetSet(targets) => match self.output_format {
                 QueryOutputFormat::Default => {
@@ -335,6 +341,42 @@ impl<'a> QueryResultPrinter<'a> {
                             .await?
                     {
                         writeln!(&mut output, "{}", target)?;
+                    }
+                }
+                QueryOutputFormat::Starlark => {
+                    for (i, target) in targets.iter().enumerate() {
+                        if i > 0 {
+                            writeln!(&mut output)?;
+                            writeln!(&mut output)?;
+                        }
+                        if call_stack {
+                            match target.call_stack() {
+                                Some(call_stack) => {
+                                    write!(&mut output, "{}", indent("#  ", &call_stack))?;
+                                }
+                                None => {
+                                    // This is `aquery`.
+                                }
+                            }
+                        }
+                        writeln!(&mut output, "{}(", target.rule_type())?;
+                        let mut inner_out = IoIndentWriter::new("  ", &mut output);
+                        let mut attrs = BTreeMap::new();
+
+                        target.defined_attrs_for_each(|k, v| {
+                            attrs.insert(
+                                k.to_owned(),
+                                format!("{:#}", target.attr_display(v, AttrFmtOptions::default())),
+                            );
+                            buck2_error::Ok(())
+                        })?;
+                        if let Some(name) = attrs.remove("name") {
+                            writeln!(&mut inner_out, "name = {},", name)?;
+                        }
+                        for (k, v) in attrs {
+                            writeln!(&mut inner_out, "{} = {},", k, v)?;
+                        }
+                        writeln!(&mut output, ")")?;
                     }
                 }
                 QueryOutputFormat::Json => {
@@ -360,6 +402,7 @@ impl<'a> QueryResultPrinter<'a> {
                         &mut output,
                     )?;
                 }
+                QueryOutputFormat::Html => Html::render(targets, &mut output)?,
                 QueryOutputFormat::DotCompact => {
                     DotCompact::render(
                         &DotTargetGraph {
@@ -375,7 +418,7 @@ impl<'a> QueryResultPrinter<'a> {
                     return Err(QueryCommandError::FileSetHasNoAttributes.into());
                 }
                 match self.output_format {
-                    QueryOutputFormat::Default => {
+                    QueryOutputFormat::Default | QueryOutputFormat::Starlark => {
                         for file in files.iter() {
                             writeln!(
                                 &mut output,
@@ -396,10 +439,22 @@ impl<'a> QueryResultPrinter<'a> {
                         writeln!(&mut output)?;
                     }
                     QueryOutputFormat::Dot => {
-                        unimplemented!("dot output for files not implemented yet")
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Unimplemented,
+                            "dot output for files not implemented yet"
+                        ));
                     }
                     QueryOutputFormat::DotCompact => {
-                        unimplemented!("dot_compact output for files not implemented yet")
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Unimplemented,
+                            "dot_compact output for files not implemented yet"
+                        ));
+                    }
+                    QueryOutputFormat::Html => {
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Unimplemented,
+                            "html output for files not implemented yet"
+                        ));
                     }
                 }
             }
@@ -414,26 +469,23 @@ async fn printable_targets<'a, T: QueryTarget>(
     print_providers: ShouldPrintProviders<'a, T>,
     attributes: &'a Option<RegexSet>,
     target_call_stacks: bool,
-) -> anyhow::Result<Vec<PrintableQueryTarget<'a, T>>> {
-    futures::future::join_all(targets.iter().map(|t| {
-        let print_providers = &print_providers;
-        async move {
-            Ok(PrintableQueryTarget {
-                value: t,
-                attributes,
-                target_call_stacks,
-                providers: match print_providers {
-                    ShouldPrintProviders::No => None,
-                    ShouldPrintProviders::Yes(lookup) => {
-                        Some(lookup.lookup(t).await?.require_compatible()?)
-                    }
-                },
-            })
-        }
+) -> buck2_error::Result<Vec<PrintableQueryTarget<'a, T>>> {
+    futures::future::join_all(targets.iter().map(|t| async move {
+        Ok(PrintableQueryTarget {
+            value: t,
+            attributes,
+            target_call_stacks,
+            providers: match print_providers {
+                ShouldPrintProviders::No => None,
+                ShouldPrintProviders::Yes(lookup) => {
+                    Some(lookup.lookup(t).await?.require_compatible()?)
+                }
+            },
+        })
     }))
     .await
     .into_iter()
-    .collect::<anyhow::Result<_>>()
+    .collect::<buck2_error::Result<_>>()
 }
 
 async fn print_action_node(
@@ -442,7 +494,7 @@ async fn print_action_node(
     json: bool,
     output_attributes: &[String],
     cell_resolver: &CellResolver,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     // Dot/DotCompact output format don't make sense here.
     let unstable_output_format = if json {
         QueryOutputFormat::Json

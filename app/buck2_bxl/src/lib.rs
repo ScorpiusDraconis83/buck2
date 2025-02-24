@@ -8,12 +8,8 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
-
-#[macro_use]
-extern crate higher_order_closure;
 
 use std::sync::Once;
 
@@ -26,9 +22,10 @@ pub fn init_late_bindings() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         bxl::starlark_defs::globals::init_bxl_specific_globals();
-        bxl::starlark_defs::context::init_eval_bxl_for_dynamic_output();
+        bxl::starlark_defs::context::dynamic::init_eval_bxl_for_dynamic_output();
         bxl::calculation::init_bxl_calculation_impl();
         commands::init_bxl_server_commands();
+        bxl::starlark_defs::context::anon_target::init_eval_bxl_for_anon_target();
     });
 }
 

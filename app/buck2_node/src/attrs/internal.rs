@@ -11,9 +11,7 @@
 
 use std::sync::Arc;
 
-use buck2_core::plugins::PluginKindSet;
 use buck2_core::provider::id::ProviderId;
-use dupe::Dupe;
 use once_cell::sync::Lazy;
 use starlark_map::ordered_map::OrderedMap;
 
@@ -22,8 +20,8 @@ use crate::attrs::attr_type::any::AnyAttrType;
 use crate::attrs::attr_type::AttrType;
 use crate::attrs::coerced_attr::CoercedAttr;
 use crate::attrs::configurable::AttrIsConfigurable;
+use crate::attrs::values::TargetModifiersValue;
 use crate::metadata::map::MetadataMap;
-use crate::provider_id_set::ProviderIdSet;
 use crate::visibility::VisibilitySpecification;
 use crate::visibility::WithinViewSpecification;
 
@@ -47,6 +45,7 @@ pub const EXEC_COMPATIBLE_WITH_ATTRIBUTE_FIELD: &str = "exec_compatible_with";
 pub const VISIBILITY_ATTRIBUTE_FIELD: &str = "visibility";
 pub const WITHIN_VIEW_ATTRIBUTE_FIELD: &str = "within_view";
 pub const METADATA_ATTRIBUTE_FIELD: &str = "metadata";
+pub const TARGET_MODIFIERS_ATTRIBUTE_FIELD: &str = "modifiers";
 
 pub const TESTS_ATTRIBUTE_FIELD: &str = "tests";
 
@@ -69,10 +68,7 @@ fn default_target_platform_attribute() -> Attribute {
     Attribute::new(
         Some(Arc::new(CoercedAttr::None)),
         "specifies the default target platform, used when no platforms are specified on the command line",
-        AttrType::option(AttrType::dep(
-            ProviderIdSet::from(vec![internal_attrs_platform_info_provider_id().dupe()]),
-            PluginKindSet::EMPTY,
-        )),
+        AttrType::option(AttrType::label()),
     )
 }
 
@@ -122,6 +118,16 @@ fn metadata_attribute() -> Attribute {
     )
 }
 
+fn target_modifiers_attribute() -> Attribute {
+    Attribute::new(
+        Some(Arc::new(CoercedAttr::TargetModifiers(
+            TargetModifiersValue::new(serde_json::Value::Array(vec![])),
+        ))),
+        "an array of modifiers associated with this target",
+        AttrType::target_modifiers(),
+    )
+}
+
 fn tests_attribute() -> Attribute {
     let entry_type = AttrType::label();
     Attribute::new(
@@ -155,6 +161,10 @@ pub fn internal_attrs() -> &'static OrderedMap<&'static str, Attribute> {
             (WITHIN_VIEW_ATTRIBUTE_FIELD, within_view_attribute()),
             (METADATA_ATTRIBUTE_FIELD, metadata_attribute()),
             (TESTS_ATTRIBUTE_FIELD, tests_attribute()),
+            (
+                TARGET_MODIFIERS_ATTRIBUTE_FIELD,
+                target_modifiers_attribute(),
+            ),
         ])
     });
     &ATTRS
@@ -169,6 +179,7 @@ pub fn attr_is_configurable(name: &str) -> AttrIsConfigurable {
         || name == VISIBILITY_ATTRIBUTE_FIELD
         || name == WITHIN_VIEW_ATTRIBUTE_FIELD
         || name == METADATA_ATTRIBUTE_FIELD
+        || name == TARGET_MODIFIERS_ATTRIBUTE_FIELD
     {
         AttrIsConfigurable::No
     } else {

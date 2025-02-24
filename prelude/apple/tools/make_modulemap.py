@@ -10,27 +10,53 @@ import argparse
 import os
 import re
 from io import TextIOWrapper
-from typing import Dict, Iterable, List
+from typing import Dict, FrozenSet, Iterable, List
+
+
+_RESERVED_KEYWORDS: FrozenSet[str] = frozenset(
+    [
+        "config_macros",
+        "conflict",
+        "exclude",
+        "explicit",
+        "extern",
+        "export_as",
+        "export",
+        "framework",
+        "header",
+        "link",
+        "module",
+        "private",
+        "requires",
+        "textual",
+        "umbrella",
+        "use",
+    ]
+)
 
 
 class Module:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, mark_headers_private: bool) -> None:
         self.name: str = name
         self.headers: List[str] = []
+        self.mark_headers_private: bool = mark_headers_private
         self.submodules: Dict[str, Module] = {}
 
     def add_header(self, src: str) -> None:
         self.headers.append(src)
 
-    def get_submodule(self, name: str) -> "Module":
+    def get_submodule(self, name: str, mark_headers_private: bool) -> "Module":
         if name not in self.submodules:
-            self.submodules[name] = Module(name)
+            self.submodules[name] = Module(name, mark_headers_private)
 
         return self.submodules[name]
 
     def render(self, f: TextIOWrapper, path_prefix: str, indent: int = 0) -> None:
         space = " " * indent
-        f.write(f"{space}module {self.name} {{\n")
+        name = self.name
+        if name in _RESERVED_KEYWORDS:
+            name = f"{name}_"
+        f.write(f"{space}module {name} {{\n")
 
         submodule_names = set()
         for submodule_name in sorted(self.submodules.keys()):
@@ -53,8 +79,9 @@ class Module:
             submodule.render(f, path_prefix, indent + 4)
 
         header_space = " " * (indent + 4)
+        prefix = "private " if self.mark_headers_private else ""
         for h in sorted(self.headers):
-            f.write(f'{header_space}header "{os.path.join(path_prefix, h)}"\n')
+            f.write(f'{header_space}{prefix}header "{os.path.join(path_prefix, h)}"\n')
 
         if self.headers:
             f.write(f"{header_space}export *\n")
@@ -63,9 +90,13 @@ class Module:
 
 
 def _write_single_module(
-    f: TextIOWrapper, name: str, headers: Iterable[str], path_prefix: str
+    f: TextIOWrapper,
+    name: str,
+    headers: Iterable[str],
+    path_prefix: str,
+    mark_headers_private: bool,
 ) -> None:
-    module = Module(name)
+    module = Module(name, mark_headers_private)
     for h in headers:
         module.add_header(h)
 
@@ -73,19 +104,23 @@ def _write_single_module(
 
 
 def _write_submodules(
-    f: TextIOWrapper, name: str, headers: Iterable[str], path_prefix: str
+    f: TextIOWrapper,
+    name: str,
+    headers: Iterable[str],
+    path_prefix: str,
+    mark_headers_private: bool,
 ) -> None:
     # Create a tree of nested modules, one for each path component.
-    root_module = Module(name)
+    root_module = Module(name, mark_headers_private)
     for h in headers:
         module = root_module
         for i, component in enumerate(h.split(os.sep)):
             if i == 0 and component == name:
-                # The common case is we have a singe header path prefix that matches the module name.
+                # The common case is we have a single header path prefix that matches the module name.
                 # In this case we add the headers directly to the root module.
                 pass
             else:
-                module = module.get_submodule(component)
+                module = module.get_submodule(component, mark_headers_private)
 
         module.add_header(h)
 
@@ -122,6 +157,11 @@ def main() -> None:
         required=True,
     )
     parser.add_argument(
+        "--mark-headers-private",
+        help="This doesn't apply to --swift-header.",
+        action="store_true",
+    )
+    parser.add_argument(
         "mappings", nargs="*", default=[], help="A list of import paths"
     )
     args = parser.parse_args()
@@ -131,11 +171,13 @@ def main() -> None:
 
     with open(args.output, "w") as f:
         if args.use_submodules:
-            # pyre-fixme[6]: For 4th param expected `str` but got `bytes`.
-            _write_submodules(f, args.name, args.mappings, path_prefix)
+            _write_submodules(
+                f, args.name, args.mappings, path_prefix, args.mark_headers_private
+            )
         else:
-            # pyre-fixme[6]: For 4th param expected `str` but got `bytes`.
-            _write_single_module(f, args.name, args.mappings, path_prefix)
+            _write_single_module(
+                f, args.name, args.mappings, path_prefix, args.mark_headers_private
+            )
 
         if args.swift_header:
             swift_header_name = os.path.relpath(args.swift_header, output_dir)

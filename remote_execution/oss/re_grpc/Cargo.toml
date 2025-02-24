@@ -12,6 +12,7 @@ dupe = { workspace = true }
 futures = { workspace = true }
 gazebo = { workspace = true }
 http = { workspace = true }
+lru = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -23,6 +24,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 buck2_re_configuration = { workspace = true }
+buck2_util = { workspace = true }
 re_grpc_proto = { path = "../re_grpc_proto" }
 
 [dev-dependencies]

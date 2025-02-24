@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Context;
 use async_trait::async_trait;
+use buck2_common::package_listing::dice::DicePackageListingResolver;
+use buck2_common::package_listing::resolver::PackageListingResolver;
 use buck2_common::pattern::resolve::ResolvedPattern;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::cell_path::CellPath;
@@ -21,8 +22,10 @@ use buck2_core::fs::paths::file_name::FileName;
 use buck2_core::fs::paths::file_name::FileNameBuf;
 use buck2_core::package::PackageLabel;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::target::label::TargetLabel;
-use buck2_node::nodes::eval_result::EvaluationResult;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_error::BuckErrorContext;
+use buck2_interpreter::load_module::InterpreterCalculation;
+use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_query::query::environment::QueryEnvironment;
 use buck2_query::query::environment::QueryEnvironmentAsNodeLookup;
@@ -41,10 +44,13 @@ use buck2_query::query::traversal::async_depth_first_postorder_traversal;
 use buck2_query::query::traversal::async_depth_limited_traversal;
 use buck2_query::query::traversal::AsyncNodeLookup;
 use buck2_query::query::traversal::ChildVisitor;
+use buck2_util::future::try_join_all;
 use derive_more::Display;
 use dice::DiceComputations;
+use dice::LinearRecomputeDiceComputations;
 use dupe::Dupe;
 use futures::stream::FuturesUnordered;
+use futures::FutureExt;
 use futures::StreamExt;
 use gazebo::prelude::*;
 use indexmap::IndexSet;
@@ -55,12 +61,14 @@ use tracing::warn;
 type ArcCellPath = Arc<CellPath>;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 enum QueryLiteralResolutionError {
     #[error("literal `{0}` missing in pre-resolved literals")]
     LiteralMissing(String),
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 enum RBuildFilesError {
     #[error("no parent found for the file `{0}`")]
     ParentDoesNotExist(ArcCellPath),
@@ -71,31 +79,29 @@ enum RBuildFilesError {
 /// UqueryDelegate resolves information needed by the QueryEnvironment.
 #[async_trait]
 pub(crate) trait UqueryDelegate: Send + Sync {
-    /// Returns the EvaluationResult for evaluation of the buildfile.
-    async fn eval_build_file(
+    async fn get_buildfile_names_by_cell(
         &self,
-        packages: PackageLabel,
-    ) -> anyhow::Result<Arc<EvaluationResult>>;
-
-    /// Get the imports from a LoadedModule corresponding to some path.
-    async fn eval_module_imports(&self, path: &ImportPath) -> anyhow::Result<Vec<ImportPath>>;
-
-    fn get_buildfile_names_by_cell(&self) -> anyhow::Result<HashMap<CellName, &[FileNameBuf]>>;
+    ) -> buck2_error::Result<HashMap<CellName, Arc<[FileNameBuf]>>>;
 
     /// Resolves a target pattern.
     async fn resolve_target_patterns(
         &self,
         pattern: &[&str],
-    ) -> anyhow::Result<ResolvedPattern<TargetPatternExtra>>;
+    ) -> buck2_error::Result<ResolvedPattern<TargetPatternExtra>>;
 
-    async fn eval_file_literal(&self, literal: &str) -> anyhow::Result<FileSet>;
+    async fn eval_file_literal(&self, literal: &str) -> buck2_error::Result<FileSet>;
 
     // Get all enclosing packages needed to compute owner function.
     // This always includes the immediate enclosing package of the path but can also include
     // all parent packages if the package matches `project.package_boundary_exceptions` buckconfig.
-    async fn get_enclosing_packages(&self, path: &CellPath) -> anyhow::Result<Vec<PackageLabel>>;
+    async fn get_enclosing_packages(
+        &self,
+        path: &CellPath,
+    ) -> buck2_error::Result<Vec<PackageLabel>>;
 
-    fn ctx(&self) -> &DiceComputations;
+    fn linear_dice_computations(&self) -> &LinearRecomputeDiceComputations<'_>;
+
+    fn ctx<'a>(&'a self) -> DiceComputations<'a>;
 }
 
 #[async_trait]
@@ -103,8 +109,8 @@ pub(crate) trait QueryLiterals<T: QueryTarget>: Send + Sync {
     async fn eval_literals(
         &self,
         literals: &[&str],
-        dice: &DiceComputations,
-    ) -> anyhow::Result<TargetSet<T>>;
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<TargetSet<T>>;
 }
 
 pub(crate) struct UqueryEnvironment<'c> {
@@ -126,20 +132,22 @@ impl<T: QueryTarget> PreresolvedQueryLiterals<T> {
     pub(crate) async fn pre_resolve(
         base: &dyn QueryLiterals<T>,
         literals: &[String],
-        dice: &DiceComputations,
+        dice: &mut DiceComputations<'_>,
     ) -> Self {
-        let futs = literals
-            .iter()
-            .map(|lit| async move { (lit.to_owned(), base.eval_literals(&[lit], dice).await) });
+        let resolved_literal_results = dice
+            .compute_join(literals.iter(), |ctx, lit| {
+                async move { (lit.to_owned(), base.eval_literals(&[lit], ctx).await) }.boxed()
+            })
+            .await;
         let mut resolved_literals = HashMap::new();
-        for (literal, result) in futures::future::join_all(futs).await {
+        for (literal, result) in resolved_literal_results {
             resolved_literals.insert(literal, result.map_err(buck2_error::Error::from));
         }
         Self { resolved_literals }
     }
 
     /// All the literals, or error if resolution of any failed.
-    pub(crate) fn literals(&self) -> anyhow::Result<TargetSet<T>> {
+    pub(crate) fn literals(&self) -> buck2_error::Result<TargetSet<T>> {
         let mut literals = TargetSet::new();
         for result in self.resolved_literals.values() {
             literals.extend(result.as_ref().map_err(|e| e.dupe())?);
@@ -153,8 +161,8 @@ impl<T: QueryTarget> QueryLiterals<T> for PreresolvedQueryLiterals<T> {
     async fn eval_literals(
         &self,
         literals: &[&str],
-        _: &DiceComputations,
-    ) -> anyhow::Result<TargetSet<T>> {
+        _: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<TargetSet<T>> {
         let mut targets = TargetSet::new();
         for lit in literals {
             let resolved = match self
@@ -186,12 +194,13 @@ impl<'c> UqueryEnvironment<'c> {
         }
     }
 
-    async fn get_node(&self, target: &TargetLabel) -> anyhow::Result<TargetNode> {
+    async fn get_node(&self, target: &TargetLabel) -> buck2_error::Result<TargetNode> {
         let package = self
             .delegate
-            .eval_build_file(target.pkg())
+            .ctx()
+            .get_interpreter_results(target.pkg())
             .await
-            .with_context(|| format!("Error looking up `{}``", target))?;
+            .with_buck_error_context(|| format!("Error looking up `{}`", target))?;
         let node = package.resolve_target(target.name())?;
         Ok(node.to_owned())
     }
@@ -201,27 +210,27 @@ impl<'c> UqueryEnvironment<'c> {
 impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
     type Target = TargetNode;
 
-    async fn get_node(&self, node_ref: &TargetLabel) -> anyhow::Result<Self::Target> {
+    async fn get_node(&self, node_ref: &TargetLabel) -> buck2_error::Result<Self::Target> {
         UqueryEnvironment::get_node(self, node_ref).await
     }
 
     async fn get_node_for_default_configured_target(
         &self,
         _node_ref: &TargetLabel,
-    ) -> anyhow::Result<MaybeCompatible<Self::Target>> {
+    ) -> buck2_error::Result<MaybeCompatible<Self::Target>> {
         Err(QueryError::FunctionUnimplemented(
             "get_node_for_default_configured_target() only for CqueryEnvironment",
         )
         .into())
     }
 
-    async fn eval_literals(&self, literals: &[&str]) -> anyhow::Result<TargetSet<TargetNode>> {
+    async fn eval_literals(&self, literals: &[&str]) -> buck2_error::Result<TargetSet<TargetNode>> {
         self.literals
-            .eval_literals(literals, self.delegate.ctx())
+            .eval_literals(literals, &mut self.delegate.ctx())
             .await
     }
 
-    async fn eval_file_literal(&self, literal: &str) -> anyhow::Result<FileSet> {
+    async fn eval_file_literal(&self, literal: &str) -> buck2_error::Result<FileSet> {
         self.delegate.eval_file_literal(literal).await
     }
 
@@ -229,8 +238,8 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
         &self,
         root: &TargetSet<TargetNode>,
         traversal_delegate: impl AsyncChildVisitor<TargetNode>,
-        visit: impl FnMut(TargetNode) -> anyhow::Result<()> + Send,
-    ) -> anyhow::Result<()> {
+        visit: impl FnMut(TargetNode) -> buck2_error::Result<()> + Send,
+    ) -> buck2_error::Result<()> {
         async_depth_first_postorder_traversal(
             &QueryEnvironmentAsNodeLookup { env: self },
             root.iter_names(),
@@ -244,9 +253,9 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
         &self,
         root: &TargetSet<Self::Target>,
         delegate: impl AsyncChildVisitor<Self::Target>,
-        visit: impl FnMut(Self::Target) -> anyhow::Result<()> + Send,
+        visit: impl FnMut(Self::Target) -> buck2_error::Result<()> + Send,
         depth: u32,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         async_depth_limited_traversal(
             &QueryEnvironmentAsNodeLookup { env: self },
             root.iter_names(),
@@ -257,15 +266,22 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
         .await
     }
 
-    async fn allbuildfiles(&self, universe: &TargetSet<Self::Target>) -> anyhow::Result<FileSet> {
+    async fn allbuildfiles(
+        &self,
+        universe: &TargetSet<Self::Target>,
+    ) -> buck2_error::Result<FileSet> {
         return allbuildfiles(universe, self.delegate).await;
     }
 
-    async fn rbuildfiles(&self, universe: &FileSet, argset: &FileSet) -> anyhow::Result<FileSet> {
+    async fn rbuildfiles(
+        &self,
+        universe: &FileSet,
+        argset: &FileSet,
+    ) -> buck2_error::Result<FileSet> {
         return rbuildfiles(universe, argset, self.delegate).await;
     }
 
-    async fn owner(&self, paths: &FileSet) -> anyhow::Result<TargetSet<Self::Target>> {
+    async fn owner(&self, paths: &FileSet) -> buck2_error::Result<TargetSet<Self::Target>> {
         let mut result: TargetSet<Self::Target> = TargetSet::new();
         for path in paths.iter() {
             // need to explicitly track this rather than checking for changes to result set since the owner might
@@ -275,7 +291,11 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
                 Ok(packages) => {
                     let package_futs = packages.map(|package| async move {
                         // TODO(cjhopman): We should make sure that the file exists.
-                        let targets = self.delegate.eval_build_file(package.dupe()).await?;
+                        let targets = self
+                            .delegate
+                            .ctx()
+                            .get_interpreter_results(package.dupe())
+                            .await?;
 
                         let owner_targets: Vec<Self::Target> = targets
                             .targets()
@@ -292,7 +312,7 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
                                 None
                             })
                             .collect();
-                        anyhow::Ok(owner_targets)
+                        buck2_error::Ok(owner_targets)
                     });
 
                     for nodes in futures::future::join_all(package_futs).await.into_iter() {
@@ -313,12 +333,59 @@ impl<'c> QueryEnvironment for UqueryEnvironment<'c> {
         }
         Ok(result)
     }
+
+    /// Finds all targets in some buildfiles.
+    ///
+    /// todo(dbarsky): instead of having this be a trait method, this should be implemented as a uquery-specific module
+    /// similar to [crate::aquery::functions::AqueryFunctions].
+    async fn targets_in_buildfile(
+        &self,
+        paths: &FileSet,
+    ) -> buck2_error::Result<TargetSet<Self::Target>> {
+        let mut result: TargetSet<Self::Target> = TargetSet::new();
+
+        let compute = &mut self.delegate.ctx();
+        let mut resolver = DicePackageListingResolver(compute);
+
+        let mut buildfiles = vec![];
+        for path in paths.iter() {
+            let package_label = resolver.get_enclosing_package(path.as_ref()).await?;
+            let listing = resolver.resolve(package_label.dupe()).await?;
+
+            // the listing's buildfile is relative to the package (the BUCK/TARGETS file).
+            // this makes it actually relative to the cell.
+            let buildfile = package_label.as_cell_path().join(listing.buildfile());
+            if buildfile != *path {
+                // file is a not a buildfile.
+                continue;
+            }
+            buildfiles.push(package_label);
+        }
+
+        let mut evaluations = vec![];
+        for buildfile in buildfiles {
+            let fut = async move { self.delegate.ctx().get_interpreter_results(buildfile).await };
+            evaluations.push(fut);
+        }
+
+        let targets = try_join_all(evaluations).await?;
+        for evaluation_result in targets {
+            result.extend(
+                evaluation_result
+                    .targets()
+                    .values()
+                    .map(|target_ref| target_ref.to_owned()),
+            );
+        }
+
+        Ok(result)
+    }
 }
 
 pub(crate) async fn allbuildfiles<'c, T: QueryTarget>(
     universe: &TargetSet<T>,
     delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<FileSet> {
+) -> buck2_error::Result<FileSet> {
     let mut paths = IndexSet::<FileNode>::new();
 
     let mut top_level_imports = Vec::<ImportPath>::new();
@@ -327,13 +394,15 @@ pub(crate) async fn allbuildfiles<'c, T: QueryTarget>(
         paths.insert(FileNode(target.dupe().buildfile_path().path()));
 
         let eval_result = delegate
-            .eval_build_file(target.buildfile_path().package())
+            .ctx()
+            .get_interpreter_results(target.buildfile_path().package())
             .await?; // TODO: no longer use eval_build_file, just parse imports directly (will solve async issue too)
 
         top_level_imports.extend(eval_result.imports().iter().cloned());
     }
 
-    let loads = get_transitive_loads(top_level_imports, delegate).await?;
+    let loads =
+        get_transitive_loads(top_level_imports, delegate.linear_dice_computations()).await?;
 
     let mut new_paths = IndexSet::<FileNode>::new();
     for load in &loads {
@@ -347,11 +416,11 @@ pub(crate) async fn rbuildfiles<'c>(
     universe: &FileSet,
     argset: &FileSet,
     delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<FileSet> {
+) -> buck2_error::Result<FileSet> {
     let universe_paths: Vec<ArcCellPath> =
         universe.iter().map(|file| Arc::new(file.clone())).collect();
     // step 1: split the build files and bzl files
-    let (buildfiles, bzlfiles) = split_universe_files(&universe_paths, delegate)?;
+    let (buildfiles, bzlfiles) = split_universe_files(&universe_paths, delegate).await?;
 
     // step 2: get all top level imports accordingly
     let top_level_import_by_build_file =
@@ -396,7 +465,7 @@ pub(crate) async fn rbuildfiles<'c>(
 
     #[async_trait]
     impl AsyncNodeLookup<Node> for Lookup {
-        async fn get(&self, label: &NodeRef) -> anyhow::Result<Node> {
+        async fn get(&self, label: &NodeRef) -> buck2_error::Result<Node> {
             Ok(Node(Arc::new(label.0.clone())))
         }
     }
@@ -432,7 +501,7 @@ pub(crate) async fn rbuildfiles<'c>(
             &self,
             node: &Node,
             mut func: impl ChildVisitor<Node>,
-        ) -> anyhow::Result<()> {
+        ) -> buck2_error::Result<()> {
             for import in self
                 .first_order_import_map
                 .get(node.import_path())
@@ -488,17 +557,21 @@ pub(crate) async fn rbuildfiles<'c>(
     Ok(FileSet::new(output_files))
 }
 
-fn split_universe_files<'c>(
+async fn split_universe_files<'c>(
     universe: &[ArcCellPath],
     delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<(Vec<ArcCellPath>, Vec<ArcCellPath>)> {
+) -> buck2_error::Result<(Vec<ArcCellPath>, Vec<ArcCellPath>)> {
     let mut buildfiles = Vec::<ArcCellPath>::new();
     let mut bzlfiles = Vec::<ArcCellPath>::new();
-    let buildfile_names_by_cell = delegate.get_buildfile_names_by_cell()?;
+    let buildfile_names_by_cell = delegate.get_buildfile_names_by_cell().await?;
     for file in universe {
         let buildfile_names_for_file =
             buildfile_names_by_cell.get(&file.cell()).ok_or_else(|| {
-                anyhow::anyhow!(RBuildFilesError::CellMissingBuildFileNames(file.cell()))
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "{}",
+                    RBuildFilesError::CellMissingBuildFileNames(file.cell()).to_string()
+                )
             })?;
 
         if let Some(name) = file.path().file_name() {
@@ -521,7 +594,7 @@ async fn top_level_imports_by_build_file<'c>(
     buildfiles: &[ArcCellPath],
     bzlfiles: &[ArcCellPath],
     delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<HashMap<ArcCellPath, Vec<ImportPath>>> {
+) -> buck2_error::Result<HashMap<ArcCellPath, Vec<ImportPath>>> {
     let mut top_level_import_by_build_file = HashMap::<ArcCellPath, Vec<ImportPath>>::new();
 
     for file in bzlfiles {
@@ -536,7 +609,8 @@ async fn top_level_imports_by_build_file<'c>(
                 (
                     file.dupe(),
                     delegate
-                        .eval_build_file(PackageLabel::from_cell_path(parent))
+                        .ctx()
+                        .get_interpreter_results(PackageLabel::from_cell_path(parent))
                         .await,
                 )
             } else {
@@ -560,12 +634,16 @@ async fn top_level_imports_by_build_file<'c>(
 async fn first_order_imports<'c>(
     all_top_level_imports: &[ImportPath],
     delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<HashMap<ImportPath, Vec<ImportPath>>> {
-    let all_imports = get_transitive_loads(all_top_level_imports.to_vec(), delegate).await?;
+) -> buck2_error::Result<HashMap<ImportPath, Vec<ImportPath>>> {
+    let all_imports = get_transitive_loads(
+        all_top_level_imports.to_vec(),
+        delegate.linear_dice_computations(),
+    )
+    .await?;
 
     let mut all_first_order_futs: FuturesUnordered<_> = all_imports
         .iter()
-        .map(|node| async move { (node, delegate.eval_module_imports(node).await) })
+        .map(|node| async move { (node, delegate.ctx().get_loaded_module_imports(node).await) })
         .collect();
 
     let mut first_order_import_map = HashMap::<ImportPath, Vec<ImportPath>>::new();
@@ -580,10 +658,10 @@ async fn first_order_imports<'c>(
 }
 
 // Uquery and Cquery share ImportPath traversal logic, so we move the logic to this function.
-pub(crate) async fn get_transitive_loads<'c>(
+pub(crate) async fn get_transitive_loads(
     top_level_imports: Vec<ImportPath>,
-    delegate: &'c dyn UqueryDelegate,
-) -> anyhow::Result<Vec<ImportPath>> {
+    ctx: &LinearRecomputeDiceComputations<'_>,
+) -> buck2_error::Result<Vec<ImportPath>> {
     #[derive(Clone, Dupe)]
     struct Node(Arc<ImportPath>);
 
@@ -611,15 +689,15 @@ pub(crate) async fn get_transitive_loads<'c>(
 
     #[async_trait]
     impl AsyncNodeLookup<Node> for Lookup {
-        async fn get(&self, label: &NodeRef) -> anyhow::Result<Node> {
+        async fn get(&self, label: &NodeRef) -> buck2_error::Result<Node> {
             Ok(Node(Arc::new(label.0.clone())))
         }
     }
 
     let mut imports: Vec<ImportPath> = Vec::new();
 
-    struct Delegate<'c> {
-        delegate: &'c dyn UqueryDelegate,
+    struct Delegate<'c, 'a> {
+        ctx: &'c LinearRecomputeDiceComputations<'a>,
     }
 
     let visit = |target: Node| {
@@ -627,15 +705,16 @@ pub(crate) async fn get_transitive_loads<'c>(
         Ok(())
     };
 
-    impl AsyncChildVisitor<Node> for Delegate<'_> {
+    impl AsyncChildVisitor<Node> for Delegate<'_, '_> {
         async fn for_each_child(
             &self,
             target: &Node,
             mut func: impl ChildVisitor<Node>,
-        ) -> anyhow::Result<()> {
+        ) -> buck2_error::Result<()> {
             for import in self
-                .delegate
-                .eval_module_imports(target.import_path())
+                .ctx
+                .get()
+                .get_loaded_module_imports(target.import_path())
                 .await?
             {
                 func.visit(&NodeRef(import))?;
@@ -644,9 +723,7 @@ pub(crate) async fn get_transitive_loads<'c>(
         }
     }
 
-    let traversal_delegate = Delegate {
-        delegate: delegate.dupe(),
-    };
+    let traversal_delegate = Delegate { ctx };
     let lookup = Lookup {};
 
     let import_nodes = top_level_imports.iter().map(NodeRef::ref_cast);

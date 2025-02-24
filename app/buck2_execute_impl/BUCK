@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -13,6 +12,8 @@ rust_library(
             "linux",
             [
                 "//buck2/app/buck2_forkserver_proto:buck2_forkserver_proto",
+                # @oss-disable[end= ]: "//common/rust/shed/hostcaps:hostcaps",
+                # @oss-disable[end= ]: "//justknobs/rust:justknobs",
             ],
         ),
         (
@@ -41,6 +42,7 @@ rust_library(
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:pin-project",
         "fbsource//third-party/rust:prost",
+        "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:rusqlite",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tokio-stream",
@@ -53,6 +55,7 @@ rust_library(
         "//buck2/app/buck2_common:buck2_common",
         "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_data:buck2_data",
+        "//buck2/app/buck2_directory:buck2_directory",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_events:buck2_events",
         "//buck2/app/buck2_execute:buck2_execute",

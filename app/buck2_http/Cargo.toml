@@ -17,8 +17,6 @@ hyper-timeout = { workspace = true }
 ipnetwork = { workspace = true }
 pin-project = { workspace = true }
 rustls = { workspace = true }
-rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
@@ -26,8 +24,8 @@ tracing = { workspace = true }
 
 allocative = { workspace = true }
 dupe = { workspace = true }
-gazebo = { workspace = true }
 
+buck2_certs = { workspace = true }
 buck2_error = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -38,3 +36,6 @@ httptest = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 tempfile = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

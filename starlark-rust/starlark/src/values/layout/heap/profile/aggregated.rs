@@ -22,9 +22,6 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use allocative::Allocative;
 use dupe::Dupe;
@@ -34,12 +31,13 @@ use crate::eval::runtime::profile::data::ProfileDataImpl;
 use crate::eval::runtime::profile::flamegraph::FlameGraphData;
 use crate::eval::runtime::profile::flamegraph::FlameGraphNode;
 use crate::eval::runtime::profile::heap::RetainedHeapProfileMode;
+use crate::eval::runtime::profile::instant::ProfilerInstant;
 use crate::eval::runtime::small_duration::SmallDuration;
 use crate::eval::ProfileData;
+use crate::util::arc_str::ArcStr;
 use crate::values::layout::heap::arena::ArenaVisitor;
 use crate::values::layout::heap::heap_type::HeapKind;
 use crate::values::layout::heap::profile::alloc_counts::AllocCounts;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
 use crate::values::layout::heap::profile::by_type::HeapSummary;
 use crate::values::layout::heap::profile::string_index::StringId;
 use crate::values::layout::heap::profile::string_index::StringIndex;
@@ -126,7 +124,7 @@ impl StackFrameBuilder {
 /// An accumulator for stack frames that lets us visit the heap.
 pub(crate) struct StackCollector {
     /// Timestamp of last call enter or exit.
-    last_time: Option<Instant>,
+    last_time: Option<ProfilerInstant>,
     ids: FunctionIds,
     current: Vec<StackFrameBuilder>,
     /// What we are collecting.
@@ -147,6 +145,10 @@ impl StackCollector {
 }
 
 impl<'v> ArenaVisitor<'v> for StackCollector {
+    fn enter_bump(&mut self) {
+        self.last_time = None;
+    }
+
     fn regular_value(&mut self, value: &'v AValueOrForward) {
         let value = match (value.unpack(), self.retained) {
             (AValueOrForwardUnpack::Header(header), None) => unsafe {
@@ -175,10 +177,10 @@ impl<'v> ArenaVisitor<'v> for StackCollector {
         );
     }
 
-    fn call_enter(&mut self, function: Value<'v>, time: Instant) {
+    fn call_enter(&mut self, function: Value<'v>, time: ProfilerInstant) {
         if let Some(last_time) = self.last_time {
             self.current.last_mut().unwrap().0.borrow_mut().time_x2 +=
-                time.saturating_duration_since(last_time);
+                time.duration_since(last_time);
             self.current.last_mut().unwrap().0.borrow_mut().calls_x2 += 1;
         }
 
@@ -195,10 +197,10 @@ impl<'v> ArenaVisitor<'v> for StackCollector {
         self.last_time = Some(time)
     }
 
-    fn call_exit(&mut self, time: Instant) {
+    fn call_exit(&mut self, time: ProfilerInstant) {
         if let Some(last_time) = self.last_time {
             self.current.last_mut().unwrap().0.borrow_mut().time_x2 +=
-                time.saturating_duration_since(last_time);
+                time.duration_since(last_time);
         }
         self.current.pop().unwrap();
         self.last_time = Some(time);
@@ -256,6 +258,14 @@ impl StackFrame {
             calls_x2,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn normalize_for_golden_tests(&mut self) {
+        for (_, v) in &mut self.callees {
+            v.normalize_for_golden_tests();
+        }
+        self.allocs.normalize_for_golden_tests();
+    }
 }
 
 struct StackFrameWithContext<'c> {
@@ -276,40 +286,16 @@ impl<'c> StackFrameWithContext<'c> {
         })
     }
 
-    /// Write this stack frame's data to a file in flamegraph.pl format.
-    fn write_flame_graph(&self, node: &mut FlameGraphNode) {
+    /// Accumulate this stack frame's data into the given FlameGraphNode
+    fn gen_flame_graph_data(&self, node: &mut FlameGraphNode) {
         for (k, v) in &self.frame.allocs.summary {
             node.child((*k).into()).add(v.bytes as u64);
         }
 
         for (id, frame) in self.callees() {
             let child_node = node.child(id.dupe());
-            frame.write_flame_graph(child_node);
+            frame.gen_flame_graph_data(child_node);
         }
-    }
-}
-
-/// `Clone` wrapper.
-#[derive(Default, Allocative)]
-pub(crate) struct UnusedCapacity(AtomicUsize);
-
-impl Clone for UnusedCapacity {
-    fn clone(&self) -> Self {
-        UnusedCapacity(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
-    }
-}
-
-impl UnusedCapacity {
-    pub(crate) fn new(value: usize) -> UnusedCapacity {
-        UnusedCapacity(AtomicUsize::new(value))
-    }
-
-    pub(crate) fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn set(&self, value: usize) {
-        self.0.store(value, Ordering::Relaxed);
     }
 }
 
@@ -319,11 +305,9 @@ impl UnusedCapacity {
 /// * written as CSV or flamegraph
 /// * merged with another data
 #[derive(Clone, Allocative)]
-pub struct AggregateHeapProfileInfo {
+pub(crate) struct AggregateHeapProfileInfo {
     pub(crate) strings: StringIndex,
     pub(crate) root: StackFrame,
-    /// Memory allocated in bump, but unused.
-    pub(crate) unused_capacity: UnusedCapacity,
 }
 
 impl Debug for AggregateHeapProfileInfo {
@@ -339,7 +323,6 @@ impl Default for AggregateHeapProfileInfo {
         AggregateHeapProfileInfo {
             root: StackFrame::default(),
             strings,
-            unused_capacity: UnusedCapacity::default(),
         }
     }
 }
@@ -351,16 +334,9 @@ impl AggregateHeapProfileInfo {
             heap.visit_arena(HeapKind::Unfrozen, &mut collector);
         }
         assert_eq!(1, collector.current.len());
-        let unused_capacity = if retained.is_some() {
-            // Filled later.
-            UnusedCapacity::default()
-        } else {
-            UnusedCapacity::new(heap.unused_capacity())
-        };
         AggregateHeapProfileInfo {
             strings: collector.ids.strings,
             root: collector.current.pop().unwrap().build(),
-            unused_capacity,
         }
     }
 
@@ -378,30 +354,26 @@ impl AggregateHeapProfileInfo {
         let profiles: Vec<_> = Vec::from_iter(profiles);
 
         let mut strings = StringIndex::default();
-        let unused_capacity =
-            UnusedCapacity::new(profiles.iter().map(|p| p.unused_capacity.get()).sum());
         let roots = profiles.into_iter().map(|p| p.root());
         let root = StackFrame::merge(roots, &mut strings);
-        AggregateHeapProfileInfo {
-            strings,
-            root,
-            unused_capacity,
-        }
+        AggregateHeapProfileInfo { strings, root }
     }
 
-    /// Write this out recursively to a file.
-    pub fn gen_flame_graph(&self) -> String {
+    /// Generate the flame graph data and return it as a string.
+    pub fn gen_flame_graph_data(&self) -> String {
         let mut data = FlameGraphData::default();
-        self.root().write_flame_graph(data.root());
-        data.root()
-            .child(ArcStr::new_static("unused_capacity"))
-            .add(self.unused_capacity.get() as u64);
+        self.root().gen_flame_graph_data(data.root());
         data.write()
     }
 
-    /// Write per-function summary in CSV format.
+    /// Generate per-function summary in CSV format.
     pub fn gen_summary_csv(&self) -> String {
         HeapSummaryByFunction::init(self).gen_csv()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalize_for_golden_tests(&mut self) {
+        self.root.normalize_for_golden_tests();
     }
 }
 
@@ -414,8 +386,17 @@ pub(crate) struct RetainedHeapProfile {
 impl RetainedHeapProfile {
     pub(crate) fn to_profile(&self) -> ProfileData {
         ProfileData {
-            profile: ProfileDataImpl::AggregateHeapProfileInfo(Box::new(self.info.clone())),
-            profile_mode: self.mode.to_profile_mode(),
+            profile: match self.mode {
+                RetainedHeapProfileMode::FlameAndSummary => {
+                    ProfileDataImpl::HeapRetained(Box::new(self.info.clone()))
+                }
+                RetainedHeapProfileMode::Flame => {
+                    ProfileDataImpl::HeapFlameRetained(Box::new(self.info.clone()))
+                }
+                RetainedHeapProfileMode::Summary => {
+                    ProfileDataImpl::HeapSummaryRetained(Box::new(self.info.clone()))
+                }
+            },
         }
     }
 }

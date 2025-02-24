@@ -25,7 +25,9 @@ use allocative::Allocative;
 use dupe::Dupe;
 
 /// Slightly faster than `Duration`.
-#[derive(Copy, Clone, Dupe, Default, Debug, Allocative)]
+#[derive(
+    Copy, Clone, Dupe, Default, Eq, PartialEq, Ord, PartialOrd, Debug, Allocative
+)]
 pub(crate) struct SmallDuration {
     /// `u64::MAX` nanos is 500 years.
     pub(crate) nanos: u64,
@@ -36,6 +38,11 @@ impl SmallDuration {
         SmallDuration {
             nanos: duration.as_nanos() as u64,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_millis(millis: u64) -> SmallDuration {
+        Self::from_duration(Duration::from_millis(millis))
     }
 
     pub(crate) fn to_duration(self) -> Duration {

@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use anyhow::Context as _;
-use fnv::FnvBuildHasher;
+use buck2_error::BuckErrorContext;
+use buck2_util::hash::BuckHasherBuilder;
 use starlark::values::Value;
 use starlark::values::ValueIdentity;
 use starlark::values::ValueLike;
@@ -37,7 +37,7 @@ where
     TransitiveSetGen<V>: TransitiveSetLike<'v>,
 {
     TransitiveSetLike::from_value(child)
-        .with_context(|| {
+        .with_buck_error_context(|| {
             format!(
                 "Invalid set: expected {:?}, got: {:?}",
                 std::any::type_name::<V>(),
@@ -48,9 +48,9 @@ where
 }
 
 /// A DFS, left-to-right iterator over a TransitiveSet.
-pub struct PreorderTransitiveSetIteratorGen<'a, 'v, V> {
+pub struct PreorderTransitiveSetIteratorGen<'a, 'v, V: ValueLike<'v>> {
     stack: Vec<&'a TransitiveSetGen<V>>,
-    seen: HashSet<ValueIdentity<'v>, FnvBuildHasher>,
+    seen: HashSet<ValueIdentity<'v>, BuckHasherBuilder>,
 }
 
 impl<'a, 'v, V> PreorderTransitiveSetIteratorGen<'a, 'v, V>
@@ -108,10 +108,10 @@ where
 
 /// A postorder traversal iterator over a TransitiveSet.
 /// Traverses by children left-to-right, and then visits the current node.
-pub struct PostorderTransitiveSetIteratorGen<'a, 'v, V> {
+pub struct PostorderTransitiveSetIteratorGen<'a, 'v, V: ValueLike<'v>> {
     stack: Vec<Option<&'a TransitiveSetGen<V>>>,
     parent_stack: Vec<&'a TransitiveSetGen<V>>,
-    seen: HashSet<ValueIdentity<'v>, FnvBuildHasher>,
+    seen: HashSet<ValueIdentity<'v>, BuckHasherBuilder>,
 }
 
 impl<'a, 'v, V> PostorderTransitiveSetIteratorGen<'a, 'v, V>
@@ -183,9 +183,9 @@ where
 ///
 /// This is equivalent to a pre-order traversal, except that when nodes are shared with more than
 /// one parent it is returned in the order of its last occurrence.
-pub struct TopologicalTransitiveSetIteratorGen<'a, 'v, V> {
+pub struct TopologicalTransitiveSetIteratorGen<'a, 'v, V: ValueLike<'v>> {
     output_stack: Vec<&'a TransitiveSetGen<V>>,
-    instance_counts: HashMap<ValueIdentity<'v>, u32, FnvBuildHasher>,
+    instance_counts: HashMap<ValueIdentity<'v>, u32, BuckHasherBuilder>,
 }
 
 impl<'a, 'v, V> TopologicalTransitiveSetIteratorGen<'a, 'v, V>
@@ -203,9 +203,9 @@ where
 
     fn count_instances(
         set: &'a TransitiveSetGen<V>,
-    ) -> HashMap<ValueIdentity<'v>, u32, FnvBuildHasher> {
+    ) -> HashMap<ValueIdentity<'v>, u32, BuckHasherBuilder> {
         let mut stack = vec![set];
-        let mut instance_counts = HashMap::<ValueIdentity<'v>, u32, FnvBuildHasher>::default();
+        let mut instance_counts = HashMap::<ValueIdentity<'v>, u32, BuckHasherBuilder>::default();
 
         while let Some(next) = stack.pop() {
             for child in next.children.iter().rev() {
@@ -278,9 +278,9 @@ where
 }
 
 /// A breadth-first-search (BFS), left-to-right iterator over a TransitiveSet.
-pub struct BfsTransitiveSetIteratorGen<'a, 'v, V> {
+pub struct BfsTransitiveSetIteratorGen<'a, 'v, V: ValueLike<'v>> {
     queue: VecDeque<&'a TransitiveSetGen<V>>,
-    seen: HashSet<ValueIdentity<'v>, FnvBuildHasher>,
+    seen: HashSet<ValueIdentity<'v>, BuckHasherBuilder>,
 }
 
 impl<'a, 'v, V> BfsTransitiveSetIteratorGen<'a, 'v, V>
@@ -336,7 +336,7 @@ where
     }
 }
 
-pub struct TransitiveSetValuesIteratorGen<'a, 'v, V> {
+pub struct TransitiveSetValuesIteratorGen<'a, 'v, V: ValueLike<'v>> {
     inner: Box<dyn TransitiveSetIteratorLike<'a, 'v, V> + 'a>,
 }
 

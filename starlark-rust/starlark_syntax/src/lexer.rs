@@ -59,9 +59,9 @@ pub enum LexemeError {
     CannotParse(String, u32),
 }
 
-impl From<LexemeError> for crate::Error {
+impl From<LexemeError> for crate::error::Error {
     fn from(e: LexemeError) -> Self {
-        crate::Error::new(crate::ErrorKind::Lexer(anyhow::Error::new(e)))
+        crate::error::Error::new_kind(crate::error::ErrorKind::Parser(anyhow::Error::new(e)))
     }
 }
 
@@ -966,7 +966,7 @@ pub fn lex_exactly_one_identifier(s: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::lexer::lex_exactly_one_identifier;
 
     #[test]

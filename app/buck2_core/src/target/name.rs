@@ -36,6 +36,7 @@ pub const EQ_SIGN_SUBST: &str = "_eqsb_";
 pub struct TargetName(ThinArcStr);
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(input)]
 enum TargetNameError {
     #[error(
         "Invalid target name `{}`. Target names are non-empty strings and can only contain alpha numeric characters, and symbols \
@@ -58,17 +59,16 @@ enum TargetNameError {
 
 impl TargetName {
     #[inline]
-    pub fn new(name: &str) -> anyhow::Result<Self> {
+    pub fn new(name: &str) -> buck2_error::Result<Self> {
         TargetNameRef::new(name)?;
         Ok(Self(ThinArcStr::from(name)))
     }
 
-    #[inline]
-    pub fn unchecked_new(name: &str) -> Self {
-        Self(ThinArcStr::from(name))
+    pub fn testing_new(name: &str) -> Self {
+        TargetName::new(name).unwrap()
     }
 
-    fn bad_name_error(name: &str) -> anyhow::Error {
+    fn bad_name_error(name: &str) -> buck2_error::Error {
         if let Some((_, p)) = name.split_once('[') {
             if p.contains(']') {
                 return TargetNameError::FoundProvidersLabel(name.to_owned()).into();
@@ -77,7 +77,7 @@ impl TargetName {
         TargetNameError::InvalidName(name.to_owned()).into()
     }
 
-    fn verify(name: &str) -> anyhow::Result<()> {
+    fn verify(name: &str) -> buck2_error::Result<()> {
         const VALID_CHARS: &str =
             r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_,.=-\/~@!+$";
         const SET: AsciiCharSet = AsciiCharSet::new(VALID_CHARS);
@@ -99,6 +99,7 @@ impl TargetName {
             soft_error!(
                 "label_has_comma",
                 TargetNameError::LabelHasSpecialCharacter(name.to_owned(), ',').into(),
+                deprecation: true,
                 quiet: true
             )?;
         }
@@ -106,6 +107,7 @@ impl TargetName {
             soft_error!(
                 "label_has_dollar_sign",
                 TargetNameError::LabelHasSpecialCharacter(name.to_owned(), '$').into(),
+                deprecation: true,
                 quiet: true
             )?;
         }
@@ -162,7 +164,8 @@ impl Deref for TargetName {
 pub struct TargetNameRef(str);
 
 impl TargetNameRef {
-    pub fn new(name: &str) -> anyhow::Result<&TargetNameRef> {
+    #[inline]
+    pub fn new(name: &str) -> buck2_error::Result<&TargetNameRef> {
         TargetName::verify(name)?;
         Ok(TargetNameRef::unchecked_new(name))
     }
@@ -182,7 +185,7 @@ impl TargetNameRef {
 
     #[inline]
     pub fn to_owned(&self) -> TargetName {
-        TargetName::unchecked_new(&self.0)
+        TargetName(ThinArcStr::from(&self.0))
     }
 }
 
@@ -245,7 +248,7 @@ mod tests {
 
         assert_eq!(
             hash(TargetNameRef::unchecked_new("foo")),
-            hash(&TargetName::unchecked_new("foo"))
+            hash(&TargetName::testing_new("foo"))
         );
     }
 }

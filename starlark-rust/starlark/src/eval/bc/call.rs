@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use starlark_syntax::slice_vec_ext::VecExt;
 
 use crate::coerce::coerce;
-use crate::collections::symbol_map::Symbol;
+use crate::collections::symbol::symbol::Symbol;
 use crate::eval::bc::frame::BcFramePtr;
 use crate::eval::bc::instr_arg::BcInstrArg;
 use crate::eval::bc::stack_ptr::BcSlotIn;
@@ -99,33 +99,28 @@ impl BcCallArgsFull<Symbol> {
 
 impl<S: ArgSymbol> Display for BcCallArgsFull<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        let mut write_sep = |f: &mut Formatter| {
-            if !first {
-                write!(f, " ")?;
-            }
-            first = false;
-            Ok(())
-        };
+        let BcCallArgsFull {
+            pos_named,
+            names,
+            args,
+            kwargs,
+        } = self;
+        write!(f, "{}", pos_named)?;
         // Number of positional arguments.
         if self.pos() != 0 {
-            write_sep(f)?;
-            write!(f, "{}", self.pos())?;
+            write!(f, " {}", self.pos())?;
         }
         // Named arguments.
-        for (_, name) in &*self.names {
-            write_sep(f)?;
-            write!(f, "{}", name.as_str())?;
+        for (_, name) in &**names {
+            write!(f, " {}", name.as_str())?;
         }
         // Star argument?
-        if self.args.is_some() {
-            write_sep(f)?;
-            write!(f, "*")?;
+        if let Some(args) = args {
+            write!(f, " *{args}")?;
         }
         // Star-star argument?
-        if self.kwargs.is_some() {
-            write_sep(f)?;
-            write!(f, "**")?;
+        if let Some(kwargs) = kwargs {
+            write!(f, " **{kwargs}")?;
         }
         Ok(())
     }
@@ -141,7 +136,7 @@ impl<S: ArgSymbol> BcCallArgs<S> for BcCallArgsFull<S> {
         ArgumentsFull {
             pos,
             named,
-            names: ArgNames::new(coerce(&self.names)),
+            names: ArgNames::new_unique(coerce(&self.names)),
             args,
             kwargs,
         }
@@ -155,7 +150,7 @@ impl<S: ArgSymbol> BcCallArgs<S> for BcCallArgsPos {
         ArgumentsFull {
             pos,
             named: &[],
-            names: ArgNames::new(&[]),
+            names: ArgNames::new_unique(&[]),
             args: None,
             kwargs: None,
         }
@@ -180,7 +175,7 @@ impl BcCallArgsForDef for BcCallArgsFull<ResolvedArgName> {
         ArgumentsFull {
             pos,
             named,
-            names: ArgNames::new(coerce(&self.names)),
+            names: ArgNames::new_unique(coerce(&self.names)),
             args,
             kwargs,
         }

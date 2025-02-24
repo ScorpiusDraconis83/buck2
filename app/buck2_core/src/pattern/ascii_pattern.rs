@@ -37,6 +37,7 @@ const fn assert_ascii_str(s: &str) -> &[u8] {
 /// Caller of this trait skips boundary checks/UTF-8 checks, so this trait is `unsafe`.
 pub(crate) unsafe trait AsciiPattern {
     fn first_index_in(&self, s: &str) -> Option<usize>;
+    #[allow(dead_code)]
     fn last_index_in(&self, s: &str) -> Option<usize>;
     fn is_prefix_of(&self, s: &str) -> bool;
     fn is_suffix_of(&self, s: &str) -> bool;
@@ -242,10 +243,7 @@ mod tests {
         "yyy",
     ];
 
-    fn test_is_prefix_of_impl<'p>(
-        ascii: impl AsciiPattern + Copy,
-        str_pattern: impl Pattern<'p> + Copy,
-    ) {
+    fn test_is_prefix_of_impl(ascii: impl AsciiPattern + Copy, str_pattern: impl Pattern + Copy) {
         for s in STRINGS {
             assert_eq!(ascii.is_prefix_of(s), str_pattern.is_prefix_of(s));
         }
@@ -253,26 +251,24 @@ mod tests {
 
     fn test_is_suffix_of_impl<'p>(
         ascii: impl AsciiPattern + Copy,
-        str_pattern: impl Pattern<'p, Searcher = impl ReverseSearcher<'p>> + Copy,
+        str_pattern: impl Pattern<Searcher<'p> = impl ReverseSearcher<'p>> + Copy,
     ) {
         for s in STRINGS {
             assert_eq!(ascii.is_suffix_of(s), str_pattern.is_suffix_of(s));
         }
     }
 
-    fn test_first_index_in_impl<'p>(
-        ascii: impl AsciiPattern + Copy,
-        str_pattern: impl Pattern<'p> + Copy,
-    ) {
+    fn test_first_index_in_impl(ascii: impl AsciiPattern + Copy, str_pattern: impl Pattern + Copy) {
         for s in STRINGS {
             assert_eq!(ascii.first_index_in(s), s.find(str_pattern));
         }
     }
 
-    fn test_last_index_in_impl<'p>(
-        ascii: impl AsciiPattern + Copy,
-        str_pattern: impl Pattern<'p, Searcher = impl ReverseSearcher<'p>> + Copy,
-    ) {
+    fn test_last_index_in_impl<P>(ascii: impl AsciiPattern + Copy, str_pattern: P)
+    where
+        P: Pattern + Copy,
+        for<'p> <P as Pattern>::Searcher<'p>: ReverseSearcher<'p>,
+    {
         for s in STRINGS {
             assert_eq!(ascii.last_index_in(s), s.rfind(str_pattern));
         }

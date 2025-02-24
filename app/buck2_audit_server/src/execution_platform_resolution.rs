@@ -12,99 +12,73 @@ use std::io::Write;
 use async_trait::async_trait;
 use buck2_audit::execution_platform_resolution::AuditExecutionPlatformResolutionCommand;
 use buck2_cli_proto::ClientContext;
-use buck2_core::configuration::bound_id::BoundConfigurationId;
-use buck2_core::configuration::data::ConfigurationData;
-use buck2_core::pattern::pattern_type::ConfigurationPredicate;
-use buck2_core::pattern::pattern_type::ConfiguredTargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
-use buck2_core::target::label::TargetLabel;
-use buck2_node::load_patterns::load_patterns;
-use buck2_node::load_patterns::MissingTargetBehavior;
+use buck2_node::execution::GetExecutionPlatforms;
+use buck2_node::execution::EXECUTION_PLATFORMS_BUCKCONFIG;
 use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
-use buck2_node::target_calculation::ConfiguredTargetCalculation;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::global_cfg_options_from_client_context;
-use buck2_server_ctx::pattern::PatternParser;
 use indent_write::io::IndentWriter;
 
-use crate::AuditSubcommand;
-
-#[derive(Debug, buck2_error::Error)]
-enum AuditExecutionPlatformResolutionCommandError {
-    #[error("Builtin configurations are not supported: `{0}`")]
-    BuiltinConfigurationsNotSupported(String),
-    #[error(
-        "Patterns with configuration label without configuration hash are not supported: `{0}`"
-    )]
-    ConfigurationLabelWithoutHashNotSupported(String),
-}
+use crate::common::configured_target_labels::audit_command_configured_target_labels;
+use crate::ServerAuditSubcommand;
 
 #[async_trait]
-impl AuditSubcommand for AuditExecutionPlatformResolutionCommand {
+impl ServerAuditSubcommand for AuditExecutionPlatformResolutionCommand {
     async fn server_execute(
         &self,
         server_ctx: &dyn ServerCommandContextTrait,
         mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
-        client_ctx: ClientContext,
-    ) -> anyhow::Result<()> {
-        server_ctx.with_dice_ctx(
-            async move |server_ctx, mut ctx| {
-                let pattern_parser = PatternParser::new(
+        _client_ctx: ClientContext,
+    ) -> buck2_error::Result<()> {
+        Ok(server_ctx
+            .with_dice_ctx(|server_ctx, mut ctx| async move {
+                let configured_patterns = audit_command_configured_target_labels(
                     &mut ctx,
-                    server_ctx.working_dir(),
-                ).await?;
-
-                let mut configured_patterns = Vec::new();
-                let mut target_patterns = Vec::new();
-                for pat in self.patterns.iter() {
-                    let pat = pattern_parser.parse_pattern::<ConfiguredTargetPatternExtra>(pat)?;
-                    match pat.clone() {
-                        ParsedPattern::Package(pkg) => target_patterns.push(ParsedPattern::Package(pkg)),
-                        ParsedPattern::Recursive(path) => target_patterns.push(ParsedPattern::Recursive(path)),
-                        ParsedPattern::Target(pkg, target_name, extra) => {
-                            match extra.cfg {
-                                ConfigurationPredicate::Any => target_patterns.push(ParsedPattern::Target(pkg, target_name, extra)),
-                                ConfigurationPredicate::Builtin(_) => return Err(AuditExecutionPlatformResolutionCommandError::BuiltinConfigurationsNotSupported(pat.to_string()).into()),
-                                ConfigurationPredicate::Bound(_label, None) => return Err(AuditExecutionPlatformResolutionCommandError::ConfigurationLabelWithoutHashNotSupported(pat.to_string()).into()),
-                                ConfigurationPredicate::Bound(label, Some(hash)) => {
-                                    let cfg = ConfigurationData::lookup_bound(BoundConfigurationId { label, hash })?;
-                                    configured_patterns.push(TargetLabel::new(pkg, target_name.as_ref()).configure(cfg));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let loaded_patterns = load_patterns(&ctx, target_patterns, MissingTargetBehavior::Fail).await?;
-                let global_cfg_options = global_cfg_options_from_client_context(
-                    &client_ctx,
+                    &self.patterns,
+                    &self.target_cfg,
                     server_ctx,
-                    &mut ctx,
                 )
                 .await?;
 
-                for (_, targets) in loaded_patterns.into_iter() {
-                    for (_, node) in targets? {
-                        configured_patterns.push(
-                            ctx.get_configured_target(node.label(), &global_cfg_options)
-                                .await?,
-                        );
+                let mut stdout = stdout.as_writer();
+
+                match ctx.get_execution_platforms().await? {
+                    None => {
+                        writeln!(
+                            stdout,
+                            "Execution platforms are not configured: {} unset",
+                            EXECUTION_PLATFORMS_BUCKCONFIG
+                        )?;
+                        writeln!(stdout, "Using legacy execution platform")?;
+                    }
+                    Some(platforms) => {
+                        writeln!(
+                            stdout,
+                            "Checking each target against execution platforms defined by {}",
+                            platforms.execution_platforms_target()
+                        )?;
                     }
                 }
 
-                let mut stdout = stdout.as_writer();
-
                 for configured_target in configured_patterns {
-                    let configured_node = ctx.get_configured_target_node(&configured_target).await?;
+                    // This calls `get_internal_configured_target_node` rather than
+                    // `get_configured_target_node` because exec platform resolution operates
+                    // on `get_internal_configured_target_node`.
+                    let configured_node = ctx
+                        .get_internal_configured_target_node(&configured_target)
+                        .await?;
                     let configured_node = configured_node.require_compatible()?;
                     writeln!(stdout, "{}:", configured_target)?;
                     let resolution = configured_node.execution_platform_resolution();
                     match resolution.platform() {
                         Ok(platform) => {
                             writeln!(stdout, "  Execution platform: {}", platform.id())?;
-                            writeln!(stdout, "    Execution platform configuration: {}", platform.cfg())?;
+                            writeln!(
+                                stdout,
+                                "    Execution platform configuration: {}",
+                                platform.cfg()
+                            )?;
                             writeln!(stdout, "    Execution deps:")?;
                             for execution_dep in configured_node.exec_deps() {
                                 writeln!(stdout, "      {}", execution_dep.label())?;
@@ -112,6 +86,10 @@ impl AuditSubcommand for AuditExecutionPlatformResolutionCommand {
                             writeln!(stdout, "    Toolchain deps:")?;
                             for toolchain_dep in configured_node.toolchain_deps() {
                                 writeln!(stdout, "      {}", toolchain_dep.label())?;
+                            }
+                            writeln!(stdout, "    Configuration deps:")?;
+                            for config_dep in configured_node.configuration_deps() {
+                                writeln!(stdout, "      {}", config_dep.label())?;
                             }
                             for (label, reason) in resolution.skipped() {
                                 writeln!(stdout, "    Skipped {}", label)?;
@@ -124,6 +102,6 @@ impl AuditSubcommand for AuditExecutionPlatformResolutionCommand {
 
                 Ok(())
             })
-        .await
+            .await?)
     }
 }

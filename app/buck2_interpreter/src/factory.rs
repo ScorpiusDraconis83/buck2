@@ -7,34 +7,33 @@
  * of this source tree.
  */
 
-use starlark::environment::FrozenModule;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 
 /// Provides a starlark Evaluator.
 pub trait StarlarkEvaluatorProvider {
     /// Creates an Evaluator for a module. The evaluator will be configured for instrumenting/profiling/debugging
-    /// as appropriate.
-    fn make<'v, 'a>(&mut self, module: &'v Module) -> anyhow::Result<Evaluator<'v, 'a>>;
+    /// as appropriate. Also returns whether profiling is enabled.
+    fn make<'v, 'a, 'e>(
+        &mut self,
+        module: &'v Module,
+    ) -> buck2_error::Result<(Evaluator<'v, 'a, 'e>, bool)>;
 
-    fn evaluation_complete(&mut self, eval: &mut Evaluator) -> anyhow::Result<()>;
-
-    fn visit_frozen_module(&mut self, module: Option<&FrozenModule>) -> anyhow::Result<()>;
+    fn evaluation_complete(&mut self, eval: &mut Evaluator) -> buck2_error::Result<()>;
 }
 
 /// Trivial provider that just constructs an Evaluator. Useful for tests (but not necessarily limited to them).
 pub struct StarlarkPassthroughProvider;
 
 impl StarlarkEvaluatorProvider for StarlarkPassthroughProvider {
-    fn make<'v, 'a>(&mut self, module: &'v Module) -> anyhow::Result<Evaluator<'v, 'a>> {
-        Ok(Evaluator::new(module))
+    fn make<'v, 'a, 'e>(
+        &mut self,
+        module: &'v Module,
+    ) -> buck2_error::Result<(Evaluator<'v, 'a, 'e>, bool)> {
+        Ok((Evaluator::new(module), true))
     }
 
-    fn evaluation_complete(&mut self, _eval: &mut Evaluator) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn visit_frozen_module(&mut self, _module: Option<&FrozenModule>) -> anyhow::Result<()> {
+    fn evaluation_complete(&mut self, _eval: &mut Evaluator) -> buck2_error::Result<()> {
         Ok(())
     }
 }

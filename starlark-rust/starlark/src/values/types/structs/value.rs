@@ -26,7 +26,6 @@ use display_container::fmt_keyed_container;
 use serde::Serialize;
 use starlark_derive::starlark_value;
 use starlark_derive::Freeze;
-use starlark_derive::StarlarkDocs;
 use starlark_derive::Trace;
 use starlark_map::small_map::SmallMap;
 use starlark_map::Hashed;
@@ -38,15 +37,15 @@ use crate::coerce::coerce;
 use crate::coerce::Coerce;
 use crate::docs::DocItem;
 use crate::docs::DocMember;
-use crate::docs::DocObject;
 use crate::docs::DocProperty;
 use crate::starlark_complex_value;
 use crate::typing::Ty;
 use crate::typing::TyStruct;
+use crate::util::arc_str::ArcStr;
 use crate::values::comparison::compare_small_map;
 use crate::values::comparison::equals_small_map;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
 use crate::values::structs::unordered_hasher::UnorderedHasher;
+use crate::values::FreezeResult;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
 use crate::values::Heap;
@@ -75,6 +74,17 @@ impl<'v, V: ValueLike<'v>> StructGen<'v, V> {
             .iter()
             .map(|(name, value)| (name.to_string_value(), *value))
     }
+
+    fn self_ty(&self) -> Ty {
+        Ty::custom(TyStruct {
+            fields: self
+                .fields
+                .iter()
+                .map(|(name, value)| (ArcStr::from(name.as_str()), Ty::of_value(value.to_value())))
+                .collect(),
+            extra: false,
+        })
+    }
 }
 
 impl StructGen<'static, FrozenValue> {
@@ -88,17 +98,7 @@ impl StructGen<'static, FrozenValue> {
 starlark_complex_value!(pub(crate) Struct<'v>);
 
 /// The result of calling `struct()`.
-#[derive(
-    Clone,
-    Default,
-    Debug,
-    Trace,
-    Freeze,
-    ProvidesStaticType,
-    StarlarkDocs,
-    Allocative
-)]
-#[starlark_docs(builtin = "extension")]
+#[derive(Clone, Default, Debug, Trace, Freeze, ProvidesStaticType, Allocative)]
 #[repr(C)]
 pub(crate) struct StructGen<'v, V: ValueLike<'v>> {
     /// The fields in a struct.
@@ -120,7 +120,7 @@ impl<'v, V: ValueLike<'v>> Display for StructGen<'v, V> {
 }
 
 #[starlark_value(type = Struct::TYPE)]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for StructGen<'v, V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StructGen<'v, V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -180,28 +180,13 @@ where
         self.fields.keys().map(|x| x.as_str().to_owned()).collect()
     }
 
-    fn documentation(&self) -> Option<DocItem> {
-        let members = self
-            .fields
-            .iter()
-            .map(|(k, v)| {
-                let name = k.as_str().to_owned();
-                match v.to_value().documentation() {
-                    Some(DocItem::Function(f)) => (name, DocMember::Function(f)),
-                    _ => (
-                        name,
-                        DocMember::Property(DocProperty {
-                            docs: None,
-                            typ: Ty::any(),
-                        }),
-                    ),
-                }
-            })
-            .collect();
-        Some(DocItem::Object(DocObject {
-            docs: None,
-            members,
-        }))
+    fn documentation(&self) -> DocItem {
+        // This treats structs as being value-like, and intentionally generates bad docs in the case
+        // of namespace-like usage. See
+        // <https://fb.workplace.com/groups/starlark/permalink/1463680027654154/> for some
+        // additional discussion
+        let typ = self.self_ty();
+        DocItem::Member(DocMember::Property(DocProperty { docs: None, typ }))
     }
 
     fn get_type_starlark_repr() -> Ty {
@@ -209,14 +194,7 @@ where
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
-        Some(Ty::custom(TyStruct {
-            fields: self
-                .fields
-                .iter()
-                .map(|(name, value)| (ArcStr::from(name.as_str()), Ty::of_value(value.to_value())))
-                .collect(),
-            extra: false,
-        }))
+        Some(self.self_ty())
     }
 }
 

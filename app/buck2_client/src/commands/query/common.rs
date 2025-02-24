@@ -16,7 +16,7 @@ use dupe::Dupe;
     Debug,
     Clone,
     Dupe,
-    clap::ArgEnum,
+    clap::ValueEnum,
     serde::Serialize,
     serde::Deserialize
 )]
@@ -25,6 +25,8 @@ enum QueryOutputFormatArg {
     Dot,
     Json,
     DotCompact,
+    Starlark,
+    Html,
 }
 
 /// Args common to all the query commands
@@ -53,10 +55,12 @@ pub(crate) struct CommonQueryOptions {
         long_help = "Output format (default: list). \n
            dot -  dot graph format. \n
            dot_compact - compact alternative to dot format. \n
-           json - JSON format.
+           json - JSON format. \n
+           starlark - targets are printed like starlark code that would produce them.
+           html - html file containing interactive target graph.
          ",
-        value_name = "dot|dot_compact|json",
-        arg_enum
+        value_name = "dot|dot_compact|json|starlark|html",
+        value_enum
     )]
     output_format: Option<QueryOutputFormatArg>,
 
@@ -87,6 +91,8 @@ impl CommonQueryOptions {
             Some(QueryOutputFormatArg::Json) => QueryOutputFormat::Json,
             Some(QueryOutputFormatArg::Dot) => QueryOutputFormat::Dot,
             Some(QueryOutputFormatArg::DotCompact) => QueryOutputFormat::DotCompact,
+            Some(QueryOutputFormatArg::Starlark) => QueryOutputFormat::Starlark,
+            Some(QueryOutputFormatArg::Html) => QueryOutputFormat::Html,
             None => {
                 if self.json {
                     QueryOutputFormat::Json

@@ -13,9 +13,8 @@ use async_trait::async_trait;
 use buck2_build_api::bxl::calculation::BxlCalculationDyn;
 use buck2_build_api::bxl::calculation::BxlComputeResult;
 use buck2_build_api::bxl::calculation::BXL_CALCULATION_IMPL;
-use buck2_core::base_deferred_key::BaseDeferredKeyDyn;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyBxl;
 use buck2_futures::cancellation::CancellationContext;
-use buck2_interpreter::dice::starlark_profiler::GetStarlarkProfilerInstrumentation;
 use dice::DiceComputations;
 use dice::Key;
 use dupe::Dupe;
@@ -31,9 +30,9 @@ struct BxlCalculationImpl;
 impl BxlCalculationDyn for BxlCalculationImpl {
     async fn eval_bxl(
         &self,
-        ctx: &DiceComputations,
-        bxl: Arc<dyn BaseDeferredKeyDyn>,
-    ) -> anyhow::Result<BxlComputeResult> {
+        ctx: &mut DiceComputations<'_>,
+        bxl: BaseDeferredKeyBxl,
+    ) -> buck2_error::Result<BxlComputeResult> {
         eval_bxl(ctx, BxlKey::from_base_deferred_key_dyn_impl_err(bxl)?).await
     }
 }
@@ -43,12 +42,12 @@ pub(crate) fn init_bxl_calculation_impl() {
 }
 
 pub(crate) async fn eval_bxl(
-    ctx: &DiceComputations,
+    ctx: &mut DiceComputations<'_>,
     bxl: BxlKey,
-) -> anyhow::Result<BxlComputeResult> {
+) -> buck2_error::Result<BxlComputeResult> {
     ctx.compute(&internal::BxlComputeKey(bxl))
         .await?
-        .map_err(anyhow::Error::from)
+        .map_err(buck2_error::Error::from)
 }
 
 #[async_trait]
@@ -62,18 +61,13 @@ impl Key for internal::BxlComputeKey {
     ) -> Self::Value {
         let key = self.0.dupe();
 
-        let profiler = ctx.get_profile_mode_for_intermediate_analysis().await?;
-
         cancellation
             .with_structured_cancellation(|observer| {
                 async move {
-                    eval(ctx, key, profiler, observer)
+                    eval(ctx, key, observer)
                         .await
                         .map_err(buck2_error::Error::from)
-                        .map(|(result, _, materializations)| BxlComputeResult {
-                            bxl_result: Arc::new(result),
-                            materializations,
-                        })
+                        .map(|(result, _)| BxlComputeResult(Arc::new(result)))
                 }
                 .boxed()
             })
@@ -94,9 +88,4 @@ mod internal {
 
     #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
     pub(crate) struct BxlComputeKey(pub(crate) BxlKey);
-}
-
-#[cfg(test)]
-pub(crate) mod testing {
-    pub(crate) use crate::bxl::calculation::internal::BxlComputeKey;
 }

@@ -9,10 +9,12 @@
 
 //! A cheap version of [`Clone`].
 
+pub mod __macro_refs;
 pub(crate) mod iter;
 pub(crate) mod option;
 
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use std::num::*;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -44,6 +46,7 @@ impl<A: ?Sized> Dupe for std::sync::Weak<A> {}
 impl<A: ?Sized> Dupe for Rc<A> {}
 impl<A: ?Sized> Dupe for std::rc::Weak<A> {}
 impl<A: Copy> Dupe for Cell<A> {}
+impl<A: Dupe> Dupe for ManuallyDrop<A> {}
 
 // Small containers
 impl<A: Dupe> Dupe for Option<A> {}
@@ -52,12 +55,30 @@ impl<A: Dupe> Dupe for std::ops::Bound<A> {}
 impl<A: Dupe> Dupe for std::pin::Pin<A> {}
 impl<A: Dupe> Dupe for std::ptr::NonNull<A> {}
 impl<A: Dupe> Dupe for std::task::Poll<A> {}
+impl Dupe for () {}
 impl<A: Dupe> Dupe for (A,) {}
-// Not clear if Dupe should be implemented for pairs or not.
-// Concern is deeply nested pairs could be exponentially more expensive than their inner dupes.
+impl<A: Dupe, B: Dupe> Dupe for (A, B) {}
+impl<A: Dupe, B: Dupe, C: Dupe> Dupe for (A, B, C) {}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe> Dupe for (A, B, C, D) {}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe> Dupe for (A, B, C, D, E) {}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe, F: Dupe> Dupe for (A, B, C, D, E, F) {}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe, F: Dupe, G: Dupe> Dupe for (A, B, C, D, E, F, G) {}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe, F: Dupe, G: Dupe, H: Dupe> Dupe
+    for (A, B, C, D, E, F, G, H)
+{
+}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe, F: Dupe, G: Dupe, H: Dupe, I: Dupe> Dupe
+    for (A, B, C, D, E, F, G, H, I)
+{
+}
+impl<A: Dupe, B: Dupe, C: Dupe, D: Dupe, E: Dupe, F: Dupe, G: Dupe, H: Dupe, I: Dupe, J: Dupe> Dupe
+    for (A, B, C, D, E, F, G, H, I, J)
+{
+}
+
+impl<A: Dupe, const N: usize> Dupe for [A; N] {}
 
 // Atomic types
-impl Dupe for () {}
 impl Dupe for bool {}
 impl Dupe for char {}
 impl Dupe for u8 {}

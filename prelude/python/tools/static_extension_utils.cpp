@@ -114,7 +114,6 @@ static PyObject* _create_module(PyObject* self, PyObject* spec) {
 
 static PyObject* _exec_module(PyObject* self, PyObject* module) {
   PyModuleDef* def;
-  int res;
 
   // TODO errors
   if (!PyModule_Check(module)) {
@@ -128,8 +127,9 @@ static PyObject* _exec_module(PyObject* self, PyObject* module) {
     Py_RETURN_NONE;
   }
 
-  res = PyModule_ExecDef(module, def);
-  // TODO check res
+  // TODO check this result
+  PyModule_ExecDef(module, def);
+
   Py_RETURN_NONE;
 }
 
@@ -157,7 +157,7 @@ static PyMethodDef StaticExtensionLoaderType_methods[] = {
      (PyCFunction)(void (*)(void))_get_source,
      METH_STATIC | METH_O,
      nullptr},
-    {nullptr, nullptr}};
+    {}};
 
 static PyType_Slot StaticExtensionLoader_slots[] = {
     {Py_tp_doc, (void*)StaticExtensionLoader_doc},
@@ -204,11 +204,11 @@ static PyObject* _check_module(PyObject* self, PyObject* fullname) {
 
 static PyModuleDef_Slot _static_extension_utils_slots[] = {
     {Py_mod_exec, (void*)_static_extension_utils_exec},
-    {0, nullptr}};
+    {}};
 
 static PyMethodDef _static_extension_utils_methods[] = {
     {"_check_module", _check_module, METH_O, _check_module_doc},
-    {nullptr, nullptr}};
+    {}};
 
 PyDoc_STRVAR(
     module_doc,

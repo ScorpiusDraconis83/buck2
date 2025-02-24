@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -29,15 +28,16 @@ rust_library(
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
         "fbsource//third-party/rust:indoc",
-        "fbsource//third-party/rust:maplit",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:test-case",
+        "fbsource//third-party/rust:triomphe",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-scoped",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:blake3",
+        "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:compact_str",
         "fbsource//third-party/rust:dashmap",
@@ -45,9 +45,11 @@ rust_library(
         "fbsource//third-party/rust:derive_more",
         "fbsource//third-party/rust:digest",
         "fbsource//third-party/rust:dirs",
+        "fbsource//third-party/rust:fs4",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:globset",
         "fbsource//third-party/rust:hex",
+        "fbsource//third-party/rust:hyper",
         "fbsource//third-party/rust:indexmap",
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:num_enum",
@@ -67,18 +69,25 @@ rust_library(
         "fbsource//third-party/rust:tonic",
         "fbsource//third-party/rust:tracing",
         "//buck2/allocative/allocative:allocative",
+        "//buck2/app/buck2_cli_proto:buck2_cli_proto",
         "//buck2/app/buck2_core:buck2_core",
+        "//buck2/app/buck2_data:buck2_data",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_events:buck2_events",
         "//buck2/app/buck2_futures:buck2_futures",
         "//buck2/app/buck2_http:buck2_http",
         "//buck2/app/buck2_util:buck2_util",
+        "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
         "//buck2/dice/dice:dice",
-        "//buck2/facebook/allocator-stats:allocator-stats",
+        # @oss-disable[end= ]: "//buck2/facebook/allocator-stats:allocator-stats",
         "//buck2/gazebo/cmp_any:cmp_any",
         "//buck2/gazebo/dupe:dupe",
         "//buck2/gazebo/gazebo:gazebo",
         "//buck2/starlark-rust/starlark_map:starlark_map",
-        # @oss-disable: "//common/rust/folly/memory:memory", 
+        # @oss-disable[end= ]: "//common/rust/folly/logging:logging",
+        # @oss-disable[end= ]: "//common/rust/folly/memory:memory",
+        # @oss-disable[end= ]: "//common/rust/gflags:gflags",
+        "//common/rust/shed/fbinit:fbinit",
+        # @oss-disable[end= ]: "//common/rust/shed/hostcaps:hostcaps",
     ],
 )

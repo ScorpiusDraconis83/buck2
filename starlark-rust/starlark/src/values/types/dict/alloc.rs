@@ -23,8 +23,8 @@ use crate::typing::Ty;
 use crate::values::dict::value::FrozenDictData;
 use crate::values::dict::Dict;
 use crate::values::layout::value::ValueLike;
-use crate::values::type_repr::DictType;
 use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::types::dict::dict_type::DictType;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
 use crate::values::FrozenHeap;
@@ -65,6 +65,8 @@ where
     K: StarlarkTypeRepr,
     V: StarlarkTypeRepr,
 {
+    type Canonical = DictType<K::Canonical, V::Canonical>;
+
     fn starlark_type_repr() -> Ty {
         DictType::<K, V>::starlark_type_repr()
     }

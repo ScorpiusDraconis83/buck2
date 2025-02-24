@@ -19,7 +19,7 @@ use allocative::Allocative;
 use derive_more::Display;
 use dupe::Dupe;
 
-use crate::target::label::TargetLabel;
+use crate::target::label::label::TargetLabel;
 
 /// A ConstraintKey is a label for a `constraint_setting()` target.
 #[derive(
@@ -27,7 +27,19 @@ use crate::target::label::TargetLabel;
 )]
 pub struct ConstraintKey(pub TargetLabel);
 
+impl ConstraintKey {
+    pub fn testing_new(label: &str) -> ConstraintKey {
+        ConstraintKey(TargetLabel::testing_parse(label))
+    }
+}
+
 #[derive(
     Clone, Dupe, Debug, Display, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative
 )]
 pub struct ConstraintValue(pub TargetLabel);
+
+impl ConstraintValue {
+    pub fn testing_new(label: &str) -> ConstraintValue {
+        ConstraintValue(TargetLabel::testing_parse(label))
+    }
+}

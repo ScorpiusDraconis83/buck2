@@ -9,8 +9,12 @@
 
 use std::collections::HashMap;
 use std::env::VarError;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use buck2_re_configuration::Buck2OssReConfiguration;
@@ -23,6 +27,7 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::Stream;
 use gazebo::prelude::*;
+use lru::LruCache;
 use once_cell::sync::Lazy;
 use prost::Message;
 use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
@@ -45,7 +50,9 @@ use re_grpc_proto::build::bazel::remote::execution::v2::FindMissingBlobsRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::FindMissingBlobsResponse;
 use re_grpc_proto::build::bazel::remote::execution::v2::GetActionResultRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::GetCapabilitiesRequest;
+use re_grpc_proto::build::bazel::remote::execution::v2::RequestMetadata;
 use re_grpc_proto::build::bazel::remote::execution::v2::ResultsCachePolicy;
+use re_grpc_proto::build::bazel::remote::execution::v2::ToolDetails;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use re_grpc_proto::google::bytestream::ReadRequest;
 use re_grpc_proto::google::bytestream::ReadResponse;
@@ -74,12 +81,7 @@ use crate::metadata::*;
 use crate::request::*;
 use crate::response::*;
 
-// RBE Services (e.g. Buildbarn) may not be robust against having too many files open at
-// once. Limit to an arbitrary reasonable number since this information is not expressed
-// in the Capabilities message query.
-const CONCURRENT_UPLOAD_LIMIT: usize = 64;
-
-const DEFAULT_MAX_MSG_SIZE: usize = 4 * 1000 * 1000;
+const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -112,6 +114,7 @@ fn check_status(status: Status) -> Result<(), REClientError> {
     Err(REClientError {
         code: TCode(status.code),
         message: status.message,
+        group: TCodeReasonGroup::UNKNOWN,
     })
 }
 
@@ -202,9 +205,17 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
 pub struct RECapabilities {
     /// Largest size of a message before being uploaded using bytestream service.
     /// 0 indicates no limit beyond constraint of underlying transport (which is unknown).
-    max_msg_size: usize,
+    max_total_batch_size: usize,
     /// Does the remote server support execution.
     exec_enabled: bool,
+}
+
+/// Contains runtime options for the remote execution client as set under `buck2_re_client`
+pub struct RERuntimeOpts {
+    /// Use the Meta version of the request metadata
+    use_fbcode_metadata: bool,
+    /// Maximum number of concurrent upload requests.
+    max_concurrent_uploads_per_action: Option<usize>,
 }
 
 struct InstanceName(Option<String>);
@@ -266,11 +277,52 @@ impl REClientBuilder {
 
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
-        let mut grpc_clients = GRPCClients {
+        let mut capabilities_client = CapabilitiesClient::with_interceptor(
+            capabilities.context("Error creating Capabilities client")?,
+            interceptor.dupe(),
+        );
+
+        if let Some(max_decoding_message_size) = opts.max_decoding_message_size {
+            capabilities_client =
+                capabilities_client.max_decoding_message_size(max_decoding_message_size);
+        }
+
+        let instance_name = InstanceName(opts.instance_name.clone());
+
+        let capabilities = if opts.capabilities.unwrap_or(true) {
+            Self::fetch_rbe_capabilities(
+                &mut capabilities_client,
+                &instance_name,
+                opts.max_total_batch_size,
+            )
+            .await?
+        } else {
+            RECapabilities {
+                exec_enabled: true,
+                max_total_batch_size: DEFAULT_MAX_TOTAL_BATCH_SIZE,
+            }
+        };
+
+        if !capabilities.exec_enabled {
+            return Err(anyhow::anyhow!("Server has remote execution disabled."));
+        }
+
+        let max_decoding_msg_size = opts
+            .max_decoding_message_size
+            .unwrap_or(capabilities.max_total_batch_size * 2);
+
+        if max_decoding_msg_size < capabilities.max_total_batch_size {
+            return Err(anyhow::anyhow!(
+                "Attribute `max_decoding_message_size` must always be equal or higher to `max_total_batch_size`"
+            ));
+        }
+
+        let grpc_clients = GRPCClients {
             cas_client: ContentAddressableStorageClient::with_interceptor(
                 cas.context("Error creating CAS client")?,
                 interceptor.dupe(),
-            ),
+            )
+            .max_decoding_message_size(max_decoding_msg_size),
             execution_client: ExecutionClient::with_interceptor(
                 execution.context("Error creating Execution client")?,
                 interceptor.dupe(),
@@ -282,64 +334,61 @@ impl REClientBuilder {
             bytestream_client: ByteStreamClient::with_interceptor(
                 bytestream.context("Error creating Bytestream client")?,
                 interceptor.dupe(),
-            ),
-            capabilities_client: CapabilitiesClient::with_interceptor(
-                capabilities.context("Error creating Capabilities client")?,
-                interceptor.dupe(),
-            ),
+            )
+            .max_decoding_message_size(max_decoding_msg_size),
         };
 
-        let instance_name = InstanceName(opts.instance_name.clone());
-
-        let capabilities = if opts.capabilities.unwrap_or(true) {
-            Self::fetch_rbe_capabilities(&mut grpc_clients, &instance_name).await?
-        } else {
-            RECapabilities {
-                exec_enabled: true,
-                max_msg_size: DEFAULT_MAX_MSG_SIZE,
-            }
-        };
-
-        if !capabilities.exec_enabled {
-            return Err(anyhow::anyhow!("Server has remote execution disabled."));
-        }
-
-        Ok(REClient::new(grpc_clients, capabilities, instance_name))
+        Ok(REClient::new(
+            RERuntimeOpts {
+                use_fbcode_metadata: opts.use_fbcode_metadata,
+                max_concurrent_uploads_per_action: opts.max_concurrent_uploads_per_action,
+            },
+            grpc_clients,
+            capabilities,
+            instance_name,
+        ))
     }
 
     async fn fetch_rbe_capabilities(
-        clients: &mut GRPCClients,
+        client: &mut CapabilitiesClient<GrpcService>,
         instance_name: &InstanceName,
+        max_total_batch_size: Option<usize>,
     ) -> anyhow::Result<RECapabilities> {
         // TODO use more of the capabilities of the remote build executor
 
-        let resp = clients
-            .capabilities_client
+        let resp = client
             .get_capabilities(GetCapabilitiesRequest {
                 instance_name: instance_name.as_str().to_owned(),
             })
             .await
             .context("Failed to query capabilities of remote")?
             .into_inner();
-        // Default is a reasonable size for the gRPC transport
-        // with enough room for headers.
-        let mut max_msg_size = DEFAULT_MAX_MSG_SIZE;
+
         let mut exec_enabled = true;
 
-        if let Some(cache_cap) = resp.cache_capabilities {
-            let size = cache_cap.max_batch_total_size_bytes as usize;
-            // A value of 0 means no limit is set
-            if size != 0 {
-                max_msg_size = size;
-            }
-        }
+        let max_total_batch_size_from_capabilities: Option<usize> =
+            if let Some(cache_cap) = resp.cache_capabilities {
+                let size = cache_cap.max_batch_total_size_bytes as usize;
+                // A value of 0 means no limit is set
+                if size != 0 { Some(size) } else { None }
+            } else {
+                None
+            };
+
+        let max_total_batch_size =
+            match (max_total_batch_size_from_capabilities, max_total_batch_size) {
+                (Some(cap), Some(config)) => std::cmp::min(cap, config),
+                (Some(cap), None) => cap,
+                (None, Some(config)) => config,
+                (None, None) => DEFAULT_MAX_TOTAL_BATCH_SIZE,
+            };
 
         if let Some(exec_cap) = resp.execution_capabilities {
             exec_enabled = exec_cap.exec_enabled;
         }
 
         Ok(RECapabilities {
-            max_msg_size,
+            max_total_batch_size,
             exec_enabled,
         })
     }
@@ -390,19 +439,53 @@ impl Interceptor for InjectHeadersInterceptor {
     }
 }
 
+type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
+
 pub struct GRPCClients {
-    cas_client:
-        ContentAddressableStorageClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
-    execution_client: ExecutionClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
-    action_cache_client: ActionCacheClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
-    bytestream_client: ByteStreamClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
-    capabilities_client: CapabilitiesClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
+    cas_client: ContentAddressableStorageClient<GrpcService>,
+    execution_client: ExecutionClient<GrpcService>,
+    action_cache_client: ActionCacheClient<GrpcService>,
+    bytestream_client: ByteStreamClient<GrpcService>,
+}
+
+enum DigestRemoteState {
+    ExistsOnRemote,
+    Missing,
+}
+
+struct FindMissingCache {
+    cache: LruCache<TDigest, DigestRemoteState>,
+    /// To avoid a situation where we cache that an artifact is available remotely, but the artifact then expires
+    /// we clear our local cache once every `ttl`.
+    ttl: Duration,
+    last_check: Instant,
+}
+
+impl FindMissingCache {
+    fn clear_if_ttl_expires(&mut self) {
+        if self.last_check.elapsed() > self.ttl {
+            self.cache.clear();
+            self.last_check = Instant::now();
+        }
+    }
+
+    pub fn put(&mut self, digest: TDigest, state: DigestRemoteState) {
+        self.clear_if_ttl_expires();
+        self.cache.put(digest, state);
+    }
+    pub fn get(&mut self, digest: &TDigest) -> Option<&DigestRemoteState> {
+        self.clear_if_ttl_expires();
+        self.cache.get(digest)
+    }
 }
 
 pub struct REClient {
+    runtime_opts: RERuntimeOpts,
     grpc_clients: GRPCClients,
     capabilities: RECapabilities,
     instance_name: InstanceName,
+    // buck2 calls find_missing for same blobs
+    find_missing_cache: Mutex<FindMissingCache>,
 }
 
 impl Drop for REClient {
@@ -462,14 +545,21 @@ impl BatchUploadReqAggregator {
 
 impl REClient {
     fn new(
+        runtime_opts: RERuntimeOpts,
         grpc_clients: GRPCClients,
         capabilities: RECapabilities,
         instance_name: InstanceName,
     ) -> Self {
         REClient {
+            runtime_opts,
             grpc_clients,
             capabilities,
             instance_name,
+            find_missing_cache: Mutex::new(FindMissingCache {
+                cache: LruCache::new(NonZeroUsize::new(50 << 20).unwrap()), // 50Mb
+                ttl: Duration::from_secs(12 * 60 * 60), // 12 hours TODO: Tune this parameter
+                last_check: Instant::now(),
+            }),
         }
     }
 
@@ -481,13 +571,14 @@ impl REClient {
         let mut client = self.grpc_clients.action_cache_client.clone();
 
         let res = client
-            .get_action_result(with_internal_metadata(
+            .get_action_result(with_re_metadata(
                 GetActionResultRequest {
                     instance_name: self.instance_name.as_str().to_owned(),
                     action_digest: Some(tdigest_to(request.digest)),
                     ..Default::default()
                 },
                 metadata,
+                self.runtime_opts.use_fbcode_metadata,
             ))
             .await?;
 
@@ -526,7 +617,11 @@ impl REClient {
         };
 
         let stream = client
-            .execute(with_internal_metadata(request, metadata))
+            .execute(with_re_metadata(
+                request,
+                metadata,
+                self.runtime_opts.use_fbcode_metadata,
+            ))
             .await?
             .into_inner();
 
@@ -545,6 +640,7 @@ impl REClient {
                         return Err(REClientError {
                             code: TCode(rpc_status.code),
                             message: rpc_status.message,
+                            group: TCodeReasonGroup::UNKNOWN,
                         }
                         .into());
                     }
@@ -564,8 +660,9 @@ impl REClient {
                             action_result,
                             action_result_digest: TDigest::default(),
                             action_result_ttl: 0,
-                            error: REError {
+                            status: TStatus {
                                 code: TCode::OK,
+                                message: execute_response_grpc.message,
                                 ..Default::default()
                             },
                             cached_result: execute_response_grpc.cached_result,
@@ -630,12 +727,17 @@ impl REClient {
         upload_impl(
             &self.instance_name,
             request,
-            self.capabilities.max_msg_size,
+            self.capabilities.max_total_batch_size,
+            self.runtime_opts.max_concurrent_uploads_per_action,
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut cas_client = self.grpc_clients.cas_client.clone();
                 let resp = cas_client
-                    .batch_update_blobs(with_internal_metadata(re_request, metadata))
+                    .batch_update_blobs(with_re_metadata(
+                        re_request,
+                        metadata,
+                        self.runtime_opts.use_fbcode_metadata,
+                    ))
                     .await?;
                 Ok(resp.into_inner())
             },
@@ -644,7 +746,11 @@ impl REClient {
                 let mut bytestream_client = self.grpc_clients.bytestream_client.clone();
                 let requests = futures::stream::iter(segments);
                 let resp = bytestream_client
-                    .write(with_internal_metadata(requests, metadata))
+                    .write(with_re_metadata(
+                        requests,
+                        metadata,
+                        self.runtime_opts.use_fbcode_metadata,
+                    ))
                     .await?;
 
                 Ok(resp.into_inner())
@@ -653,13 +759,29 @@ impl REClient {
         .await
     }
 
-    pub async fn upload_blob(
+    pub async fn upload_blob_with_digest(
         &self,
-        _blob: Vec<u8>,
-        _metadata: RemoteExecutionMetadata,
+        blob: Vec<u8>,
+        digest: TDigest,
+        metadata: RemoteExecutionMetadata,
     ) -> anyhow::Result<TDigest> {
-        // TODO(aloiscochard)
-        Err(anyhow::anyhow!("Not implemented (RE upload_blob)"))
+        let blob = InlinedBlobWithDigest {
+            digest: digest.clone(),
+            blob,
+            ..Default::default()
+        };
+        self.upload(
+            metadata,
+            UploadRequest {
+                inlined_blobs_with_digest: Some(vec![blob]),
+                files_with_digest: None,
+                directories: None,
+                upload_only_missing: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(digest)
     }
 
     pub async fn download(
@@ -670,12 +792,16 @@ impl REClient {
         download_impl(
             &self.instance_name,
             request,
-            self.capabilities.max_msg_size,
+            self.capabilities.max_total_batch_size,
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut client = self.grpc_clients.cas_client.clone();
                 Ok(client
-                    .batch_read_blobs(with_internal_metadata(re_request, metadata))
+                    .batch_read_blobs(with_re_metadata(
+                        re_request,
+                        metadata,
+                        self.runtime_opts.use_fbcode_metadata,
+                    ))
                     .await?
                     .into_inner())
             },
@@ -684,7 +810,11 @@ impl REClient {
                 async move {
                     let mut client = self.grpc_clients.bytestream_client.clone();
                     let response = client
-                        .read(with_internal_metadata(read_request, metadata))
+                        .read(with_re_metadata(
+                            read_request,
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                        ))
                         .await?
                         .into_inner();
                     Ok(Box::pin(response.into_stream()))
@@ -703,30 +833,50 @@ impl REClient {
         let mut remote_ttl: HashMap<TDigest, DigestWithTtl> = HashMap::new();
 
         for digest_chunk in request.digests.chunks(100) {
-            for digest in digest_chunk {
-                // Assume that all digests are present on the remote because the API
-                // returns what is *not* present.
-                remote_ttl.insert(
-                    digest.clone(),
-                    DigestWithTtl {
-                        digest: digest.clone(),
-                        // NOTE: This is an arbitrary number because RBE does not return information
-                        // on the TTL of the remote blob.
-                        ttl: 60,
-                    },
-                );
+            let mut digest_to_check: Vec<TDigest> = Vec::new();
+            {
+                let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+                for digest in digest_chunk {
+                    // Assume that all digests are present on the remote because the API
+                    // returns what is *not* present.
+                    remote_ttl.insert(
+                        digest.clone(),
+                        DigestWithTtl {
+                            digest: digest.clone(),
+                            // NOTE: This is an arbitrary number because RBE does not return information
+                            // on the TTL of the remote blob.
+                            ttl: 60,
+                        },
+                    );
+                    match find_missing_cache.get(digest) {
+                        Some(DigestRemoteState::Missing) | None => {
+                            digest_to_check.push(digest.clone());
+                        }
+                        _ => {}
+                    }
+                }
             }
+
+            if digest_to_check.is_empty() {
+                continue;
+            }
+
             let missing_blobs = cas_client
-                .find_missing_blobs(with_internal_metadata(
+                .find_missing_blobs(with_re_metadata(
                     FindMissingBlobsRequest {
                         instance_name: self.instance_name.as_str().to_owned(),
-                        blob_digests: digest_chunk.map(|b| tdigest_to(b.clone())),
+                        blob_digests: digest_to_check.map(|b| tdigest_to(b.clone())),
                     },
                     metadata.clone(),
+                    self.runtime_opts.use_fbcode_metadata,
                 ))
                 .await
                 .context("Failed to request what blobs are not present on remote")?;
             let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
+            let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
+            for digest in &digest_to_check {
+                find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+            }
             for digest in &resp.missing_blob_digests.map(|d| tdigest_from(d.clone())) {
                 // If it's present in the MissingBlobsResponse, it's expired on the remote and
                 // needs to be refetched.
@@ -737,12 +887,22 @@ impl REClient {
                         ttl: 0,
                     },
                 );
+                find_missing_cache.put(digest.clone(), DigestRemoteState::Missing);
             }
         }
 
         Ok(GetDigestsTtlResponse {
             digests_with_ttl: remote_ttl.values().cloned().collect::<Vec<DigestWithTtl>>(),
         })
+    }
+
+    pub async fn extend_digest_ttl(
+        &self,
+        _metadata: RemoteExecutionMetadata,
+        _request: ExtendDigestsTtlRequest,
+    ) -> anyhow::Result<TDigest> {
+        // TODO(arr)
+        Err(anyhow::anyhow!("Not implemented (RE extend_digest_ttl)"))
     }
 
     pub fn get_execution_client(&self) -> &Self {
@@ -793,6 +953,16 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
         })
     })?;
 
+    let output_symlinks = action_result
+        .output_symlinks
+        .into_try_map(|output_symlink| {
+            anyhow::Ok(TSymlink {
+                name: output_symlink.path,
+                target: output_symlink.target,
+                _dot_dot_default: (),
+            })
+        })?;
+
     let output_directories = action_result
         .output_directories
         .into_try_map(|output_directory| {
@@ -811,6 +981,7 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
 
     let action_result = TActionResult2 {
         output_files,
+        output_symlinks,
         output_directories,
         exit_code: action_result.exit_code,
         stdout_raw: Some(action_result.stdout_raw),
@@ -859,7 +1030,7 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
 async fn download_impl<Byt, BytRet, Cas>(
     instance_name: &InstanceName,
     request: DownloadRequest,
-    max_msg_size: usize,
+    max_total_batch_size: usize,
     cas_f: impl Fn(BatchReadBlobsRequest) -> Cas,
     bystream_fut: impl Fn(ReadRequest) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<DownloadResponse>
@@ -901,19 +1072,20 @@ where
         .map(|d| tdigest_to(d.clone()))
         .filter(|d| d.size_bytes > 0)
     {
-        if digest.size_bytes as usize >= max_msg_size {
+        if digest.size_bytes as usize >= max_total_batch_size {
             // digest is too big to download in a BatchReadBlobsRequest
             // need to use the bytstream api
             continue;
         }
         curr_size += digest.size_bytes;
-        if curr_size >= max_msg_size as i64 {
+        if curr_size >= max_total_batch_size as i64 {
             let read_blob_req = BatchReadBlobsRequest {
                 instance_name: instance_name.as_str().to_owned(),
                 digests: std::mem::take(&mut curr_digests),
                 acceptable_compressors: vec![compressor::Value::Identity as i32],
             };
             requests.push(read_blob_req);
+            curr_size = digest.size_bytes;
         }
         curr_digests.push(digest.clone());
     }
@@ -952,7 +1124,7 @@ where
 
     let mut inlined_blobs = vec![];
     for digest in inlined_digests {
-        let data = if digest.size_in_bytes as usize >= max_msg_size {
+        let data = if digest.size_in_bytes as usize >= max_total_batch_size {
             let mut accum = vec![];
             let mut responses = bystream_fut(digest.clone()).await?;
             while let Some(resp) = responses.next().await {
@@ -993,7 +1165,7 @@ where
             // If the data is small enough to be transferred in a batch
             // blob update, write it all at once to the file. Otherwise, it'll
             // be streamed in chunks as the remote responds.
-            if req.named_digest.digest.size_in_bytes < max_msg_size as i64 {
+            if req.named_digest.digest.size_in_bytes < max_total_batch_size as i64 {
                 let data = get(&req.named_digest.digest)?;
                 file.write_all(&data)
                     .await
@@ -1020,18 +1192,20 @@ where
         })
     });
 
-    futures::future::try_join_all(writes).await?;
+    buck2_util::future::try_join_all(writes).await?;
 
     Ok(DownloadResponse {
         inlined_blobs: Some(inlined_blobs),
         directories: None,
+        local_cache_stats: Default::default(),
     })
 }
 
 async fn upload_impl<Byt, Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
-    max_msg_size: usize,
+    max_total_batch_size: usize,
+    max_concurrent_uploads: Option<usize>,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
 ) -> anyhow::Result<UploadResponse>
@@ -1044,14 +1218,14 @@ where
 
     // For small file uploads the client should group them together and call `BatchUpdateBlobs`
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
-    let mut batched_blob_updates = BatchUploadReqAggregator::new(max_msg_size);
+    let mut batched_blob_updates = BatchUploadReqAggregator::new(max_total_batch_size);
 
     // Create futures for any blobs that need uploading.
     for blob in request.inlined_blobs_with_digest.unwrap_or_default() {
         let hash = blob.digest.hash.clone();
         let size = blob.digest.size_in_bytes;
 
-        if size < max_msg_size as i64 {
+        if size < max_total_batch_size as i64 {
             batched_blob_updates.push(BatchUploadRequest::Blob(blob));
             continue;
         }
@@ -1068,10 +1242,10 @@ where
         let fut = async move {
             // Number of complete (non-partial) messages
             let mut upload_segments = vec![];
-            for (i, chunk) in data.chunks(max_msg_size).enumerate() {
+            for (i, chunk) in data.chunks(max_total_batch_size).enumerate() {
                 upload_segments.push(WriteRequest {
                     resource_name: resource_name.to_owned(),
-                    write_offset: (i * max_msg_size) as i64,
+                    write_offset: (i * max_total_batch_size) as i64,
                     finish_write: false,
                     data: chunk.to_owned(),
                 });
@@ -1095,7 +1269,7 @@ where
         let hash = file.digest.hash.clone();
         let size = file.digest.size_in_bytes;
         let name = file.name.clone();
-        if size < max_msg_size as i64 {
+        if size < max_total_batch_size as i64 {
             batched_blob_updates.push(BatchUploadRequest::File(file));
             continue;
         }
@@ -1111,7 +1285,7 @@ where
             let mut file = tokio::fs::File::open(&name)
                 .await
                 .with_context(|| format!("Opening `{name}` for reading failed"))?;
-            let mut data = vec![0; max_msg_size];
+            let mut data = vec![0; max_total_batch_size];
 
             let mut write_offset = 0;
             let mut upload_segments = Vec::new();
@@ -1215,42 +1389,96 @@ where
         upload_futures.push(Box::pin(fut));
     }
 
-    let upload_stream =
-        futures::stream::iter(upload_futures).buffer_unordered(CONCURRENT_UPLOAD_LIMIT);
-    let blob_hashes = upload_stream.try_collect::<Vec<Vec<String>>>().await?;
+    let blob_hashes = if let Some(concurrency_limit) = max_concurrent_uploads {
+        futures::stream::iter(upload_futures)
+            .buffer_unordered(concurrency_limit)
+            .try_collect::<Vec<Vec<String>>>()
+            .await?
+    } else {
+        futures::future::try_join_all(upload_futures).await?
+    };
 
     tracing::debug!("uploaded: {:?}", blob_hashes);
     Ok(UploadResponse {})
 }
 
-fn with_internal_metadata<T>(t: T, metadata: RemoteExecutionMetadata) -> tonic::Request<T> {
-    // This is pretty ugly, but the protobuf spec that defines this is internal, so considering
-    // field numbers need to be stable anyway (= low risk), and this is not used in prod (= low
-    // impact if this goes wrong), we just inline it here. This is a small hack that lets us use
-    // our internal RE using this GRPC client for testing.
+fn with_re_metadata<T>(
+    t: T,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+) -> tonic::Request<T> {
+    // This creates a new Tonic request with attached metadata for the RE
+    // backend. There are two cases here we need to support:
     //
-    // This is defined in `fbcode/remote_execution/grpc/metadata.proto`.
-    #[derive(prost::Message)]
-    struct Metadata {
-        #[prost(message, optional, tag = "15")]
-        platform: Option<crate::grpc::Platform>,
-        #[prost(string, optional, tag = "18")]
-        use_case_id: Option<String>,
-    }
+    //   - Servers that abide by the remote execution apis defined with Bazel,
+    //     AKA the "OSS RE API", which this package implements
+    //   - The internal RE solution used at Meta, which uses a different API,
+    //     but is compatible with the OSS RE API to some extent.
+    //
+    // The second case is supported only through attaching some metadata to the
+    // request, which the fbcode RE service understands; and the reason for all
+    // of this is that it allows this OSS client package to be tested inside of
+    // fbcode builds within Meta. So there doesn't need to be a separate CI
+    // check.
+    //
+    // However, we don't need it for FOSS builds of Buck2. And in theory we
+    // could test the OSS Bazel API in the upstream GitHub CI, but doing it this
+    // way is only a little ugly, it's hidden, and it helps ensure the internal
+    // Meta builds catch those issues earlier.
 
     let mut msg = tonic::Request::new(t);
 
-    // We encode minimal metadata here. This is a bit of a hack to be compatible with internal RE.
+    if use_fbcode_metadata {
+        // This is pretty ugly, but the protobuf spec that defines this is
+        // internal, so considering field numbers need to be stable anyway (=
+        // low risk), and this is not used in prod (= low impact if this goes
+        // wrong), we just inline it here. This is a small hack that lets us use
+        // our internal RE using this GRPC client for testing.
+        //
+        // This is defined in `fbcode/remote_execution/grpc/metadata.proto`.
+        #[derive(prost::Message)]
+        struct Metadata {
+            #[prost(message, optional, tag = "15")]
+            platform: Option<crate::grpc::Platform>,
+            #[prost(string, optional, tag = "18")]
+            use_case_id: Option<String>,
+        }
 
-    let mut encoded = Vec::new();
-    Metadata {
-        platform: metadata.platform,
-        use_case_id: Some(metadata.use_case_id),
-    }
-    .encode(&mut encoded)
-    .expect("Encoding into a Vec cannot not fail");
-    msg.metadata_mut()
-        .insert_bin("re-metadata-bin", MetadataValue::from_bytes(&encoded));
+        let mut encoded = Vec::new();
+        Metadata {
+            platform: metadata.platform,
+            use_case_id: Some(metadata.use_case_id),
+        }
+        .encode(&mut encoded)
+        .expect("Encoding into a Vec cannot not fail");
+
+        msg.metadata_mut()
+            .insert_bin("re-metadata-bin", MetadataValue::from_bytes(&encoded));
+    } else {
+        let mut encoded = Vec::new();
+        RequestMetadata {
+            tool_details: Some(ToolDetails {
+                tool_name: "buck2".to_owned(),
+                // TODO(#503): Pull the BuckVersion::get_unique_id() from BuckDaemon
+                tool_version: "0.1.0".to_owned(),
+            }),
+            action_id: "".to_owned(),
+            tool_invocation_id: metadata
+                .buck_info
+                .map_or(String::new(), |buck_info| buck_info.build_id),
+            correlated_invocations_id: "".to_owned(),
+            action_mnemonic: "".to_owned(),
+            target_id: "".to_owned(),
+            configuration_id: "".to_owned(),
+        }
+        .encode(&mut encoded)
+        .expect("Encoding into a Vec cannot not fail");
+
+        msg.metadata_mut().insert_bin(
+            "build.bazel.remote.execution.v2.requestmetadata-bin",
+            MetadataValue::from_bytes(&encoded),
+        );
+    };
     msg
 }
 
@@ -1285,12 +1513,13 @@ fn substitute_env_vars_impl(
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::Ordering;
+    use std::sync::atomic::AtomicU16;
+
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_read_blobs_response;
     use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
 
     use super::*;
-    use crate::NamedDigest;
-    use crate::NamedDigestWithPermissions;
 
     #[tokio::test]
     async fn test_download_named() -> anyhow::Result<()> {
@@ -1574,6 +1803,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_download_multiple_batches() -> anyhow::Result<()> {
+        let digest1 = &TDigest {
+            hash: "aa".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digest2 = &TDigest {
+            hash: "bb".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digest3 = &TDigest {
+            hash: "cc".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digest4 = &TDigest {
+            hash: "dd".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digest5 = &TDigest {
+            hash: "dd".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digest6 = &TDigest {
+            hash: "dd".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+
+        let digests = vec![
+            digest1.clone(),
+            digest2.clone(),
+            digest3.clone(),
+            digest4.clone(),
+            digest5.clone(),
+            digest6.clone(),
+        ];
+
+        let req = DownloadRequest {
+            inlined_digests: Some(digests.clone()),
+            ..Default::default()
+        };
+
+        let counter = AtomicU16::new(0);
+
+        let res = download_impl(
+            &InstanceName(None),
+            req,
+            7,
+            |req| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let res = BatchReadBlobsResponse {
+                    responses: req.digests.map(|d| batch_read_blobs_response::Response {
+                        digest: Some(d.clone()),
+                        data: vec![0, 1, 2],
+                        ..Default::default()
+                    }),
+                };
+                async { Ok(res) }
+            },
+            |_digest| async move { anyhow::Ok(Box::pin(futures::stream::iter(vec![]))) },
+        )
+        .await?;
+
+        let inlined_blobs = res.inlined_blobs.unwrap();
+
+        assert_eq!(inlined_blobs.len(), digests.len());
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_download_large_inlined() -> anyhow::Result<()> {
         let digest1 = &TDigest {
             hash: "aa".to_owned(),
@@ -1780,6 +2090,7 @@ mod tests {
             &InstanceName(None),
             req,
             10000,
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -1862,6 +2173,7 @@ mod tests {
             &InstanceName(None),
             req,
             10, // kept small to simulate a large file upload
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -1935,6 +2247,7 @@ mod tests {
             &InstanceName(None),
             req,
             10, // kept small to simulate a large inlined upload
+            None,
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -1995,6 +2308,7 @@ mod tests {
             &InstanceName(None), // TODO
             req,
             10,
+            None,
             |_req| async move {
                 panic!("This should not be called as there are no blobs to upload in batch");
             },
@@ -2055,6 +2369,7 @@ mod tests {
             &InstanceName(None),
             req,
             3,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2095,6 +2410,7 @@ mod tests {
             &InstanceName(None),
             req,
             0,
+            None,
             |_req| async move {
                 panic!("Not called");
             },
@@ -2140,6 +2456,7 @@ mod tests {
             &InstanceName(Some("instance".to_owned())),
             req,
             1,
+            None,
             |_req| async move {
                 panic!("Not called");
             },

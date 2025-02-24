@@ -22,12 +22,11 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 
+mod alloc_value;
 mod any_lifetime;
 mod attrs;
 mod bc;
 mod coerce;
-mod docs;
-mod for_each_field;
 mod freeze;
 mod module;
 mod serde;
@@ -35,6 +34,8 @@ mod starlark_type_repr;
 mod starlark_value;
 mod trace;
 mod unpack_value;
+mod util;
+mod v_lifetime;
 mod visit_span;
 mod vtable;
 
@@ -85,7 +86,7 @@ mod vtable;
 /// There are two special arguments, distinguished by their type, which provides access to interpreter state:
 ///
 /// * `heap: &'v Heap` gives access to the Starlark heap, for allocating things.
-/// * `eval: &mut Evaluator<'v, '_>` gives access to the Starlark evaluator, which can be used to look at interpreter state.
+/// * `eval: &mut Evaluator<'v, '_, '_>` gives access to the Starlark evaluator, which can be used to look at interpreter state.
 ///
 /// A module can be used to define globals (with `GlobalsBuilder`) or methods on an object (with `MethodsBuilder`).
 /// In the case of methods, the first argument to each function will be the object itself, typically named `this`.
@@ -163,43 +164,31 @@ pub fn derive_starlark_type_repr(input: proc_macro::TokenStream) -> proc_macro::
 }
 
 /// Derive the `UnpackValue` trait.
-#[proc_macro_derive(UnpackValue, attributes(starlark))]
+#[proc_macro_derive(UnpackValue)]
 pub fn derive_unpack_value(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     unpack_value::derive_unpack_value(input)
 }
 
-/// Derive accessor methods that are designed to be used from {has,get,dir}_attr
-/// in an `impl StarlarkValue` block. All fields in the struct that are not
-/// marked with #[starlark(skip)] are exported to Starlark code as attributes.
-/// NOTE: Any usage must also call `starlark_attrs!()` in the impl block for
-/// `StarlarkValue`, otherwise the generated attr methods will not be used.
+/// Derive the `AllocValue` trait.
+#[proc_macro_derive(AllocValue)]
+pub fn derive_alloc_value(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    alloc_value::derive_alloc_value(input)
+}
+
+/// Derive the `AllocFrozenValue` trait.
+#[proc_macro_derive(AllocFrozenValue)]
+pub fn derive_alloc_frozen_value(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    alloc_value::derive_alloc_frozen_value(input)
+}
+
+/// Derive accessor methods that are designed to be used from {has,get,dir}_attr in an `impl StarlarkValue` block.
+///
+/// All fields in the struct that are not marked with #[starlark(skip)] are exported to Starlark code as
+/// attributes. NOTE: Any usage must also call `starlark_attrs!()` in the impl block for `StarlarkValue`,
+/// otherwise the generated attr methods will not be used.
 #[proc_macro_derive(StarlarkAttrs, attributes(starlark))]
 pub fn derive_starlark_attrs(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     attrs::derive_attrs(input)
-}
-
-/// Generate an accessor function on the provided type that returns its documentation
-/// based on `StarlarkValue::get_methods()`. This macro requires that the type implements
-/// `starlark::StarlarkValue`.
-///
-/// Types that derive `StarlarkDocs` are also registered automatically with the `inventory` crate.
-/// To get all types annotated with `StarlarkDocs`, see `starlark::docs::get_registered_starlark_docs()`
-///
-/// Note that for statically linked binaries, documentation from all compiled crates in the binary
-/// will be included.
-///
-/// For dynamically linked binaries, documentation will only be able to retrieved after the crate's
-/// library is `dlopen()`ed.
-///
-/// `#[starlark_docs(key="value", second_key="second_value",...)]` can be used to insert
-/// arbitrary keys and string values into the generated `Docs::custom_attrs` for use
-/// by documentation tooling.
-///
-/// Types provided by the `starlark` library itself will have the `builtin` key set to either
-/// `standard` or `extension` depending on whether the type is part of the Starlark standard.
-#[proc_macro_derive(StarlarkDocs, attributes(starlark_docs))]
-pub fn derive_starlark_docs(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    docs::derive_docs(input)
 }
 
 /// Generate `{has,get,dir}_attr` in the `StarlarkValue` impl block that proxy

@@ -8,41 +8,51 @@
  */
 
 use allocative::Allocative;
-use buck2_core::fs::buck_out_path::BuckOutPath;
+use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_data::ToProtoMessage;
+use buck2_error::internal_error;
 use buck2_execute::execute::request::OutputType;
 use derivative::Derivative;
 use derive_more::Display;
 use dupe::Dupe;
+use static_assertions::assert_eq_size;
 
 use crate::actions::key::ActionKey;
 
 /// An artifact that is built by the build system
-#[allow(clippy::derived_hash_with_manual_eq)] // The Eq is equivalent to what would have been generated
-#[derive(Clone, Debug, Dupe, Display, Derivative, Allocative)]
-#[derivative(PartialEq, Eq, Hash)]
-#[display(fmt = "`{}`, action: {}", path, key)]
+#[derive(
+    Clone, PartialEq, Eq, Hash, Debug, Dupe, Display, Derivative, Allocative
+)]
+#[display("`{}`, action: {}", path, key)]
 pub struct BuildArtifact {
-    pub path: BuckOutPath,
-    // If two BuildArtifact's have the same path then they are basically the same,
-    // even if the ActionKey differs due to things like `dynamic_output`.
-    // TODO(ndmitchell): Clean this up by making it more explicit in ActionKey.
-    #[derivative(PartialEq = "ignore", Hash = "ignore")]
-    pub key: ActionKey,
-    #[derivative(PartialEq = "ignore", Hash = "ignore")]
-    pub output_type: OutputType,
+    path: BuildArtifactPath,
+    key: ActionKey,
+    output_type: OutputType,
 }
 
+assert_eq_size!(BuildArtifact, [usize; 6]);
+
 impl BuildArtifact {
-    pub fn new(path: BuckOutPath, key: ActionKey, output_type: OutputType) -> Self {
-        BuildArtifact {
+    pub fn new(
+        path: BuildArtifactPath,
+        key: ActionKey,
+        output_type: OutputType,
+    ) -> buck2_error::Result<Self> {
+        if !key.holder_key().starts_with(path.owner()) {
+            return Err(internal_error!(
+                "BaseDeferredKey mismatch: in action key: {}, in path: {}",
+                key.holder_key(),
+                path.owner(),
+            ));
+        }
+        Ok(BuildArtifact {
             path,
             key,
             output_type,
-        }
+        })
     }
 
-    pub fn get_path(&self) -> &BuckOutPath {
+    pub fn get_path(&self) -> &BuildArtifactPath {
         &self.path
     }
 

@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,9 +19,6 @@ use crate::AuditSubcommand;
     about = "list build file extensions imported at parse time."
 )]
 pub struct AuditIncludesCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     /// Print json representation of outputs
     #[clap(long)]
     pub json: bool,
@@ -30,6 +28,13 @@ pub struct AuditIncludesCommand {
         help = "Build files to audit. These are expected to be relative paths from the working dir cell."
     )]
     pub patterns: Vec<String>,
+
+    /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
+    #[clap(flatten)]
+    _target_cfg: TargetCfgUnusedOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

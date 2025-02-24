@@ -21,7 +21,6 @@ use std::mem::ManuallyDrop;
 use std::ptr;
 
 use dupe::Dupe;
-use either::Either;
 
 use crate::any::AnyLifetime;
 use crate::cast;
@@ -77,9 +76,20 @@ pub(crate) struct AValueRepr<T> {
 pub(crate) struct ForwardPtr(usize);
 
 impl ForwardPtr {
-    pub(crate) fn new(ptr: usize) -> ForwardPtr {
+    fn new(ptr: usize) -> ForwardPtr {
         debug_assert!(ptr & 1 == 0);
         ForwardPtr(ptr)
+    }
+
+    /// Create a forward pointer to a frozen value. This is used during heap freeze.
+    pub(crate) fn new_frozen(value: FrozenValue) -> ForwardPtr {
+        ForwardPtr::new(value.0.raw().ptr_value())
+    }
+
+    /// Create a forward pointer to an unfrozen value. This is used during heap GC.
+    pub(crate) fn new_unfrozen(value: Value) -> ForwardPtr {
+        debug_assert!(value.unpack_frozen().is_none());
+        ForwardPtr::new(value.0.raw().ptr_value() & !1)
     }
 
     /// It's caller responsibility to ensure that forward pointer points to a frozen value.
@@ -102,6 +112,7 @@ impl ForwardPtr {
 
 /// This is object written over [`AValueRepr`] during GC.
 #[repr(C)]
+#[derive(Debug)]
 pub(crate) struct AValueForward {
     /// Moved object pointer with lowest bit set.
     forward_ptr: usize,
@@ -146,14 +157,6 @@ impl AValueOrForward {
             AValueOrForwardUnpack::Forward(unsafe { &self.forward })
         } else {
             AValueOrForwardUnpack::Header(unsafe { &self.header })
-        }
-    }
-
-    /// Unpack something that might have been overwritten.
-    pub(crate) fn unpack_overwrite<'v>(&'v self) -> Either<ForwardPtr, AValueDyn<'v>> {
-        match self.unpack() {
-            AValueOrForwardUnpack::Header(header) => Either::Right(header.unpack()),
-            AValueOrForwardUnpack::Forward(forward) => Either::Left(forward.forward_ptr()),
         }
     }
 
@@ -257,7 +260,7 @@ impl AValueHeader {
 
     /// After performing the overwrite any existing pointers to this value
     /// are corrupted.
-    pub unsafe fn overwrite_with_forward<'v, T: AValue<'v>>(
+    pub unsafe fn overwrite_with_forward<'v, T: StarlarkValue<'v>>(
         me: *mut AValueRepr<T>,
         forward_ptr: ForwardPtr,
     ) -> T {
@@ -272,12 +275,7 @@ impl AValueHeader {
 
     /// Cast header pointer to repr pointer.
     #[inline]
-    pub(crate) unsafe fn as_repr<'v, A: AValue<'v>>(&self) -> &AValueRepr<A> {
-        &*(self.as_repr_v::<A::StarlarkValue>() as *const _ as *const _)
-    }
-
-    #[inline]
-    pub(crate) unsafe fn as_repr_v<'v, T: StarlarkValue<'v>>(&self) -> &AValueRepr<T> {
+    pub(crate) unsafe fn as_repr<'v, T: StarlarkValue<'v>>(&self) -> &AValueRepr<T> {
         debug_assert_eq!(T::static_type_id(), self.0.static_type_of_value.get());
         &*(self as *const AValueHeader as *const AValueRepr<T>)
     }

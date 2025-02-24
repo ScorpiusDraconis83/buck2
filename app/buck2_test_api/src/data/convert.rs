@@ -7,16 +7,22 @@
  * of this source tree.
  */
 
+use std::time::Duration;
 use std::time::SystemTime;
 
 use anyhow::Context as _;
 use buck2_core::cells::name::CellName;
+use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_error::BuckErrorContext;
 use gazebo::prelude::*;
 
+use super::LocalExecutionCommand;
 use super::LocalResourceType;
 use super::PrepareForLocalExecutionResult;
+use super::RemoteStorageConfig;
 use super::RequiredLocalResources;
+use super::TtlConfig;
 use crate::convert;
 use crate::data::ArgHandle;
 use crate::data::ArgValue;
@@ -24,7 +30,6 @@ use crate::data::ArgValueContent;
 use crate::data::ConfiguredTarget;
 use crate::data::ConfiguredTargetHandle;
 use crate::data::DeclaredOutput;
-use crate::data::DisplayMetadata;
 use crate::data::EnvHandle;
 use crate::data::ExecuteRequest2;
 use crate::data::ExecutionResult2;
@@ -34,17 +39,22 @@ use crate::data::ExecutorConfigOverride;
 use crate::data::ExternalRunnerSpec;
 use crate::data::ExternalRunnerSpecValue;
 use crate::data::Output;
+use crate::data::OutputName;
+use crate::data::RemoteDir;
+use crate::data::RemoteFile;
+use crate::data::RemoteObject;
 use crate::data::TestExecutable;
 use crate::data::TestResult;
+use crate::data::TestStage;
 use crate::data::TestStatus;
 use crate::protocol::convert::host_sharing_requirements_from_grpc;
 use crate::protocol::convert::host_sharing_requirements_to_grpc;
 
-impl TryFrom<buck2_test_proto::DisplayMetadata> for DisplayMetadata {
+impl TryFrom<buck2_test_proto::TestStage> for TestStage {
     type Error = anyhow::Error;
 
-    fn try_from(s: buck2_test_proto::DisplayMetadata) -> Result<Self, Self::Error> {
-        use buck2_test_proto::display_metadata::*;
+    fn try_from(s: buck2_test_proto::TestStage) -> Result<Self, Self::Error> {
+        use buck2_test_proto::test_stage::*;
         use buck2_test_proto::Testing;
 
         let res = match s.item.context("Missing `item`")? {
@@ -56,11 +66,11 @@ impl TryFrom<buck2_test_proto::DisplayMetadata> for DisplayMetadata {
     }
 }
 
-impl TryInto<buck2_test_proto::DisplayMetadata> for DisplayMetadata {
+impl TryInto<buck2_test_proto::TestStage> for TestStage {
     type Error = anyhow::Error;
 
-    fn try_into(self) -> Result<buck2_test_proto::DisplayMetadata, Self::Error> {
-        use buck2_test_proto::display_metadata::*;
+    fn try_into(self) -> Result<buck2_test_proto::TestStage, Self::Error> {
+        use buck2_test_proto::test_stage::*;
         use buck2_test_proto::Testing;
 
         let item = match self {
@@ -68,7 +78,7 @@ impl TryInto<buck2_test_proto::DisplayMetadata> for DisplayMetadata {
             Self::Testing { suite, testcases } => Item::Testing(Testing { suite, testcases }),
         };
 
-        Ok(buck2_test_proto::DisplayMetadata { item: Some(item) })
+        Ok(buck2_test_proto::TestStage { item: Some(item) })
     }
 }
 
@@ -247,6 +257,7 @@ impl TryFrom<buck2_test_proto::TestResult> for TestResult {
             msg,
             duration,
             details,
+            max_memory_used_bytes,
         } = s;
 
         let duration = duration
@@ -263,6 +274,7 @@ impl TryFrom<buck2_test_proto::TestResult> for TestResult {
             status: status.try_into().context("Invalid `status`")?,
             msg: msg.map(|m| m.msg),
             duration,
+            max_memory_used_bytes,
             details,
         })
     }
@@ -281,6 +293,7 @@ impl TryInto<buck2_test_proto::TestResult> for TestResult {
             details: self.details,
             msg: self.msg.map(|msg| OptionalMsg { msg }),
             duration: self.duration.try_map(|d| d.try_into())?,
+            max_memory_used_bytes: self.max_memory_used_bytes,
         })
     }
 }
@@ -386,10 +399,46 @@ impl TryInto<buck2_test_proto::ExternalRunnerSpecValue> for ExternalRunnerSpecVa
     }
 }
 
+impl From<OutputName> for buck2_test_proto::OutputName {
+    fn from(o: OutputName) -> Self {
+        Self {
+            name: o.name.as_str().to_owned(),
+        }
+    }
+}
+
+impl TryFrom<buck2_test_proto::OutputName> for OutputName {
+    type Error = anyhow::Error;
+
+    fn try_from(o: buck2_test_proto::OutputName) -> Result<Self, Self::Error> {
+        let name = ForwardRelativePathBuf::try_from(o.name)?;
+        Ok(Self { name })
+    }
+}
+
+impl From<TtlConfig> for buck2_test_proto::TtlConfig {
+    fn from(o: TtlConfig) -> Self {
+        Self {
+            ttl_seconds: o.ttl.as_secs() as i64,
+            use_case: o.use_case.to_string(),
+        }
+    }
+}
+
+impl From<buck2_test_proto::TtlConfig> for TtlConfig {
+    fn from(o: buck2_test_proto::TtlConfig) -> Self {
+        let ttl = Duration::from_secs(o.ttl_seconds as u64);
+        let use_case = RemoteExecutorUseCase::new(o.use_case);
+        Self { ttl, use_case }
+    }
+}
+
 impl From<DeclaredOutput> for buck2_test_proto::DeclaredOutput {
     fn from(o: DeclaredOutput) -> Self {
         Self {
             name: o.name.as_str().to_owned(),
+            supports_remote: o.remote_storage_config.supports_remote,
+            ttl_config: o.remote_storage_config.ttl_config.map(Into::into),
         }
     }
 }
@@ -398,8 +447,15 @@ impl TryFrom<buck2_test_proto::DeclaredOutput> for DeclaredOutput {
     type Error = anyhow::Error;
 
     fn try_from(o: buck2_test_proto::DeclaredOutput) -> Result<Self, Self::Error> {
-        let name = ForwardRelativePathBuf::try_from(o.name)?;
-        Ok(Self { name })
+        let name = ForwardRelativePathBuf::try_from(o.name)?.into();
+        let remote_storage_config = RemoteStorageConfig {
+            supports_remote: o.supports_remote,
+            ttl_config: o.ttl_config.map(Into::into),
+        };
+        Ok(Self {
+            name,
+            remote_storage_config,
+        })
     }
 }
 
@@ -565,6 +621,58 @@ impl TryInto<buck2_test_proto::ExecuteRequest2> for ExecuteRequest2 {
     }
 }
 
+impl TryInto<buck2_test_proto::RemoteObject> for RemoteObject {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<buck2_test_proto::RemoteObject, Self::Error> {
+        match self {
+            RemoteObject::File(RemoteFile { name, digest }) => {
+                let node = buck2_test_proto::RemoteFileNode { name };
+                Ok(buck2_test_proto::RemoteObject {
+                    digest: Some(digest),
+                    node: Some(buck2_test_proto::remote_object::Node::File(node)),
+                })
+            }
+            RemoteObject::Dir(RemoteDir {
+                name,
+                digest,
+                children,
+            }) => {
+                let children = children
+                    .into_iter()
+                    .map(|child| child.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                let node = buck2_test_proto::RemoteDirNode { name, children };
+                Ok(buck2_test_proto::RemoteObject {
+                    digest: Some(digest),
+                    node: Some(buck2_test_proto::remote_object::Node::Dir(node)),
+                })
+            }
+        }
+    }
+}
+
+impl TryFrom<buck2_test_proto::RemoteObject> for RemoteObject {
+    type Error = anyhow::Error;
+
+    fn try_from(value: buck2_test_proto::RemoteObject) -> Result<Self, Self::Error> {
+        let digest = value.digest.context("missing digest")?;
+        match value.node.context("missing node")? {
+            buck2_test_proto::remote_object::Node::File(file) => {
+                Ok(RemoteObject::file(file.name, digest))
+            }
+            buck2_test_proto::remote_object::Node::Dir(dir) => {
+                let children = dir
+                    .children
+                    .into_iter()
+                    .map(|child| child.try_into())
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RemoteObject::dir(dir.name, digest, children))
+            }
+        }
+    }
+}
+
 impl TryInto<buck2_test_proto::Output> for Output {
     type Error = anyhow::Error;
 
@@ -572,9 +680,13 @@ impl TryInto<buck2_test_proto::Output> for Output {
         use buck2_test_proto::output::*;
 
         let value = match self {
-            Self::LocalPath(value) => {
-                Value::LocalPath(value.to_str().context("Invalid local path")?.to_owned())
-            }
+            Self::LocalPath(value) => Value::LocalPath(
+                value
+                    .to_str()
+                    .buck_error_context_anyhow("Invalid local path")?
+                    .to_owned(),
+            ),
+            Self::RemoteObject(value) => Value::RemoteObject(value.try_into()?),
         };
 
         Ok(buck2_test_proto::Output { value: Some(value) })
@@ -588,9 +700,12 @@ impl TryFrom<buck2_test_proto::Output> for Output {
         use buck2_test_proto::output::*;
 
         Ok(match s.value.context("Missing `value`")? {
-            Value::LocalPath(value) => {
-                Self::LocalPath(value.try_into().context("Invalid local path value.")?)
-            }
+            Value::LocalPath(value) => Self::LocalPath(
+                value
+                    .try_into()
+                    .buck_error_context_anyhow("Invalid local path value.")?,
+            ),
+            Value::RemoteObject(value) => Self::RemoteObject(value.try_into()?),
         })
     }
 }
@@ -621,6 +736,7 @@ impl TryInto<buck2_test_proto::ExecutionResult2> for ExecutionResult2 {
             ),
             execution_time: Some(self.execution_time.try_into()?),
             execution_details: Some(self.execution_details),
+            max_memory_used_bytes: self.max_memory_used_bytes,
         })
     }
 }
@@ -637,6 +753,7 @@ impl TryFrom<buck2_test_proto::ExecutionResult2> for ExecutionResult2 {
             start_time,
             execution_time,
             execution_details,
+            max_memory_used_bytes,
         } = s;
         let status = status
             .context("Missing `status`")?
@@ -688,6 +805,7 @@ impl TryFrom<buck2_test_proto::ExecutionResult2> for ExecutionResult2 {
             start_time,
             execution_time,
             execution_details,
+            max_memory_used_bytes,
         })
     }
 }
@@ -697,13 +815,13 @@ impl TryFrom<buck2_test_proto::TestExecutable> for TestExecutable {
 
     fn try_from(s: buck2_test_proto::TestExecutable) -> Result<Self, Self::Error> {
         let buck2_test_proto::TestExecutable {
-            ui_prints,
+            stage,
             target,
             cmd,
             pre_create_dirs,
             env,
         } = s;
-        let ui_prints = ui_prints
+        let ui_prints = stage
             .context("Missing `ui_prints`")?
             .try_into()
             .context("Invalid `ui_prints`")?;
@@ -734,7 +852,7 @@ impl TryFrom<buck2_test_proto::TestExecutable> for TestExecutable {
             .context("Invalid `pre_create_dirs`")?;
 
         Ok(TestExecutable {
-            ui_prints,
+            stage: ui_prints,
             target,
             cmd,
             env,
@@ -747,7 +865,7 @@ impl TryInto<buck2_test_proto::TestExecutable> for TestExecutable {
     type Error = anyhow::Error;
 
     fn try_into(self) -> Result<buck2_test_proto::TestExecutable, Self::Error> {
-        let ui_prints = Some(self.ui_prints.try_into().context("Invalid `ui_prints`")?);
+        let stage = Some(self.stage.try_into().context("Invalid `ui_prints`")?);
         let target = Some(self.target.try_into().context("Invalid `target`")?);
         let cmd = self
             .cmd
@@ -772,7 +890,7 @@ impl TryInto<buck2_test_proto::TestExecutable> for TestExecutable {
         let pre_create_dirs = self.pre_create_dirs.into_map(|i| i.into());
 
         Ok(buck2_test_proto::TestExecutable {
-            ui_prints,
+            stage,
             target,
             cmd,
             pre_create_dirs,
@@ -781,44 +899,130 @@ impl TryInto<buck2_test_proto::TestExecutable> for TestExecutable {
     }
 }
 
-impl TryInto<buck2_test_proto::PrepareForLocalExecutionResult> for PrepareForLocalExecutionResult {
+impl TryInto<buck2_test_proto::PrepareForLocalExecutionResponse>
+    for PrepareForLocalExecutionResult
+{
     type Error = anyhow::Error;
 
-    fn try_into(self) -> Result<buck2_test_proto::PrepareForLocalExecutionResult, Self::Error> {
-        let cwd = self.cwd.to_str().context("Invalid cwd path")?.to_owned();
+    fn try_into(self) -> Result<buck2_test_proto::PrepareForLocalExecutionResponse, Self::Error> {
+        let cwd = self
+            .command
+            .cwd
+            .to_str()
+            .buck_error_context_anyhow("Invalid cwd path")?
+            .to_owned();
 
-        Ok(buck2_test_proto::PrepareForLocalExecutionResult {
+        Ok(buck2_test_proto::PrepareForLocalExecutionResponse {
+            result: Some(buck2_test_proto::PrepareForLocalExecutionResult {
+                cmd: self.command.cmd,
+                cwd,
+                env: self
+                    .command
+                    .env
+                    .into_iter()
+                    .map(
+                        |(key, value)| buck2_test_proto::VerbatimEnvironmentVariable { key, value },
+                    )
+                    .collect(),
+            }),
+            setup_local_resource_commands: self
+                .local_resource_setup_commands
+                .into_iter()
+                .map(|c| {
+                    <LocalExecutionCommand as TryInto<
+                        buck2_test_proto::SetupLocalResourceLocalExecutionCommand,
+                    >>::try_into(c)
+                })
+                .collect::<Result<Vec<_>, anyhow::Error>>()?,
+        })
+    }
+}
+
+impl TryInto<buck2_test_proto::SetupLocalResourceLocalExecutionCommand> for LocalExecutionCommand {
+    type Error = anyhow::Error;
+
+    fn try_into(
+        self,
+    ) -> Result<buck2_test_proto::SetupLocalResourceLocalExecutionCommand, Self::Error> {
+        Ok(buck2_test_proto::SetupLocalResourceLocalExecutionCommand {
             cmd: self.cmd,
-            cwd,
+            cwd: self
+                .cwd
+                .to_str()
+                .buck_error_context_anyhow("Invalid cwd path for local resource")?
+                .to_owned(),
             env: self
                 .env
                 .into_iter()
-                .map(|(key, value)| buck2_test_proto::VerbatimEnvironmentVariable { key, value })
+                .map(|(k, v)| buck2_test_proto::VerbatimEnvironmentVariable { key: k, value: v })
                 .collect(),
         })
     }
 }
 
-impl TryFrom<buck2_test_proto::PrepareForLocalExecutionResult> for PrepareForLocalExecutionResult {
+impl TryFrom<buck2_test_proto::PrepareForLocalExecutionResult> for LocalExecutionCommand {
     type Error = anyhow::Error;
 
     fn try_from(s: buck2_test_proto::PrepareForLocalExecutionResult) -> Result<Self, Self::Error> {
-        let buck2_test_proto::PrepareForLocalExecutionResult { cmd, cwd, env } = s;
-        let cwd = cwd.try_into().context("Invalid cwd value.")?;
+        Ok(Self {
+            cmd: s.cmd,
+            cwd: s
+                .cwd
+                .try_into()
+                .buck_error_context_anyhow("Invalid cwd value.")?,
+            env: s
+                .env
+                .into_iter()
+                .map(|env_var| (env_var.key, env_var.value))
+                .collect(),
+        })
+    }
+}
 
-        let env = env
-            .into_iter()
-            .map(|env_var| (env_var.key, env_var.value))
-            .collect();
+impl TryFrom<buck2_test_proto::SetupLocalResourceLocalExecutionCommand> for LocalExecutionCommand {
+    type Error = anyhow::Error;
 
-        Ok(PrepareForLocalExecutionResult { cmd, env, cwd })
+    fn try_from(
+        s: buck2_test_proto::SetupLocalResourceLocalExecutionCommand,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cmd: s.cmd,
+            cwd: s
+                .cwd
+                .try_into()
+                .buck_error_context_anyhow("Invalid cwd value.")?,
+            env: s
+                .env
+                .into_iter()
+                .map(|env_var| (env_var.key, env_var.value))
+                .collect(),
+        })
+    }
+}
+
+impl TryFrom<buck2_test_proto::PrepareForLocalExecutionResponse>
+    for PrepareForLocalExecutionResult
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        s: buck2_test_proto::PrepareForLocalExecutionResponse,
+    ) -> Result<Self, Self::Error> {
+        let result = s.result.context("Missing `result`")?;
+        Ok(Self {
+            command: LocalExecutionCommand::try_from(result)?,
+            local_resource_setup_commands: s
+                .setup_local_resource_commands
+                .into_iter()
+                .map(LocalExecutionCommand::try_from)
+                .collect::<Result<Vec<_>, anyhow::Error>>()?,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
-    use std::time::Duration;
 
     use host_sharing::HostSharingRequirements;
     use sorted_vector_map::sorted_vector_map;
@@ -877,11 +1081,12 @@ mod tests {
     #[test]
     fn execute_request2_roundtrip() {
         let declared_output = DeclaredOutput {
-            name: ForwardRelativePathBuf::unchecked_new("name".to_owned()),
+            name: OutputName::unchecked_new("name".to_owned()),
+            remote_storage_config: RemoteStorageConfig::new(true),
         };
 
         let test_executable = TestExecutable {
-            ui_prints: DisplayMetadata::Listing("name".to_owned()),
+            stage: TestStage::Listing("name".to_owned()),
             target: ConfiguredTargetHandle(42),
             cmd: vec![
                 ArgValue {
@@ -891,7 +1096,7 @@ mod tests {
                     format: None,
                 },
                 ArgValue {
-                    content: ArgValueContent::DeclaredOutput(declared_output.clone()),
+                    content: ArgValueContent::DeclaredOutput(declared_output.name.clone()),
                     format: Some("--output={}".to_owned()),
                 },
             ],
@@ -933,9 +1138,7 @@ mod tests {
             stdout: ExecutionStream::Inline(vec![97, 115, 109]),
             stderr: ExecutionStream::Inline(vec![118, 105, 109]),
             outputs: [(
-                DeclaredOutput {
-                    name: ForwardRelativePathBuf::unchecked_new("name".to_owned()),
-                },
+                OutputName::unchecked_new("name".to_owned()),
                 Output::LocalPath(String::from(local_path).try_into().expect("valid abs path")),
             )]
             .into_iter()
@@ -943,12 +1146,12 @@ mod tests {
             start_time: SystemTime::UNIX_EPOCH + Duration::from_secs(123),
             execution_time: Duration::from_secs(456),
             execution_details: Default::default(),
+            max_memory_used_bytes: None,
         };
         assert_roundtrips::<buck2_test_proto::ExecutionResult2, ExecutionResult2>(&result);
     }
 
-    #[test]
-    fn prepare_for_local_execution_result_roundtrip() {
+    fn dummy_local_execution_command() -> LocalExecutionCommand {
         let cmd = vec![
             "my_cmd".to_owned(),
             "--some-arg".to_owned(),
@@ -962,10 +1165,18 @@ mod tests {
         let cwd = String::from(local_path).try_into().expect("valid abs path");
         let env = sorted_vector_map! { "some_env".to_owned() => "some_env_val".to_owned() };
 
-        let result = PrepareForLocalExecutionResult { cmd, env, cwd };
+        LocalExecutionCommand { cmd, env, cwd }
+    }
+
+    #[test]
+    fn prepare_for_local_execution_result_roundtrip() {
+        let result = PrepareForLocalExecutionResult {
+            command: dummy_local_execution_command(),
+            local_resource_setup_commands: vec![dummy_local_execution_command()],
+        };
 
         assert_roundtrips::<
-            buck2_test_proto::PrepareForLocalExecutionResult,
+            buck2_test_proto::PrepareForLocalExecutionResponse,
             PrepareForLocalExecutionResult,
         >(&result);
     }
@@ -973,11 +1184,12 @@ mod tests {
     #[test]
     fn test_executable_roundtrip() {
         let declared_output = DeclaredOutput {
-            name: ForwardRelativePathBuf::unchecked_new("name".to_owned()),
+            name: OutputName::unchecked_new("name".to_owned()),
+            remote_storage_config: RemoteStorageConfig::new(false),
         };
 
         let test_executable = TestExecutable {
-            ui_prints: DisplayMetadata::Listing("name".to_owned()),
+            stage: TestStage::Listing("name".to_owned()),
             target: ConfiguredTargetHandle(42),
             cmd: vec![
                 ArgValue {
@@ -987,7 +1199,7 @@ mod tests {
                     format: None,
                 },
                 ArgValue {
-                    content: ArgValueContent::DeclaredOutput(declared_output.clone()),
+                    content: ArgValueContent::DeclaredOutput(declared_output.name.clone()),
                     format: Some("--output={}".to_owned()),
                 },
             ],

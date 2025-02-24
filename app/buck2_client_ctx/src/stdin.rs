@@ -15,6 +15,7 @@ use std::task::Poll;
 use std::thread::JoinHandle;
 
 use buck2_core::buck2_env;
+use buck2_util::threads::thread_spawn;
 use bytes::Bytes;
 use futures::stream::Fuse;
 use futures::stream::StreamExt;
@@ -24,9 +25,6 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
-
-use crate::common::CommonConsoleOptions;
-use crate::console_interaction_stream::ConsoleInteractionStream;
 
 #[pin_project]
 pub struct Stdin {
@@ -50,8 +48,13 @@ impl AsyncRead for Stdin {
 }
 
 impl Stdin {
-    pub fn new() -> anyhow::Result<Self> {
-        let buffer_size = buck2_env!("BUCK2_TEST_STDIN_BUFFER_SIZE", type=usize)?.unwrap_or(8192);
+    pub fn new() -> buck2_error::Result<Self> {
+        let buffer_size = buck2_env!(
+            "BUCK2_TEST_STDIN_BUFFER_SIZE",
+            type=usize,
+            applicability=testing,
+        )?
+        .unwrap_or(8192);
 
         // Small buffer, this isn't bytes we're buffering, just buffers of bytes. That said, since
         // we're on separate threads, give ourselves a bit of buffering.
@@ -62,20 +65,9 @@ impl Stdin {
             state: State::Pending { buffer_size, tx },
         })
     }
-
-    pub fn console_interaction_stream(
-        &mut self,
-        opts: &CommonConsoleOptions,
-    ) -> Option<ConsoleInteractionStream<'_>> {
-        if opts.no_interactive_console {
-            tracing::debug!("Disabling console interaction: no_interactive_console is set");
-            return None;
-        }
-
-        ConsoleInteractionStream::new(self)
-    }
 }
 
+#[allow(dead_code)] // field `0` is never read
 enum State {
     Pending {
         buffer_size: usize,
@@ -96,7 +88,7 @@ impl State {
                     buffer_size,
                     mut tx,
                 } => {
-                    let handle = std::thread::spawn({
+                    let handle = thread_spawn("buck2-stdin", {
                         move || {
                             #[allow(clippy::let_and_return)]
                             let stdin = std::io::stdin().lock();
@@ -109,7 +101,8 @@ impl State {
                             // NOTE: We ignore send errors since there is no point in reading without a receiver.
                             let _ignored = read_and_forward(stdin, &mut tx, buffer_size);
                         }
-                    });
+                    })
+                    .unwrap();
 
                     Self::Started(handle)
                 }

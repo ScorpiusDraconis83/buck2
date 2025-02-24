@@ -8,6 +8,7 @@
  */
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_event_log::read::ReaderStats;
 use tokio_stream::StreamExt;
@@ -17,22 +18,22 @@ use crate::commands::log::options::EventLogOptions;
 /// This command outputs the most recent log in JSON format
 #[derive(Debug, clap::Parser)]
 pub struct LogPerfCommand {
-    #[clap(flatten)]
-    event_log: EventLogOptions,
-
     /// Stats will be emitted every `interval` events.
     #[clap(long, default_value = "10000")]
     interval: u64,
+
+    #[clap(flatten)]
+    event_log: EventLogOptions,
 }
 
 impl LogPerfCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self {
             event_log,
             interval,
         } = self;
 
-        ctx.with_runtime(async move |ctx| {
+        ctx.with_runtime(|ctx| async move {
             let log_path = event_log.get(&ctx).await?;
 
             let mut total_alloc = 0;
@@ -65,7 +66,7 @@ impl LogPerfCommand {
                 total_alloc
             )?;
 
-            anyhow::Ok(())
+            buck2_error::Ok(())
         })?;
         ExitResult::success()
     }

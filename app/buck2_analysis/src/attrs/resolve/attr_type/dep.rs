@@ -8,7 +8,6 @@
  */
 
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollection;
-use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::dependency::Dependency;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
@@ -19,13 +18,18 @@ use buck2_node::attrs::attr_type::dep::DepAttrTransition;
 use buck2_node::attrs::attr_type::dep::DepAttrType;
 use buck2_node::provider_id_set::ProviderIdSet;
 use starlark::environment::Module;
+use starlark::values::FrozenValueTyped;
 use starlark::values::Value;
 
 use crate::attrs::resolve::ctx::AttrResolutionContext;
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum ResolutionError {
-    #[error("required provider `{0}` was not found on `{1}`. Found these providers: {}", .2.join(", "))]
+    #[error(
+        "Attribute requires a dep that provides `{0}`, but it was not found on `{1}`. Found these providers: {}",
+        .2.join(", "),
+)]
     MissingRequiredProvider(String, ConfiguredProvidersLabel, Vec<String>),
 }
 
@@ -34,12 +38,12 @@ pub trait DepAttrTypeExt {
         required_providers: &ProviderIdSet,
         providers: &FrozenProviderCollection,
         target: &ConfiguredProvidersLabel,
-    ) -> anyhow::Result<()>;
+    ) -> buck2_error::Result<()>;
 
     fn alloc_dependency<'v>(
         env: &'v Module,
         target: &ConfiguredProvidersLabel,
-        v: &FrozenProviderCollectionValue,
+        v: FrozenValueTyped<'v, FrozenProviderCollection>,
         execution_platform_resolution: Option<&ExecutionPlatformResolution>,
     ) -> Value<'v>;
 
@@ -48,12 +52,12 @@ pub trait DepAttrTypeExt {
         target: &ConfiguredProvidersLabel,
         required_providers: &ProviderIdSet,
         is_exec: bool,
-    ) -> anyhow::Result<Value<'v>>;
+    ) -> buck2_error::Result<Value<'v>>;
 
     fn resolve_single<'v>(
         ctx: &dyn AttrResolutionContext<'v>,
         dep_attr: &DepAttr<ConfiguredProvidersLabel>,
-    ) -> anyhow::Result<Value<'v>>;
+    ) -> buck2_error::Result<Value<'v>>;
 }
 
 impl DepAttrTypeExt for DepAttrType {
@@ -61,7 +65,7 @@ impl DepAttrTypeExt for DepAttrType {
         required_providers: &ProviderIdSet,
         providers: &FrozenProviderCollection,
         target: &ConfiguredProvidersLabel,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         for provider_id in required_providers {
             if !providers.contains_provider(provider_id) {
                 return Err(ResolutionError::MissingRequiredProvider(
@@ -78,13 +82,13 @@ impl DepAttrTypeExt for DepAttrType {
     fn alloc_dependency<'v>(
         env: &'v Module,
         target: &ConfiguredProvidersLabel,
-        v: &FrozenProviderCollectionValue,
+        v: FrozenValueTyped<'v, FrozenProviderCollection>,
         execution_platform_resolution: Option<&ExecutionPlatformResolution>,
     ) -> Value<'v> {
         env.heap().alloc(Dependency::new(
             env.heap(),
             target.clone(),
-            v.value().owned_value(env.frozen_heap()),
+            v,
             execution_platform_resolution,
         ))
     }
@@ -94,10 +98,9 @@ impl DepAttrTypeExt for DepAttrType {
         target: &ConfiguredProvidersLabel,
         required_providers: &ProviderIdSet,
         is_exec_dep: bool,
-    ) -> anyhow::Result<Value<'v>> {
-        let v = ctx.get_dep(target)?;
-        let provider_collection = v.provider_collection();
-        Self::check_providers(required_providers, provider_collection, target)?;
+    ) -> buck2_error::Result<Value<'v>> {
+        let provider_collection = ctx.get_dep(target)?;
+        Self::check_providers(required_providers, provider_collection.as_ref(), target)?;
         let execution_platform_resolution = if is_exec_dep {
             Some(ctx.execution_platform_resolution())
         } else {
@@ -107,7 +110,7 @@ impl DepAttrTypeExt for DepAttrType {
         Ok(Self::alloc_dependency(
             ctx.starlark_module(),
             target,
-            &v,
+            provider_collection,
             execution_platform_resolution,
         ))
     }
@@ -115,7 +118,7 @@ impl DepAttrTypeExt for DepAttrType {
     fn resolve_single<'v>(
         ctx: &dyn AttrResolutionContext<'v>,
         dep_attr: &DepAttr<ConfiguredProvidersLabel>,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> buck2_error::Result<Value<'v>> {
         let is_exec = dep_attr.attr_type.transition == DepAttrTransition::Exec;
         Self::resolve_single_impl(
             ctx,
@@ -130,7 +133,7 @@ pub(crate) trait ExplicitConfiguredDepAttrTypeExt {
     fn resolve_single<'v>(
         ctx: &dyn AttrResolutionContext<'v>,
         dep_attr: &ConfiguredExplicitConfiguredDep,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> buck2_error::Result<Value<'v>> {
         DepAttrType::resolve_single_impl(
             ctx,
             &dep_attr.label,

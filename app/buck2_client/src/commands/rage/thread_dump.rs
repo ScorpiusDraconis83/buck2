@@ -7,31 +7,39 @@
  * of this source tree.
  */
 
-use anyhow::Context;
 use buck2_client_ctx::daemon::client::connect::BuckdProcessInfo;
-use buck2_client_ctx::manifold::ManifoldClient;
+use buck2_common::manifold::ManifoldClient;
+use buck2_error::BuckErrorContext;
 use buck2_util::process::async_background_command;
 
 use crate::commands::rage::manifold::buf_to_manifold;
 
-pub async fn upload_thread_dump(
-    buckd: &buck2_error::Result<BuckdProcessInfo<'_>>,
-    manifold: &ManifoldClient,
-    manifold_id: &String,
-) -> anyhow::Result<String> {
-    let buckd_pid = buckd.as_ref().map_err(|e| e.clone())?.pid();
-    let command = async_background_command("lldb")
-        .arg("-p")
-        .arg(buckd_pid.to_string())
+pub(crate) fn thread_dump_command(
+    buckd: &BuckdProcessInfo<'_>,
+) -> buck2_error::Result<tokio::process::Command> {
+    let pid = buckd.pid()?;
+    let mut cmd = async_background_command("lldb");
+    cmd.arg("-p")
+        .arg(pid.to_string())
         .arg("--batch")
         .arg("-o")
         .arg("thread backtrace all")
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    Ok(cmd)
+}
+
+pub(crate) async fn upload_thread_dump(
+    buckd: &buck2_error::Result<BuckdProcessInfo<'_>>,
+    manifold: &ManifoldClient,
+    manifold_id: &String,
+) -> buck2_error::Result<String> {
+    let buckd = buckd.as_ref().map_err(|e| e.clone())?;
+    let command = thread_dump_command(buckd)?
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("Failed to spawn lldb command")?
+        .buck_error_context("Failed to spawn lldb command")?
         .wait_with_output()
         .await?;
 

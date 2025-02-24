@@ -1,3 +1,9 @@
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+oncall("build_infra")
+
+source_listing()
+
 prelude = native
 
 prelude.python_bootstrap_binary(
@@ -76,25 +82,6 @@ prelude.python_bootstrap_binary(
     visibility = ["PUBLIC"],
 )
 
-prelude.python_bootstrap_library(
-    name = "py38stdlib",
-    srcs = ["py38stdlib.py"],
-)
-
-prelude.python_bootstrap_binary(
-    name = "parse_imports",
-    main = "parse_imports.py",
-    visibility = ["PUBLIC"],
-    deps = [":py38stdlib"],
-)
-
-prelude.python_bootstrap_binary(
-    name = "traverse_dep_manifest",
-    main = "traverse_dep_manifest.py",
-    visibility = ["PUBLIC"],
-    deps = [":py38stdlib"],
-)
-
 # Main file used for native python binaries
 prelude.export_file(
     name = "embedded_main.cpp",
@@ -124,5 +111,17 @@ prelude.python_bootstrap_binary(
 prelude.python_bootstrap_binary(
     name = "fail_with_message",
     main = "fail_with_message.py",
+    visibility = ["PUBLIC"],
+)
+
+prelude.python_bootstrap_binary(
+    name = "wheel",
+    main = "wheel.py",
+    visibility = ["PUBLIC"],
+)
+
+prelude.python_bootstrap_binary(
+    name = "create_link_tree",
+    main = "create_link_tree.py",
     visibility = ["PUBLIC"],
 )

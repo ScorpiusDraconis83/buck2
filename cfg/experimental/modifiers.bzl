@@ -5,10 +5,9 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@fbsource//tools/build_defs/buck2:is_buck2.bzl", "is_buck2")
-load(":asserts.bzl?v2_only", "verify_normalized_modifier", "verify_normalized_target")
+load("@prelude//cfg/modifier:asserts.bzl", "verify_normalized_modifier", "verify_normalized_target")
 load(
-    ":types.bzl?v2_only",
+    "@prelude//cfg/modifier:types.bzl",
     "Modifier",  # @unused Used in type annotation
     "ModifiersMatch",
 )
@@ -65,9 +64,6 @@ def _modifiers_match(
     ```
     """
 
-    if not is_buck2():
-        return {}
-
     for key, sub_modifier in matcher.items():
         if key != "DEFAULT":
             verify_normalized_target(key)
@@ -77,5 +73,7 @@ def _modifiers_match(
     return matcher
 
 modifiers = struct(
+    # modifiers.match is deprecated for modifiers.conditional
     match = _modifiers_match,
+    conditional = _modifiers_match,
 )

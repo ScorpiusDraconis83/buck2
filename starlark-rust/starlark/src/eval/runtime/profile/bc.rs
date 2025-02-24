@@ -27,8 +27,54 @@ use dupe::Dupe;
 use crate::eval::bc::opcode::BcOpcode;
 use crate::eval::runtime::profile::csv::CsvWriter;
 use crate::eval::runtime::profile::data::ProfileDataImpl;
+use crate::eval::runtime::profile::profiler_type::ProfilerType;
 use crate::eval::ProfileData;
 use crate::eval::ProfileMode;
+
+pub(crate) struct BcProfilerType;
+pub(crate) struct BcPairsProfilerType;
+
+impl ProfilerType for BcProfilerType {
+    type Data = Box<BcProfileData>;
+    const PROFILE_MODE: ProfileMode = ProfileMode::Bytecode;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::Bc(bc) => Some(bc),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::Bc(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(Box::new(BcProfileData::merge(
+            profiles.iter().map(|x| &***x),
+        )))
+    }
+}
+
+impl ProfilerType for BcPairsProfilerType {
+    type Data = BcPairsProfileData;
+    const PROFILE_MODE: ProfileMode = ProfileMode::BytecodePairs;
+
+    fn data_from_generic(profile_data: &ProfileDataImpl) -> Option<&Self::Data> {
+        match profile_data {
+            ProfileDataImpl::BcPairs(bc) => Some(bc),
+            _ => None,
+        }
+    }
+
+    fn data_to_generic(data: Self::Data) -> ProfileDataImpl {
+        ProfileDataImpl::BcPairs(data)
+    }
+
+    fn merge_profiles_impl(profiles: &[&Self::Data]) -> starlark_syntax::Result<Self::Data> {
+        Ok(BcPairsProfileData::merge(profiles.iter().map(|x| &**x)))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 enum BcProfileError {
@@ -142,7 +188,7 @@ impl BcProfileData {
         csv.finish()
     }
 
-    pub(crate) fn merge<'a>(iter: impl IntoIterator<Item = &'a BcProfileData>) -> BcProfileData {
+    fn merge<'a>(iter: impl IntoIterator<Item = &'a BcProfileData>) -> BcProfileData {
         let mut sum = BcProfileData::default();
         for profile in iter {
             sum += profile;
@@ -184,9 +230,7 @@ impl BcPairsProfileData {
         csv.finish()
     }
 
-    pub(crate) fn merge<'a>(
-        iter: impl IntoIterator<Item = &'a BcPairsProfileData>,
-    ) -> BcPairsProfileData {
+    fn merge<'a>(iter: impl IntoIterator<Item = &'a BcPairsProfileData>) -> BcPairsProfileData {
         let mut sum = BcPairsProfileData::default();
         for profile in iter {
             sum += profile;
@@ -228,23 +272,25 @@ impl BcProfile {
         }
     }
 
-    pub(crate) fn gen_bc_profile(&mut self) -> anyhow::Result<ProfileData> {
+    pub(crate) fn gen_bc_profile(&mut self) -> crate::Result<ProfileData> {
         match mem::replace(&mut self.data, BcProfileDataMode::Disabled) {
             BcProfileDataMode::Bc(bc) => Ok(ProfileData {
-                profile_mode: ProfileMode::Bytecode,
                 profile: ProfileDataImpl::Bc(bc),
             }),
-            _ => Err(BcProfileError::BcProfilingNotEnabled.into()),
+            _ => Err(crate::Error::new_other(
+                BcProfileError::BcProfilingNotEnabled,
+            )),
         }
     }
 
-    pub(crate) fn gen_bc_pairs_profile(&mut self) -> anyhow::Result<ProfileData> {
+    pub(crate) fn gen_bc_pairs_profile(&mut self) -> crate::Result<ProfileData> {
         match mem::replace(&mut self.data, BcProfileDataMode::Disabled) {
             BcProfileDataMode::BcPairs(bc_pairs) => Ok(ProfileData {
-                profile_mode: ProfileMode::BytecodePairs,
                 profile: ProfileDataImpl::BcPairs(*bc_pairs),
             }),
-            _ => Err(BcProfileError::BcProfilingNotEnabled.into()),
+            _ => Err(crate::Error::new_other(
+                BcProfileError::BcProfilingNotEnabled,
+            )),
         }
     }
 
@@ -267,8 +313,8 @@ mod tests {
     use crate::eval::bc::opcode::BcOpcode;
     use crate::eval::runtime::profile::bc::BcPairsProfileData;
     use crate::eval::runtime::profile::bc::BcProfileData;
+    use crate::eval::runtime::profile::mode::ProfileMode;
     use crate::eval::Evaluator;
-    use crate::eval::ProfileMode;
     use crate::syntax::AstModule;
     use crate::syntax::Dialect;
 
@@ -283,7 +329,7 @@ mod tests {
             &globals,
         )
         .unwrap();
-        let csv = eval.gen_bc_profile().unwrap().gen().unwrap();
+        let csv = eval.gen_bc_profile().unwrap().gen_csv().unwrap();
         assert!(
             csv.contains(&format!("\n\"{:?}\",1,", BcOpcode::CallFrozenNativePos)),
             "{:?}",
@@ -302,7 +348,7 @@ mod tests {
             &globals,
         )
         .unwrap();
-        let csv = eval.gen_bc_pairs_profile().unwrap().gen().unwrap();
+        let csv = eval.gen_bc_pairs_profile().unwrap().gen_csv().unwrap();
         assert!(
             csv.contains(&format!(
                 "\n\"{:?}\",\"{:?}\",1",

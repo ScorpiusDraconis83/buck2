@@ -7,36 +7,46 @@
  * of this source tree.
  */
 
-use std::collections::BTreeMap;
+use std::io::Write;
 
-use crossbeam::channel::Sender;
-use lsp_types::notification::Notification;
-use lsp_types::WorkDoneProgress;
+use rustc_hash::FxHashMap;
+use serde::Serialize;
+use serde_json::Value;
 use tracing::span;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::Layer;
 
-pub(crate) struct ProgressLayer<S> {
+pub(crate) struct ProgressLayer<S, W> {
     _s: std::marker::PhantomData<S>,
-    sender: Sender<lsp_server::Message>,
+    writer: W,
 }
 
-impl<S> ProgressLayer<S> {
-    pub(crate) fn new(sender: Sender<lsp_server::Message>) -> Self {
-        ProgressLayer {
+impl<S, W> ProgressLayer<S, W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
             _s: std::marker::PhantomData,
-            sender,
+            writer,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct ProgressStorage {
-    token: lsp_types::ProgressToken,
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct Out<'a> {
+    #[serde(flatten)]
+    event_fields: &'a FxHashMap<String, serde_json::Value>,
+    #[serde(flatten)]
+    span_fields: &'a FxHashMap<String, serde_json::Value>,
 }
 
-impl<S> Layer<S> for ProgressLayer<S>
+#[derive(Debug, Clone, PartialEq)]
+struct ProgressStorage {
+    data: FxHashMap<String, serde_json::Value>,
+}
+
+impl<S, W> Layer<S> for ProgressLayer<S, W>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'a> MakeWriter<'a> + 'static,
 {
     fn on_new_span(
         &self,
@@ -44,120 +54,64 @@ where
         id: &span::Id,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if attrs.metadata().target() != "lsp_progress" {
-            return;
-        }
-
         let span = ctx.span(id).unwrap();
         let mut extensions = span.extensions_mut();
 
-        let mut fields = BTreeMap::new();
-        let mut visitor = StringVisitor(&mut fields);
+        let mut fields = FxHashMap::default();
+        let mut visitor = JsonVisitor(&mut fields);
         attrs.record(&mut visitor);
 
-        let Some(token) = fields.remove("token") else {
-            // we can't report on progress if we don't have a cancellation token. exit.
-            return;
-        };
-        let title = match fields.get("label") {
-            Some(label) => String::from(label),
-            None => String::from(attrs.metadata().name()),
-        };
-
-        let token = lsp_types::ProgressToken::String(token.clone());
-
-        let begin = lsp_types::WorkDoneProgressBegin {
-            title,
-            cancellable: Some(true),
-            message: Some(String::from("resolving")),
-            percentage: None,
-        };
-
-        extensions.insert(ProgressStorage {
-            token: token.clone(),
-        });
-
-        let notification = lsp_server::Notification::new(
-            lsp_types::notification::Progress::METHOD.to_owned(),
-            lsp_types::ProgressParams {
-                token,
-                value: lsp_types::ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(begin)),
-            },
-        );
-
-        let _err = self.sender.send(notification.into());
+        extensions.insert(ProgressStorage { data: fields });
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let mut fields = BTreeMap::new();
-        let mut visitor = StringVisitor(&mut fields);
+        let mut event_fields = FxHashMap::default();
+        let mut visitor = JsonVisitor(&mut event_fields);
         event.record(&mut visitor);
 
-        let Some(span) = ctx.lookup_current() else {
-            return;
-        };
-        let ext = span.extensions();
-        let Some(storage) = ext.get::<ProgressStorage>() else {
-            return;
-        };
-
-        let message = fields.get("message").map(|value| value.to_owned());
-        let report = lsp_types::WorkDoneProgressReport {
-            message,
-            cancellable: Some(true),
-            percentage: None,
+        let span_fields = match ctx.lookup_current() {
+            Some(span) => {
+                let ext = span.extensions();
+                if let Some(storage) = ext.get::<ProgressStorage>() {
+                    storage.data.clone()
+                } else {
+                    FxHashMap::default()
+                }
+            }
+            _ => FxHashMap::default(),
         };
 
-        let report: lsp_types::ProgressParamsValue =
-            lsp_types::ProgressParamsValue::WorkDone(WorkDoneProgress::Report(report));
-        let token = &storage.token;
-        let notification = lsp_server::Notification::new(
-            lsp_types::notification::Progress::METHOD.to_owned(),
-            lsp_types::ProgressParams {
-                token: token.clone(),
-                value: report,
-            },
-        );
+        if !event_fields.contains_key("kind") {
+            event_fields.insert("kind".to_owned(), Value::String("progress".to_owned()));
+        }
 
-        let _err = self.sender.send(notification.into());
-    }
-
-    fn on_close(&self, id: span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        let span = ctx.span(&id).unwrap();
-        let extensions = span.extensions();
-        let Some(storage) = extensions.get::<ProgressStorage>() else {
-            return;
+        let out = Out {
+            event_fields: &event_fields,
+            span_fields: &span_fields,
         };
-        let token = &storage.token;
-
-        let end = lsp_types::WorkDoneProgressEnd {
-            message: Some(String::from("resolving targets")),
-        };
-
-        let report: lsp_types::ProgressParamsValue =
-            lsp_types::ProgressParamsValue::WorkDone(WorkDoneProgress::End(end));
-
-        let notification = lsp_server::Notification::new(
-            lsp_types::notification::Progress::METHOD.to_owned(),
-            lsp_types::ProgressParams {
-                token: token.clone(),
-                value: report,
-            },
-        );
-
-        let _err = self.sender.send(notification.into());
+        let out = serde_json::to_string(&out).unwrap();
+        let mut writer = self.writer.make_writer();
+        writeln!(writer, "{}", out).expect("unable to write");
     }
 }
 
-struct StringVisitor<'a>(&'a mut BTreeMap<String, String>);
+struct JsonVisitor<'a>(&'a mut FxHashMap<String, serde_json::Value>);
 
-impl<'a> tracing::field::Visit for StringVisitor<'a> {
+impl<'a> tracing::field::Visit for JsonVisitor<'a> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        self.0.insert(field.name().to_owned(), String::from(value));
+        let value: String = if field.name() == "project" {
+            serde_json::from_str(value).unwrap()
+        } else {
+            String::from(value)
+        };
+        self.0
+            .insert(field.name().to_owned(), serde_json::Value::from(value));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_owned(), format!("{:?}", value));
+        self.0.insert(
+            field.name().to_owned(),
+            serde_json::Value::from(format!("{:?}", value)),
+        );
     }
 }

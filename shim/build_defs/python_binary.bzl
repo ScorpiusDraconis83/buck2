@@ -7,4 +7,6 @@
 
 def python_binary(srcs = [], **kwargs):
     _unused = srcs  # @unused
+
+    # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
     native.python_binary(**kwargs)

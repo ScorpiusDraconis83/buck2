@@ -7,7 +7,6 @@
  * of this source tree.
  */
 
-use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::ops::ControlFlow;
@@ -17,7 +16,6 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_common::file_ops::FileDigestConfig;
 use buck2_common::liveliness_observer::LivelinessObserver;
@@ -31,6 +29,8 @@ use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::tag_error;
 use buck2_core::tag_result;
+use buck2_error::buck2_error;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::get_dispatcher_opt;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -67,8 +67,8 @@ use buck2_forkserver::run::gather_output;
 use buck2_forkserver::run::maybe_absolutize_exe;
 use buck2_forkserver::run::timeout_into_cancellation;
 use buck2_forkserver::run::GatherOutputStatus;
-use buck2_futures::cancellable_future::CancellationObserver;
 use buck2_futures::cancellation::CancellationContext;
+use buck2_futures::cancellation::CancellationObserver;
 use buck2_util::process::background_command;
 use derive_more::From;
 use dupe::Dupe;
@@ -87,6 +87,7 @@ use crate::executors::worker::WorkerHandle;
 use crate::executors::worker::WorkerPool;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum LocalExecutionError {
     #[error("Args list was empty")]
     NoArgs,
@@ -140,20 +141,18 @@ impl LocalExecutor {
         exe: &'a str,
         args: impl IntoIterator<Item = impl AsRef<OsStr> + Send> + Send + 'a,
         env: impl IntoIterator<Item = (impl AsRef<OsStr> + Send, impl AsRef<OsStr> + Send)> + Send + 'a,
-        working_directory: Option<&'a ProjectRelativePath>,
+        working_directory: &'a ProjectRelativePath,
         timeout: Option<Duration>,
         env_inheritance: Option<&'a EnvironmentInheritance>,
         liveliness_observer: impl LivelinessObserver + 'static,
         disable_miniperf: bool,
+        action_digest: &'a str,
     ) -> impl futures::future::Future<
-        Output = anyhow::Result<(GatherOutputStatus, Vec<u8>, Vec<u8>)>,
+        Output = buck2_error::Result<(GatherOutputStatus, Vec<u8>, Vec<u8>)>,
     > + Send
     + 'a {
         async move {
-            let working_directory = match working_directory {
-                Some(d) => Cow::Owned(self.root.join(d)),
-                None => Cow::Borrowed(&self.root),
-            };
+            let working_directory = self.root.join_cow(working_directory);
 
             match &self.forkserver {
                 Some(forkserver) => {
@@ -169,14 +168,18 @@ impl LocalExecutor {
                             env_inheritance,
                             liveliness_observer,
                             self.knobs.enable_miniperf && !disable_miniperf,
+                            action_digest,
                         )
                         .await
                     }
 
                     #[cfg(not(unix))]
                     {
-                        let _unused = (forkserver, disable_miniperf);
-                        Err(anyhow::anyhow!("Forkserver is not supported off-UNIX"))
+                        let _unused = (forkserver, disable_miniperf, action_digest);
+                        Err(buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "Forkserver is not supported off-UNIX"
+                        ))
                     }
                 }
 
@@ -195,14 +198,16 @@ impl LocalExecutor {
 
                     let alive = liveliness_observer
                         .while_alive()
-                        .map(|()| anyhow::Ok(GatherOutputStatus::Cancelled));
+                        .map(|()| Ok(GatherOutputStatus::Cancelled));
 
                     let cancellation =
                         select(timeout.boxed(), alive.boxed()).map(|r| r.factor_first().0);
 
                     gather_output(cmd, cancellation).await
                 }
-                .with_context(|| format!("Failed to gather output from command: {}", exe)),
+                .with_buck_error_context(|| {
+                    format!("Failed to gather output from command: {}", exe)
+                }),
             }
         }
     }
@@ -213,7 +218,7 @@ impl LocalExecutor {
         request: &CommandExecutionRequest,
         manager: CommandExecutionManager,
         cancellation: CancellationObserver,
-        cancellations: &CancellationContext<'_>,
+        cancellations: &CancellationContext,
         digest_config: DigestConfig,
         local_resource_holders: &[LocalResourceHolder],
     ) -> CommandExecutionResult {
@@ -222,7 +227,7 @@ impl LocalExecutor {
             return manager.error("no_args", LocalExecutionError::NoArgs);
         }
 
-        let (scratch_path, input_materialization_duration) = match executor_stage_async(
+        let executor_stage_result = executor_stage_async(
             buck2_data::LocalStage {
                 stage: Some(buck2_data::LocalMaterializeInputs {}.into()),
             },
@@ -239,12 +244,14 @@ impl LocalExecutor {
                         // output from previous run of that action could actually be used as the
                         // input during current run (e.g. extra output which is an incremental state describing the actual output).
                         if !request.outputs_cleanup {
-                            materialize_build_outputs_from_previous_run(
+                            materialize_build_outputs(
                                 &self.artifact_fs,
                                 self.materializer.as_ref(),
                                 request,
+                                FileToMaterialize::All,
                             )
-                            .await
+                            .await?;
+                            buck2_error::Ok(())
                         } else {
                             Ok(())
                         }
@@ -255,11 +262,13 @@ impl LocalExecutor {
                 let scratch_path = r1?.scratch;
                 r2?;
 
-                anyhow::Ok((scratch_path, start.elapsed()))
+                buck2_error::Ok((scratch_path, start.elapsed()))
             },
         )
-        .await
-        {
+        .boxed()
+        .await;
+
+        let (scratch_path, input_materialization_duration) = match executor_stage_result {
             Ok((scratch_path, input_materialization_duration)) => {
                 (scratch_path, input_materialization_duration)
             }
@@ -267,7 +276,7 @@ impl LocalExecutor {
         };
 
         // TODO: Release here.
-        let manager = manager.claim().await;
+        let manager = manager.claim().boxed().await;
 
         let scratch_path = &scratch_path.0;
 
@@ -284,11 +293,12 @@ impl LocalExecutor {
                     cancellations,
                 )
                 .await
-                .context("Error creating output directories")?;
+                .buck_error_context("Error creating output directories")?;
 
-                anyhow::Ok(())
+                buck2_error::Ok(())
             },
         )
+        .boxed()
         .await
         {
             return manager.error("prepare_output_dirs_failed", e);
@@ -310,7 +320,8 @@ impl LocalExecutor {
                 if scratch_path_abs.as_os_str().len() > MAX_PATH {
                     return manager.error(
                         "scratch_dir_too_long",
-                        anyhow::anyhow!(
+                        buck2_error!(
+                            buck2_error::ErrorTag::Environment,
                             "Scratch directory path is longer than MAX_PATH: {}",
                             scratch_path_abs
                         ),
@@ -343,7 +354,10 @@ impl LocalExecutor {
         let dispatcher = match get_dispatcher_opt() {
             Some(dispatcher) => dispatcher,
             None => {
-                return manager.error("no_dispatcher", anyhow::anyhow!("No dispatcher available"));
+                return manager.error(
+                    "no_dispatcher",
+                    buck2_error!(buck2_error::ErrorTag::Tier0, "No dispatcher available"),
+                );
             }
         };
         let build_id: &str = &dispatcher.trace_id().to_string();
@@ -368,9 +382,12 @@ impl LocalExecutor {
                     StrOrOsStr::from(build_id),
                 )))
         };
-        let liveliness_observer = manager.liveliness_observer.dupe().and(cancellation);
+        let liveliness_observer = manager.inner.liveliness_observer.dupe().and(cancellation);
 
-        let (worker, manager) = self.initialize_worker(request, manager, dispatcher).await?;
+        let (worker, manager) = self
+            .initialize_worker(request, manager, dispatcher)
+            .boxed()
+            .await?;
 
         let execution_kind = match worker {
             None => CommandExecutionKind::Local {
@@ -425,7 +442,9 @@ impl LocalExecutor {
                         .into_iter()
                         .map(|(k, v)| (OsString::from(k), v.to_owned()))
                         .collect();
-                    Ok(worker.exec_cmd(request.args(), env).await)
+                    Ok(worker
+                        .exec_cmd(request.args(), env, request.timeout())
+                        .await)
                 } else {
                     self.exec(
                         &args[0],
@@ -436,13 +455,14 @@ impl LocalExecutor {
                         request.local_environment_inheritance(),
                         liveliness_observer,
                         request.disable_miniperf(),
+                        &action_digest.to_string(),
                     )
                     .await
                 };
 
                 let execution_time = execution_start.elapsed();
 
-                let timing = CommandExecutionMetadata {
+                let timing = Box::new(CommandExecutionMetadata {
                     wall_time: execution_time,
                     execution_time,
                     start_time,
@@ -451,11 +471,12 @@ impl LocalExecutor {
                     hashing_duration: Duration::ZERO, // We fill hashing info in later if available.
                     hashed_artifacts_count: 0,
                     queue_duration: None,
-                };
+                });
 
                 (timing, r)
             },
         )
+        .boxed()
         .await;
 
         let (status, stdout, stderr) = match res {
@@ -474,6 +495,7 @@ impl LocalExecutor {
             } => {
                 let (outputs, hashing_time) = match self
                     .calculate_and_declare_output_values(request, digest_config)
+                    .boxed()
                     .await
                 {
                     Ok((output_values, hashing_time)) => (output_values, hashing_time),
@@ -487,7 +509,7 @@ impl LocalExecutor {
                 timing.hashed_artifacts_count = hashing_time.hashed_artifacts_count;
 
                 if exit_code == 0 {
-                    manager.success(execution_kind, outputs, std_streams, timing)
+                    manager.success(execution_kind, outputs, std_streams, *timing)
                 } else {
                     let manager = check_inputs(
                         manager,
@@ -495,6 +517,7 @@ impl LocalExecutor {
                         self.blocking_executor.as_ref(),
                         request,
                     )
+                    .boxed()
                     .await?;
 
                     manager.failure(
@@ -502,7 +525,8 @@ impl LocalExecutor {
                         outputs,
                         std_streams,
                         Some(exit_code),
-                        timing,
+                        *timing,
+                        None,
                     )
                 }
             }
@@ -513,25 +537,40 @@ impl LocalExecutor {
                     self.blocking_executor.as_ref(),
                     request,
                 )
+                .boxed()
                 .await?;
 
                 // We are lying about the std streams here because we don't have a good mechanism
                 // to report that the command does not exist, and because that's exactly what RE
                 // also does when this happens.
-                manager.failure(
-                    execution_kind,
-                    Default::default(),
-                    CommandStdStreams::Local {
-                        stdout: Default::default(),
-                        stderr: format!("Spawning executable `{}` failed: {}", args[0], reason)
-                            .into_bytes(),
-                    },
-                    None,
-                    timing,
-                )
+                if matches!(execution_kind, CommandExecutionKind::Local { .. }) {
+                    manager.failure(
+                        execution_kind,
+                        Default::default(),
+                        CommandStdStreams::Local {
+                            stdout: Default::default(),
+                            stderr: format!("Spawning executable `{}` failed: {}", args[0], reason)
+                                .into_bytes(),
+                        },
+                        None,
+                        *timing,
+                        None,
+                    )
+                } else {
+                    // Workers executing tests often employ a health check to avoid producing
+                    // invalid test results. Differentiating a worker spawn failure from a normal
+                    // spawn or execution failure allows the test runner to handle this case
+                    // accordingly.
+                    manager.worker_failure(
+                        execution_kind,
+                        // Could probably use a better error message.
+                        format!("Spawning executable `{}` failed: {}", args[0], reason),
+                        *timing,
+                    )
+                }
             }
             GatherOutputStatus::TimedOut(duration) => {
-                manager.timeout(execution_kind, duration, std_streams, timing)
+                manager.timeout(execution_kind, duration, std_streams, *timing, None)
             }
             GatherOutputStatus::Cancelled => manager.cancel_claim(),
         }
@@ -541,7 +580,7 @@ impl LocalExecutor {
         &self,
         request: &CommandExecutionRequest,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<(IndexMap<CommandExecutionOutput, ArtifactValue>, HashingInfo)> {
+    ) -> buck2_error::Result<(IndexMap<CommandExecutionOutput, ArtifactValue>, HashingInfo)> {
         let mut builder = inputs_directory(request.inputs(), &self.artifact_fs)?;
 
         // Read outputs from disk and add them to the builder
@@ -555,9 +594,10 @@ impl LocalExecutor {
                 abspath,
                 FileDigestConfig::build(digest_config.cas_digest_config()),
                 self.blocking_executor.as_ref(),
+                self.artifact_fs.fs().root(),
             )
             .await
-            .with_context(|| format!("collecting output {:?}", path))?;
+            .with_buck_error_context(|| format!("collecting output {:?}", path))?;
             total_hashing_time += hashing_info.hashing_duration;
             total_hashed_outputs += hashing_info.hashed_artifacts_count;
             if let Some(entry) = entry {
@@ -729,11 +769,8 @@ impl PreparedCommandExecutor for LocalExecutor {
         } = command;
 
         let local_resource_holders = executor_stage_async(
-            {
-                let a = buck2_data::AcquireLocalResource {};
-                buck2_data::LocalStage {
-                    stage: Some(a.into()),
-                }
+            buck2_data::LocalStage {
+                stage: Some(buck2_data::AcquireLocalResource {}.into()),
             },
             async move {
                 let mut holders = vec![];
@@ -821,7 +858,7 @@ pub async fn materialize_inputs(
     artifact_fs: &ArtifactFs,
     materializer: &dyn Materializer,
     request: &CommandExecutionRequest,
-) -> anyhow::Result<MaterializedInputPaths> {
+) -> buck2_error::Result<MaterializedInputPaths> {
     let mut paths = vec![];
     let mut scratch = ScratchPath(None);
 
@@ -829,7 +866,7 @@ pub async fn materialize_inputs(
         match input {
             CommandExecutionInput::Artifact(group) => {
                 for (artifact, _) in group.iter() {
-                    if !artifact.is_source() {
+                    if artifact.requires_materialization(artifact_fs) {
                         paths.push(artifact.resolve_path(artifact_fs)?);
                     }
                 }
@@ -859,17 +896,18 @@ pub async fn materialize_inputs(
     while let Some(res) = stream.next().await {
         match res {
             Ok(()) => {}
-            Err(MaterializationError::NotFound { path, info, debug }) => {
-                let corrupted = info.origin.guaranteed_by_action_cache();
+            Err(MaterializationError::NotFound { source }) => {
+                let corrupted = source.info.origin.guaranteed_by_action_cache();
 
                 return Err(tag_error!(
                     "cas_missing_fatal",
-                    MaterializationError::NotFound { path, info, debug }.into(),
+                    MaterializationError::NotFound { source }.into(),
                     quiet: true,
                     task: false,
                     daemon_in_memory_state_is_corrupted: true,
                     action_cache_is_corrupted: corrupted
-                ));
+                )
+                .into());
             }
             Err(e) => {
                 return Err(e.into());
@@ -895,7 +933,7 @@ async fn check_inputs(
                 match input {
                     CommandExecutionInput::Artifact(group) => {
                         for (artifact, _) in group.iter() {
-                            if !artifact.is_source() {
+                            if artifact.requires_materialization(artifact_fs) {
                                 let path = artifact.resolve_path(artifact_fs)?;
                                 let abs_path = artifact_fs.fs().resolve(&path);
 
@@ -904,7 +942,7 @@ async fn check_inputs(
                                 // want to propagate it.
                                 let _ignored = tag_result!(
                                     "missing_local_inputs",
-                                    fs_util::symlink_metadata(&abs_path).context("Missing input"),
+                                    fs_util::symlink_metadata(&abs_path).buck_error_context("Missing input").map_err(|e| e.into()),
                                     quiet: true,
                                     task: false,
                                     daemon_materializer_state_is_corrupted: true
@@ -931,15 +969,23 @@ async fn check_inputs(
     }
 }
 
-/// Materialize build outputs from the previous run of the same command.
-/// Useful when executing incremental actions first remotely and then locally.
+pub enum FileToMaterialize {
+    All,
+    Match(String),
+}
+
+/// Materialize all output artifact for CommandExecutionRequest.
+///
+/// Note that the outputs could be from the previous run of the same command if cleanup on the action was not performed.
+/// The above is useful when executing incremental actions first remotely and then locally.
 /// In that case output from remote execution which is incremental state should be materialized prior local execution.
 /// Such incremental state in fact serves as the input while being output as well.
-pub async fn materialize_build_outputs_from_previous_run(
+pub async fn materialize_build_outputs(
     artifact_fs: &ArtifactFs,
     materializer: &dyn Materializer,
     request: &CommandExecutionRequest,
-) -> anyhow::Result<()> {
+    files_to_materialize: FileToMaterialize,
+) -> buck2_error::Result<Vec<ProjectRelativePathBuf>> {
     let mut paths = vec![];
 
     for output in request.outputs() {
@@ -947,14 +993,21 @@ pub async fn materialize_build_outputs_from_previous_run(
             CommandExecutionOutputRef::BuildArtifact {
                 path,
                 output_type: _,
-            } => {
-                paths.push(artifact_fs.resolve_build(path));
-            }
+            } => match files_to_materialize {
+                FileToMaterialize::All => paths.push(artifact_fs.resolve_build(path)),
+                FileToMaterialize::Match(ref pattern) => {
+                    if path.path().as_str().contains(pattern) {
+                        paths.push(artifact_fs.resolve_build(path));
+                    }
+                }
+            },
             CommandExecutionOutputRef::TestPath { path: _, create: _ } => {}
         }
     }
 
-    materializer.ensure_materialized(paths).await
+    materializer.ensure_materialized(paths.clone()).await?;
+
+    Ok(paths)
 }
 
 /// Create any output dirs requested by the command. Note that this makes no effort to delete
@@ -965,8 +1018,8 @@ pub async fn create_output_dirs(
     request: &CommandExecutionRequest,
     materializer: Arc<dyn Materializer>,
     blocking_executor: Arc<dyn BlockingExecutor>,
-    cancellations: &CancellationContext<'_>,
-) -> anyhow::Result<()> {
+    cancellations: &CancellationContext,
+) -> buck2_error::Result<()> {
     let outputs: Vec<_> = request
         .outputs()
         .map(|output| output.resolve(artifact_fs))
@@ -982,23 +1035,15 @@ pub async fn create_output_dirs(
 
     if request.outputs_cleanup {
         // TODO(scottcao): Move this deletion logic into materializer itself.
-        // Use Eden's clean up API if possible, it is significantly faster on Eden compared with
-        // the native method as the API does not load and materialize files or folders
-        if let Some(eden_buck_out) = materializer.eden_buck_out() {
-            eden_buck_out
-                .remove_paths_recursive(artifact_fs.fs(), output_paths, cancellations)
-                .await?;
-        } else {
-            blocking_executor
-                .execute_io(
-                    Box::new(CleanOutputPaths {
-                        paths: output_paths,
-                    }),
-                    cancellations,
-                )
-                .await
-                .context("Failed to cleanup output directory")?;
-        }
+        blocking_executor
+            .execute_io(
+                Box::new(CleanOutputPaths {
+                    paths: output_paths,
+                }),
+                cancellations,
+            )
+            .await
+            .buck_error_context("Failed to cleanup output directory")?;
     }
 
     let project_fs = artifact_fs.fs();
@@ -1074,8 +1119,6 @@ impl EnvironmentBuilder for Command {
 mod unix {
     use std::os::unix::ffi::OsStrExt;
 
-    use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
-
     use super::*;
 
     pub async fn exec_via_forkserver(
@@ -1088,7 +1131,8 @@ mod unix {
         env_inheritance: Option<&EnvironmentInheritance>,
         liveliness_observer: impl LivelinessObserver + 'static,
         enable_miniperf: bool,
-    ) -> anyhow::Result<(GatherOutputStatus, Vec<u8>, Vec<u8>)> {
+        action_digest: &str,
+    ) -> buck2_error::Result<(GatherOutputStatus, Vec<u8>, Vec<u8>)> {
         let exe = exe.as_ref();
 
         let mut req = buck2_forkserver_proto::CommandRequest {
@@ -1105,6 +1149,7 @@ mod unix {
             enable_miniperf,
             std_redirects: None,
             graceful_shutdown_timeout_s: None,
+            action_digest: Some(action_digest.to_owned()),
         };
         apply_local_execution_environment(&mut req, working_directory, env, env_inheritance);
         forkserver
@@ -1160,104 +1205,19 @@ mod unix {
 mod tests {
     use std::collections::HashMap;
     use std::str;
-    use std::sync::Arc;
-    use std::time::Instant;
 
     use buck2_common::liveliness_observer::NoopLivelinessObserver;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::name::CellName;
     use buck2_core::cells::CellResolver;
-    use buck2_core::fs::artifact_path_resolver::ArtifactFs;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
-    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
     use buck2_execute::materialize::nodisk::NoDiskMaterializer;
     use host_sharing::HostSharingStrategy;
 
     use super::*;
-
-    #[tokio::test]
-    async fn test_gather_output() -> anyhow::Result<()> {
-        let mut cmd = if cfg!(windows) {
-            background_command("powershell")
-        } else {
-            background_command("sh")
-        };
-        cmd.args(["-c", "echo hello"]);
-
-        let (status, stdout, stderr) = gather_output(cmd, futures::future::pending()).await?;
-        assert!(matches!(status, GatherOutputStatus::Finished{ exit_code, .. } if exit_code == 0));
-        assert_eq!(str::from_utf8(&stdout)?.trim(), "hello");
-        assert_eq!(stderr, b"");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_gather_does_not_wait_for_children() -> anyhow::Result<()> {
-        // If we wait for sleep, this will time out.
-        let mut cmd = if cfg!(windows) {
-            background_command("powershell")
-        } else {
-            background_command("sh")
-        };
-        if cfg!(windows) {
-            cmd.args([
-                "-c",
-                "Start-Job -ScriptBlock {sleep 10} | Out-Null; echo hello",
-            ]);
-        } else {
-            cmd.args(["-c", "(sleep 10 &) && echo hello"]);
-        }
-
-        let timeout = if cfg!(windows) { 9 } else { 1 };
-        let (status, stdout, stderr) = gather_output(
-            cmd,
-            timeout_into_cancellation(Some(Duration::from_secs(timeout))),
-        )
-        .await?;
-        assert!(
-            matches!(status, GatherOutputStatus::Finished { exit_code, .. } if exit_code == 0),
-            "status: {:?}",
-            status
-        );
-        assert_eq!(str::from_utf8(&stdout)?.trim(), "hello");
-        assert_eq!(stderr, b"");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_gather_output_timeout() -> anyhow::Result<()> {
-        let now = Instant::now();
-
-        let mut cmd = if cfg!(windows) {
-            background_command("powershell")
-        } else {
-            background_command("sh")
-        };
-        cmd.args(["-c", "echo hello; sleep 10; echo bye"]);
-
-        let timeout = if cfg!(windows) { 5 } else { 1 };
-        let (status, stdout, stderr) = gather_output(
-            cmd,
-            timeout_into_cancellation(Some(Duration::from_secs(timeout))),
-        )
-        .await?;
-        assert!(
-            matches!(status, GatherOutputStatus::TimedOut(..)),
-            "status: {:?}",
-            status
-        );
-        assert_eq!(str::from_utf8(&stdout)?.trim(), "hello");
-        assert_eq!(stderr, b"");
-
-        assert!(now.elapsed() < Duration::from_secs(9)); // Lots of leeway here.
-
-        Ok(())
-    }
 
     fn artifact_fs(project_fs: ProjectRoot) -> ArtifactFs {
         ArtifactFs::new(
@@ -1270,7 +1230,7 @@ mod tests {
         )
     }
 
-    fn test_executor() -> anyhow::Result<(LocalExecutor, AbsNormPathBuf, ProjectRootTemp)> {
+    fn test_executor() -> buck2_error::Result<(LocalExecutor, AbsNormPathBuf, ProjectRootTemp)> {
         let temp = ProjectRootTemp::new().unwrap();
         let project_fs = temp.path();
         let artifact_fs = artifact_fs(project_fs.dupe());
@@ -1295,7 +1255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exec_cmd_environment() -> anyhow::Result<()> {
+    async fn test_exec_cmd_environment() -> buck2_error::Result<()> {
         let (executor, root, _tmpdir) = test_executor()?;
 
         let interpreter = if cfg!(windows) { "powershell" } else { "sh" };
@@ -1304,16 +1264,17 @@ mod tests {
                 interpreter,
                 ["-c", "echo $PWD; pwd"],
                 &HashMap::<String, String>::default(),
-                None,
+                ProjectRelativePath::empty(),
                 None,
                 None,
                 NoopLivelinessObserver::create(),
                 false,
+                "",
             )
             .await?;
         assert!(matches!(status, GatherOutputStatus::Finished { exit_code, .. } if exit_code == 0));
 
-        let stdout = std::str::from_utf8(&stdout).context("Invalid stdout")?;
+        let stdout = std::str::from_utf8(&stdout).buck_error_context("Invalid stdout")?;
 
         if cfg!(windows) {
             let lines: Vec<&str> = stdout.split("\r\n").collect();
@@ -1330,7 +1291,7 @@ mod tests {
 
     #[cfg(unix)] // TODO: something similar on Windows: T123279320
     #[tokio::test]
-    async fn test_exec_cmd_environment_filtering() -> anyhow::Result<()> {
+    async fn test_exec_cmd_environment_filtering() -> buck2_error::Result<()> {
         use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
 
         let (executor, _root, _tmpdir) = test_executor()?;
@@ -1340,11 +1301,12 @@ mod tests {
                 "sh",
                 ["-c", "echo $USER"],
                 &HashMap::<String, String>::default(),
-                None,
+                ProjectRelativePath::empty(),
                 None,
                 Some(&EnvironmentInheritance::empty()),
                 NoopLivelinessObserver::create(),
                 false,
+                "",
             )
             .await?;
         assert!(matches!(status, GatherOutputStatus::Finished { exit_code, .. } if exit_code == 0));

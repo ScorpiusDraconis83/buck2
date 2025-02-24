@@ -7,9 +7,12 @@
  * of this source tree.
  */
 
+use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::ops::FromResidual;
 use std::ops::Try;
+
+use buck2_error::conversion::from_any_with_tag;
 
 use crate::exit_result::ExitResult;
 
@@ -58,8 +61,35 @@ impl FromResidual<CommandFailure> for ExitResult {
     }
 }
 
+impl<T> FromResidual<CommandFailure> for Result<T, ExitResult> {
+    fn from_residual(residual: CommandFailure) -> Self {
+        Err(residual.0)
+    }
+}
+
 impl<R> FromResidual<CommandFailure> for CommandOutcome<R> {
     fn from_residual(residual: CommandFailure) -> Self {
         Self::Failure(residual.0)
+    }
+}
+
+impl<R, E> FromResidual<Result<Infallible, E>> for CommandOutcome<R>
+where
+    E: Into<buck2_error::Error>,
+{
+    fn from_residual(result: Result<Infallible, E>) -> Self {
+        match result {
+            Err(err) => Self::Failure(ExitResult::err(err.into())),
+        }
+    }
+}
+
+impl<T> FromResidual<CommandFailure> for buck2_error::Result<T> {
+    fn from_residual(residual: CommandFailure) -> buck2_error::Result<T> {
+        // Err(residual.0.in)
+        Err(from_any_with_tag(
+            residual.0,
+            buck2_error::ErrorTag::ActionCommandFailure,
+        ))
     }
 }

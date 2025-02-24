@@ -11,26 +11,23 @@ use async_trait::async_trait;
 use buck2_cli_proto::InstallRequest;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
 use buck2_client_ctx::command_outcome::CommandOutcome;
+use buck2_client_ctx::common::build::CommonBuildOptions;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
-use buck2_client_ctx::common::CommonBuildOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
-use gazebo::prelude::*;
 
 #[derive(Debug, clap::Parser)]
 #[clap(name = "install", about = "Build and install an application")]
 pub struct InstallCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
-    #[clap(flatten)]
-    build_opts: CommonBuildOptions,
-
     #[clap(
         long,
         name = "installer-debug",
@@ -41,7 +38,7 @@ pub struct InstallCommand {
     #[clap(flatten)]
     android_install_opts: AndroidInstallOptions,
 
-    #[clap(name = "TARGET", help = "Target to build and install")]
+    #[clap(name = "TARGET", help = "Target to build and install", value_hint = clap::ValueHint::Other)]
     patterns: Vec<String>,
 
     #[clap(
@@ -50,6 +47,15 @@ pub struct InstallCommand {
         raw = true
     )]
     extra_run_args: Vec<String>,
+
+    #[clap(flatten)]
+    build_opts: CommonBuildOptions,
+
+    #[clap(flatten)]
+    target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 /// Defines install options for Android that exist only for compatibility
@@ -134,8 +140,9 @@ impl StreamingCommand for InstallCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let context = ctx.client_context(matches, &self)?;
 
@@ -179,15 +186,14 @@ impl StreamingCommand for InstallCommand {
             .install(
                 InstallRequest {
                     context: Some(context),
-                    target_patterns: self.patterns.map(|pat| buck2_data::TargetPattern {
-                        value: pat.to_owned(),
-                    }),
+                    target_patterns: self.patterns.clone(),
+                    target_cfg: Some(self.target_cfg.target_cfg()),
                     build_opts: Some(self.build_opts.to_proto()),
                     installer_run_args: extra_run_args,
                     installer_debug: self.installer_debug,
                 },
-                ctx.stdin()
-                    .console_interaction_stream(&self.common_opts.console_opts),
+                events_ctx,
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 &mut NoPartialResultHandler,
             )
             .await?;
@@ -195,7 +201,11 @@ impl StreamingCommand for InstallCommand {
 
         match response {
             CommandOutcome::Success(_) => {
-                console.print_success("INSTALL SUCCEEDED")?;
+                if self.patterns.is_empty() {
+                    console.print_warning("NO BUILD TARGET PATTERNS SPECIFIED")?;
+                } else {
+                    console.print_success("INSTALL SUCCEEDED")?;
+                }
                 ExitResult::success()
             }
             CommandOutcome::Failure(exit_result) => {
@@ -209,11 +219,15 @@ impl StreamingCommand for InstallCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }

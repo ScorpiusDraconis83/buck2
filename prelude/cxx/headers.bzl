@@ -6,6 +6,8 @@
 # of this source tree.
 
 load("@prelude//:paths.bzl", "paths")
+load("@prelude//cxx:cxx_toolchain_types.bzl", "LinkerType")
+load("@prelude//cxx:cxx_utility.bzl", "cxx_attrs_get_allow_cache_upload")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:lazy.bzl", "lazy")
 load("@prelude//utils:utils.bzl", "from_named_set", "map_val", "value_or")
@@ -32,6 +34,13 @@ load(":platform.bzl", "cxx_by_platform")
 # 2) header from the dict should be included as NAMESPACE/DICT_KEY:
 # #include "namespace/wfh/baz.h"
 CxxHeadersNaming = enum("apple", "regular")
+
+# Modes supporting implementing the `raw_headers` parameter of C++ rules using
+# symlink trees and/or header maps through `headers`.
+RawHeadersAsHeadersMode = enum(
+    "enabled",
+    "disabled",
+)
 
 # Modes supporting implementing the `headers` parameter of C++ rules using raw
 # headers instead of e.g. symlink trees.
@@ -66,7 +75,7 @@ HeaderStyle = enum(
 Headers = record(
     include_path = field(cmd_args),
     # NOTE(agallagher): Used for module hack replacement.
-    symlink_tree = field([Artifact, None], None),
+    symlink_tree = field(Artifact | None, None),
     # args that map symlinked private headers to source path
     file_prefix_args = field([cmd_args, None], None),
 )
@@ -110,15 +119,16 @@ CPrecompiledHeaderInfo = provider(fields = {
 def cxx_attr_header_namespace(ctx: AnalysisContext) -> str:
     return value_or(ctx.attrs.header_namespace, ctx.label.package)
 
-def cxx_attr_exported_headers(ctx: AnalysisContext, headers_layout: CxxHeadersLayout) -> list[CHeader]:
-    headers = _get_attr_headers(ctx.attrs.exported_headers, headers_layout.namespace, headers_layout.naming)
-    platform_headers = _get_attr_headers(_headers_by_platform(ctx, ctx.attrs.exported_platform_headers), headers_layout.namespace, headers_layout.naming)
+def cxx_attr_headers_list(ctx: AnalysisContext, headers: typing.Any, platform_headers: typing.Any, headers_layout: CxxHeadersLayout) -> list[CHeader]:
+    headers = _get_attr_headers(headers, headers_layout.namespace, headers_layout.naming)
+    platform_headers = _get_attr_headers(_headers_by_platform(ctx, platform_headers), headers_layout.namespace, headers_layout.naming)
     return headers + platform_headers
 
+def cxx_attr_exported_headers(ctx: AnalysisContext, headers_layout: CxxHeadersLayout) -> list[CHeader]:
+    return cxx_attr_headers_list(ctx, ctx.attrs.exported_headers, ctx.attrs.exported_platform_headers, headers_layout)
+
 def cxx_attr_headers(ctx: AnalysisContext, headers_layout: CxxHeadersLayout) -> list[CHeader]:
-    headers = _get_attr_headers(ctx.attrs.headers, headers_layout.namespace, headers_layout.naming)
-    platform_headers = _get_attr_headers(_headers_by_platform(ctx, ctx.attrs.platform_headers), headers_layout.namespace, headers_layout.naming)
-    return headers + platform_headers
+    return cxx_attr_headers_list(ctx, ctx.attrs.headers, ctx.attrs.platform_headers, headers_layout)
 
 def cxx_get_regular_cxx_headers_layout(ctx: AnalysisContext) -> CxxHeadersLayout:
     namespace = cxx_attr_header_namespace(ctx)
@@ -126,6 +136,41 @@ def cxx_get_regular_cxx_headers_layout(ctx: AnalysisContext) -> CxxHeadersLayout
 
 def cxx_attr_exported_header_style(ctx: AnalysisContext) -> HeaderStyle:
     return HeaderStyle(ctx.attrs.exported_header_style)
+
+def _concat_inc_dir_with_raw_header(namespace, inc_dir, header) -> list[str] | None:
+    namespace_parts = namespace.split("/")
+    inc_dir_parts = inc_dir.split("/")
+    header_parts = header.short_path.split("/")
+
+    for part in inc_dir_parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if not namespace_parts:
+                # Too many .., would set include root out of cell
+                return None
+            header_parts = [namespace_parts.pop()] + header_parts
+        elif part == header_parts[0]:
+            header_parts = header_parts[1:]
+        else:
+            # Header not accessible under this folder
+            return None
+    return header_parts
+
+def as_headers(
+        ctx: AnalysisContext,
+        raw_headers: list[Artifact],
+        include_directories: list[str]) -> list[CHeader]:
+    headers = []
+    base_namespace = ctx.label.package
+    for header in raw_headers:
+        for inc_dir in include_directories:
+            inc_dir = paths.normalize(inc_dir)
+            mapped_header = _concat_inc_dir_with_raw_header(base_namespace, inc_dir, header)
+            if mapped_header:
+                headers.append(CHeader(artifact = header, name = "/".join(mapped_header), namespace = "", named = True))
+
+    return headers
 
 def _get_attr_headers(xs: typing.Any, namespace: str, naming: CxxHeadersNaming) -> list[CHeader]:
     if type(xs) == type([]):
@@ -181,7 +226,7 @@ def _header_mode(ctx: AnalysisContext) -> HeaderMode:
 
     return toolchain_header_mode
 
-def prepare_headers(ctx: AnalysisContext, srcs: dict[str, Artifact], name: str, project_root_file: [Artifact, None]) -> [Headers, None]:
+def prepare_headers(ctx: AnalysisContext, srcs: dict[str, Artifact], name: str) -> [Headers, None]:
     """
     Prepare all the headers we want to use, depending on the header_mode
     set on the target's toolchain.
@@ -203,23 +248,23 @@ def prepare_headers(ctx: AnalysisContext, srcs: dict[str, Artifact], name: str, 
         lazy.is_any(lambda n: paths.basename(n) == "module.modulemap", srcs.keys())):
         header_mode = HeaderMode("symlink_tree_only")
 
-    output_name = name + "-abs" if project_root_file else name
+    output_name = name
 
     if header_mode == HeaderMode("header_map_only"):
         headers = {h: (a, "{}") for h, a in srcs.items()}
-        hmap = _mk_hmap(ctx, output_name, headers, project_root_file)
+        hmap = _mk_hmap(ctx, output_name, headers)
         return Headers(
-            include_path = cmd_args(hmap).hidden(srcs.values()),
+            include_path = cmd_args(hmap, hidden = srcs.values()),
         )
     symlink_dir = ctx.actions.symlinked_dir(output_name, _normalize_header_srcs(srcs))
     if header_mode == HeaderMode("symlink_tree_only"):
         return Headers(include_path = cmd_args(symlink_dir), symlink_tree = symlink_dir)
     if header_mode == HeaderMode("symlink_tree_with_header_map"):
         headers = {h: (symlink_dir, "{}/" + h) for h in srcs}
-        hmap = _mk_hmap(ctx, output_name, headers, project_root_file)
+        hmap = _mk_hmap(ctx, output_name, headers)
         file_prefix_args = _get_debug_prefix_args(ctx, symlink_dir)
         return Headers(
-            include_path = cmd_args(hmap).hidden(symlink_dir),
+            include_path = cmd_args(hmap, hidden = symlink_dir),
             symlink_tree = symlink_dir,
             file_prefix_args = file_prefix_args,
         )
@@ -332,31 +377,31 @@ def _get_dict_header_namespace(namespace: str, naming: CxxHeadersNaming) -> str:
 
 def _get_debug_prefix_args(ctx: AnalysisContext, header_dir: Artifact) -> [cmd_args, None]:
     # NOTE(@christylee): Do we need to enable debug-prefix-map for darwin and windows?
-    if get_cxx_toolchain_info(ctx).linker_info.type != "gnu":
+    if get_cxx_toolchain_info(ctx).linker_info.type != LinkerType("gnu"):
         return None
 
-    debug_prefix_args = cmd_args()
     fmt = "-fdebug-prefix-map={}=" + value_or(header_dir.owner.cell, ".")
-    debug_prefix_args.add(
+    return cmd_args(
         cmd_args(header_dir, format = fmt),
     )
-    return debug_prefix_args
 
-def _mk_hmap(ctx: AnalysisContext, name: str, headers: dict[str, (Artifact, str)], project_root_file: [Artifact, None]) -> Artifact:
+def _mk_hmap(ctx: AnalysisContext, name: str, headers: dict[str, (Artifact, str)]) -> Artifact:
     output = ctx.actions.declare_output(name + ".hmap")
-    cmd = cmd_args(get_cxx_toolchain_info(ctx).mk_hmap)
-    cmd.add(["--output", output.as_output()])
 
     header_args = cmd_args()
     for n, (path, fmt) in headers.items():
         header_args.add(n)
 
         # We don't care about the header contents -- just their names.
-        header_args.add(cmd_args(path, format = fmt).ignore_artifacts())
+        header_args.add(cmd_args(path, format = fmt, ignore_artifacts = True))
 
-    hmap_args_file = ctx.actions.write(output.basename + ".argsfile", cmd_args(header_args, quote = "shell"))
-    cmd.add(["--mappings-file", hmap_args_file]).hidden(header_args)
-    if project_root_file:
-        cmd.add(["--project-root-file", project_root_file])
-    ctx.actions.run(cmd, category = "generate_hmap", identifier = name, allow_cache_upload = ctx.attrs.allow_cache_upload)
+    hmap_args_file = ctx.actions.write(output.basename + ".cxx_hmap_argsfile", cmd_args(header_args, quote = "shell"))
+
+    cmd = cmd_args(
+        [get_cxx_toolchain_info(ctx).internal_tools.hmap_wrapper] +
+        ["--output", output.as_output()] +
+        ["--mappings-file", hmap_args_file],
+        hidden = header_args,
+    )
+    ctx.actions.run(cmd, category = "generate_hmap", identifier = name, allow_cache_upload = cxx_attrs_get_allow_cache_upload(ctx.attrs))
     return output

@@ -7,12 +7,12 @@
  * of this source tree.
  */
 
-use buck2_common::global_cfg_options::GlobalCfgOptions;
 use buck2_core::configuration::compatibility::IncompatiblePlatformReason;
 use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_events::dispatch::console_message;
 use buck2_node::load_patterns::load_patterns;
@@ -23,17 +23,15 @@ use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
 use buck2_query::query::syntax::simple::eval::set::TargetSet;
 use dice::DiceComputations;
-use dice::DiceComputationsParallel;
 use dupe::Dupe;
-use futures::future::BoxFuture;
 use futures::FutureExt;
 use gazebo::prelude::VecExt;
 use starlark_map::small_set::SmallSet;
 
 // Returns a tuple of compatible and incompatible targets.
 fn split_compatible_incompatible(
-    targets: impl IntoIterator<Item = anyhow::Result<MaybeCompatible<ConfiguredTargetNode>>>,
-) -> anyhow::Result<(
+    targets: impl IntoIterator<Item = buck2_error::Result<MaybeCompatible<ConfiguredTargetNode>>>,
+) -> buck2_error::Result<(
     TargetSet<ConfiguredTargetNode>,
     SmallSet<ConfiguredTargetLabel>,
 )> {
@@ -54,29 +52,30 @@ fn split_compatible_incompatible(
 }
 
 pub async fn get_maybe_compatible_targets<'a>(
-    ctx: &'a DiceComputations,
-    loaded_targets: impl IntoIterator<Item = (PackageLabel, anyhow::Result<Vec<TargetNode>>)>,
+    ctx: &'a mut DiceComputations<'_>,
+    loaded_targets: impl IntoIterator<Item = (PackageLabel, buck2_error::Result<Vec<TargetNode>>)>,
     global_cfg_options: &GlobalCfgOptions,
     keep_going: bool,
-) -> anyhow::Result<impl Iterator<Item = anyhow::Result<MaybeCompatible<ConfiguredTargetNode>>>> {
+) -> buck2_error::Result<
+    impl Iterator<Item = buck2_error::Result<MaybeCompatible<ConfiguredTargetNode>>>,
+> {
     let mut by_package_fns: Vec<_> = Vec::new();
 
     for (_package, result) in loaded_targets {
         match result {
             Ok(targets) => {
                 by_package_fns.extend({
-                    let target_fns: Vec<_> = targets.into_map(|target|
-                        higher_order_closure! {
-                            #![with<'a>]
-                            for<'x> |ctx: &'x mut DiceComputationsParallel<'a>| -> BoxFuture<'x, anyhow::Result<MaybeCompatible<ConfiguredTargetNode>>> {
-                                async move {
-                                    let target = ctx
-                                        .get_configured_target(target.label(), global_cfg_options)
-                                        .await?;
-                                    anyhow::Ok(ctx.get_configured_target_node(&target).await?)
-                                }.boxed()
+                    let target_fns: Vec<_> = targets.into_map(|target| {
+                        DiceComputations::declare_closure(|ctx| {
+                            async move {
+                                let target = ctx
+                                    .get_configured_target(target.label(), global_cfg_options)
+                                    .await?;
+                                buck2_error::Ok(ctx.get_configured_target_node(&target).await?)
                             }
-                        });
+                            .boxed()
+                        })
+                    });
 
                     target_fns
                 });
@@ -84,7 +83,7 @@ pub async fn get_maybe_compatible_targets<'a>(
             Err(e) => {
                 // TODO(@wendyy) - log the error
                 if !keep_going {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
@@ -97,10 +96,10 @@ pub async fn get_maybe_compatible_targets<'a>(
 
 /// Converts target nodes to a set of compatible configured target nodes.
 pub async fn get_compatible_targets(
-    ctx: &DiceComputations,
-    loaded_targets: impl IntoIterator<Item = (PackageLabel, anyhow::Result<Vec<TargetNode>>)>,
+    ctx: &mut DiceComputations<'_>,
+    loaded_targets: impl IntoIterator<Item = (PackageLabel, buck2_error::Result<Vec<TargetNode>>)>,
     global_cfg_options: &GlobalCfgOptions,
-) -> anyhow::Result<TargetSet<ConfiguredTargetNode>> {
+) -> buck2_error::Result<TargetSet<ConfiguredTargetNode>> {
     let maybe_compatible_targets =
         get_maybe_compatible_targets(ctx, loaded_targets, global_cfg_options, false).await?;
 
@@ -117,11 +116,11 @@ pub async fn get_compatible_targets(
 }
 
 pub async fn load_compatible_patterns(
-    ctx: &DiceComputations,
+    ctx: &mut DiceComputations<'_>,
     parsed_patterns: Vec<ParsedPattern<TargetPatternExtra>>,
     global_cfg_options: &GlobalCfgOptions,
     skip_missing_targets: MissingTargetBehavior,
-) -> anyhow::Result<TargetSet<ConfiguredTargetNode>> {
+) -> buck2_error::Result<TargetSet<ConfiguredTargetNode>> {
     let loaded_patterns = load_patterns(ctx, parsed_patterns, skip_missing_targets).await?;
     get_compatible_targets(
         ctx,

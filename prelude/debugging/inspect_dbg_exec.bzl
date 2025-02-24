@@ -5,9 +5,9 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@prelude//debugging/common.bzl", "create_target_info", "target_name")
-load("@prelude//debugging/types.bzl", "JavaInfo", "ScriptSettings")
-load("@prelude//java/class_to_srcs.bzl", "JavaClassToSourceMapInfo")
+load("@prelude//debugging:common.bzl", "create_target_info", "target_name")
+load("@prelude//debugging:types.bzl", "JavaInfo", "ScriptSettings")
+load("@prelude//java:class_to_srcs.bzl", "JavaClassToSourceMapInfo")
 
 def inspect_dbg_exec(ctx: bxl.Context, actions: AnalysisActions, target: bxl.ConfiguredTargetNode, settings: ScriptSettings):
     pointer_name = target_name(target)
@@ -18,8 +18,7 @@ def inspect_dbg_exec(ctx: bxl.Context, actions: AnalysisActions, target: bxl.Con
     providers = ctx.analysis(fbsource_alias_target).providers()
     fdb_helper = providers[RunInfo]
     fdb_helper_out = actions.declare_output("fdb_helper.json")
-    cmd = cmd_args(fdb_helper)
-    cmd.add(settings.args)
+    cmd = cmd_args(fdb_helper, settings.args)
     actions.run(cmd, category = "fdb_helper", env = {"FDB_OUTPUT_FILE": fdb_helper_out.as_output()}, local_only = True)
     result = actions.declare_output("final_out.json")
 
@@ -47,7 +46,7 @@ def inspect_dbg_exec(ctx: bxl.Context, actions: AnalysisActions, target: bxl.Con
     actions.dynamic_output(
         dynamic = [fdb_helper_out],
         inputs = [],
-        outputs = [result],
+        outputs = [result.as_output()],
         f = build_exec_info,
     )
     return result

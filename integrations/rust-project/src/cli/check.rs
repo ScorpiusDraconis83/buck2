@@ -7,21 +7,25 @@
  * of this source tree.
  */
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::buck;
 use crate::buck::select_mode;
 use crate::diagnostics;
+use crate::path::safe_canonicalize;
 
-pub struct Check {
-    pub buck: buck::Buck,
-    pub use_clippy: bool,
-    pub saved_file: PathBuf,
+pub(crate) struct Check {
+    pub(crate) buck: buck::Buck,
+    pub(crate) use_clippy: bool,
+    pub(crate) saved_file: PathBuf,
 }
 
 impl Check {
-    pub fn new(mode: Option<String>, use_clippy: bool, saved_file: PathBuf) -> Self {
+    pub(crate) fn new(mode: Option<String>, use_clippy: bool, saved_file: PathBuf) -> Self {
+        let saved_file = safe_canonicalize(&saved_file);
+
         let mode = select_mode(mode.as_deref());
         let buck = buck::Buck::new(mode);
         Self {
@@ -31,13 +35,14 @@ impl Check {
         }
     }
 
-    pub fn run(&self) -> Result<(), anyhow::Error> {
+    pub(crate) fn run(&self) -> Result<(), anyhow::Error> {
+        let start = std::time::Instant::now();
         let buck = &self.buck;
-        let cell_root = buck.resolve_project_root()?;
-        let diagnostic_files = buck.check_saved_file(self.use_clippy, &self.saved_file)?;
+
+        let check_output = buck.check_saved_file(self.use_clippy, &self.saved_file)?;
 
         let mut diagnostics = vec![];
-        for path in diagnostic_files {
+        for path in check_output.diagnostic_paths {
             let contents = std::fs::read_to_string(path)?;
             for l in contents.lines() {
                 // rustc (and with greater relevance, the underlying build.bxl script) emits diagnostics as newline-delimited JSON.
@@ -52,16 +57,8 @@ impl Check {
                 // we rewrite the file paths in the diagnostics to be relative to the buck2 project root, resulting in a fully absolute
                 // path.
                 if let Ok(mut message) = serde_json::from_str::<diagnostics::Message>(l) {
-                    for span in message.spans.iter_mut() {
-                        span.file_name = cell_root.join(&span.file_name);
-                    }
-                    for span in message
-                        .children
-                        .iter_mut()
-                        .flat_map(|child| child.spans.iter_mut())
-                    {
-                        span.file_name = cell_root.join(&span.file_name);
-                    }
+                    make_message_absolute(&mut message, &check_output.project_root);
+
                     let span = serde_json::to_value(message)?;
                     // this is done under the assumption that the number of diagnostics inside the vector
                     // is small (e.g., 32 or 64), so a linear seach of a vector will faster than hashing each element.
@@ -80,6 +77,30 @@ impl Check {
             println!("{}", out);
         }
 
+        crate::scuba::log_check(start.elapsed(), &self.saved_file, self.use_clippy);
+
         Ok(())
+    }
+}
+
+fn make_message_absolute(message: &mut diagnostics::Message, base_dir: &Path) {
+    for span in message.spans.iter_mut() {
+        make_span_absolute(span, base_dir);
+    }
+
+    for message in message.children.iter_mut() {
+        make_message_absolute(message, base_dir);
+    }
+}
+
+fn make_span_absolute(span: &mut diagnostics::Span, base_dir: &Path) {
+    span.file_name = base_dir.join(&span.file_name);
+
+    if let Some(expansion) = &mut span.expansion {
+        if let Some(def_site_span) = &mut expansion.def_site_span {
+            make_span_absolute(def_site_span, base_dir);
+        }
+
+        make_span_absolute(&mut expansion.span, base_dir);
     }
 }

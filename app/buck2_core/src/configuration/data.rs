@@ -14,12 +14,14 @@ use std::hash::Hasher;
 
 use allocative::Allocative;
 use buck2_data::ToProtoMessage;
+use buck2_util::hash::BuckHasher;
 use dupe::Dupe;
 use equivalent::Equivalent;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde::Serializer;
 use static_interner::Intern;
+use static_interner::InternDisposition;
 use static_interner::Interner;
 
 use crate::configuration::bound_id::BoundConfigurationId;
@@ -28,9 +30,10 @@ use crate::configuration::builtin::BuiltinPlatform;
 use crate::configuration::constraints::ConstraintKey;
 use crate::configuration::constraints::ConstraintValue;
 use crate::configuration::hash::ConfigurationHash;
+use crate::event::EVENT_DISPATCH;
 
 #[derive(Debug, buck2_error::Error)]
-#[buck2(user)]
+#[buck2(input)]
 enum ConfigurationError {
     #[error(
         "Attempted to access the configuration data for the {0} platform. \
@@ -47,6 +50,7 @@ enum ConfigurationError {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum ConfigurationLookupError {
     #[error("
     Could not find configuration `{0}`. Configuration lookup by string requires
@@ -58,6 +62,35 @@ enum ConfigurationLookupError {
         "Found configuration `{0}` by hash, but label mismatched from what is requested: `{1}`"
     )]
     ConfigFoundByHashLabelMismatch(ConfigurationData, BoundConfigurationId),
+}
+
+fn emit_configuration_instant_event(cfg: &ConfigurationData) -> buck2_error::Result<()> {
+    let constraints: Vec<buck2_data::Constraint> = cfg
+        .data()?
+        .constraints
+        .iter()
+        .map(|(k, v)| buck2_data::Constraint {
+            setting: k.to_string(),
+            value: v.to_string(),
+        })
+        .collect();
+
+    // Sometimes this isn't going to be init'd in tests (oss or buck2), let's
+    // ignore that and rely on e2e test to assert we're still logging data from
+    // production code paths.
+    if let Ok(event_dispatch) = EVENT_DISPATCH.get() {
+        event_dispatch.emit_instant_event_for_data(
+            buck2_data::ConfigurationCreated {
+                cfg: Some(buck2_data::ConfigurationWithConstraints {
+                    full_name: cfg.full_name().to_owned(),
+                    constraint: constraints,
+                }),
+            }
+            .into(),
+        );
+    }
+
+    Ok(())
 }
 
 /// The inner PlatformConfigurationData is interned as the same configuration could be formed through
@@ -85,15 +118,20 @@ impl<'a> Equivalent<HashedConfigurationPlatform> for ConfigurationHashRef<'a> {
     }
 }
 
-static INTERNER: Interner<HashedConfigurationPlatform> = Interner::new();
+static INTERNER: Interner<HashedConfigurationPlatform, BuckHasher> = Interner::new();
 
 impl ConfigurationData {
     /// Produces a "bound" configuration for a platform. The label should be a unique identifier for the data.
-    pub fn from_platform(label: String, data: ConfigurationDataData) -> anyhow::Result<Self> {
+    pub fn from_platform(label: String, data: ConfigurationDataData) -> buck2_error::Result<Self> {
         let label = BoundConfigurationLabel::new(label)?;
-        Ok(Self::from_data(HashedConfigurationPlatform::new(
+        let (cfg, disposition) = Self::from_data(HashedConfigurationPlatform::new(
             ConfigurationPlatform::Bound(label, data),
-        )))
+        ));
+        if let InternDisposition::Computed = disposition {
+            emit_configuration_instant_event(&cfg)?;
+        }
+
+        Ok(cfg)
     }
 
     pub fn unspecified() -> Self {
@@ -101,6 +139,7 @@ impl ConfigurationData {
             ConfigurationData::from_data(HashedConfigurationPlatform::new(
                 ConfigurationPlatform::Builtin(BuiltinPlatform::Unspecified),
             ))
+            .0
         });
         CONFIG.dupe()
     }
@@ -110,6 +149,7 @@ impl ConfigurationData {
             ConfigurationData::from_data(HashedConfigurationPlatform::new(
                 ConfigurationPlatform::Builtin(BuiltinPlatform::UnspecifiedExec),
             ))
+            .0
         });
         CONFIG.dupe()
     }
@@ -121,6 +161,7 @@ impl ConfigurationData {
             ConfigurationData::from_data(HashedConfigurationPlatform::new(
                 ConfigurationPlatform::Builtin(BuiltinPlatform::Unbound),
             ))
+            .0
         });
         CONFIG.dupe()
     }
@@ -132,6 +173,7 @@ impl ConfigurationData {
             ConfigurationData::from_data(HashedConfigurationPlatform::new(
                 ConfigurationPlatform::Builtin(BuiltinPlatform::UnboundExec),
             ))
+            .0
         });
         CONFIG.dupe()
     }
@@ -155,10 +197,12 @@ impl ConfigurationData {
                 },
             ),
         ))
+        .0
     }
 
-    fn from_data(data: HashedConfigurationPlatform) -> Self {
-        Self(INTERNER.intern(data))
+    fn from_data(data: HashedConfigurationPlatform) -> (Self, InternDisposition) {
+        let (val, disposition) = INTERNER.observed_intern(data);
+        (Self(val), disposition)
     }
 
     /// Iterates over the existing interned configurations. As these configurations
@@ -175,7 +219,7 @@ impl ConfigurationData {
     ///
     /// This can only find configurations that have otherwise already been encountered by
     /// the current daemon process.
-    pub fn lookup_bound(cfg: BoundConfigurationId) -> anyhow::Result<Self> {
+    pub fn lookup_bound(cfg: BoundConfigurationId) -> buck2_error::Result<Self> {
         match INTERNER.get(ConfigurationHashRef(cfg.hash.as_str())) {
             Some(found_cfg) => {
                 let found_cfg = ConfigurationData(found_cfg);
@@ -195,18 +239,18 @@ impl ConfigurationData {
     pub fn get_constraint_value(
         &self,
         key: &ConstraintKey,
-    ) -> anyhow::Result<Option<&ConstraintValue>> {
+    ) -> buck2_error::Result<Option<&ConstraintValue>> {
         Ok(self.data()?.constraints.get(key))
     }
 
-    pub fn label(&self) -> anyhow::Result<&str> {
+    pub fn label(&self) -> buck2_error::Result<&str> {
         match &self.0.configuration_platform {
             ConfigurationPlatform::Bound(label, _) => Ok(label.as_str()),
             _ => Err(ConfigurationError::NotBound(self.to_string()).into()),
         }
     }
 
-    pub fn data(&self) -> anyhow::Result<&ConfigurationDataData> {
+    pub fn data(&self) -> buck2_error::Result<&ConfigurationDataData> {
         match &self.0.configuration_platform {
             ConfigurationPlatform::Builtin(BuiltinPlatform::UnspecifiedExec) => {
                 Err(ConfigurationError::UnspecifiedExec.into())
@@ -350,7 +394,7 @@ impl ConfigurationDataData {
     Allocative,
     derive_more::Display
 )]
-#[display(fmt = "{}", full_name)]
+#[display("{}", full_name)]
 pub(crate) struct HashedConfigurationPlatform {
     configuration_platform: ConfigurationPlatform,
     // The remaining fields are computed from `platform_configuration_data`.
@@ -399,13 +443,13 @@ mod tests {
     use crate::configuration::constraints::ConstraintValue;
     use crate::configuration::data::ConfigurationData;
     use crate::configuration::data::ConfigurationDataData;
-    use crate::target::label::TargetLabel;
+    use crate::target::label::label::TargetLabel;
 
     /// We don't want the output hash to change by accident. This test is here to assert that it
     /// doesn't. If we have a legit reason to update the config hash, we can update the hash here,
     /// but this will ensure we a) know and b) don't do it by accident.
     #[test]
-    fn test_stable_output_hash() -> anyhow::Result<()> {
+    fn test_stable_output_hash() -> buck2_error::Result<()> {
         let configuration = ConfigurationData::from_platform(
             "cfg_for//:testing_exec".to_owned(),
             ConfigurationDataData {
@@ -423,10 +467,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(configuration.output_hash().as_str(), "fd698fb05d52efbc");
+        assert_eq!(configuration.output_hash().as_str(), "7978e19328f9f229");
         assert_eq!(
             configuration.to_string(),
-            "cfg_for//:testing_exec#fd698fb05d52efbc"
+            "cfg_for//:testing_exec#7978e19328f9f229"
         );
 
         Ok(())
@@ -452,12 +496,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            "cfg_for//:testing_exec#fd698fb05d52efbc",
+            "cfg_for//:testing_exec#7978e19328f9f229",
             configuration.to_string()
         );
 
         let looked_up = ConfigurationData::lookup_bound(
-            BoundConfigurationId::parse("cfg_for//:testing_exec#fd698fb05d52efbc").unwrap(),
+            BoundConfigurationId::parse("cfg_for//:testing_exec#7978e19328f9f229").unwrap(),
         )
         .unwrap();
         assert_eq!(configuration, looked_up);

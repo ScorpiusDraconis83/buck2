@@ -5,22 +5,24 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//:genrule.bzl", "genrule_attributes")
 load("@prelude//android:build_only_native_code.bzl", "is_build_only_native_code")
+load("@prelude//decls:common.bzl", "buck")
+load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
 load("@prelude//js:js_bundle.bzl", "js_bundle_impl")
 load("@prelude//js:js_bundle_genrule.bzl", "js_bundle_genrule_impl")
 load("@prelude//js:js_library.bzl", "js_library_impl")
-load("@prelude//decls/common.bzl", "buck")
-load("@prelude//decls/toolchains_common.bzl", "toolchains_common")
-load("@prelude//genrule.bzl", "genrule_attributes")
 
 def _select_platform():
     return select({
         "DEFAULT": select({
             "DEFAULT": "android",
             "config//os/constraints:iphoneos": "ios",
-            "config//os/constraints:macos": "macos",
             "config//os/constraints:windows": "windows",
         }),
+        "config//react-native:macos": "macos",
+        # TODO(T210407097): Remove after deleting //third-party/microsoft-fork-of-react-native
+        "fbsource//tools/build_defs/js/config:macos_legacy": "macos_legacy",
         "fbsource//tools/build_defs/js/config:platform_override_android": "android",
         "fbsource//tools/build_defs/js/config:platform_override_ios": "ios",
         "fbsource//tools/build_defs/js/config:platform_override_macos": "macos",
@@ -35,6 +37,13 @@ def _is_release():
             "fbsource//tools/build_defs/android/config:build_mode_opt": True,
         }),
         "config//build_mode/constraints:release": True,
+    })
+
+def _select_asset_dest_path_resolver():
+    return select({
+        "DEFAULT": None,
+        "fbsource//tools/build_defs/js/config:asset_dest_path_resolver_android": "android",
+        "fbsource//tools/build_defs/js/config:asset_dest_path_resolver_generic": "generic",
     })
 
 implemented_rules = {
@@ -68,6 +77,10 @@ extra_attributes = {
     },
     "js_library": {
         "worker": attrs.exec_dep(),
+        "_asset_dest_path_resolver": attrs.option(
+            attrs.string(),
+            default = _select_asset_dest_path_resolver(),
+        ),
         "_build_only_native_code": attrs.bool(default = is_build_only_native_code()),
         "_is_release": attrs.bool(
             default = _is_release(),

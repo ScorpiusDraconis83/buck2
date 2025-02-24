@@ -7,7 +7,6 @@
  * of this source tree.
  */
 
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -23,39 +22,9 @@ use dice::Key;
 use dupe::Dupe;
 use smallvec::SmallVec;
 
-use crate::dice::cells::HasCellResolver;
-use crate::dice::file_ops::HasFileOps;
 use crate::package_listing::interpreter::InterpreterPackageListingResolver;
 use crate::package_listing::listing::PackageListing;
 use crate::package_listing::resolver::PackageListingResolver;
-
-#[async_trait]
-pub trait HasPackageListingResolver<'c> {
-    type PL: PackageListingResolver + 'c;
-    fn get_package_listing_resolver(&'c self) -> Self::PL;
-    async fn resolve_package_listing(
-        &self,
-        package: PackageLabel,
-    ) -> anyhow::Result<PackageListing>;
-}
-
-#[async_trait]
-impl<'c> HasPackageListingResolver<'c> for DiceComputations {
-    type PL = DicePackageListingResolver<'c>;
-    fn get_package_listing_resolver(&'c self) -> Self::PL {
-        DicePackageListingResolver(self)
-    }
-
-    async fn resolve_package_listing(
-        &self,
-        package: PackageLabel,
-    ) -> anyhow::Result<PackageListing> {
-        self.get_package_listing_resolver()
-            .resolve(package)
-            .await
-            .map_err(anyhow::Error::from)
-    }
-}
 
 #[derive(
     Clone,
@@ -84,11 +53,8 @@ impl Key for PackageListingKey {
     ) -> Self::Value {
         let now = Instant::now();
 
-        let cell_resolver = ctx.get_cell_resolver().await?;
-        let file_ops = ctx.file_ops();
         let (result, spans) = async_record_root_spans(
-            InterpreterPackageListingResolver::new(cell_resolver, Arc::new(file_ops))
-                .resolve(self.0.dupe()),
+            InterpreterPackageListingResolver::new(ctx).resolve(self.0.dupe()),
         )
         .await;
 
@@ -108,35 +74,41 @@ impl Key for PackageListingKey {
     }
 }
 
-#[derive(Clone, Dupe)]
-pub struct DicePackageListingResolver<'compute>(&'compute DiceComputations);
+pub struct DicePackageListingResolver<'compute, 'dice>(pub &'compute mut DiceComputations<'dice>);
 
 #[async_trait]
-impl<'c> PackageListingResolver for DicePackageListingResolver<'c> {
-    async fn resolve(&self, package: PackageLabel) -> buck2_error::Result<PackageListing> {
-        self.0.compute(&PackageListingKey(package.dupe())).await?
+impl<'c, 'd> PackageListingResolver for DicePackageListingResolver<'c, 'd> {
+    async fn resolve(&mut self, package: PackageLabel) -> buck2_error::Result<PackageListing> {
+        self.0.compute(&PackageListingKey(package)).await?
     }
 
     async fn get_enclosing_package(
-        &self,
+        &mut self,
         path: CellPathRef<'async_trait>,
-    ) -> anyhow::Result<PackageLabel> {
-        let cell_resolver = self.0.get_cell_resolver().await?;
-        let file_ops = self.0.file_ops();
-        InterpreterPackageListingResolver::new(cell_resolver, Arc::new(file_ops))
+    ) -> buck2_error::Result<PackageLabel> {
+        InterpreterPackageListingResolver::new(self.0)
             .get_enclosing_package(path)
             .await
     }
 
     async fn get_enclosing_packages(
-        &self,
+        &mut self,
         path: CellPathRef<'async_trait>,
         enclosing_violation_path: CellPathRef<'async_trait>,
-    ) -> anyhow::Result<Vec<PackageLabel>> {
-        let cell_resolver = self.0.get_cell_resolver().await?;
-        let file_ops = self.0.file_ops();
-        InterpreterPackageListingResolver::new(cell_resolver, Arc::new(file_ops))
+    ) -> buck2_error::Result<Vec<PackageLabel>> {
+        InterpreterPackageListingResolver::new(self.0)
             .get_enclosing_packages(path, enclosing_violation_path)
             .await
+    }
+}
+
+impl DicePackageListingResolver<'_, '_> {
+    pub async fn resolve_package_listing(
+        &mut self,
+        package: PackageLabel,
+    ) -> buck2_error::Result<PackageListing> {
+        self.resolve(package)
+            .await
+            .map_err(buck2_error::Error::from)
     }
 }

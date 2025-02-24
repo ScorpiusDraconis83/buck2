@@ -16,30 +16,39 @@ load(
     "map_val",
     "value_or",
 )
-load(":compile.bzl", "compile", "get_filtered_srcs")
 load(":link.bzl", "link")
+load(":package_builder.bzl", "build_package")
+load(":packages.bzl", "go_attr_pkg_name")
 load(":toolchain.bzl", "GoToolchainInfo", "evaluate_cgo_enabled")
 
 def go_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     go_toolchain = ctx.attrs._go_toolchain[GoToolchainInfo]
-    cgo_enabled = evaluate_cgo_enabled(go_toolchain, ctx.attrs.cgo_enabled)
+    pkg_name = go_attr_pkg_name(ctx)
 
-    lib = compile(
-        ctx,
-        "main",
-        get_filtered_srcs(ctx, ctx.attrs.srcs),
-        cgo_enabled = cgo_enabled,
+    lib, pkg_info = build_package(
+        ctx = ctx,
+        pkg_name = pkg_name,
+        main = True,
+        srcs = ctx.attrs.srcs,
+        package_root = ctx.attrs.package_root,
         deps = ctx.attrs.deps,
-        compile_flags = ctx.attrs.compiler_flags,
+        compiler_flags = ctx.attrs.compiler_flags,
+        build_tags = ctx.attrs._build_tags,
+        race = ctx.attrs._race,
+        asan = ctx.attrs._asan,
+        embedcfg = ctx.attrs.embedcfg,
+        cgo_enabled = evaluate_cgo_enabled(go_toolchain, ctx.attrs.cgo_enabled),
     )
     (bin, runtime_files, external_debug_info) = link(
         ctx,
         lib,
-        cgo_enabled = cgo_enabled,
         deps = ctx.attrs.deps,
         link_style = value_or(map_val(LinkStyle, ctx.attrs.link_style), LinkStyle("static")),
         linker_flags = ctx.attrs.linker_flags,
         link_mode = ctx.attrs.link_mode,
+        race = ctx.attrs._race,
+        asan = ctx.attrs._asan,
+        external_linker_flags = ctx.attrs.external_linker_flags,
     )
 
     # runtime_files are all the artifacts that must be present in order for this
@@ -66,6 +75,7 @@ def go_binary_impl(ctx: AnalysisContext) -> list[Provider]:
             default_output = bin,
             other_outputs = other_outputs,
         ),
-        RunInfo(args = cmd_args(bin).hidden(other_outputs)),
+        RunInfo(args = cmd_args(bin, hidden = other_outputs)),
         DistInfo(nondebug_runtime_files = runtime_files),
+        pkg_info,
     ]

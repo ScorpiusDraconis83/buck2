@@ -31,8 +31,9 @@ use crate::coerce::CoerceKey;
 use crate::collections::Hashed;
 use crate::sealed::Sealed;
 use crate::values::layout::static_string::VALUE_EMPTY_STRING;
-use crate::values::string::StarlarkStr;
+use crate::values::string::str_type::StarlarkStr;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenValue;
 use crate::values::FrozenValueTyped;
@@ -122,7 +123,7 @@ impl FrozenStringValue {
 
 impl<'v> StringValue<'v> {
     /// Convert a value to a [`FrozenStringValue`] using a supplied [`Freezer`].
-    pub fn freeze(self, freezer: &Freezer) -> anyhow::Result<FrozenStringValue> {
+    pub fn freeze(self, freezer: &Freezer) -> FreezeResult<FrozenStringValue> {
         Ok(unsafe { FrozenStringValue::new_unchecked(freezer.freeze(self.to_value())?) })
     }
 
@@ -147,6 +148,11 @@ impl<'v> StringValue<'v> {
             .unpack_frozen()
             .map(|s| unsafe { FrozenStringValue::new_unchecked(s) })
     }
+
+    #[inline]
+    pub(crate) unsafe fn cast_lifetime<'w>(self) -> StringValue<'w> {
+        StringValue::new_unchecked(self.to_value().cast_lifetime())
+    }
 }
 
 /// Common type for [`StringValue`] and [`FrozenStringValue`].
@@ -154,6 +160,7 @@ pub trait StringValueLike<'v>:
     Trace<'v>
     + Freeze<Frozen = FrozenStringValue>
     + CoerceKey<StringValue<'v>>
+    + Borrow<str>
     + Display
     + Debug
     + Default
@@ -165,6 +172,7 @@ pub trait StringValueLike<'v>:
     + Serialize
     + Allocative
     + Sealed
+    + 'v
 {
     /// Convert to a [`StringValue`].
     fn to_string_value(self) -> StringValue<'v>;

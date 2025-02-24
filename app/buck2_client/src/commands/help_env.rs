@@ -11,32 +11,54 @@ use std::cmp;
 use std::iter;
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
+use buck2_core::env::registry::Applicability;
 use buck2_core::env::registry::EnvInfoEntry;
 use buck2_core::env::registry::ENV_INFO;
-use buck2_error::Context;
+use buck2_error::BuckErrorContext;
 
 /// Print help for environment variables used by buck2.
 #[derive(Debug, clap::Parser)]
-pub struct HelpEnvCommand;
+pub struct HelpEnvCommand {
+    /// Also print those environment variables that are only used for buck2 integration tests.
+    ///
+    /// These are all unstable and not meant to be used by most users.
+    #[clap(long)]
+    self_testing: bool,
+}
 
 impl HelpEnvCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, _ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, _ctx: ClientCommandContext<'_>) -> ExitResult {
         // TODO(nga): print special buckconfigs too.
 
-        let mut env_info: Vec<EnvInfoEntry> = ENV_INFO.iter().copied().collect();
+        // This command depends on `linkme` aggregating all the environment variables.
+        if let Some(res) = ExitResult::retry_command_with_full_binary()? {
+            return res;
+        }
+
+        let mut env_info: Vec<EnvInfoEntry> = ENV_INFO
+            .iter()
+            .copied()
+            .filter(|x| match x.applicability {
+                Applicability::All => true,
+                Applicability::Testing => self.self_testing,
+                Applicability::Internal => !buck2_core::is_open_source(),
+            })
+            .collect();
         env_info.sort();
+        env_info.dedup();
 
         let longest_name = env_info
             .iter()
             .map(|e| e.name.len())
             .max()
-            .context("No environment variables stored defined, this is a bug")?;
+            .buck_error_context("No environment variables stored defined, this is a bug")?;
         let longest_ty = env_info
             .iter()
             .map(|e| e.ty_short().len())
             .max()
-            .context("No environment variables stored defined, this is a bug")?;
+            .buck_error_context("No environment variables stored defined, this is a bug")?;
         let longest_default = env_info
             .iter()
             .filter_map(|e| e.default)

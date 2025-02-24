@@ -13,26 +13,27 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use async_trait::async_trait;
 use buck2_analysis::analysis::calculation::AnalysisKey;
+use buck2_artifact::deferred::key::DeferredHolderKey;
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
 use buck2_build_api::analysis::AnalysisResult;
 use buck2_build_api::deferred::calculation::DeferredCalculation;
-use buck2_build_api::deferred::types::BaseKey;
 use buck2_build_api::deferred::types::Deferred;
 use buck2_build_api::deferred::types::DeferredCtx;
 use buck2_build_api::deferred::types::DeferredInput;
+use buck2_build_api::deferred::types::DeferredInputsRef;
+use buck2_build_api::deferred::types::DeferredOutput;
 use buck2_build_api::deferred::types::DeferredRegistry;
-use buck2_build_api::deferred::types::DeferredTable;
 use buck2_build_api::deferred::types::DeferredValue;
 use buck2_common::dice::data::testing::SetTestingIoProvider;
 use buck2_configured::nodes::calculation::ConfiguredTargetNodeKey;
 use buck2_core::base_deferred_key::BaseDeferredKey;
 use buck2_core::configuration::compatibility::MaybeCompatible;
 use buck2_core::configuration::data::ConfigurationData;
+use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::fs::project::ProjectRootTemp;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::SetDigestConfig;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
@@ -45,28 +46,32 @@ use indoc::indoc;
 
 use crate::interpreter::rule_defs::provider::testing::FrozenProviderCollectionValueExt;
 
-#[derive(Allocative)]
+#[derive(Debug, Allocative)]
 struct FakeDeferred(usize, IndexSet<DeferredInput>, Arc<AtomicBool>);
 
 impl provider::Provider for FakeDeferred {
     fn provide<'a>(&'a self, _demand: &mut provider::Demand<'a>) {}
 }
 
-#[async_trait]
-impl Deferred for FakeDeferred {
-    type Output = usize;
+#[derive(Allocative, Clone, Debug, Eq, PartialEq)]
+struct UsizeOutput(usize);
 
-    fn inputs(&self) -> &IndexSet<DeferredInput> {
-        &self.1
+impl DeferredOutput for UsizeOutput {}
+
+impl Deferred for FakeDeferred {
+    type Output = UsizeOutput;
+
+    fn inputs(&self) -> DeferredInputsRef<'_> {
+        DeferredInputsRef::IndexSet(&self.1)
     }
 
     async fn execute(
         &self,
         _ctx: &mut dyn DeferredCtx,
-        _dice: &mut DiceComputations,
+        _dice: &mut DiceComputations<'_>,
     ) -> anyhow::Result<DeferredValue<Self::Output>> {
         self.2.store(true, Ordering::SeqCst);
-        Ok(DeferredValue::Ready(self.0))
+        Ok(DeferredValue::Ready(UsizeOutput(self.0)))
     }
 }
 
@@ -84,14 +89,15 @@ async fn lookup_deferred_from_analysis() -> anyhow::Result<()> {
         "#
     ));
 
-    let mut deferred =
-        DeferredRegistry::new(BaseKey::Base(BaseDeferredKey::TargetLabel(target.dupe())));
+    let mut deferred = DeferredRegistry::new(DeferredHolderKey::Base(
+        BaseDeferredKey::TargetLabel(target.dupe()),
+    ));
 
     let executed0 = Arc::new(AtomicBool::new(false));
     let executed1 = Arc::new(AtomicBool::new(false));
     let data0 = deferred.defer(FakeDeferred(1, IndexSet::new(), executed0.dupe()));
     let data1 = deferred.defer(FakeDeferred(5, IndexSet::new(), executed1.dupe()));
-    let deferred_result = DeferredTable::new(deferred.take_result()?);
+    let (deferred_result, analysis_values) = deferred.take_result()?;
 
     let fs = ProjectRootTemp::new()?;
     let dice = DiceBuilder::new()
@@ -104,36 +110,45 @@ async fn lookup_deferred_from_analysis() -> anyhow::Result<()> {
             buck2_error::Ok(MaybeCompatible::Compatible(AnalysisResult::new(
                 provider_collection,
                 deferred_result,
+                analysis_values,
                 None,
                 HashMap::new(),
+                0,
+                0,
             ))),
         )
         .mock_and_return(
             configured_node_key,
             Ok(MaybeCompatible::Compatible(
-                ConfiguredTargetNode::testing_new(target.dupe(), "foo_lib"),
+                ConfiguredTargetNode::testing_new(
+                    target.dupe(),
+                    "foo_lib",
+                    ExecutionPlatformResolution::new(None, Vec::new()),
+                    vec![],
+                    vec![],
+                ),
             )),
         );
 
     let mut dice_data = UserComputationData::new();
     set_fallback_executor_config(&mut dice_data.data, CommandExecutorConfig::testing_local());
 
-    let dice = dice.build(dice_data)?.commit().await;
+    let mut dice = dice.build(dice_data)?.commit().await;
     let deferred_result = dice.compute_deferred_data(&data0).await?;
-    assert_eq!(*deferred_result, 1);
+    assert_eq!(deferred_result.0, 1);
     assert_eq!(executed0.load(Ordering::SeqCst), true);
     // we should cache deferred execution
     executed0.store(false, Ordering::SeqCst);
     let deferred_result = dice.compute_deferred_data(&data0).await?;
-    assert_eq!(*deferred_result, 1);
+    assert_eq!(deferred_result.0, 1);
     assert_eq!(executed0.load(Ordering::SeqCst), false);
 
     let deferred_result = dice.compute_deferred_data(&data1).await?;
-    assert_eq!(*deferred_result, 5);
+    assert_eq!(deferred_result.0, 5);
     assert_eq!(executed1.load(Ordering::SeqCst), true);
     // we should cache deferred execution
     executed1.store(false, Ordering::SeqCst);
-    assert_eq!(*deferred_result, 5);
+    assert_eq!(deferred_result.0, 5);
     assert_eq!(executed1.load(Ordering::SeqCst), false);
 
     Ok(())
@@ -141,25 +156,24 @@ async fn lookup_deferred_from_analysis() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn lookup_deferred_that_has_deferreds() -> anyhow::Result<()> {
-    #[derive(Allocative)]
-    struct DeferringDeferred(usize, IndexSet<DeferredInput>, Arc<AtomicBool>);
+    #[derive(Debug, Allocative)]
+    struct TestDeferringDeferred(usize, IndexSet<DeferredInput>, Arc<AtomicBool>);
 
-    impl provider::Provider for DeferringDeferred {
+    impl provider::Provider for TestDeferringDeferred {
         fn provide<'a>(&'a self, _demand: &mut provider::Demand<'a>) {}
     }
 
-    #[async_trait]
-    impl Deferred for DeferringDeferred {
-        type Output = usize;
+    impl Deferred for TestDeferringDeferred {
+        type Output = UsizeOutput;
 
-        fn inputs(&self) -> &IndexSet<DeferredInput> {
-            &self.1
+        fn inputs(&self) -> DeferredInputsRef<'_> {
+            DeferredInputsRef::IndexSet(&self.1)
         }
 
         async fn execute(
             &self,
             ctx: &mut dyn DeferredCtx,
-            _dice: &mut DiceComputations,
+            _dice: &mut DiceComputations<'_>,
         ) -> anyhow::Result<DeferredValue<Self::Output>> {
             let data = ctx
                 .registry()
@@ -180,12 +194,13 @@ async fn lookup_deferred_that_has_deferreds() -> anyhow::Result<()> {
         "#
     ));
 
-    let mut deferred =
-        DeferredRegistry::new(BaseKey::Base(BaseDeferredKey::TargetLabel(target.dupe())));
+    let mut deferred = DeferredRegistry::new(DeferredHolderKey::Base(
+        BaseDeferredKey::TargetLabel(target.dupe()),
+    ));
 
     let executed = Arc::new(AtomicBool::new(false));
-    let data = deferred.defer(DeferringDeferred(8, IndexSet::new(), executed.dupe()));
-    let deferred_result = DeferredTable::new(deferred.take_result()?);
+    let data = deferred.defer(TestDeferringDeferred(8, IndexSet::new(), executed.dupe()));
+    let (deferred_result, analysis_values) = deferred.take_result()?;
 
     let fs = ProjectRootTemp::new()?;
     let dice = DiceBuilder::new()
@@ -198,28 +213,37 @@ async fn lookup_deferred_that_has_deferreds() -> anyhow::Result<()> {
             buck2_error::Ok(MaybeCompatible::Compatible(AnalysisResult::new(
                 provider_collection,
                 deferred_result,
+                analysis_values,
                 None,
                 HashMap::new(),
+                0,
+                0,
             ))),
         )
         .mock_and_return(
             configured_node_key,
             Ok(MaybeCompatible::Compatible(
-                ConfiguredTargetNode::testing_new(target.dupe(), "foo_lib"),
+                ConfiguredTargetNode::testing_new(
+                    target.dupe(),
+                    "foo_lib",
+                    ExecutionPlatformResolution::new(None, Vec::new()),
+                    vec![],
+                    vec![],
+                ),
             )),
         );
 
     let mut dice_data = UserComputationData::new();
     set_fallback_executor_config(&mut dice_data.data, CommandExecutorConfig::testing_local());
 
-    let dice = dice.build(dice_data)?.commit().await;
+    let mut dice = dice.build(dice_data)?.commit().await;
     let deferred_result = dice.compute_deferred_data(&data).await?;
-    assert_eq!(*deferred_result, 8);
+    assert_eq!(deferred_result.0, 8);
     assert_eq!(executed.load(Ordering::SeqCst), true);
     // we should cache deferred execution
     executed.store(false, Ordering::SeqCst);
     let deferred_result = dice.compute_deferred_data(&data).await?;
-    assert_eq!(*deferred_result, 8);
+    assert_eq!(deferred_result.0, 8);
     assert_eq!(executed.load(Ordering::SeqCst), false);
 
     Ok(())

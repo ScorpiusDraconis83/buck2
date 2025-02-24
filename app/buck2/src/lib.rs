@@ -10,16 +10,16 @@
 #![feature(error_generic_member_access)]
 #![feature(used_with_arg)]
 
-//! `buck2 audit` command implementation, both client and server.
+use std::thread;
 
-use anyhow::Context as _;
 use buck2_audit::AuditCommand;
-use buck2_client::args::expand_argfiles_with_context;
 use buck2_client::commands::build::BuildCommand;
 use buck2_client::commands::bxl::BxlCommand;
 use buck2_client::commands::clean::CleanCommand;
 use buck2_client::commands::ctargets::ConfiguredTargetsCommand;
 use buck2_client::commands::debug::DebugCommand;
+use buck2_client::commands::expand_external_cell::ExpandExternalCellsCommand;
+use buck2_client::commands::explain::ExplainCommand;
 use buck2_client::commands::help_env::HelpEnvCommand;
 use buck2_client::commands::init::InitCommand;
 use buck2_client::commands::install::InstallCommand;
@@ -39,50 +39,47 @@ use buck2_client::commands::status::StatusCommand;
 use buck2_client::commands::subscribe::SubscribeCommand;
 use buck2_client::commands::targets::TargetsCommand;
 use buck2_client::commands::test::TestCommand;
+use buck2_client_ctx::argfiles::expand_argv;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
 use buck2_client_ctx::client_metadata::ClientMetadata;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::immediate_config::ImmediateConfigContext;
 use buck2_client_ctx::streaming::BuckSubcommand;
 use buck2_client_ctx::tokio_runtime_setup::client_tokio_runtime;
 use buck2_client_ctx::version::BuckVersion;
+use buck2_cmd_starlark_client::StarlarkCommand;
 use buck2_common::argv::Argv;
-use buck2_common::invocation_paths::InvocationPaths;
-use buck2_common::invocation_roots::find_invocation_roots;
+use buck2_common::invocation_paths_result::InvocationPathsResult;
+use buck2_common::invocation_roots::get_invocation_paths_result;
 use buck2_core::buck2_env;
 use buck2_core::fs::paths::file_name::FileNameBuf;
+use buck2_error::buck2_error;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_event_observer::verbosity::Verbosity;
-pub use buck2_server_ctx::logging::TracingLogFile;
-use buck2_starlark::StarlarkCommand;
-use buck2_util::cleanup_ctx::AsyncCleanupContextGuard;
-use clap::AppSettings;
-use clap::Parser;
-use dice::DetectCycles;
-use dice::WhichDice;
+use buck2_util::threads::thread_spawn_scoped;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use dupe::Dupe;
-use no_buckd::start_in_process_daemon;
 
 use crate::check_user_allowed::check_user_allowed;
-use crate::commands::daemon::DaemonCommand;
-use crate::commands::docs::DocsCommand;
-use crate::commands::forkserver::ForkserverCommand;
-use crate::commands::internal_test_runner::InternalTestRunnerCommand;
 use crate::process_context::ProcessContext;
 
-#[macro_use]
-pub mod panic;
 mod check_user_allowed;
-
-pub mod commands;
-mod no_buckd;
+mod cli_style;
+pub(crate) mod commands;
+pub mod panic;
 pub mod process_context;
 
 fn parse_isolation_dir(s: &str) -> anyhow::Result<FileNameBuf> {
-    FileNameBuf::try_from(s.to_owned()).context("isolation dir must be a directory name")
+    FileNameBuf::try_from(s.to_owned())
+        .buck_error_context_anyhow("isolation dir must be a directory name")
 }
 
 /// Options of `buck2` command, before subcommand.
 #[derive(Clone, Debug, clap::Parser)]
+#[clap(next_help_heading = "Universal Options")]
 struct BeforeSubcommandOptions {
     /// The name of the directory that Buck2 creates within buck-out for writing outputs and daemon
     /// information. If one is not provided, Buck2 creates a directory with the default name.
@@ -91,16 +88,12 @@ struct BeforeSubcommandOptions {
     /// The isolation directory also influences the output paths provided by Buck2,
     /// and as a result using a non-default isolation dir will cause cache misses (and slower builds).
     #[clap(
-        parse(try_from_str = parse_isolation_dir),
+        value_parser = parse_isolation_dir,
         env("BUCK_ISOLATION_DIR"),
         long,
         default_value="v2"
     )]
     isolation_dir: FileNameBuf,
-
-    // TODO: Those should be on the daemon subcommand.
-    #[clap(flatten)]
-    daemon: DaemonBeforeSubcommandOptions,
 
     /// How verbose buck should be while logging.
     ///
@@ -118,7 +111,7 @@ struct BeforeSubcommandOptions {
         long = "verbose",
         default_value = "1",
         global = true,
-        parse(try_from_str = Verbosity::try_from_cli)
+        value_parser= Verbosity::try_from_cli
     )]
     verbosity: Verbosity,
 
@@ -139,7 +132,7 @@ struct BeforeSubcommandOptions {
     /// running with the same isolation directory.
     ///
     /// This is an unsupported option used only for development work.
-    #[clap(env("BUCK2_NO_BUCKD"), long, global(true), hidden(true))]
+    #[clap(env("BUCK2_NO_BUCKD"), long, global(true), hide(true))]
     // Env var is BUCK2_NO_BUCKD instead of NO_BUCKD env var from buck1 because no buckd
     // is not supported for production work for buck2 and lots of places already set
     // NO_BUCKD=1 for buck1.
@@ -149,24 +142,6 @@ struct BeforeSubcommandOptions {
     #[clap(skip)] // @oss-enable
     // @oss-disable: #[clap(long)]
     help_wrapper: bool,
-}
-
-#[derive(Clone, Debug, clap::Parser)]
-struct DaemonBeforeSubcommandOptions {
-    #[clap(env("DICE_DETECT_CYCLES_UNSTABLE"), long, hidden(true))]
-    detect_cycles: Option<DetectCycles>,
-
-    #[clap(env("WHICH_DICE_UNSTABLE"), long, hidden(true))]
-    which_dice: Option<WhichDice>,
-
-    #[clap(env("ENABLE_TRACE_IO"), long, hidden(true))]
-    enable_trace_io: bool,
-
-    /// If passed a given materializer identity, if the materializer state DB matches that
-    /// identity, the daemon will not use it and will instead create a new empty materializer
-    /// state.
-    #[clap(long, hidden(true))]
-    reject_materializer_state: Option<String>,
 }
 
 #[rustfmt::skip] // Formatting in internal and in OSS versions disagree after oss markers applied.
@@ -183,13 +158,14 @@ fn help() -> &'static str {
 #[clap(
     name = "buck2",
     about(Some(help())),
-    version(BuckVersion::get_version())
+    version(BuckVersion::get_version()),
+    styles = cli_style::get_styles(),
 )]
 pub(crate) struct Opt {
-    #[clap(flatten)]
-    common_opts: BeforeSubcommandOptions,
     #[clap(subcommand)]
     cmd: CommandKind,
+    #[clap(flatten)]
+    common_opts: BeforeSubcommandOptions,
 }
 
 impl Opt {
@@ -197,13 +173,10 @@ impl Opt {
         self,
         process: ProcessContext<'_>,
         immediate_config: &ImmediateConfigContext,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         argv: Argv,
     ) -> ExitResult {
-        let subcommand_matches = match matches.subcommand().map(|s| s.1) {
-            Some(submatches) => submatches,
-            None => panic!("Parsed a subcommand but couldn't extract subcommand argument matches"),
-        };
+        let subcommand_matches = matches.unwrap_subcommand();
 
         self.cmd.exec(
             process,
@@ -217,57 +190,96 @@ impl Opt {
 
 pub fn exec(process: ProcessContext<'_>) -> ExitResult {
     let mut immediate_config = ImmediateConfigContext::new(process.working_dir);
-    let mut expanded_args =
-        expand_argfiles_with_context(process.args.to_vec(), &mut immediate_config)
-            .context("Error expanding argsfiles")?;
-
-    // Override arg0 in `buck2 help`.
-    if let Some(arg0) = buck2_env!("BUCK2_ARG0")? {
-        expanded_args[0] = arg0.to_owned();
-    }
-
-    let clap = Opt::clap();
-    let matches = clap.get_matches_from(&expanded_args);
-    let opt: Opt = Opt::from_clap(&matches);
-
-    if opt.common_opts.help_wrapper {
-        return ExitResult::err(anyhow::anyhow!(
-            "`--help-wrapper` should have been handled by the wrapper"
-        ));
-    }
-
-    match &opt.cmd {
-        CommandKind::Clean(..) | CommandKind::Daemon(..) | CommandKind::Forkserver(..) => {}
-        _ => {
-            check_user_allowed()?;
-        }
-    }
+    let arg0_override = buck2_env!("BUCK2_ARG0")?;
+    let expanded_args = expand_argv(
+        arg0_override,
+        process.args.to_vec(),
+        &mut immediate_config,
+        process.working_dir,
+    )
+    .buck_error_context("Error expanding argsfiles")?;
 
     let argv = Argv {
         argv: process.args.to_vec(),
         expanded_argv: expanded_args,
     };
 
-    opt.exec(process, &immediate_config, &matches, argv)
+    let opt = ParsedArgv::parse(argv)?;
+
+    opt.exec(process, &immediate_config)
+}
+
+struct ParsedArgv {
+    opt: Opt,
+    argv: Argv,
+    matches: clap::ArgMatches,
+}
+
+impl ParsedArgv {
+    fn parse(argv: Argv) -> buck2_error::Result<Self> {
+        let clap = Opt::command();
+        let matches = clap.get_matches_from(argv.expanded_argv.args());
+
+        let opt: Opt = Opt::from_arg_matches(&matches)?;
+
+        if opt.common_opts.help_wrapper {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "`--help-wrapper` should have been handled by the wrapper"
+            ));
+        }
+
+        match &opt.cmd {
+            #[cfg(not(client_only))]
+            CommandKind::Daemon(..) | CommandKind::Forkserver(..) => {}
+            CommandKind::Clean(..) => {}
+            _ => {
+                check_user_allowed()?;
+            }
+        }
+
+        Ok(ParsedArgv { opt, argv, matches })
+    }
+
+    fn exec(
+        self,
+        process: ProcessContext<'_>,
+        immediate_config: &ImmediateConfigContext,
+    ) -> ExitResult {
+        let expanded_args = self.argv.expanded_argv.clone();
+        self.opt.exec(
+            process,
+            &immediate_config,
+            BuckArgMatches::from_clap(&self.matches, &expanded_args),
+            self.argv,
+        )
+    }
 }
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum CommandKind {
-    #[clap(setting(AppSettings::Hidden))]
-    Daemon(DaemonCommand),
-    #[clap(setting(AppSettings::Hidden))]
-    Forkserver(ForkserverCommand),
-    #[clap(setting(AppSettings::Hidden))]
-    InternalTestRunner(InternalTestRunnerCommand),
+    #[cfg(not(client_only))]
+    #[clap(hide = true)]
+    Daemon(buck2_daemon::daemon::DaemonCommand),
+    #[cfg(not(client_only))]
+    #[clap(hide = true)]
+    Forkserver(crate::commands::forkserver::ForkserverCommand),
+    #[cfg(not(client_only))]
+    #[clap(hide = true)]
+    InternalTestRunner(crate::commands::internal_test_runner::InternalTestRunnerCommand),
     #[clap(subcommand)]
     Audit(AuditCommand),
     Aquery(AqueryCommand),
     Build(BuildCommand),
     Bxl(BxlCommand),
+    // TODO(nga): implement `buck2 help-buckconfig` too
+    //   https://www.internalfb.com/tasks/?t=183528129
     HelpEnv(HelpEnvCommand),
     Test(TestCommand),
     Cquery(CqueryCommand),
     Init(InitCommand),
+    Explain(ExplainCommand),
+    ExpandExternalCell(ExpandExternalCellsCommand),
     Install(InstallCommand),
     Kill(KillCommand),
     Killall(KillallCommand),
@@ -284,9 +296,12 @@ pub(crate) enum CommandKind {
     Utargets(TargetsCommand),
     Ctargets(ConfiguredTargetsCommand),
     Uquery(UqueryCommand),
-    #[clap(subcommand, setting(AppSettings::Hidden))]
+    #[clap(subcommand, hide = true)]
     Debug(DebugCommand),
-    Docs(DocsCommand),
+    #[clap(hide = true)]
+    Complete(buck2_cmd_completion_client::complete::CompleteCommand),
+    Completion(buck2_cmd_completion_client::completion::CompletionCommand),
+    Docs(buck2_cmd_docs::DocsCommand),
     #[clap(subcommand)]
     Profile(ProfileCommand),
     #[clap(hide(true))] // @oss-enable
@@ -303,72 +318,113 @@ impl CommandKind {
         self,
         process: ProcessContext<'_>,
         immediate_config: &ImmediateConfigContext,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         argv: Argv,
         common_opts: BeforeSubcommandOptions,
     ) -> ExitResult {
-        let roots = find_invocation_roots(process.working_dir.path());
-        let paths = roots
-            .map(|r| InvocationPaths {
-                roots: r,
-                isolation: common_opts.isolation_dir.clone(),
-            })
-            .map_err(buck2_error::Error::from);
+        let paths_result =
+            get_invocation_paths_result(process.working_dir, common_opts.isolation_dir.clone());
 
         // Handle the daemon command earlier: it wants to fork, but the things we do below might
         // want to create threads.
+        #[cfg(not(client_only))]
         if let CommandKind::Daemon(cmd) = self {
             return cmd
                 .exec(
-                    process.init,
                     process.log_reload_handle.dupe(),
-                    paths?,
-                    common_opts.daemon,
+                    paths_result.get_result()?,
                     false,
                     || {},
                 )
                 .into();
         }
+        thread::scope(|scope| {
+            // Spawn a thread to have stack size independent on linker/environment.
+            match thread_spawn_scoped("buck2-main", scope, move || {
+                self.exec_no_daemon(
+                    common_opts,
+                    process,
+                    immediate_config,
+                    matches,
+                    argv,
+                    paths_result,
+                )
+            }) {
+                Ok(t) => match t.join() {
+                    Ok(res) => res,
+                    Err(_) => ExitResult::bail("Main thread panicked"),
+                },
+                Err(e) => ExitResult::bail(format_args!("Failed to start main thread: {}", e)),
+            }
+        })
+    }
+
+    fn exec_no_daemon(
+        self,
+        common_opts: BeforeSubcommandOptions,
+        process: ProcessContext<'_>,
+        immediate_config: &ImmediateConfigContext,
+        matches: BuckArgMatches<'_>,
+        argv: Argv,
+        paths: InvocationPathsResult,
+    ) -> ExitResult {
+        if common_opts.no_buckd {
+            // `no_buckd` can't work in a client-only binary
+            if let Some(res) = ExitResult::retry_command_with_full_binary()? {
+                return res;
+            }
+        }
+
+        let fb = buck2_common::fbinit::get_or_init_fbcode_globals();
 
         let runtime = client_tokio_runtime()?;
-        let async_cleanup = AsyncCleanupContextGuard::new(&runtime);
 
         let start_in_process_daemon = if common_opts.no_buckd {
-            start_in_process_daemon(
-                process.init,
+            #[cfg(not(client_only))]
+            let v = buck2_daemon::no_buckd::start_in_process_daemon(
                 immediate_config.daemon_startup_config()?,
-                paths.clone()?,
-                common_opts.daemon,
+                paths.clone().get_result()?,
                 &runtime,
-            )?
+            )?;
+            #[cfg(client_only)]
+            let v = unreachable!(); // case covered above
+            #[allow(dead_code)]
+            v
         } else {
             None
         };
 
-        let command_ctx = ClientCommandContext {
-            init: process.init,
+        let command_ctx = ClientCommandContext::new(
+            fb,
             immediate_config,
             paths,
-            verbosity: common_opts.verbosity,
+            process.working_dir.clone(),
+            common_opts.verbosity,
             start_in_process_daemon,
-            working_dir: process.working_dir.clone(),
-            trace_id: process.trace_id.dupe(),
-            async_cleanup: async_cleanup.ctx().dupe(),
-            stdin: process.stdin,
-            restarter: process.restarter,
-            restarted_trace_id: process.restarted_trace_id.dupe(),
             argv,
-            runtime: &runtime,
-            oncall: common_opts.oncall,
-            client_metadata: common_opts.client_metadata,
-        };
+            process.trace_id.dupe(),
+            process.stdin,
+            process.restarter,
+            process.restarted_trace_id.dupe(),
+            &runtime,
+            common_opts.oncall,
+            common_opts.client_metadata,
+            common_opts.isolation_dir,
+        );
 
         match self {
+            #[cfg(not(client_only))]
             CommandKind::Daemon(..) => unreachable!("Checked earlier"),
+            #[cfg(not(client_only))]
             CommandKind::Forkserver(cmd) => cmd
                 .exec(matches, command_ctx, process.log_reload_handle.dupe())
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
                 .into(),
-            CommandKind::InternalTestRunner(cmd) => cmd.exec(matches, command_ctx).into(),
+            #[cfg(not(client_only))]
+            CommandKind::InternalTestRunner(cmd) => cmd
+                .exec(matches, command_ctx)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                .into(),
             CommandKind::Aquery(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Build(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Bxl(cmd) => cmd.exec(matches, command_ctx),
@@ -395,14 +451,18 @@ impl CommandKind {
             CommandKind::Run(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Uquery(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Debug(cmd) => cmd.exec(matches, command_ctx),
+            CommandKind::Complete(cmd) => cmd.exec(matches, command_ctx),
+            CommandKind::Completion(cmd) => cmd.exec(Opt::command(), matches, command_ctx),
             CommandKind::Docs(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Profile(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Rage(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Init(cmd) => cmd.exec(matches, command_ctx),
+            CommandKind::Explain(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Install(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Log(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Lsp(cmd) => cmd.exec(matches, command_ctx),
             CommandKind::Subscribe(cmd) => cmd.exec(matches, command_ctx),
+            CommandKind::ExpandExternalCell(cmd) => cmd.exec(matches, command_ctx),
         }
     }
 }

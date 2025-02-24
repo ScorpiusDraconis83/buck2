@@ -13,6 +13,7 @@ use std::ops::Deref;
 
 use allocative::Allocative;
 use buck2_util::arc_str::ArcSlice;
+use display_container::fmt_keyed_container;
 use serde_json::Value;
 
 use crate::attrs::attr_type::any_matches::AnyMatches;
@@ -59,15 +60,15 @@ impl<C: Eq> Deref for DictLiteral<C> {
 
 impl<C: Eq + AttrDisplayWithContext> AttrDisplayWithContext for DictLiteral<C> {
     fn fmt(&self, ctx: &AttrFmtContext, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{{")?;
-        for (i, (k, v)) in self.0.iter().enumerate() {
-            if i != 0 {
-                write!(f, ",")?;
-            }
-            write!(f, "{}: {}", k.as_display(ctx), v.as_display(ctx))?;
-        }
-        write!(f, "}}")?;
-        Ok(())
+        fmt_keyed_container(
+            f,
+            "{",
+            "}",
+            ": ",
+            self.0
+                .iter()
+                .map(|(k, v)| (k.as_display(ctx), v.as_display(ctx))),
+        )
     }
 }
 
@@ -78,7 +79,10 @@ impl<C: Eq> FromIterator<(C, C)> for DictLiteral<C> {
 }
 
 impl<C: Eq + AnyMatches> AnyMatches for DictLiteral<C> {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         for (k, v) in self.0.iter() {
             if k.any_matches(filter)? || v.any_matches(filter)? {
                 return Ok(true);
@@ -89,7 +93,7 @@ impl<C: Eq + AnyMatches> AnyMatches for DictLiteral<C> {
 }
 
 impl<C: Eq + ToJsonWithContext> ToJsonWithContext for DictLiteral<C> {
-    fn to_json(&self, ctx: &AttrFmtContext) -> anyhow::Result<Value> {
+    fn to_json(&self, ctx: &AttrFmtContext) -> buck2_error::Result<Value> {
         let mut res: serde_json::Map<String, serde_json::Value> =
             serde_json::Map::with_capacity(self.len());
         for (k, v) in self.iter() {

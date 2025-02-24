@@ -27,7 +27,7 @@ use crate::environment::FrozenModule;
 /// A trait for turning a `path` given by a `load()` statement into a [`FrozenModule`].
 pub trait FileLoader {
     /// Open the file given by the load statement `path`.
-    fn load(&self, path: &str) -> anyhow::Result<FrozenModule>;
+    fn load(&self, path: &str) -> crate::Result<FrozenModule>;
 }
 
 /// [`FileLoader`] that looks up modules by name from a [`HashMap`].
@@ -41,30 +41,32 @@ pub struct ReturnFileLoader<'a> {
 }
 
 impl<'a> FileLoader for ReturnFileLoader<'a> {
-    fn load(&self, path: &str) -> anyhow::Result<FrozenModule> {
+    fn load(&self, path: &str) -> crate::Result<FrozenModule> {
         match self.modules.get(path) {
             Some(v) => Ok((*v).dupe()),
-            None => Err(anyhow::anyhow!(
+            None => Err(crate::Error::new_other(anyhow::anyhow!(
                 "ReturnFileLoader does not know the module `{}`",
                 path
-            )),
+            ))),
         }
     }
 }
 
 /// Same as [`ReturnFileLoader`], but does not require fighting the borrow checker.
+#[cfg(test)]
 pub(crate) struct ReturnOwnedFileLoader {
     pub(crate) modules: HashMap<String, FrozenModule>,
 }
 
+#[cfg(test)]
 impl FileLoader for ReturnOwnedFileLoader {
-    fn load(&self, path: &str) -> anyhow::Result<FrozenModule> {
+    fn load(&self, path: &str) -> crate::Result<FrozenModule> {
         match self.modules.get(path) {
             Some(v) => Ok(v.dupe()),
-            None => Err(anyhow::anyhow!(
+            None => Err(crate::Error::new_other(anyhow::anyhow!(
                 "ReturnOwnedFileLoader does not know the module `{}`",
                 path
-            )),
+            ))),
         }
     }
 }

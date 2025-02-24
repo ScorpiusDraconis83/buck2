@@ -15,7 +15,7 @@ use dupe::Dupe;
 use starlark::environment::GlobalsBuilder;
 use starlark::typing::Ty;
 use starlark::typing::TyStarlarkValue;
-use starlark::values::function::NativeFunction;
+use starlark::values::function::FUNCTION_TYPE;
 use starlark::values::typing::TypeInstanceId;
 use starlark::values::StarlarkValue;
 use starlark_map::sorted_map::SortedMap;
@@ -87,13 +87,14 @@ fn builtin_provider_typechecker_ty<'v, C: StarlarkValue<'v> + ProviderCallableLi
     if iter.next().is_some() {
         panic!("more then one global in creator func globals");
     }
-    if first.1.to_value().get_type() != NativeFunction::TYPE {
+    if first.1.to_value().get_type() != FUNCTION_TYPE {
         panic!("creator func is not a function");
     }
     let ty = Ty::of_value(first.1.to_value());
-    let ty_function = ty
+    let ty_callable = ty
         .as_function()
         .expect("creator func is not a function")
-        .clone();
-    ty_provider_callable::<C>(ty_function).unwrap()
+        .callable()
+        .dupe();
+    ty_provider_callable::<C>(ty_callable).unwrap()
 }

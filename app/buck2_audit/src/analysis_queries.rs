@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgWithUniverseOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,8 +19,11 @@ use crate::AuditSubcommand;
     about = "buck audit analysis resolving query attrs"
 )]
 pub struct AuditAnalysisQueriesCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
+    #[clap(
+        long,
+        help = "Enable to print the outputs for the targets in the resolved queries"
+    )]
+    pub include_outputs: bool,
 
     #[clap(
         name = "TARGET_PATTERNS",
@@ -27,11 +31,11 @@ pub struct AuditAnalysisQueriesCommand {
     )]
     pub patterns: Vec<String>,
 
-    #[clap(
-        long,
-        help = "Enable to print the outputs for the targets in the resolved queries"
-    )]
-    pub include_outputs: bool,
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgWithUniverseOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

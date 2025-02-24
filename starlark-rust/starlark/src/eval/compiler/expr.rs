@@ -34,7 +34,7 @@ use starlark_syntax::syntax::ast::StmtP;
 use thiserror::Error;
 
 use crate::codemap::Spanned;
-use crate::collections::symbol_map::Symbol;
+use crate::collections::symbol::symbol::Symbol;
 use crate::environment::slots::ModuleSlotId;
 use crate::errors::did_you_mean::did_you_mean;
 use crate::eval::compiler::args::ArgsCompiledValue;
@@ -43,6 +43,7 @@ use crate::eval::compiler::compr::ComprCompiled;
 use crate::eval::compiler::constants::Constants;
 use crate::eval::compiler::def::DefCompiled;
 use crate::eval::compiler::def::FrozenDef;
+use crate::eval::compiler::error::CompilerInternalError;
 use crate::eval::compiler::expr_bool::ExprCompiledBool;
 use crate::eval::compiler::known::list_to_tuple;
 use crate::eval::compiler::opt_ctx::OptCtx;
@@ -58,25 +59,27 @@ use crate::eval::runtime::frame_span::FrameSpan;
 use crate::eval::runtime::frozen_file_span::FrozenFileSpan;
 use crate::eval::runtime::slots::LocalCapturedSlotId;
 use crate::eval::runtime::slots::LocalSlotId;
+use crate::eval::Arguments;
+use crate::eval::Evaluator;
+use crate::values::bool::StarlarkBool;
 use crate::values::function::BoundMethodGen;
 use crate::values::function::FrozenBoundMethod;
-use crate::values::layout::value_not_special::FrozenValueNotSpecial;
 use crate::values::list::ListRef;
+use crate::values::range::Range;
 use crate::values::string::interpolation::parse_percent_s_one;
-use crate::values::types::bool::StarlarkBool;
 use crate::values::types::dict::Dict;
 use crate::values::types::ellipsis::Ellipsis;
 use crate::values::types::float::StarlarkFloat;
-use crate::values::types::inline_int::InlineInt;
-use crate::values::types::int_or_big::StarlarkInt;
+use crate::values::types::int::inline_int::InlineInt;
+use crate::values::types::int::int_or_big::StarlarkInt;
 use crate::values::types::list::value::FrozenListData;
 use crate::values::types::list::value::ListData;
-use crate::values::types::range::Range;
 use crate::values::types::string::dot_format::format_one;
 use crate::values::types::string::interpolation::percent_s_one;
 use crate::values::types::tuple::value::Tuple;
-use crate::values::types::unbound::MaybeUnboundValue;
+use crate::values::types::unbound::UnboundValue;
 use crate::values::FrozenHeap;
+use crate::values::FrozenRef;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
 use crate::values::FrozenValueTyped;
@@ -143,7 +146,7 @@ pub(crate) enum Builtin1 {
 }
 
 impl Builtin1 {
-    fn eval<'v>(&self, v: FrozenValue, ctx: &mut OptCtx<'v, '_, '_>) -> Option<Value<'v>> {
+    fn eval<'v>(&self, v: FrozenValue, ctx: &mut OptCtx<'v, '_, '_, '_>) -> Option<Value<'v>> {
         match self {
             Builtin1::Minus => v.to_value().minus(ctx.heap()).ok(),
             Builtin1::Plus => v.to_value().plus(ctx.heap()).ok(),
@@ -354,26 +357,6 @@ impl ExprCompiled {
         FrozenStringValue::new(self.as_value()?)
     }
 
-    /// Try to extract `[c0, c1, ..., cn]` from this expression.
-    pub(crate) fn as_short_list_of_consts(&self) -> Option<Vec<FrozenValue>> {
-        // Prevent exponential explosion during optimization.
-        const MAX_LEN: usize = 1000;
-        match self {
-            ExprCompiled::List(xs) if xs.len() <= MAX_LEN => {
-                xs.try_map(|x| x.as_value().ok_or(())).ok()
-            }
-            ExprCompiled::Value(v) => {
-                let list = FrozenListData::from_frozen_value(v)?;
-                if list.len() <= MAX_LEN {
-                    Some(list.content().to_owned())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
     /// Iterable produced by this expression results in empty.
     pub(crate) fn is_iterable_empty(&self) -> bool {
         match self {
@@ -464,7 +447,49 @@ impl ExprCompiled {
     }
 }
 
+enum ExprShortList<'a> {
+    Exprs(&'a [IrSpanned<ExprCompiled>]),
+    Constants(&'a [FrozenValue]),
+}
+
+impl<'a> IrSpanned<ExprShortList<'a>> {
+    fn as_exprs(&self) -> Vec<IrSpanned<ExprCompiled>> {
+        match &self.node {
+            ExprShortList::Exprs(exprs) => exprs.to_vec(),
+            ExprShortList::Constants(constants) => constants
+                .iter()
+                .map(|c| IrSpanned {
+                    node: ExprCompiled::Value(*c),
+                    span: self.span,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl IrSpanned<ExprCompiled> {
+    /// Try to extract `[e0, e1, ..., en]` from this expression.
+    fn as_short_list(&self) -> Option<IrSpanned<ExprShortList>> {
+        // Prevent exponential explosion during optimization.
+        const MAX_LEN: usize = 1000;
+        match &self.node {
+            ExprCompiled::List(xs) if xs.len() <= MAX_LEN => Some(ExprShortList::Exprs(xs)),
+            ExprCompiled::Value(v) => {
+                let list = FrozenListData::from_frozen_value(v)?;
+                if list.len() <= MAX_LEN {
+                    Some(ExprShortList::Constants(list.content()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+        .map(|node| IrSpanned {
+            node,
+            span: self.span,
+        })
+    }
+
     pub(crate) fn optimize(&self, ctx: &mut OptCtx) -> IrSpanned<ExprCompiled> {
         let span = self.span;
         let expr = match &self.node {
@@ -633,8 +658,8 @@ impl ExprCompiled {
     ) -> ExprCompiled {
         if let Some(v) = l.as_string() {
             if let Some((before, after)) = parse_percent_s_one(&v) {
-                let before = ctx.frozen_heap().alloc_str(&before);
-                let after = ctx.frozen_heap().alloc_str(&after);
+                let before = ctx.frozen_heap().alloc_str_intern(&before);
+                let after = ctx.frozen_heap().alloc_str_intern(&after);
                 return ExprCompiled::percent_s_one(before, r, after, ctx);
             }
         }
@@ -651,7 +676,7 @@ impl ExprCompiled {
             if let Ok(value) =
                 percent_s_one(before.as_str(), arg.to_value(), after.as_str(), ctx.heap())
             {
-                let value = ctx.frozen_heap().alloc_str(value.as_str());
+                let value = ctx.frozen_heap().alloc_str_intern(value.as_str());
                 return ExprCompiled::Value(value.to_frozen_value());
             }
         }
@@ -667,7 +692,7 @@ impl ExprCompiled {
     ) -> ExprCompiled {
         if let Some(arg) = arg.as_value() {
             let value = format_one(&before, arg.to_value(), &after, ctx.heap());
-            let value = ctx.frozen_heap().alloc_str(value.as_str());
+            let value = ctx.frozen_heap().alloc_str_intern(value.as_str());
             return ExprCompiled::Value(value.to_frozen_value());
         }
 
@@ -675,17 +700,8 @@ impl ExprCompiled {
     }
 
     fn add(l: IrSpanned<ExprCompiled>, r: IrSpanned<ExprCompiled>) -> ExprCompiled {
-        let span = l.span.merge(&r.span);
-        if let (Some(l), Some(r)) = (l.as_short_list_of_consts(), r.as_short_list_of_consts()) {
-            let lr = l
-                .iter()
-                .chain(r.iter())
-                .map(|x| IrSpanned {
-                    node: ExprCompiled::Value(*x),
-                    span,
-                })
-                .collect();
-            return ExprCompiled::List(lr);
+        if let (Some(l), Some(r)) = (l.as_short_list(), r.as_short_list()) {
+            return ExprCompiled::List(l.as_exprs().into_iter().chain(r.as_exprs()).collect());
         }
         ExprCompiled::Builtin2(Builtin2::Add, Box::new((l, r)))
     }
@@ -796,7 +812,9 @@ impl ExprCompiled {
         } else if let Some(v) = v.unpack_str() {
             if v.len() <= 1000 {
                 // If string, copy it to frozen heap.
-                Some(ExprCompiled::Value(heap.alloc_str(v).to_frozen_value()))
+                Some(ExprCompiled::Value(
+                    heap.alloc_str_intern(v).to_frozen_value(),
+                ))
             } else {
                 // Long strings may lead to exponential explosion in the optimizer,
                 // so skips optimizations for them.
@@ -856,11 +874,12 @@ impl ExprCompiled {
         // We assume `getattr` has no side effects.
         let v = get_attr_hashed_raw(left.to_value(), attr, ctx.heap()).ok()?;
         match v {
-            MemberOrValue::Member(m) => match MaybeUnboundValue::new(m) {
-                MaybeUnboundValue::Method(m) => {
-                    Some(ctx.frozen_heap().alloc_simple(BoundMethodGen::new(left, m)))
-                }
-                MaybeUnboundValue::Attr(..) => None,
+            MemberOrValue::Member(m) => match m {
+                UnboundValue::Method(m, _) => Some(
+                    ctx.frozen_heap()
+                        .alloc_simple(BoundMethodGen::new(left, *m)),
+                ),
+                UnboundValue::Attr(..) => None,
             },
             MemberOrValue::Value(v) => v.unpack_frozen(),
         }
@@ -1101,16 +1120,23 @@ fn get_attr_no_attr_error<'v>(x: Value<'v>, attribute: &Symbol) -> crate::Error 
     }
 }
 
-pub(crate) enum MemberOrValue<'v> {
-    Member(FrozenValueNotSpecial),
+pub(crate) enum MemberOrValue<'v, 'a> {
+    Member(&'a UnboundValue),
     Value(Value<'v>),
 }
 
-impl<'v> MemberOrValue<'v> {
-    pub(crate) fn to_value(&self) -> Value<'v> {
+impl<'v, 'a> MemberOrValue<'v, 'a> {
+    #[inline]
+    pub(crate) fn invoke(
+        &self,
+        this: Value<'v>,
+        span: FrozenRef<'static, FrameSpan>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> crate::Result<Value<'v>> {
         match self {
-            MemberOrValue::Member(x) => x.to_value(),
-            MemberOrValue::Value(x) => *x,
+            MemberOrValue::Member(member) => member.invoke_method(this, span, args, eval),
+            MemberOrValue::Value(value) => value.invoke_with_loc(Some(span), args, eval),
         }
     }
 }
@@ -1120,7 +1146,7 @@ pub(crate) fn get_attr_hashed_raw<'v>(
     x: Value<'v>,
     attribute: &Symbol,
     heap: &'v Heap,
-) -> crate::Result<MemberOrValue<'v>> {
+) -> crate::Result<MemberOrValue<'v, 'static>> {
     let aref = x.get_ref();
     if let Some(methods) = aref.vtable().methods() {
         if let Some(v) = methods.get_frozen_symbol(attribute) {
@@ -1141,7 +1167,7 @@ pub(crate) fn get_attr_hashed_bind<'v>(
     let aref = x.get_ref();
     if let Some(methods) = aref.vtable().methods() {
         if let Some(v) = methods.get_frozen_symbol(attribute) {
-            return MaybeUnboundValue::new(v).bind(x, heap);
+            return v.bind(x, heap);
         }
     }
     match aref.get_attr_hashed(attribute.as_str_hashed(), heap) {
@@ -1154,7 +1180,7 @@ pub(crate) fn get_attr_hashed_bind<'v>(
     }
 }
 
-impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
+impl<'v, 'a, 'e> Compiler<'v, 'a, 'e, '_> {
     fn expr_ident(&mut self, ident: &CstIdent) -> ExprCompiled {
         let resolved_ident = ident
             .node
@@ -1193,12 +1219,15 @@ impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
         }
     }
 
-    fn opt_ctx<'s>(&'s mut self) -> OptCtx<'v, 'a, 's> {
+    fn opt_ctx<'s>(&'s mut self) -> OptCtx<'v, 'a, 'e, 's> {
         let param_count = self.current_scope().param_count();
         OptCtx::new(self.eval, param_count)
     }
 
-    pub(crate) fn expr(&mut self, expr: &CstExpr) -> IrSpanned<ExprCompiled> {
+    pub(crate) fn expr(
+        &mut self,
+        expr: &CstExpr,
+    ) -> Result<IrSpanned<ExprCompiled>, CompilerInternalError> {
         // println!("compile {}", expr.node);
         let span = FrameSpan::new(FrozenFileSpan::new(self.codemap, expr.span));
         let expr = match &expr.node {
@@ -1216,72 +1245,75 @@ impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
                     // TODO(nga): unnecessary clone.
                     node: StmtP::Return(Some(*body.clone())),
                 };
-                self.function("lambda", signature_span, *scope_id, params, None, &suite)
+                self.function("lambda", signature_span, *scope_id, params, None, &suite)?
             }
             ExprP::Tuple(exprs) => {
-                let xs = exprs.map(|x| self.expr(x));
+                let xs = self.exprs(exprs)?;
                 ExprCompiled::tuple(xs, self.eval.module_env.frozen_heap())
             }
             ExprP::List(exprs) => {
-                let xs = exprs.map(|x| self.expr(x));
+                let xs = self.exprs(exprs)?;
                 ExprCompiled::List(xs)
             }
             ExprP::Dict(exprs) => {
-                let xs = exprs.map(|(k, v)| (self.expr(k), self.expr(v)));
+                let xs = exprs
+                    .iter()
+                    .map(|(k, v)| Ok((self.expr(k)?, self.expr(v)?)))
+                    .collect::<Result<_, CompilerInternalError>>()?;
                 ExprCompiled::Dict(xs)
             }
             ExprP::If(cond_then_expr_else_expr) => {
                 let (cond, then_expr, else_expr) = &**cond_then_expr_else_expr;
-                let cond = self.expr(cond);
-                let then_expr = self.expr(then_expr);
-                let else_expr = self.expr(else_expr);
-                return ExprCompiled::if_expr(cond, then_expr, else_expr);
+                let cond = self.expr(cond)?;
+                let then_expr = self.expr(then_expr)?;
+                let else_expr = self.expr(else_expr)?;
+                return Ok(ExprCompiled::if_expr(cond, then_expr, else_expr));
             }
             ExprP::Dot(left, right) => {
-                let left = self.expr(left);
+                let left = self.expr(left)?;
                 let s = Symbol::new(&right.node);
 
                 ExprCompiled::dot(left, &s, &mut self.opt_ctx())
             }
             ExprP::Call(left, args) => {
-                let left = self.expr(left);
-                let args = self.args(args);
+                let left = self.expr(left)?;
+                let args = self.args(args)?;
                 CallCompiled::call(span, left, args, &mut self.opt_ctx())
             }
             ExprP::Index(array_index) => {
                 let (array, index) = &**array_index;
-                let array = self.expr(array);
-                let index = self.expr(index);
+                let array = self.expr(array)?;
+                let index = self.expr(index)?;
                 ExprCompiled::index(array, index, &mut self.opt_ctx())
             }
             ExprP::Index2(array_index0_index1) => {
                 let (array, index0, index1) = &**array_index0_index1;
-                let array = self.expr(array);
-                let index0 = self.expr(index0);
-                let index1 = self.expr(index1);
+                let array = self.expr(array)?;
+                let index0 = self.expr(index0)?;
+                let index1 = self.expr(index1)?;
                 ExprCompiled::index2(array, index0, index1)
             }
             ExprP::Slice(collection, start, stop, stride) => {
-                let collection = self.expr(collection);
-                let start = start.as_ref().map(|x| self.expr(x));
-                let stop = stop.as_ref().map(|x| self.expr(x));
-                let stride = stride.as_ref().map(|x| self.expr(x));
+                let collection = self.expr(collection)?;
+                let start = start.as_ref().map(|x| self.expr(x)).transpose()?;
+                let stop = stop.as_ref().map(|x| self.expr(x)).transpose()?;
+                let stride = stride.as_ref().map(|x| self.expr(x)).transpose()?;
                 ExprCompiled::slice(span, collection, start, stop, stride, &mut self.opt_ctx())
             }
             ExprP::Not(expr) => {
-                let expr = self.expr(expr);
-                return ExprCompiled::not(span, expr);
+                let expr = self.expr(expr)?;
+                return Ok(ExprCompiled::not(span, expr));
             }
             ExprP::Minus(expr) => {
-                let expr = self.expr(expr);
+                let expr = self.expr(expr)?;
                 ExprCompiled::un_op(span, &Builtin1::Minus, expr, &mut self.opt_ctx())
             }
             ExprP::Plus(expr) => {
-                let expr = self.expr(expr);
+                let expr = self.expr(expr)?;
                 ExprCompiled::un_op(span, &Builtin1::Plus, expr, &mut self.opt_ctx())
             }
             ExprP::BitNot(expr) => {
-                let expr = self.expr(expr);
+                let expr = self.expr(expr)?;
                 ExprCompiled::un_op(span, &Builtin1::BitNot, expr, &mut self.opt_ctx())
             }
             ExprP::Op(left, op, right) => {
@@ -1298,14 +1330,14 @@ impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
                         Cow::Borrowed(&**right)
                     };
 
-                    let l = self.expr(left);
-                    let r = self.expr(&right);
+                    let l = self.expr(left)?;
+                    let r = self.expr(&right)?;
                     match op {
-                        BinOp::Or => return ExprCompiled::or(l, r),
-                        BinOp::And => return ExprCompiled::and(l, r),
-                        BinOp::Equal => return ExprCompiled::equals(l, r),
+                        BinOp::Or => return Ok(ExprCompiled::or(l, r)),
+                        BinOp::And => return Ok(ExprCompiled::and(l, r)),
+                        BinOp::Equal => return Ok(ExprCompiled::equals(l, r)),
                         BinOp::NotEqual => {
-                            return ExprCompiled::not(span, ExprCompiled::equals(l, r));
+                            return Ok(ExprCompiled::not(span, ExprCompiled::equals(l, r)));
                         }
                         BinOp::Less => ExprCompiled::bin_op(
                             Builtin2::Compare(CompareOp::Less),
@@ -1383,10 +1415,12 @@ impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
                     }
                 }
             }
-            ExprP::ListComprehension(x, for_, clauses) => self.list_comprehension(x, for_, clauses),
+            ExprP::ListComprehension(x, for_, clauses) => {
+                self.list_comprehension(x, for_, clauses)?
+            }
             ExprP::DictComprehension(k_v, for_, clauses) => {
                 let (k, v) = &**k_v;
-                self.dict_comprehension(k, v, for_, clauses)
+                self.dict_comprehension(k, v, for_, clauses)?
             }
             ExprP::Literal(x) => {
                 let val = x.compile(self.eval.module_env.frozen_heap());
@@ -1418,19 +1452,32 @@ impl<'v, 'a, 'e> Compiler<'v, 'a, 'e> {
 
                 let mut args = ArgsCompiledValue::default();
                 for expr in expressions {
-                    args.push_pos(self.expr(expr));
+                    args.push_pos(self.expr(expr)?);
                 }
 
                 CallCompiled::call(span, method, args, &mut self.opt_ctx())
             }
         };
-        IrSpanned { node: expr, span }
+        Ok(IrSpanned { node: expr, span })
     }
 
     /// Like `expr` but returns an expression optimized assuming
     /// only the truth of the result is needed.
-    pub(crate) fn expr_truth(&mut self, expr: &CstExpr) -> IrSpanned<ExprCompiledBool> {
-        let expr = self.expr(expr);
-        ExprCompiledBool::new(expr)
+    pub(crate) fn expr_truth(
+        &mut self,
+        expr: &CstExpr,
+    ) -> Result<IrSpanned<ExprCompiledBool>, CompilerInternalError> {
+        let expr = self.expr(expr)?;
+        Ok(ExprCompiledBool::new(expr))
+    }
+
+    pub(crate) fn exprs(
+        &mut self,
+        exprs: &[CstExpr],
+    ) -> Result<Vec<IrSpanned<ExprCompiled>>, CompilerInternalError> {
+        exprs
+            .iter()
+            .map(|e| self.expr(e))
+            .collect::<Result<_, CompilerInternalError>>()
     }
 }

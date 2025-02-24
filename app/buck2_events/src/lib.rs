@@ -9,6 +9,7 @@
 
 #![feature(error_generic_member_access)]
 #![feature(used_with_arg)]
+#![feature(once_cell_try)]
 
 //!
 //! Events and event streams for Buck2.
@@ -28,6 +29,7 @@ pub mod daemon_id;
 pub mod dispatch;
 pub mod errors;
 pub mod metadata;
+pub mod schedule_type;
 pub mod sink;
 pub mod source;
 pub mod span;
@@ -37,9 +39,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::Context;
 use buck2_cli_proto::CommandResult;
 use buck2_cli_proto::PartialResult;
+use buck2_error::BuckErrorContext;
 use buck2_wrapper_common::invocation_id::TraceId;
 use derive_more::From;
 use gazebo::variants::UnpackVariants;
@@ -65,11 +67,11 @@ pub struct BuckEvent {
 
     /// If this event starts a new span, the span ID assigned to this span, or None if this event is a leaf event
     /// that does not start a new span.
-    span_id: Option<SpanId>,
+    pub span_id: Option<SpanId>,
 
     /// The ID of the span that contains this event. Will be non-None in all Events except the first and last events
     /// of a trace.
-    parent_id: Option<SpanId>,
+    pub parent_id: Option<SpanId>,
 }
 
 impl BuckEvent {
@@ -99,7 +101,7 @@ impl BuckEvent {
         self.timestamp
     }
 
-    pub fn trace_id(&self) -> anyhow::Result<TraceId> {
+    pub fn trace_id(&self) -> buck2_error::Result<TraceId> {
         Ok(TraceId::from_str(&self.event.trace_id)?)
     }
 
@@ -143,14 +145,14 @@ impl BuckEvent {
         }
     }
 
-    pub fn command_start(&self) -> anyhow::Result<Option<&buck2_data::CommandStart>> {
+    pub fn command_start(&self) -> buck2_error::Result<Option<&buck2_data::CommandStart>> {
         match self.span_start_event() {
             None => Ok(None),
             Some(span_start_event) => {
                 match span_start_event
                     .data
                     .as_ref()
-                    .with_context(|| BuckEventError::MissingField(self.clone()))?
+                    .with_buck_error_context(|| BuckEventError::MissingField(self.clone()))?
                 {
                     buck2_data::span_start_event::Data::Command(command_start) => {
                         Ok(Some(command_start))
@@ -169,9 +171,9 @@ impl From<BuckEvent> for Box<buck2_data::BuckEvent> {
 }
 
 impl TryFrom<Box<buck2_data::BuckEvent>> for BuckEvent {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
-    fn try_from(event: Box<buck2_data::BuckEvent>) -> anyhow::Result<BuckEvent> {
+    fn try_from(event: Box<buck2_data::BuckEvent>) -> buck2_error::Result<BuckEvent> {
         event.data.as_ref().ok_or(BuckEventError::MissingData)?;
         fn new_span_id(num: u64) -> Option<SpanId> {
             NonZeroU64::new(num).map(SpanId)
@@ -191,7 +193,7 @@ impl TryFrom<Box<buck2_data::BuckEvent>> for BuckEvent {
 }
 
 /// The set of events that can flow out of an EventSource.
-#[derive(Clone, From, UnpackVariants)]
+#[derive(Debug, Clone, From, UnpackVariants)]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// A command result, produced upon completion of a command.
@@ -207,24 +209,47 @@ pub enum Event {
 pub struct EventSinkStats {
     /// Count of number of successful messages (e.g. those that have been processed by their downstream destination).
     pub successes: u64,
-    /// Count of messages that failed to be submitted and will not be retried.
-    pub failures: u64,
+    // Count of messages that failed to be submitted and will not be retried.
+    pub failures_invalid_request: u64,
+    pub failures_unauthorized: u64,
+    pub failures_rate_limited: u64,
+    pub failures_pushed_back: u64,
+    pub failures_enqueue_failed: u64,
+    pub failures_internal_error: u64,
+    pub failures_timed_out: u64,
+    pub failures_unknown: u64,
     /// How many messages are currently buffered by this sink.
     pub buffered: u64,
     /// How many messages were not even enqueued by this sink.
     pub dropped: u64,
+    /// How many bytes were written into this sink.
+    pub bytes_written: u64,
 }
 
 impl EventSinkStats {
-    /// Since there can be one or more sinks (e.g. with [`sink::TeeSink`](???)), we need to aggregate these into
-    /// useful singular values.
-    pub fn aggregate(&self, other: &Self) -> Self {
-        Self {
-            successes: self.successes + other.successes,
-            failures: self.failures + other.failures,
-            buffered: self.buffered + other.buffered,
-            dropped: self.dropped + other.dropped,
-        }
+    pub fn failures(&self) -> u64 {
+        let EventSinkStats {
+            successes: _,
+            failures_invalid_request,
+            failures_unauthorized,
+            failures_rate_limited,
+            failures_pushed_back,
+            failures_enqueue_failed,
+            failures_internal_error,
+            failures_timed_out,
+            failures_unknown,
+            buffered: _,
+            dropped: _,
+            bytes_written: _,
+        } = self;
+        *failures_invalid_request
+            + *failures_unauthorized
+            + *failures_rate_limited
+            + *failures_pushed_back
+            + *failures_enqueue_failed
+            + *failures_internal_error
+            + *failures_timed_out
+            + *failures_unknown
     }
 }
 
@@ -241,7 +266,7 @@ pub trait EventSinkWithStats: Send + Sync {
     fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink>;
 
     /// Collects stats on this sink (e.g. messages accepted, rejected).
-    fn stats(&self) -> Option<EventSinkStats>;
+    fn stats(&self) -> EventSinkStats;
 }
 
 impl EventSink for Arc<dyn EventSink> {
@@ -260,6 +285,7 @@ pub fn create_source_sink_pair() -> (ChannelEventSource, impl EventSink) {
 
 #[allow(clippy::large_enum_variant)]
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Tier0)]
 enum BuckEventError {
     #[error("The `buck2_data::BuckEvent` provided has no `Timestamp`")]
     MissingTimestamp,
@@ -267,6 +293,10 @@ enum BuckEventError {
     MissingData,
     #[error("Sent an event missing one or more fields: `{0:?}`")]
     MissingField(BuckEvent),
+}
+
+pub fn init_late_bindings() {
+    buck2_core::event::EVENT_DISPATCH.init(&dispatch::EventDispatcherLateBinding);
 }
 
 #[cfg(test)]

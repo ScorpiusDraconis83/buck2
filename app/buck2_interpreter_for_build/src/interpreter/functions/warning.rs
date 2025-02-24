@@ -12,13 +12,13 @@ use starlark::starlark_module;
 use starlark::values::none::NoneType;
 
 #[starlark_module]
-pub fn register_warning(builder: &mut GlobalsBuilder) {
+pub(crate) fn register_warning(builder: &mut GlobalsBuilder) {
     /// Print a warning. The line will be decorated with the timestamp and other details,
     /// including the word `WARN` (colored, if the console supports it).
     ///
     /// If you are not writing a warning, use `print` instead. Be aware that printing
     /// lots of output (warnings or not) can be cause all information to be ignored by the user.
-    fn warning(#[starlark(require = pos)] x: &str) -> anyhow::Result<NoneType> {
+    fn warning(#[starlark(require = pos)] x: &str) -> starlark::Result<NoneType> {
         tracing::warn!("{}", x);
         Ok(NoneType)
     }

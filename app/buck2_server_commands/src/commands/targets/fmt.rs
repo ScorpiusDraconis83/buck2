@@ -7,10 +7,10 @@
  * of this source tree.
  */
 
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
-use anyhow::Context;
 use buck2_cli_proto::targets_request;
 use buck2_cli_proto::targets_request::OutputFormat;
 use buck2_cli_proto::targets_request::TargetHashGraphType;
@@ -19,6 +19,8 @@ use buck2_cli_proto::TargetsRequest;
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::package::PackageLabel;
+use buck2_error::internal_error;
+use buck2_error::BuckErrorContext;
 use buck2_node::attrs::hacks::value_to_json;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::nodes::attributes::DEPS;
@@ -38,21 +40,13 @@ use regex::RegexSet;
 use crate::json::QuotedJson;
 use crate::target_hash::BuckTargetHash;
 
-#[derive(Debug, buck2_error::Error)]
-enum FormatterError {
-    #[error("Attributes can only be specified when output format is JSON (internal error)")]
-    AttrsOnlyWithJson,
-    #[error("`output_format` is not set (internal error)")]
-    OutputFormatNotSet,
-}
-
 pub(crate) struct TargetInfo<'a> {
     pub(crate) node: TargetNodeRef<'a>,
     pub(crate) target_hash: Option<BuckTargetHash>,
     pub(crate) super_package: &'a SuperPackage,
 }
 
-fn package_error_to_stderr(package: &PackageLabel, error: &anyhow::Error, stderr: &mut String) {
+fn package_error_to_stderr(package: PackageLabel, error: &buck2_error::Error, stderr: &mut String) {
     writeln!(stderr, "Error parsing {package}\n{error:?}").unwrap();
 }
 
@@ -74,11 +68,11 @@ pub(crate) trait TargetFormatter: Send + Sync {
     fn package_error(
         &self,
         package: PackageLabel,
-        error: &anyhow::Error,
+        error: &buck2_error::Error,
         stdout: &mut String,
         stderr: &mut String,
     ) {
-        package_error_to_stderr(&package, error, stderr);
+        package_error_to_stderr(package, error, stderr);
     }
 }
 
@@ -294,14 +288,14 @@ impl TargetFormatter for JsonFormat {
     fn package_error(
         &self,
         package: PackageLabel,
-        error: &anyhow::Error,
+        error: &buck2_error::Error,
         stdout: &mut String,
         stderr: &mut String,
     ) {
         // When an error happens we print it to stdout (as a JSON entry) and to stderr (as a human message).
         // If the user has keep-going turned on, they'll get the JSON on stdout, but also have the error message appear on stderr.
         // If the user has keep-going turned off, they'll only see one error message and then abort.
-        package_error_to_stderr(&package, error, stderr);
+        package_error_to_stderr(package, error, stderr);
         self.writer.entry_start(stdout);
         let mut first = true;
         self.writer.entry_item(
@@ -314,7 +308,7 @@ impl TargetFormatter for JsonFormat {
             stdout,
             &mut first,
             "buck.error",
-            QuotedJson::quote_str(&format!("{:?}", error)),
+            QuotedJson::quote_str(&format!("{error:?}")),
         );
         self.writer.entry_end(stdout, first);
     }
@@ -323,6 +317,7 @@ impl TargetFormatter for JsonFormat {
 #[derive(Debug, Default)]
 pub(crate) struct Stats {
     pub(crate) errors: u64,
+    error_tags: BTreeSet<buck2_error::ErrorTag>,
     pub(crate) success: u64,
     pub(crate) targets: u64,
 }
@@ -332,6 +327,34 @@ impl Stats {
         self.errors += stats.errors;
         self.success += stats.success;
         self.targets += stats.targets;
+    }
+
+    pub(crate) fn add_error(&mut self, e: &buck2_error::Error) {
+        self.error_tags.extend(e.tags());
+        self.errors += 1;
+    }
+
+    pub(crate) fn to_error(&self) -> Option<buck2_error::Error> {
+        if self.errors == 0 {
+            return None;
+        }
+        // Simpler error so that we don't print long errors twice (when exiting buck2)
+        let package_str = if self.errors == 1 {
+            "package"
+        } else {
+            "packages"
+        };
+
+        #[derive(buck2_error::Error, Debug)]
+        #[buck2(tag = Input)]
+        enum TargetsError {
+            #[error("Failed to parse {0} {1}")]
+            FailedToParse(u64, &'static str),
+        }
+
+        let mut e = buck2_error::Error::from(TargetsError::FailedToParse(self.errors, package_str));
+        e = e.tag(self.error_tags.iter().copied());
+        Some(e.into())
     }
 }
 
@@ -374,9 +397,9 @@ pub(crate) fn print_target_call_stack_after_target(out: &mut String, call_stack:
 pub(crate) fn create_formatter(
     request: &TargetsRequest,
     other: &targets_request::Other,
-) -> anyhow::Result<Arc<dyn TargetFormatter>> {
+) -> buck2_error::Result<Arc<dyn TargetFormatter>> {
     let output_format = OutputFormat::from_i32(request.output_format)
-        .context("Invalid value of `output_format` (internal error)")?;
+        .internal_error("Invalid value of `output_format`")?;
 
     let target_call_stacks = request.client_context()?.target_call_stacks;
 
@@ -385,13 +408,15 @@ pub(crate) fn create_formatter(
         _ => {
             // Self-check.
             if !other.output_attributes.is_empty() {
-                return Err(FormatterError::AttrsOnlyWithJson.into());
+                return Err(internal_error!(
+                    "Attributes can only be specified when output format is JSON"
+                ));
             }
         }
     }
 
     match output_format {
-        OutputFormat::Unknown => Err(FormatterError::OutputFormatNotSet.into()),
+        OutputFormat::Unknown => Err(internal_error!("`output_format` is not set")),
         OutputFormat::Stats => Ok(Arc::new(StatsFormat)),
         OutputFormat::Text => Ok(Arc::new(TargetNameFormat {
             target_call_stacks,

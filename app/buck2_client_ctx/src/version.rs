@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::sync::OnceLock;
 
+use buck2_core::buck2_env;
 use object::Object;
 
 /// Provides information about this buck version.
@@ -52,10 +53,8 @@ impl BuckVersion {
     }
 
     fn compute() -> BuckVersion {
-        // TODO(cjhopman): Currently, buck is just a single executable and we don't have really stringent
-        // perf requirements so we hash the binary itself for the unique id. We will need to move this to
-        // be part of the build/packaging process at some point.
-        let exe = std::env::current_exe().unwrap();
+        // Make sure to use the daemon exe's version, if there is one
+        let exe = crate::daemon::client::connect::get_daemon_exe().unwrap();
         let mut file = File::open(exe).unwrap();
         let file_m = match unsafe { memmap2::Mmap::map(&file) } {
             Ok(mmap) => mmap,
@@ -82,7 +81,7 @@ impl BuckVersion {
         {
             (internal_exe_hash, "<build-id>")
         } else {
-            if !buck2_core::is_open_source() {
+            if !(buck2_core::is_open_source() || buck2_env!("BUCK2_IGNORE_VERSION_EXTRACTION_FAILURE", type=bool, default=false, applicability=testing).unwrap_or(false)) {
                 let _ignored = crate::eprintln!(
                     "version extraction failed. This indicates an issue with the buck2 release, will fallback to binary hash"
                 );

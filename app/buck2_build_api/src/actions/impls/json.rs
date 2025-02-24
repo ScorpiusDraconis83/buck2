@@ -9,62 +9,85 @@
 
 use std::io::sink;
 use std::io::Write;
+use std::sync::Arc;
 
-use anyhow::Context;
 use buck2_artifact::artifact::artifact_type::Artifact;
+use buck2_error::BuckErrorContext;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use dupe::Dupe;
+use either::Either;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::values::dict::DictRef;
 use starlark::values::enumeration::EnumValue;
 use starlark::values::list::ListRef;
+use starlark::values::none::NoneType;
 use starlark::values::record::Record;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
+use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueLike;
+use starlark::values::ValueTypedComplex;
 
 use crate::artifact_groups::ArtifactGroup;
-use crate::interpreter::rule_defs::artifact::FrozenStarlarkOutputArtifact;
-use crate::interpreter::rule_defs::artifact::StarlarkArtifactLike;
-use crate::interpreter::rule_defs::artifact::StarlarkOutputArtifact;
-use crate::interpreter::rule_defs::artifact::ValueAsArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
+use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
 use crate::interpreter::rule_defs::artifact_tagging::TaggedValue;
+use crate::interpreter::rule_defs::cmd_args::value::CommandLineArg;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use crate::interpreter::rule_defs::cmd_args::AbsCommandLineContext;
-use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::CommandLineContext;
 use crate::interpreter::rule_defs::cmd_args::DefaultCommandLineContext;
 use crate::interpreter::rule_defs::cmd_args::FrozenStarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
-use crate::interpreter::rule_defs::provider::ProviderLike;
 use crate::interpreter::rule_defs::provider::ValueAsProviderLike;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSetJsonProjection;
 
 /// A wrapper with a Serialize instance so we can pass down the necessary context.
 pub struct SerializeValue<'a, 'v> {
-    pub value: Value<'v>,
+    pub value: JsonUnpack<'v>,
     pub fs: Option<&'a ExecutorFs<'a>>,
     pub absolute: bool,
 }
 
-impl<'a, 'v> SerializeValue<'a, 'v> {
-    fn with_value(&self, x: Value<'v>) -> Self {
-        Self {
-            value: x,
-            fs: self.fs,
-            absolute: self.absolute,
+struct Buck2ErrorResultOfSerializedValue<'a, 'v> {
+    result: buck2_error::Result<SerializeValue<'a, 'v>>,
+}
+
+impl<'a, 'v> Serialize for Buck2ErrorResultOfSerializedValue<'a, 'v> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match &self.result {
+            Ok(v) => v.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!("{:#}", e))),
         }
     }
 }
 
-fn err<R, E: serde::ser::Error>(res: anyhow::Result<R>) -> Result<R, E> {
+impl<'a, 'v> SerializeValue<'a, 'v> {
+    fn with_value(&self, x: Value<'v>) -> Buck2ErrorResultOfSerializedValue<'a, 'v> {
+        Buck2ErrorResultOfSerializedValue {
+            result: JsonUnpack::unpack_value_err(x)
+                .map_err(buck2_error::Error::from)
+                .map(|value| SerializeValue {
+                    value,
+                    fs: self.fs,
+                    absolute: self.absolute,
+                }),
+        }
+    }
+}
+
+fn err<R, E: serde::ser::Error>(res: buck2_error::Result<R>) -> Result<R, E> {
     match res {
         Ok(v) => Ok(v),
         Err(e) => Err(serde::ser::Error::custom(format!("{:#}", e))),
@@ -91,20 +114,30 @@ where
 /// We want to deal with both normal artifacts, and .as_output() artifacts,
 /// since otherwise the .as_output ones will fall through as a cmd_args
 /// and end up getting wrapped in a list below.
-fn get_artifact<'v>(x: Value<'v>) -> Option<Box<dyn FnOnce() -> anyhow::Result<Artifact> + 'v>> {
-    if let Some(x) = ValueAsArtifactLike::unpack_value(x) {
-        Some(Box::new(|| Ok(x.0.get_bound_artifact()?.dupe())))
-    } else if let Some(x) = x.downcast_ref::<StarlarkOutputArtifact>() {
-        Some(Box::new(|| Ok(((*x.inner()).get_bound_artifact())?.dupe())))
-    } else if let Some(x) = x.downcast_ref::<FrozenStarlarkOutputArtifact>() {
-        Some(Box::new(|| Ok(x.inner().artifact())))
-    } else {
-        None
+#[derive(UnpackValue, StarlarkTypeRepr)]
+pub enum JsonArtifact<'v> {
+    ValueAsArtifactLike(ValueAsArtifactLike<'v>),
+    StarlarkOutputArtifact(ValueTypedComplex<'v, StarlarkOutputArtifact<'v>>),
+}
+
+impl<'v> JsonArtifact<'v> {
+    fn artifact(&self) -> buck2_error::Result<Artifact> {
+        match self {
+            JsonArtifact::ValueAsArtifactLike(x) => Ok(x.0.get_bound_artifact()?.dupe()),
+            JsonArtifact::StarlarkOutputArtifact(x) => match x.unpack() {
+                Either::Left(x) => Ok((*x.inner()?).get_bound_artifact()?.dupe()),
+                Either::Right(x) => Ok(x.inner()?.artifact()),
+            },
+        }
     }
 }
 
-enum JsonUnpack<'v> {
-    None,
+/// Partially unpack the value into JSON writable with `ctx.actions.write_json`.
+/// This does not help typechecker much (because it only validates top-level types),
+/// but it provides better documentation.
+#[derive(UnpackValue, StarlarkTypeRepr)]
+pub enum JsonUnpack<'v> {
+    None(NoneType),
     String(&'v str),
     Number(i64),
     Bool(bool),
@@ -117,51 +150,10 @@ enum JsonUnpack<'v> {
     TransitiveSetJsonProjection(&'v TransitiveSetJsonProjection<'v>),
     TargetLabel(&'v StarlarkTargetLabel),
     ConfiguredProvidersLabel(&'v StarlarkConfiguredProvidersLabel),
-    Artifact(Box<dyn FnOnce() -> anyhow::Result<Artifact> + 'v>),
-    CommandLine(&'v dyn CommandLineArgLike),
-    Provider(&'v dyn ProviderLike<'v>),
+    Artifact(JsonArtifact<'v>),
+    CommandLine(CommandLineArg<'v>),
+    Provider(ValueAsProviderLike<'v>),
     TaggedValue(&'v TaggedValue<'v>),
-    Unsupported,
-}
-
-fn unpack<'v>(value: Value<'v>) -> JsonUnpack<'v> {
-    if value.is_none() {
-        JsonUnpack::None
-    } else if let Some(x) = value.unpack_str() {
-        JsonUnpack::String(x)
-    } else if let Some(x) = i64::unpack_value(value) {
-        JsonUnpack::Number(x)
-    } else if let Some(x) = value.unpack_bool() {
-        JsonUnpack::Bool(x)
-    } else if let Some(x) = ListRef::from_value(value) {
-        JsonUnpack::List(x)
-    } else if let Some(x) = TupleRef::from_value(value) {
-        JsonUnpack::Tuple(x)
-    } else if let Some(x) = DictRef::from_value(value) {
-        JsonUnpack::Dict(x)
-    } else if let Some(x) = StructRef::from_value(value) {
-        JsonUnpack::Struct(x)
-    } else if let Some(x) = Record::from_value(value) {
-        JsonUnpack::Record(x)
-    } else if let Some(x) = EnumValue::from_value(value) {
-        JsonUnpack::Enum(x)
-    } else if let Some(x) = TransitiveSetJsonProjection::from_value(value) {
-        JsonUnpack::TransitiveSetJsonProjection(x)
-    } else if let Some(x) = StarlarkTargetLabel::from_value(value) {
-        JsonUnpack::TargetLabel(x)
-    } else if let Some(x) = StarlarkConfiguredProvidersLabel::from_value(value) {
-        JsonUnpack::ConfiguredProvidersLabel(x)
-    } else if let Some(x) = get_artifact(value) {
-        JsonUnpack::Artifact(x)
-    } else if let Some(x) = ValueAsCommandLineLike::unpack_value(value) {
-        JsonUnpack::CommandLine(x.0)
-    } else if let Some(x) = value.as_provider() {
-        JsonUnpack::Provider(x)
-    } else if let Some(x) = TaggedValue::from_value(value) {
-        JsonUnpack::TaggedValue(x)
-    } else {
-        JsonUnpack::Unsupported
-    }
 }
 
 impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
@@ -169,11 +161,11 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
     where
         S: Serializer,
     {
-        match unpack(self.value) {
-            JsonUnpack::None => serializer.serialize_none(),
+        match &self.value {
+            JsonUnpack::None(_) => serializer.serialize_none(),
             JsonUnpack::String(x) => serializer.serialize_str(x),
-            JsonUnpack::Number(x) => serializer.serialize_i64(x),
-            JsonUnpack::Bool(x) => serializer.serialize_bool(x),
+            JsonUnpack::Number(x) => serializer.serialize_i64(*x),
+            JsonUnpack::Bool(x) => serializer.serialize_bool(*x),
             JsonUnpack::List(x) => serializer.collect_seq(x.iter().map(|v| self.with_value(v))),
             JsonUnpack::Tuple(x) => serializer.collect_seq(x.iter().map(|v| self.with_value(v))),
             JsonUnpack::Dict(x) => serializer.collect_map(
@@ -208,7 +200,7 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                         serializer.serialize_str("")
                     }
                     Some(fs) => {
-                        let path = err(err(x())?.resolve_path(fs.fs()))?;
+                        let path = err(err(x.artifact())?.resolve_path(fs.fs()))?;
                         let path = with_command_line_context(fs, self.absolute, |ctx| {
                             err(ctx.resolve_project_path(path)).map(|loc| loc.into_string())
                         })?;
@@ -217,7 +209,7 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                 }
             }
             JsonUnpack::CommandLine(x) => {
-                let singleton = is_singleton_cmdargs(self.value);
+                let singleton = is_singleton_cmdargs(*x);
                 match self.fs {
                     None => {
                         // See a few lines up for fs == None details.
@@ -233,7 +225,7 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                         let mut items = Vec::<String>::new();
 
                         with_command_line_context(fs, self.absolute, |ctx| {
-                            err(x.add_to_command_line(&mut items, ctx))
+                            err(x.as_command_line_arg().add_to_command_line(&mut items, ctx))
                         })?;
 
                         // We change the type, based on the value - singleton = String, otherwise list.
@@ -248,40 +240,36 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                 }
             }
             JsonUnpack::Provider(x) => {
-                serializer.collect_map(x.items().iter().map(|(k, v)| (k, self.with_value(*v))))
+                serializer.collect_map(x.0.items().iter().map(|(k, v)| (k, self.with_value(*v))))
             }
             JsonUnpack::TaggedValue(x) => self.with_value(*x.value()).serialize(serializer),
-            JsonUnpack::Unsupported => Err(serde::ser::Error::custom(format!(
-                "Type `{}` is not supported by `write_json`",
-                self.value.get_type()
-            ))),
         }
     }
 }
 
-fn is_singleton_cmdargs(x: Value) -> bool {
-    if let Some(x) = x.downcast_ref::<StarlarkCmdArgs>() {
+fn is_singleton_cmdargs(x: CommandLineArg) -> bool {
+    if let Some(x) = x.to_value().downcast_ref::<StarlarkCmdArgs>() {
         x.is_concat()
-    } else if let Some(x) = x.downcast_ref::<FrozenStarlarkCmdArgs>() {
+    } else if let Some(x) = x.to_value().downcast_ref::<FrozenStarlarkCmdArgs>() {
         x.is_concat()
     } else {
         false
     }
 }
 
-pub fn validate_json(x: Value) -> anyhow::Result<()> {
+pub fn validate_json(x: JsonUnpack) -> buck2_error::Result<()> {
     write_json(x, None, &mut sink(), false, false)
 }
 
 pub fn write_json(
-    x: Value,
+    value: JsonUnpack,
     fs: Option<&ExecutorFs>,
     mut writer: &mut dyn Write,
     pretty: bool,
     absolute: bool,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let value = SerializeValue {
-        value: x,
+        value,
         fs,
         absolute,
     };
@@ -294,17 +282,17 @@ pub fn write_json(
         } else {
             serde_json::to_writer(&mut writer, &value)?;
         }
-        anyhow::Ok(())
+        buck2_error::Ok(())
     })()
-    .context("Error converting to JSON for `write_json`")
+    .buck_error_context("Error converting to JSON for `write_json`")
 }
 
 pub fn visit_json_artifacts(
     v: Value,
     visitor: &mut dyn CommandLineArtifactVisitor,
-) -> anyhow::Result<()> {
-    match unpack(v) {
-        JsonUnpack::None
+) -> buck2_error::Result<()> {
+    match JsonUnpack::unpack_value_err(v)? {
+        JsonUnpack::None(_)
         | JsonUnpack::String(_)
         | JsonUnpack::Number(_)
         | JsonUnpack::Bool(_)
@@ -339,7 +327,7 @@ pub fn visit_json_artifacts(
             }
         }
         JsonUnpack::TransitiveSetJsonProjection(x) => visitor.visit_input(
-            ArtifactGroup::TransitiveSetProjection(x.to_projection_key()?),
+            ArtifactGroup::TransitiveSetProjection(Arc::new(x.to_projection_key()?)),
             None,
         ),
         JsonUnpack::Artifact(_x) => {
@@ -350,15 +338,9 @@ pub fn visit_json_artifacts(
                 .0
                 .visit_artifacts(visitor)?;
         }
-        JsonUnpack::CommandLine(x) => x.visit_artifacts(visitor)?,
-        JsonUnpack::Unsupported => {
-            return Err(anyhow::anyhow!(
-                "Type `{}` is not supported by `write_json` (this should be unreachable)",
-                v.get_type()
-            ));
-        }
+        JsonUnpack::CommandLine(x) => x.as_command_line_arg().visit_artifacts(visitor)?,
         JsonUnpack::Provider(x) => {
-            for (_, v) in x.items() {
+            for (_, v) in x.0.items() {
                 visit_json_artifacts(v, visitor)?;
             }
         }

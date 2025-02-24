@@ -11,6 +11,7 @@ use buck2_node::attrs::attr_type::configuration_dep::ConfigurationDepAttrType;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
 use buck2_node::attrs::configurable::AttrIsConfigurable;
+use buck2_node::configuration::resolved::ConfigurationSettingKey;
 use starlark::typing::Ty;
 use starlark::values::string::STRING_TYPE;
 use starlark::values::Value;
@@ -25,13 +26,13 @@ impl AttrTypeCoerce for ConfigurationDepAttrType {
         _configurable: AttrIsConfigurable,
         ctx: &dyn AttrCoercionContext,
         value: Value,
-    ) -> anyhow::Result<CoercedAttr> {
+    ) -> buck2_error::Result<CoercedAttr> {
         let label = value
             .unpack_str()
-            .ok_or_else(|| anyhow::anyhow!(CoercionError::type_error(STRING_TYPE, value)))?;
+            .ok_or_else(|| CoercionError::type_error(STRING_TYPE, value))?;
 
-        ctx.coerce_target_label(label)
-            .map(CoercedAttr::ConfigurationDep)
+        ctx.coerce_providers_label(label)
+            .map(|t| CoercedAttr::ConfigurationDep(ConfigurationSettingKey(t)))
     }
 
     fn starlark_type(&self) -> TyMaybeSelect {

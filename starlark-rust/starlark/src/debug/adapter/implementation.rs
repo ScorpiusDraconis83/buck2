@@ -27,6 +27,7 @@ use std::sync::Mutex;
 
 use debugserver_types::*;
 use dupe::Dupe;
+use starlark_syntax::error::StarlarkResultExt;
 use starlark_syntax::slice_vec_ext::SliceExt;
 
 use super::EvaluateExprInfo;
@@ -87,27 +88,31 @@ struct DapAdapterEvalHookImpl {
 
 fn evaluate_expr<'v>(
     state: &SharedAdapterState,
-    eval: &mut Evaluator<'v, '_>,
+    eval: &mut Evaluator<'v, '_, '_>,
     expr: String,
 ) -> anyhow::Result<Value<'v>> {
     // We don't want to trigger breakpoints during an evaluate,
     // not least because we currently don't allow reenterant evaluate
     state.disable_breakpoints.fetch_add(1, Ordering::SeqCst);
     // Don't use `?`, we need to reset disable_breakpoints.
-    let ast = AstModule::parse("interactive", expr, &Dialect::Extended);
+    let ast = AstModule::parse("interactive", expr, &Dialect::AllOptionsInternal);
     // This technically loses structured access to the diagnostic information. However, it's
     // completely unused, so there's not much point in converting all of this code to using
     // `starlark::Error`, only for buck2 to then go and blindly turn it into a `anyhow::Error`
     // anyway.
     let res = ast
         .and_then(|ast| eval.eval_statements(ast))
-        .map_err(crate::Error::into_anyhow);
+        .into_anyhow_result();
     state.disable_breakpoints.fetch_sub(1, Ordering::SeqCst);
     res
 }
 
-impl<'a> BeforeStmtFuncDyn<'a> for DapAdapterEvalHookImpl {
-    fn call<'v>(&mut self, span_loc: FileSpanRef, eval: &mut Evaluator<'v, 'a>) {
+impl<'a, 'e: 'a> BeforeStmtFuncDyn<'a, 'e> for DapAdapterEvalHookImpl {
+    fn call<'v>(
+        &mut self,
+        span_loc: FileSpanRef,
+        eval: &mut Evaluator<'v, 'a, 'e>,
+    ) -> crate::Result<()> {
         let stop = if self.state.disable_breakpoints.load(Ordering::SeqCst) > 0 {
             false
         } else {
@@ -119,7 +124,11 @@ impl<'a> BeforeStmtFuncDyn<'a> for DapAdapterEvalHookImpl {
                     ..
                 }) => match evaluate_expr(&self.state, eval, condition.to_owned()) {
                     Ok(v) => v.to_bool(),
-                    _ => true,
+                    Err(_) => {
+                        // If failed to evaluate the condition, stop.
+                        // TODO(nga): print the error.
+                        true
+                    }
                 },
                 Some(..) => true,
                 None => false,
@@ -138,7 +147,7 @@ impl<'a> BeforeStmtFuncDyn<'a> for DapAdapterEvalHookImpl {
 
         if stop || step_stop {
             self.step = None;
-            self.state.client.event_stopped();
+            self.state.client.event_stopped()?;
             loop {
                 let msg = self.receiver.recv();
                 match msg.map(|msg| msg(span_loc, eval)) {
@@ -155,6 +164,7 @@ impl<'a> BeforeStmtFuncDyn<'a> for DapAdapterEvalHookImpl {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -175,7 +185,7 @@ impl DapAdapterEvalHookImpl {
 }
 
 impl DapAdapterEvalHook for DapAdapterEvalHookImpl {
-    fn add_dap_hooks<'v, 'a>(self: Box<Self>, eval: &mut Evaluator<'v, 'a>) {
+    fn add_dap_hooks(self: Box<Self>, eval: &mut Evaluator<'_, '_, '_>) {
         eval.before_stmt_for_dap((self as Box<dyn BeforeStmtFuncDyn>).into());
     }
 }
@@ -335,7 +345,7 @@ impl DapAdapter for DapAdapterImpl {
                     let mut vars = eval.local_variables();
                     // since vars is owned within this closure scope we can just remove value from the map
                     // obtaining owned variable as the rest of the map will be dropped anyway
-                    vars.remove(name).ok_or_else(|| {
+                    vars.shift_remove(name).ok_or_else(|| {
                         anyhow::Error::msg(format!("Local variable {} not found", name))
                     })
                 }
@@ -343,12 +353,9 @@ impl DapAdapter for DapAdapterImpl {
             }?;
 
             for p in access_path.iter() {
-                value = p
-                    .get(&value, eval.heap())
-                    .map_err(crate::Error::into_anyhow)?;
+                value = p.get(&value, eval.heap()).into_anyhow_result()?;
             }
-            InspectVariableInfo::try_from_value(value, eval.heap())
-                .map_err(crate::Error::into_anyhow)
+            InspectVariableInfo::try_from_value(value, eval.heap()).into_anyhow_result()
         }))
     }
 

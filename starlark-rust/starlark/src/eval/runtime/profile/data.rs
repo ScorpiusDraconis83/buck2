@@ -15,208 +15,171 @@
  * limitations under the License.
  */
 
-use std::fs;
-use std::path::Path;
-
-use anyhow::Context;
-use dupe::Dupe;
-use starlark_syntax::slice_vec_ext::SliceExt;
-
 use crate::eval::runtime::profile::bc::BcPairsProfileData;
+use crate::eval::runtime::profile::bc::BcPairsProfilerType;
 use crate::eval::runtime::profile::bc::BcProfileData;
+use crate::eval::runtime::profile::bc::BcProfilerType;
 use crate::eval::runtime::profile::flamegraph::FlameGraphData;
-use crate::eval::ProfileMode;
-use crate::values::AggregateHeapProfileInfo;
+use crate::eval::runtime::profile::heap::HeapAllocatedProfilerType;
+use crate::eval::runtime::profile::heap::HeapFlameAllocatedProfilerType;
+use crate::eval::runtime::profile::heap::HeapFlameRetainedProfilerType;
+use crate::eval::runtime::profile::heap::HeapRetainedProfilerType;
+use crate::eval::runtime::profile::heap::HeapSummaryAllocatedProfilerType;
+use crate::eval::runtime::profile::heap::HeapSummaryRetainedProfilerType;
+use crate::eval::runtime::profile::mode::ProfileMode;
+use crate::eval::runtime::profile::profiler_type::ProfilerType;
+use crate::eval::runtime::profile::stmt::CoverageProfileType;
+use crate::eval::runtime::profile::stmt::StmtProfileData;
+use crate::eval::runtime::profile::stmt::StmtProfilerType;
+use crate::eval::runtime::profile::time_flame::TimeFlameProfilerType;
+use crate::eval::runtime::profile::typecheck::TypecheckProfileData;
+use crate::eval::runtime::profile::typecheck::TypecheckProfilerType;
+use crate::values::layout::heap::profile::aggregated::AggregateHeapProfileInfo;
 
 #[derive(Debug, thiserror::Error)]
 enum ProfileDataError {
-    #[error("Profile data is not consistent with profile mode (internal error)")]
-    ProfileDataNotConsistent,
     #[error("Empty profile list cannot be merged")]
     EmptyProfileList,
     #[error("Different profile modes in profile")]
     DifferentProfileModes,
-    #[error("Merge of profile data for profile mode `{0}` is not implemented")]
-    MergeNotImplemented(ProfileMode),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProfileDataImpl {
     Bc(Box<BcProfileData>),
     BcPairs(BcPairsProfileData),
-    AggregateHeapProfileInfo(Box<AggregateHeapProfileInfo>),
+    HeapRetained(Box<AggregateHeapProfileInfo>),
+    HeapAllocated(Box<AggregateHeapProfileInfo>),
+    HeapFlameRetained(Box<AggregateHeapProfileInfo>),
+    HeapFlameAllocated(Box<AggregateHeapProfileInfo>),
+    HeapSummaryRetained(Box<AggregateHeapProfileInfo>),
+    HeapSummaryAllocated(Box<AggregateHeapProfileInfo>),
     /// Flame graph data is in milliseconds.
     TimeFlameProfile(FlameGraphData),
-    Other(String),
+    Statement(StmtProfileData),
+    Coverage(StmtProfileData),
+    Typecheck(TypecheckProfileData),
+    None,
+}
+
+impl ProfileDataImpl {
+    pub(crate) fn profile_mode(&self) -> ProfileMode {
+        match self {
+            ProfileDataImpl::Bc(_) => ProfileMode::Bytecode,
+            ProfileDataImpl::BcPairs(_) => ProfileMode::BytecodePairs,
+            ProfileDataImpl::HeapRetained(_) => ProfileMode::HeapRetained,
+            ProfileDataImpl::HeapAllocated(_) => ProfileMode::HeapAllocated,
+            ProfileDataImpl::HeapFlameRetained(_) => ProfileMode::HeapFlameRetained,
+            ProfileDataImpl::HeapFlameAllocated(_) => ProfileMode::HeapFlameAllocated,
+            ProfileDataImpl::HeapSummaryRetained(_) => ProfileMode::HeapSummaryRetained,
+            ProfileDataImpl::HeapSummaryAllocated(_) => ProfileMode::HeapSummaryAllocated,
+            ProfileDataImpl::TimeFlameProfile(_) => ProfileMode::TimeFlame,
+            ProfileDataImpl::Statement(_) => ProfileMode::Statement,
+            ProfileDataImpl::Coverage(_) => ProfileMode::Coverage,
+            ProfileDataImpl::Typecheck(_) => ProfileMode::Typecheck,
+            ProfileDataImpl::None => ProfileMode::None,
+        }
+    }
 }
 
 /// Collected profiling data.
 #[derive(Clone, Debug)]
 pub struct ProfileData {
-    pub(crate) profile_mode: ProfileMode,
-    /// Serialized to text (e.g. CSV or flamegraph).
     pub(crate) profile: ProfileDataImpl,
 }
 
+fn _assert_profile_data_send_sync() {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<ProfileData>();
+}
+
 impl ProfileData {
-    pub(crate) fn new(profile_mode: ProfileMode, profile: String) -> ProfileData {
-        ProfileData {
-            profile_mode,
-            profile: ProfileDataImpl::Other(profile),
+    /// Profile mode used to collect this data.
+    pub fn profile_mode(&self) -> ProfileMode {
+        self.profile.profile_mode()
+    }
+
+    /// Generate a string with flamegraph profile data, depending on profile type.
+    pub fn gen_flame_data(&self) -> crate::Result<String> {
+        match &self.profile {
+            ProfileDataImpl::TimeFlameProfile(profile) => Ok(profile.write()),
+            ProfileDataImpl::HeapRetained(profile)
+            | ProfileDataImpl::HeapAllocated(profile)
+            | ProfileDataImpl::HeapFlameRetained(profile)
+            | ProfileDataImpl::HeapFlameAllocated(profile) => Ok(profile.gen_flame_graph_data()),
+            _ => Ok("".to_owned()),
         }
     }
 
-    /// Generate a string with profile data (e.g. CSV or flamegraph, depending on profile type).
-    pub fn gen(&self) -> anyhow::Result<String> {
-        match (&self.profile, &self.profile_mode) {
-            (ProfileDataImpl::Other(profile), _) => Ok(profile.clone()),
-            (ProfileDataImpl::Bc(bc), _) => Ok(bc.gen_csv()),
-            (ProfileDataImpl::BcPairs(bc_pairs), _) => Ok(bc_pairs.gen_csv()),
-            (
-                ProfileDataImpl::AggregateHeapProfileInfo(profile),
-                ProfileMode::HeapFlameRetained | ProfileMode::HeapFlameAllocated,
-            ) => Ok(profile.gen_flame_graph()),
-            (
-                ProfileDataImpl::AggregateHeapProfileInfo(profile),
-                ProfileMode::HeapSummaryRetained | ProfileMode::HeapSummaryAllocated,
-            ) => Ok(profile.gen_summary_csv()),
-            (ProfileDataImpl::AggregateHeapProfileInfo(_), _) => {
-                Err(ProfileDataError::ProfileDataNotConsistent.into())
+    /// Generate a string with csv profile data, depending on profile type.
+    pub fn gen_csv(&self) -> crate::Result<String> {
+        match &self.profile {
+            ProfileDataImpl::Bc(bc) => Ok(bc.gen_csv()),
+            ProfileDataImpl::BcPairs(bc_pairs) => Ok(bc_pairs.gen_csv()),
+            ProfileDataImpl::HeapRetained(profile) | ProfileDataImpl::HeapAllocated(profile) => {
+                Ok(profile.gen_summary_csv())
             }
-            (ProfileDataImpl::TimeFlameProfile(data), ProfileMode::TimeFlame) => Ok(data.write()),
-            (ProfileDataImpl::TimeFlameProfile(_), _) => {
-                Err(ProfileDataError::ProfileDataNotConsistent.into())
-            }
+            ProfileDataImpl::HeapSummaryRetained(profile)
+            | ProfileDataImpl::HeapSummaryAllocated(profile) => Ok(profile.gen_summary_csv()),
+            ProfileDataImpl::TimeFlameProfile(data) => Ok(data.write()),
+            ProfileDataImpl::Statement(data) => Ok(data.write_to_string()),
+            ProfileDataImpl::Coverage(data) => Ok(data.write_coverage()),
+            ProfileDataImpl::Typecheck(data) => Ok(data.gen_csv()),
+            _ => Ok("".to_owned()),
         }
-    }
-
-    /// Write to a file.
-    pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        fs::write(path, self.gen()?).with_context(|| {
-            format!(
-                "write profile `{}` data to `{}`",
-                self.profile_mode,
-                path.display()
-            )
-        })?;
-        Ok(())
     }
 
     /// Merge profiles (aggregate).
     pub fn merge<'a>(
         profiles: impl IntoIterator<Item = &'a ProfileData>,
-    ) -> anyhow::Result<ProfileData> {
+    ) -> crate::Result<ProfileData> {
         let profiles = Vec::from_iter(profiles);
+
+        if let [one] = profiles.as_slice() {
+            // If there's only one profile, just return it instead of invoking merge.
+            // - Merge may fail
+            // - Or may not be implemented for the profile type
+            return Ok(ProfileData::clone(one));
+        }
+
         let profile_mode = match profiles.first() {
-            None => return Err(ProfileDataError::EmptyProfileList.into()),
-            Some(p) => p.profile_mode.dupe(),
+            None => return Err(crate::Error::new_other(ProfileDataError::EmptyProfileList)),
+            Some(p) => p.profile.profile_mode(),
         };
         for p in &profiles {
-            if p.profile_mode != profile_mode {
-                return Err(ProfileDataError::DifferentProfileModes.into());
+            if p.profile.profile_mode() != profile_mode {
+                return Err(crate::Error::new_other(
+                    ProfileDataError::DifferentProfileModes,
+                ));
             }
         }
         let profile = match &profile_mode {
-            ProfileMode::Bytecode => {
-                let profiles = profiles.try_map(|p| match &p.profile {
-                    ProfileDataImpl::Bc(bc) => Ok(&**bc),
-                    _ => Err(ProfileDataError::ProfileDataNotConsistent),
-                })?;
-                let profile = BcProfileData::merge(profiles);
-                ProfileDataImpl::Bc(Box::new(profile))
+            ProfileMode::Bytecode => BcProfilerType::merge_profiles(&profiles)?.profile,
+            ProfileMode::BytecodePairs => BcPairsProfilerType::merge_profiles(&profiles)?.profile,
+            ProfileMode::HeapAllocated => {
+                HeapAllocatedProfilerType::merge_profiles(&profiles)?.profile
             }
-            ProfileMode::BytecodePairs => {
-                let profiles = profiles.try_map(|p| match &p.profile {
-                    ProfileDataImpl::BcPairs(bc_pairs) => Ok(bc_pairs),
-                    _ => Err(ProfileDataError::ProfileDataNotConsistent),
-                })?;
-                let profile = BcPairsProfileData::merge(profiles);
-                ProfileDataImpl::BcPairs(profile)
+            ProfileMode::HeapRetained => {
+                HeapRetainedProfilerType::merge_profiles(&profiles)?.profile
             }
-            ProfileMode::HeapSummaryAllocated
-            | ProfileMode::HeapSummaryRetained
-            | ProfileMode::HeapFlameAllocated
-            | ProfileMode::HeapFlameRetained => {
-                let profiles = profiles.try_map(|p| match &p.profile {
-                    ProfileDataImpl::AggregateHeapProfileInfo(profile) => Ok(&**profile),
-                    _ => Err(ProfileDataError::ProfileDataNotConsistent),
-                })?;
-                let profile = AggregateHeapProfileInfo::merge(profiles);
-                ProfileDataImpl::AggregateHeapProfileInfo(Box::new(profile))
+            ProfileMode::HeapSummaryAllocated => {
+                HeapSummaryAllocatedProfilerType::merge_profiles(&profiles)?.profile
             }
-            ProfileMode::TimeFlame => {
-                let profiles = profiles.try_map(|p| match &p.profile {
-                    ProfileDataImpl::TimeFlameProfile(data) => Ok(data),
-                    _ => Err(ProfileDataError::ProfileDataNotConsistent),
-                })?;
-                let profile = FlameGraphData::merge(profiles);
-                ProfileDataImpl::TimeFlameProfile(profile)
+            ProfileMode::HeapSummaryRetained => {
+                HeapSummaryRetainedProfilerType::merge_profiles(&profiles)?.profile
             }
-            profile_mode => {
-                return Err(ProfileDataError::MergeNotImplemented(profile_mode.dupe()).into());
+            ProfileMode::HeapFlameAllocated => {
+                HeapFlameAllocatedProfilerType::merge_profiles(&profiles)?.profile
             }
+            ProfileMode::HeapFlameRetained => {
+                HeapFlameRetainedProfilerType::merge_profiles(&profiles)?.profile
+            }
+            ProfileMode::TimeFlame => TimeFlameProfilerType::merge_profiles(&profiles)?.profile,
+            ProfileMode::Typecheck => TypecheckProfilerType::merge_profiles(&profiles)?.profile,
+            ProfileMode::Statement => StmtProfilerType::merge_profiles(&profiles)?.profile,
+            ProfileMode::Coverage => CoverageProfileType::merge_profiles(&profiles)?.profile,
+            ProfileMode::None => ProfileDataImpl::None,
         };
-        Ok(ProfileData {
-            profile_mode,
-            profile,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use dupe::Dupe;
-
-    use crate::eval::runtime::profile::bc::BcPairsProfileData;
-    use crate::eval::runtime::profile::data::ProfileDataImpl;
-    use crate::eval::runtime::profile::flamegraph::FlameGraphData;
-    use crate::eval::ProfileData;
-    use crate::eval::ProfileMode;
-
-    #[test]
-    fn merge_bc() {
-        let profile = ProfileData {
-            profile_mode: ProfileMode::Bytecode,
-            profile: ProfileDataImpl::Bc(Box::default()),
-        };
-        // Smoke.
-        ProfileData::merge([&profile, &profile]).unwrap();
-    }
-
-    #[test]
-    fn merge_bc_pairs() {
-        let profile = ProfileData {
-            profile_mode: ProfileMode::BytecodePairs,
-            profile: ProfileDataImpl::BcPairs(BcPairsProfileData::default()),
-        };
-        // Smoke.
-        ProfileData::merge([&profile, &profile]).unwrap();
-    }
-
-    #[test]
-    fn merge_aggregated_heap_profile() {
-        for profile_mode in [
-            ProfileMode::HeapFlameRetained,
-            ProfileMode::HeapFlameAllocated,
-            ProfileMode::HeapSummaryRetained,
-            ProfileMode::HeapSummaryAllocated,
-        ] {
-            let profile = ProfileData {
-                profile_mode: profile_mode.dupe(),
-                profile: ProfileDataImpl::AggregateHeapProfileInfo(Box::default()),
-            };
-            // Smoke.
-            ProfileData::merge([&profile, &profile]).unwrap();
-        }
-    }
-
-    #[test]
-    fn merge_time_flame() {
-        let profile = ProfileData {
-            profile_mode: ProfileMode::TimeFlame,
-            profile: ProfileDataImpl::TimeFlameProfile(FlameGraphData::default()),
-        };
-        // Smoke.
-        ProfileData::merge([&profile, &profile]).unwrap();
+        Ok(ProfileData { profile })
     }
 }

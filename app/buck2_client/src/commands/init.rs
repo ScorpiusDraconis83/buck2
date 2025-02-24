@@ -10,9 +10,9 @@
 use std::io::ErrorKind;
 use std::io::Write;
 
-use anyhow::Context;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
-use buck2_client_ctx::common::CommonConsoleOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitCode;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::final_console::FinalConsole;
@@ -21,29 +21,19 @@ use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
 use buck2_core::fs::fs_util;
 use buck2_core::fs::paths::abs_path::AbsPath;
+use buck2_error::buck2_error;
+use buck2_error::BuckErrorContext;
 use buck2_util::process::background_command;
 
-/// Buck2 Init
-///
-/// This command is intended to be part-tutorial part-convenience
-/// for generating buck2 projects. Given a path and optional name
-/// (in the case that the folder name is not desirable).
+/// Initializes a buck2 project at the provided path.
 #[derive(Debug, clap::Parser)]
 #[clap(name = "install", about = "Initialize a buck2 project")]
 pub struct InitCommand {
-    #[clap(flatten)]
-    console_opts: CommonConsoleOptions,
-
     /// The path to initialize the project in. The folder does not need to exist.
     #[clap(default_value = ".")]
     path: PathArg,
 
-    /// The name for the project. If not provided will default to the last segment
-    /// of the path.
-    #[clap(short, long)]
-    name: Option<String>,
-
-    /// Don't generate a prelude or a toolchain.
+    /// Don't include the standard prelude or generate toolchain definitions.
     #[clap(long)]
     no_prelude: bool,
 
@@ -51,13 +41,17 @@ pub struct InitCommand {
     #[clap(long)]
     allow_dirty: bool,
 
-    // Use git to initialize the project and pull in buck2-prelude as a submodule
+    /// Also initialize a git repository at the given path, and set up an appropriate `.gitignore`
+    /// file.
     #[clap(long)]
     git: bool,
+
+    #[clap(flatten)]
+    console_opts: CommonConsoleOptions,
 }
 
 impl InitCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let console = self.console_opts.final_console();
 
         match exec_impl(self, ctx, &console) {
@@ -80,14 +74,15 @@ fn exec_impl(
     cmd: InitCommand,
     ctx: ClientCommandContext<'_>,
     console: &FinalConsole,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let path = cmd.path.resolve(&ctx.working_dir);
     fs_util::create_dir_all(&path)?;
     let absolute = fs_util::canonicalize(&path)?;
     let git = cmd.git;
 
     if absolute.is_file() {
-        return Err(anyhow::anyhow!(
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
             "Target path {} cannot be an existing file",
             absolute.display()
         ));
@@ -105,7 +100,7 @@ fn exec_impl(
                 )?;
                 None
             }
-            r => Some(r.context("Couldn't detect dirty status of folder.")?),
+            r => Some(r.buck_error_context("Couldn't detect dirty status of folder.")?),
         };
 
         let changes = status.filter(|o| o.status.success()).map(|o| {
@@ -116,7 +111,8 @@ fn exec_impl(
         });
 
         if let (Some(true), false) = (changes, cmd.allow_dirty) {
-            return Err(anyhow::anyhow!(
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
                 "Refusing to initialize in a dirty repo. Stash your changes or use `--allow-dirty` to override."
             ));
         }
@@ -125,45 +121,58 @@ fn exec_impl(
     set_up_project(&absolute, git, !cmd.no_prelude)
 }
 
-fn initialize_buckconfig(repo_root: &AbsPath, prelude: bool, git: bool) -> anyhow::Result<()> {
+fn initialize_buckconfig(repo_root: &AbsPath, prelude: bool, git: bool) -> buck2_error::Result<()> {
     let mut buckconfig = std::fs::File::create(repo_root.join(".buckconfig"))?;
-    writeln!(buckconfig, "[repositories]")?;
-    writeln!(buckconfig, "root = .")?;
-    writeln!(buckconfig, "prelude = prelude")?;
+    writeln!(buckconfig, "[cells]")?;
+    writeln!(buckconfig, "  root = .")?;
 
     // Add additional configs that depend on prelude / no-prelude mode
     if prelude {
-        writeln!(buckconfig, "toolchains = toolchains")?;
-        writeln!(buckconfig, "none = none")?;
+        writeln!(buckconfig, "  prelude = prelude")?;
+        writeln!(buckconfig, "  toolchains = toolchains")?;
+        writeln!(buckconfig, "  none = none")?;
         writeln!(buckconfig)?;
-        writeln!(buckconfig, "[repository_aliases]")?;
-        writeln!(buckconfig, "config = prelude")?;
-        writeln!(buckconfig, "ovr_config = prelude")?;
-        writeln!(buckconfig, "fbcode = none")?;
-        writeln!(buckconfig, "fbsource = none")?;
-        writeln!(buckconfig, "fbcode_macros = none")?;
-        writeln!(buckconfig, "buck = none")?;
+        writeln!(buckconfig, "[cell_aliases]")?;
+        writeln!(buckconfig, "  config = prelude")?;
+        writeln!(buckconfig, "  ovr_config = prelude")?;
+        writeln!(buckconfig, "  fbcode = none")?;
+        writeln!(buckconfig, "  fbsource = none")?;
+        writeln!(buckconfig, "  fbcode_macros = none")?;
+        writeln!(buckconfig, "  buck = none")?;
+        writeln!(buckconfig)?;
+        writeln!(
+            buckconfig,
+            "# Uses a copy of the prelude bundled with the buck2 binary. You can alternatively delete this"
+        )?;
+        writeln!(
+            buckconfig,
+            "# section and vendor a copy of the prelude to the `prelude` directory of your project."
+        )?;
+        writeln!(buckconfig, "[external_cells]")?;
+        writeln!(buckconfig, "  prelude = bundled")?;
         writeln!(buckconfig)?;
         writeln!(buckconfig, "[parser]")?;
         writeln!(
             buckconfig,
-            "target_platform_detector_spec = target:root//...->prelude//platforms:default"
+            "  target_platform_detector_spec = target:root//...->prelude//platforms:default"
         )?;
-    } else {
-        // For the no-prelude mode, create an empty prelude/prelude.bzl as Buck2 expects one.
-        let prelude_dir = repo_root.join("prelude");
-        fs_util::create_dir(&prelude_dir)?;
-        fs_util::create_file(prelude_dir.join("prelude.bzl"))?;
+        writeln!(buckconfig)?;
+        writeln!(buckconfig, "[build]")?;
+        writeln!(
+            buckconfig,
+            "  execution_platforms = prelude//platforms:default"
+        )?;
     }
+
     if git {
         writeln!(buckconfig)?;
         writeln!(buckconfig, "[project]")?;
-        writeln!(buckconfig, "ignore = .git")?;
+        writeln!(buckconfig, "  ignore = .git")?;
     }
     Ok(())
 }
 
-fn initialize_toolchains_buck(repo_root: &AbsPath) -> anyhow::Result<()> {
+fn initialize_toolchains_buck(repo_root: &AbsPath) -> buck2_error::Result<()> {
     std::fs::write(
         repo_root.join("BUCK"),
         r#"
@@ -178,13 +187,13 @@ system_demo_toolchains()
     Ok(())
 }
 
-fn initialize_root_buck(repo_root: &AbsPath, prelude: bool) -> anyhow::Result<()> {
+fn initialize_root_buck(repo_root: &AbsPath, prelude: bool) -> buck2_error::Result<()> {
     let mut buck = std::fs::File::create(repo_root.join("BUCK"))?;
 
     if prelude {
         writeln!(
             buck,
-            "# A list of available rules and their signatures can be found here: https://buck2.build/docs/api/rules/"
+            "# A list of available rules and their signatures can be found here: https://buck2.build/docs/prelude/globals/"
         )?;
         writeln!(buck)?;
         writeln!(buck, "genrule(")?;
@@ -197,33 +206,7 @@ fn initialize_root_buck(repo_root: &AbsPath, prelude: bool) -> anyhow::Result<()
     Ok(())
 }
 
-fn set_up_prelude(repo_root: &AbsPath, git: bool) -> anyhow::Result<()> {
-    if git {
-        if !background_command("git")
-            .args([
-                "submodule",
-                "add",
-                "https://github.com/facebook/buck2-prelude.git",
-                "prelude",
-            ])
-            .current_dir(repo_root)
-            .status()?
-            .success()
-        {
-            return Err(anyhow::anyhow!(
-                "Unable to clone the prelude. Is the folder in use?"
-            ));
-        }
-    } else {
-        println!(
-            "* Download https://github.com/facebookincubator/buck2-prelude.git into `prelude/` with a VCS of your choice."
-        );
-        println!("* If you wish to use git submodule, run the command again with --git");
-    }
-    Ok(())
-}
-
-fn set_up_gitignore(repo_root: &AbsPath) -> anyhow::Result<()> {
+fn set_up_gitignore(repo_root: &AbsPath) -> buck2_error::Result<()> {
     let gitignore = repo_root.join(".gitignore");
     // If .gitignore is empty or doesn't exist, add in buck-out
     if !gitignore.exists() || fs_util::metadata(&gitignore)?.len() == 0 {
@@ -232,12 +215,12 @@ fn set_up_gitignore(repo_root: &AbsPath) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_up_buckroot(repo_root: &AbsPath) -> anyhow::Result<()> {
+fn set_up_buckroot(repo_root: &AbsPath) -> buck2_error::Result<()> {
     fs_util::write(repo_root.join(".buckroot"), "")?;
     Ok(())
 }
 
-fn set_up_project(repo_root: &AbsPath, git: bool, prelude: bool) -> anyhow::Result<()> {
+fn set_up_project(repo_root: &AbsPath, git: bool, prelude: bool) -> buck2_error::Result<()> {
     set_up_buckroot(repo_root)?;
 
     if git {
@@ -247,17 +230,19 @@ fn set_up_project(repo_root: &AbsPath, git: bool, prelude: bool) -> anyhow::Resu
             .status()?
             .success()
         {
-            return Err(anyhow::anyhow!("Failure when running `git init`."));
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Failure when running `git init`."
+            ));
         };
         set_up_gitignore(repo_root)?;
     }
 
-    if prelude {
-        set_up_prelude(repo_root, git)?;
-    }
-
     // If the project already contains a .buckconfig, leave it alone
     if repo_root.join(".buckconfig").exists() {
+        buck2_client_ctx::println!(
+            ".buckconfig already exists, not overwriting and not generating toolchains"
+        )?;
         return Ok(());
     }
 
@@ -286,7 +271,7 @@ mod tests {
     use crate::commands::init::set_up_project;
 
     #[test]
-    fn test_set_up_project_with_prelude_no_git() -> anyhow::Result<()> {
+    fn test_set_up_project_with_prelude_no_git() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let tempdir_path = tempdir.path();
         let tempdir_path = AbsPath::new(tempdir_path)?;
@@ -302,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_gitignore() -> anyhow::Result<()> {
+    fn test_default_gitignore() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let tempdir_path = tempdir.path();
         let tempdir_path = AbsPath::new(tempdir_path)?;
@@ -334,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buckconfig_generation_with_prelude() -> anyhow::Result<()> {
+    fn test_buckconfig_generation_with_prelude() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let tempdir_path = tempdir.path();
         let tempdir_path = AbsPath::new(tempdir_path)?;
@@ -343,32 +328,40 @@ mod tests {
         let buckconfig_path = tempdir_path.join(".buckconfig");
         initialize_buckconfig(tempdir_path, true, true)?;
         let actual_buckconfig = fs_util::read_to_string(buckconfig_path)?;
-        let expected_buckconfig = "[repositories]
-root = .
-prelude = prelude
-toolchains = toolchains
-none = none
+        let expected_buckconfig = "[cells]
+  root = .
+  prelude = prelude
+  toolchains = toolchains
+  none = none
 
-[repository_aliases]
-config = prelude
-ovr_config = prelude
-fbcode = none
-fbsource = none
-fbcode_macros = none
-buck = none
+[cell_aliases]
+  config = prelude
+  ovr_config = prelude
+  fbcode = none
+  fbsource = none
+  fbcode_macros = none
+  buck = none
+
+# Uses a copy of the prelude bundled with the buck2 binary. You can alternatively delete this
+# section and vendor a copy of the prelude to the `prelude` directory of your project.
+[external_cells]
+  prelude = bundled
 
 [parser]
-target_platform_detector_spec = target:root//...->prelude//platforms:default
+  target_platform_detector_spec = target:root//...->prelude//platforms:default
+
+[build]
+  execution_platforms = prelude//platforms:default
 
 [project]
-ignore = .git
+  ignore = .git
 ";
         assert_eq!(actual_buckconfig, expected_buckconfig);
         Ok(())
     }
 
     #[test]
-    fn test_buckconfig_generation_without_prelude() -> anyhow::Result<()> {
+    fn test_buckconfig_generation_without_prelude() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let tempdir_path = tempdir.path();
         let tempdir_path = AbsPath::new(tempdir_path)?;
@@ -377,19 +370,16 @@ ignore = .git
         let buckconfig_path = tempdir_path.join(".buckconfig");
         initialize_buckconfig(tempdir_path, false, false)?;
         let actual_buckconfig = fs_util::read_to_string(buckconfig_path)?;
-        let expected_buckconfig = "[repositories]
-root = .
-prelude = prelude
+        let expected_buckconfig = "[cells]
+  root = .
 ";
         assert_eq!(actual_buckconfig, expected_buckconfig);
 
-        // Test we have an empty prelude directory and prelude.bzl file
-        assert!(tempdir_path.join("prelude/prelude.bzl").exists());
         Ok(())
     }
 
     #[test]
-    fn test_buckfile_generation_with_prelude() -> anyhow::Result<()> {
+    fn test_buckfile_generation_with_prelude() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let tempdir_path = tempdir.path();
         let tempdir_path = AbsPath::new(tempdir_path)?;
@@ -398,7 +388,7 @@ prelude = prelude
         let buck_path = tempdir_path.join("BUCK");
         initialize_root_buck(tempdir_path, true)?;
         let actual_buck = fs_util::read_to_string(buck_path)?;
-        let expected_buck = "# A list of available rules and their signatures can be found here: https://buck2.build/docs/api/rules/
+        let expected_buck = "# A list of available rules and their signatures can be found here: https://buck2.build/docs/prelude/globals/
 
 genrule(
     name = \"hello_world\",

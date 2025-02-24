@@ -9,30 +9,23 @@
 
 //!
 //! Implements the ability for bxl to build targets
-use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_artifact::artifact::artifact_type::Artifact;
-use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::build::BuildConfiguredLabelOptions;
 use buck2_build_api::build::BuildEvent;
 use buck2_build_api::build::BuildTargetResult;
 use buck2_build_api::build::ConfiguredBuildEvent;
-use buck2_build_api::build::ConvertMaterializationContext;
 use buck2_build_api::build::ProvidersToBuild;
 use buck2_build_api::bxl::build_result::BxlBuildResult;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_cli_proto::build_request::Materializations;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
+use buck2_cli_proto::build_request::Uploads;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
-use dashmap::DashMap;
 use derive_more::Display;
-use dice::DiceComputationsParallel;
 use dupe::Dupe;
-use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
 use futures::FutureExt;
 use futures::StreamExt;
 use itertools::Itertools;
@@ -42,6 +35,7 @@ use starlark::eval::Evaluator;
 use starlark::starlark_complex_value;
 use starlark::values::starlark_value;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
@@ -49,13 +43,14 @@ use starlark::values::Trace;
 use starlark::values::UnpackValue as _;
 use starlark::values::Value;
 use starlark::values::ValueError;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
 use starlark::values::ValueTyped;
 use starlark_map::small_map::SmallMap;
 
 use crate::bxl::starlark_defs::build_result::StarlarkBxlBuildResult;
 use crate::bxl::starlark_defs::context::BxlContext;
-use crate::bxl::starlark_defs::providers_expr::ConfiguredProvidersExprArg;
+use crate::bxl::starlark_defs::providers_expr::AnyProvidersExprArg;
 use crate::bxl::starlark_defs::providers_expr::ProvidersExpr;
 use crate::bxl::value_as_starlark_target_label::ValueAsStarlarkTargetLabel;
 
@@ -71,11 +66,11 @@ use crate::bxl::value_as_starlark_target_label::ValueAsStarlarkTargetLabel;
     Allocative
 )]
 #[repr(C)]
-pub(crate) struct StarlarkProvidersArtifactIterableGen<V>(pub(crate) V);
+pub(crate) struct StarlarkProvidersArtifactIterableGen<V: ValueLifetimeless>(pub(crate) V);
 
 starlark_complex_value!(pub(crate) StarlarkProvidersArtifactIterable);
 
-impl<'v, V: ValueLike<'v> + 'v> StarlarkProvidersArtifactIterableGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkProvidersArtifactIterableGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -86,6 +81,7 @@ where
             .0
             .unpack_built()
             .unwrap()
+            .1
             .outputs
             .iter()
             .filter_map(|built| built.as_ref().ok())
@@ -94,7 +90,7 @@ where
 }
 
 #[starlark_value(type = "bxl_built_artifacts_iterable")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for StarlarkProvidersArtifactIterableGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StarlarkProvidersArtifactIterableGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -132,11 +128,11 @@ where
     Allocative
 )]
 #[repr(C)]
-pub(crate) struct StarlarkFailedArtifactIterableGen<V>(pub(crate) V);
+pub(crate) struct StarlarkFailedArtifactIterableGen<V: ValueLifetimeless>(pub(crate) V);
 
 starlark_complex_value!(pub(crate) StarlarkFailedArtifactIterable);
 
-impl<'v, V: ValueLike<'v> + 'v> StarlarkFailedArtifactIterableGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkFailedArtifactIterableGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -147,6 +143,7 @@ where
             .0
             .unpack_built()
             .unwrap()
+            .1
             .outputs
             .iter()
             .filter_map(|built| built.as_ref().err())
@@ -154,7 +151,7 @@ where
 }
 
 #[starlark_value(type = "bxl_failed_artifacts_iterable")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for StarlarkFailedArtifactIterableGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StarlarkFailedArtifactIterableGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -179,52 +176,39 @@ where
 
 pub(crate) fn build<'v>(
     ctx: &BxlContext<'v>,
-    materializations_map: &Arc<DashMap<BuildArtifact, ()>>,
-    spec: ConfiguredProvidersExprArg<'v>,
+    spec: AnyProvidersExprArg<'v>,
     target_platform: ValueAsStarlarkTargetLabel<'v>,
     materializations: Materializations,
-    eval: &Evaluator<'v, '_>,
-) -> anyhow::Result<
+    uploads: Uploads,
+    eval: &Evaluator<'v, '_, '_>,
+) -> buck2_error::Result<
     SmallMap<
         ValueTyped<'v, StarlarkConfiguredProvidersLabel>,
         ValueTyped<'v, StarlarkBxlBuildResult>,
     >,
 > {
-    let materializations =
-        ConvertMaterializationContext::with_existing_map(materializations, materializations_map);
+    let global_cfg_options = ctx.resolve_global_cfg_options(target_platform, vec![].into())?;
 
-    let target_platform = target_platform.parse_target_platforms(
-        &ctx.data.target_alias_resolver,
-        &ctx.data.cell_resolver,
-        ctx.data.cell_name,
-        &ctx.data.global_cfg_options().target_platform,
-    )?;
+    let build_result = ctx.via_dice(|dice, ctx| {
+        dice.via(|dice| {
+            async {
+                let build_spec = ProvidersExpr::<ConfiguredProvidersLabel>::unpack(
+                    spec,
+                    &global_cfg_options,
+                    ctx,
+                    dice,
+                )
+                .await?;
 
-    let build_result = ctx.via_dice(
-        |mut dice, ctx|
-            dice.via(|dice|
-        async {
-            let build_spec = ProvidersExpr::<ConfiguredProvidersLabel>::unpack(
-                spec,
-                &GlobalCfgOptions {
-                    target_platform,
-                    cli_modifiers: vec![].into()
-                },
-                ctx,
-                dice,
-            )
-            .await?;
+                let per_spec_results: Vec<Vec<ConfiguredBuildEvent>> = dice
+                    .compute_join(build_spec.labels().unique(), |ctx, target| {
+                        async move {
+                            let target = target.clone();
 
-            let stream = dice
-                .compute_many(build_spec.labels().unique().map(|target| {
-                    let target = target.clone();
-                    let materializations = materializations.dupe();
-                    higher_order_closure! {
-                        for <'x> move |dice: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, Vec<ConfiguredBuildEvent>> {
-                            async move {
+                            ctx.with_linear_recompute(|ctx| async move {
                                 build_configured_label(
-                                    dice,
-                                    &materializations,
+                                    &ctx,
+                                    &(materializations, uploads).into(),
                                     target,
                                     &ProvidersToBuild {
                                         default: true,
@@ -236,17 +220,33 @@ pub(crate) fn build<'v>(
                                         skippable: false,
                                         want_configured_graph_size: false,
                                     },
-                                ).await
-                            }.then(|stream| stream.collect::<Vec<_>>()).boxed()
+                                    None, // TODO: support timeouts?
+                                )
+                                .await
+                                .collect::<Vec<_>>()
+                                .await
+                            })
+                            .await
                         }
-                    }
-                }))
-                .into_iter().collect::<FuturesUnordered<_>>().map(|v| v.into_iter().map(futures::future::ready).collect::<FuturesUnordered<_>>()).flatten();
+                        .boxed()
+                    })
+                    .await;
 
-            // TODO (torozco): support --fail-fast in BXL.
-            BuildTargetResult::collect_stream(stream.map(BuildEvent::Configured), false).await
-        }.boxed_local())
-    )?;
+                // TODO (torozco): support --fail-fast in BXL.
+                BuildTargetResult::collect_stream(
+                    futures::stream::iter(
+                        per_spec_results
+                            .into_iter()
+                            .flatten()
+                            .map(BuildEvent::Configured),
+                    ),
+                    false,
+                )
+                .await
+            }
+            .boxed_local()
+        })
+    })?;
 
     if let Some(err) = build_result
         .configured
@@ -265,11 +265,14 @@ pub(crate) fn build<'v>(
         .map(|(target, result)| {
             (
                 eval.heap()
-                    .alloc_typed(StarlarkConfiguredProvidersLabel::new(target))
+                    .alloc_typed(StarlarkConfiguredProvidersLabel::new(target.clone()))
                     .hashed()
                     .unwrap(),
                 eval.heap()
-                    .alloc_typed(StarlarkBxlBuildResult(BxlBuildResult::new(result))),
+                    .alloc_typed(StarlarkBxlBuildResult(BxlBuildResult::new(
+                        target.clone(),
+                        result,
+                    ))),
             )
         })
         .collect())

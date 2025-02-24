@@ -10,6 +10,8 @@ load("@prelude//android:android_binary_resources_rules.bzl", "get_android_binary
 load("@prelude//android:android_build_config.bzl", "generate_android_build_config", "get_build_config_fields")
 load(
     "@prelude//android:android_providers.bzl",
+    "AndroidBinaryNativeLibsInfo",  # @unused Used as type
+    "AndroidBinaryResourcesInfo",  # @unused Used as type
     "AndroidBuildConfigInfo",  # @unused Used as type
     "BuildConfigField",
     "DexFilesInfo",
@@ -24,25 +26,30 @@ load("@prelude//android:preprocess_java_classes.bzl", "get_preprocessed_java_cla
 load("@prelude//android:proguard.bzl", "get_proguard_output")
 load("@prelude//android:util.bzl", "create_enhancement_context")
 load("@prelude//android:voltron.bzl", "get_target_to_module_mapping")
-load("@prelude//java:java_providers.bzl", "JavaPackagingInfo", "create_java_packaging_dep", "get_all_java_packaging_deps", "get_all_java_packaging_deps_from_packaging_infos")
+load(
+    "@prelude//java:java_providers.bzl",
+    "JavaPackagingDep",  # @unused Used as type
+    "JavaPackagingInfo",
+    "create_java_packaging_dep",
+    "get_all_java_packaging_deps",
+    "get_all_java_packaging_deps_from_packaging_infos",
+)
 load("@prelude//utils:expect.bzl", "expect")
 
 AndroidBinaryInfo = record(
     sub_targets = dict,
-    java_packaging_deps = list["JavaPackagingDep"],
+    java_packaging_deps = list[JavaPackagingDep],
     deps_by_platform = dict,
     primary_platform = str,
     dex_files_info = DexFilesInfo,
-    native_library_info = "AndroidBinaryNativeLibsInfo",
-    resources_info = "AndroidBinaryResourcesInfo",
+    native_library_info = AndroidBinaryNativeLibsInfo,
+    resources_info = AndroidBinaryResourcesInfo,
     materialized_artifacts = list[Artifact],
 )
 
 def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBinaryInfo:
     sub_targets = {}
     materialized_artifacts = []
-
-    _verify_params(ctx)
 
     deps_by_platform = get_deps_by_platform(ctx)
     primary_platform = CPU_FILTER_FOR_PRIMARY_PLATFORM if CPU_FILTER_FOR_PRIMARY_PLATFORM in deps_by_platform else CPU_FILTER_FOR_DEFAULT_PLATFORM
@@ -69,8 +76,8 @@ def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBina
     native_library_info = get_android_binary_native_library_info(enhancement_ctx, android_packageable_info, deps_by_platform, apk_module_graph_file = target_to_module_mapping_file)
     java_packaging_deps.extend([create_java_packaging_dep(
         ctx,
-        lib.library_output.full_library,
-    ) for lib in native_library_info.generated_java_code])
+        library_output,
+    ) for library_output in native_library_info.generated_java_code])
 
     referenced_resources_lists = [java_packaging_dep.dex.referenced_resources for java_packaging_dep in java_packaging_deps if java_packaging_dep.dex] if ctx.attrs.trim_resource_ids and should_pre_dex else []
     resources_info = get_android_binary_resources_info(
@@ -82,8 +89,10 @@ def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBina
         use_proto_format = use_proto_format,
         referenced_resources_lists = referenced_resources_lists,
         manifest_entries = ctx.attrs.manifest_entries,
+        generate_strings_and_ids_separately = should_pre_dex,
         aapt2_preferred_density = ctx.attrs.aapt2_preferred_density,
     )
+    sub_targets["manifest"] = [DefaultInfo(default_output = resources_info.manifest)]
     android_toolchain = ctx.attrs._android_toolchain[AndroidToolchainInfo]
     compiled_r_dot_java_deps = [
         create_java_packaging_dep(
@@ -119,13 +128,14 @@ def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBina
                 pre_dexed_libs,
                 get_split_dex_merge_config(ctx, android_toolchain),
                 target_to_module_mapping_file,
+                enable_bootstrap_dexes = ctx.attrs.enable_bootstrap_dexes,
             )
         else:
             dex_files_info = merge_to_single_dex(ctx, android_toolchain, pre_dexed_libs)
     else:
         jars_to_owners = {packaging_dep.jar: packaging_dep.jar.owner.raw_target() for packaging_dep in dex_java_packaging_deps}
         if ctx.attrs.preprocess_java_classes_bash:
-            jars_to_owners, materialized_artifacts_dir = get_preprocessed_java_classes(ctx, jars_to_owners)
+            jars_to_owners, materialized_artifacts_dir = get_preprocessed_java_classes(enhancement_ctx, jars_to_owners)
             if materialized_artifacts_dir:
                 materialized_artifacts.append(materialized_artifacts_dir)
         if has_proguard_config:
@@ -136,6 +146,7 @@ def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBina
                 resources_info.proguard_config_file,
                 [no_dx[DefaultInfo].default_outputs[0] for no_dx in ctx.attrs.no_dx if len(no_dx[DefaultInfo].default_outputs) == 1],
             )
+            materialized_artifacts.extend(proguard_output.proguard_artifacts)
             jars_to_owners = proguard_output.jars_to_owners
             dir_srcs = {artifact.basename: artifact for artifact in proguard_output.proguard_artifacts}
             for i, hidden_artifact in enumerate(proguard_output.proguard_hidden_artifacts):
@@ -161,6 +172,7 @@ def get_binary_info(ctx: AnalysisContext, use_proto_format: bool) -> AndroidBina
                 proguard_output.proguard_mapping_output_file if proguard_output else None,
                 is_optimized = has_proguard_config,
                 apk_module_graph_file = target_to_module_mapping_file,
+                enable_bootstrap_dexes = ctx.attrs.enable_bootstrap_dexes,
             )
         else:
             dex_files_info = get_single_primary_dex(
@@ -209,6 +221,8 @@ def get_build_config_java_libraries(
 
     default_build_config_fields = get_build_config_fields(ctx.attrs.build_config_values)
 
+    android_binary_values_file = ctx.attrs.build_config_values_file[DefaultInfo].default_outputs[0] if isinstance(ctx.attrs.build_config_values_file, Dependency) else ctx.attrs.build_config_values_file
+
     java_libraries = []
     java_packages_seen = []
     for build_config_info in build_config_infos:
@@ -220,17 +234,14 @@ def get_build_config_java_libraries(
         for build_config_field in build_config_info.build_config_fields + default_build_config_fields + build_config_constants:
             all_build_config_values[build_config_field.name] = build_config_field
 
+        values_file = android_binary_values_file if android_binary_values_file else build_config_info.values_file
         java_libraries.append(generate_android_build_config(
             ctx,
             java_package,
             java_package,
             True,  # use_constant_expressions
             all_build_config_values.values(),
-            ctx.attrs.build_config_values_file[DefaultInfo].default_outputs[0] if isinstance(ctx.attrs.build_config_values_file, Dependency) else ctx.attrs.build_config_values_file,
+            values_file,
         )[1])
 
     return java_libraries
-
-def _verify_params(ctx: AnalysisContext):
-    expect(ctx.attrs.aapt_mode == "aapt2", "aapt1 is deprecated!")
-    expect(ctx.attrs.dex_tool == "d8", "dx is deprecated!")

@@ -160,7 +160,6 @@ fn use_ignored(codemap: &CodeMap, x: &AstStmt, res: &mut Vec<LintT<UnderscoreWar
 #[cfg(test)]
 mod tests {
     use starlark_syntax::slice_vec_ext::SliceExt;
-    use starlark_syntax::syntax::module::AstModuleFields;
 
     use super::*;
     use crate::syntax::Dialect;
@@ -175,7 +174,7 @@ mod tests {
     }
 
     fn module(x: &str) -> AstModule {
-        AstModule::parse("X", x.to_owned(), &Dialect::Extended).unwrap()
+        AstModule::parse("X", x.to_owned(), &Dialect::AllOptionsInternal).unwrap()
     }
 
     #[test]

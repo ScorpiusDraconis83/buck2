@@ -5,60 +5,30 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@fbsource//tools/build_defs/buck2:is_buck2.bzl", "is_buck2")
-load(":common.bzl?v2_only", "get_tagged_modifiers", "tagged_modifiers_to_json")
-load(":set_cfg_constructor.bzl?v2_only", "MODIFIER_METADATA_KEY")
-load(":types.bzl?v2_only", "Modifier", "ModifierPackageLocation")
+load("@prelude//cfg/modifier:set_cfg_modifiers.bzl", _set_cfg_modifiers = "set_cfg_modifiers")
+load("@prelude//cfg/modifier:types.bzl", "Modifier")  # @unused Used in type annotation
 
-def set_cfg_modifiers(modifiers: list[Modifier]):
+##########################################################
+# NOTE: This file is now available in the buck2 prelude. #
+#                                                        #
+# You should prefer including / using that version.      #
+##########################################################
+
+def set_cfg_modifiers(
+        cfg_modifiers: list[Modifier] | None = None,
+        extra_cfg_modifiers_per_rule: dict[str, list[Modifier]] | None = None):
     """
     Sets a configuration modifier for all targets under this PACKAGE file. This can only be called from a PACKAGE file context
     (e.g. a PACKAGE file or a bzl file transitively loaded by a PACKAGE file).
 
     Args:
-        constraint_setting:
-            The constraint key to modify. This must be a `constraint_setting` target.
-            For example, to change the OS constraint setting in fbsource, this would be "ovr_config//os/constraints:os".
-        modifier:
-            The modifier to change this constraint setting. This can be a constraint value target.
-            For example, to change the OS to linux in fbsource, this can be specified as "ovr_config//os/constraints:linux".
-            TODO(scottcao): Add support for modifier select types.
+        cfg_modifiers:
+            A list of modifiers to set. The simplest modifier is a constraint value target.
+            For example, to change the OS to linux in fbsource, this can be specified as `["ovr_config//os/constraints:linux"]`.
+        extra_cfg_modifiers_per_rule:
+            A dictionary of rule name to a list of modifiers to set. This is applied on top of modifiers from `cfg_modifiers` parameter
+            if a target's rule name matches the key, so it can override any modifier from `cfg_modifiers` parameter in the same PACKAGE.
+            For example, if this dictionary is `{"python_binary": ["ovr_config//os/constraints:macos"]}`,
+            then all python_binary targets covered will have the macos constraint added to their configurations.
     """
-    if not is_buck2():
-        return
-
-    # Make this buck1-proof
-    write_package_value = getattr(native, "write_package_value", None)
-    read_parent_package_value = getattr(native, "read_parent_package_value", None)
-
-    merged_modifier_jsons = read_parent_package_value(MODIFIER_METADATA_KEY)
-
-    # `read_parent_package_value` returns immutable values. `list()` makes it mutable.
-    merged_modifier_jsons = list(merged_modifier_jsons) if merged_modifier_jsons else []
-
-    tagged_modifiers = get_tagged_modifiers(
-        modifiers,
-        ModifierPackageLocation(package_path = _get_package_path()),
-    )
-    merged_modifier_jsons.append(tagged_modifiers_to_json(tagged_modifiers))
-
-    write_package_value(
-        MODIFIER_METADATA_KEY,
-        merged_modifier_jsons,
-        overwrite = True,
-    )
-
-_BUCK1_COMPAT_STR = "Internal error: Modifiers are for buck2 only"
-
-def _get_package_path() -> str:
-    """
-    Returns the cell-relative path of the current PACKAGE file.
-    Ex. `foo//bar/PACKAGE`
-    """
-    if not is_buck2():
-        return _BUCK1_COMPAT_STR
-
-    # Make this buck1-proof
-    get_cell_name = getattr(native, "get_cell_name", None)
-    get_base_path = getattr(native, "get_base_path", None)
-    return "{}//{}/PACKAGE".format(get_cell_name(), get_base_path())
+    _set_cfg_modifiers(cfg_modifiers, extra_cfg_modifiers_per_rule)

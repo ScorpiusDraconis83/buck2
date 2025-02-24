@@ -3,6 +3,8 @@ id: index
 title: Introduction
 ---
 
+import { FbInternalOnly } from 'docusaurus-plugin-internaldocs-fb/internal';
+
 Welcome to Buck2, a large scale, fast, reliable, and extensible build tool
 developed and used by Meta. Buck2 supports a variety of languages on many
 platforms.
@@ -31,8 +33,9 @@ your team.
 
 ### For end users
 
-- [Getting Started](getting_started.md) - how to get started with using Buck2.
-- [Benefits](benefits.md) - the benefits of using Buck2.
+- [Getting Started](about/getting_started.md) - how to get started with using
+  Buck2.
+- [Benefits](about/benefits/compared_to_buck1.md) - the benefits of using Buck2.
 
 <FbInternalOnly>
 
@@ -50,9 +53,9 @@ your team.
 
 - [Writing Rules](rule_authors/writing_rules.md) - how to write rules to support
   new languages.
-- [Build APIs](api/build/globals) - documentation for the APIs available when
-  writing rules.
-- [Starlark Types](https://github.com/facebookexperimental/starlark-rust/blob/main/docs/types.md) -
+- [Build APIs](api/build) - documentation for the APIs available when writing
+  rules.
+- [Starlark Types](https://github.com/facebook/starlark-rust/blob/main/docs/types.md) -
   rules are written in Starlark (which is approximately Python), but our version
   adds types.
 
@@ -65,13 +68,20 @@ your team.
 
 ### For people integrating with Buck2
 
-- [Extending Buck via BXL](developers/bxl.md) - powerful Starlark scripts for
-  introspection of Buck2's graphs.
+- [Extending Buck via BXL](./bxl) - powerful Starlark scripts for introspection
+  of Buck2's graphs.
+- [Buck2 change detector](https://github.com/facebookincubator/buck2-change-detector) -
+  tools for building a CI that only builds/tests what has changed in diff/PR.
+- [Buck2 GitHub actions installer](https://github.com/dtolnay/install-buck2) -
+  script to make GitHub CI with Buck2 easier.
 - [Reindeer](https://github.com/facebookincubator/reindeer) - a set of tools for
   importing Rust crates from crates.io, git repos etc and generating a BUCK file
   for using them.
 - [ocaml-scripts](https://github.com/facebook/ocaml-scripts) - scripts to
   generate a BUCK file enabling the use of OCaml packages from an OPAM switch.
+- [Buckle](https://github.com/benbrittain/buckle) - a launcher for Buck2 on a
+  per-project basis. Enables a project or team to do seamless upgrades of their
+  build system tooling.
 
 ### External articles about Buck2
 
@@ -93,6 +103,13 @@ your team.
 
 ### External videos about Buck2
 
+- [Accelerating builds with Buck2](https://www.youtube.com/watch?v=oMIzKVxUNAE)
+  Neil talks about why Buck2 is fast.
+- [Buck2: optimizations & dynamic dependencies](https://www.youtube.com/watch?v=EQfVu42KwDs)
+  Neil and Chris talk about why Buck2 is fast and some of the advanced
+  dependency features.
+- [Building Erlang with Buck2](https://www.youtube.com/watch?v=4ALgsBqNBhQ)
+  Andreas talks about building WhatsApp with Buck2.
 - [antlir2: Deterministic image bulids with Buck2](https://www.youtube.com/watch?v=Wv-ilbckSx4)
   talks about layering a packaging system over Buck2.
 
@@ -122,57 +139,5 @@ your project.
   how to get started, compile Buck2 and the basic workflows.
 - [Notes for Developers](developers/developers.fb.md) - more advanced workflows
   and notes around debugging, profiling etc.
-
-## Specialised groups
-
-We have Workplace groups and task tags for various projects. Most task folders
-are _not monitored_, so post all questions and bug reports to a Workplace group.
-
-### Workplace groups
-
-- [Admarket](https://fb.workplace.com/groups/2011248092366093) - collaboration
-  between Admarket, DevX and Build Infra teams in their effort to migrate
-  Admarket to Buck2.
-- [Android](https://fb.workplace.com/groups/4318511658259181) - discussions on
-  anything related to the migration of fbandroid to Buck2.
-- [Apple](https://fb.workplace.com/groups/305599448025888/) - discussions
-  related to the migration of fbobjc to Buck2.
-- [Fbcode TD](https://fb.workplace.com/groups/603286664133355/) - migrations for
-  TDs, including fbcode, mobile, and rl TDs, as well as UTD.
-- [Fbcode](https://fb.workplace.com/groups/1080276222750085) - collaboration
-  between fbcode teams, DevX and Build Infra in their effort to migrate fbcode
-  services to Buck2.
-- [Hack](https://fb.workplace.com/groups/496546384752884) - discussions, ideas,
-  updates, and more as we move Hack to Buck2.
-- [Haskell](https://fb.workplace.com/groups/202582585277200/) - discussions,
-  ideas, updates, and more as we move Haskell to Buck2.
-- [Infer](https://fb.workplace.com/groups/601798364244831/) - discussions
-  related to ideas, bugs, jobs, and feedback on Infer.
-- [Open source](https://fb.workplace.com/groups/3434452653448246) - people
-  particularly enthusiastic about open sourcing Buck2.
-- [Reality labs](https://fb.workplace.com/groups/930797200910874/) - unmoderated
-  non-support group for talking about arvr's integration and onboarding to
-  Buck2.
-- [Shots](https://fb.workplace.com/groups/4899204743424118) - Shots engineers
-  who are experimenting with Buck2.
-- [Tpx](https://fb.workplace.com/groups/900436963938958/) - Buck2/Tpx
-  coordination group.
-- [Unicorn](https://fb.workplace.com/groups/503973410692177) - collaboration
-  between Unicorn, DevX and Build Infra teams in their effort to migrate Unicorn
-  to Buck2.
-- [WhatsApp](https://fb.workplace.com/groups/whatsapp.buck2) - Buck2 in the
-  WhatsApp server.
-- [Windows](https://fb.workplace.com/groups/580747310463852/) - discussions
-  related to Buck2 on Windows.
-
-### Task folders
-
-- [Admarket on Buck V2](https://www.internalfb.com/tasks?q=163089765955500)
-- [Apple Build Infra](https://www.internalfb.com/tasks?q=1710478139132259)
-- [Buck2](https://www.internalfb.com/tasks?q=446583836738538)
-- [DICE - BuckV2](https://www.internalfb.com/tasks?q=413466250534831)
-- [Eden on Buck V2](https://www.internalfb.com/tasks?q=406698320868619)
-- [FbCode TD on Buck2](https://www.internalfb.com/tasks?q=980682532796984)
-- [Unicorn on Buck V2](https://www.internalfb.com/tasks?q=262220628906648)
 
 </FbInternalOnly>

@@ -9,13 +9,20 @@ load(
     "@prelude//:artifact_tset.bzl",
     "ArtifactInfo",
     "make_artifact_tset",
+    "stringify_artifact_label",
 )
-load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo")
+load(
+    "@prelude//cxx:cxx_toolchain_types.bzl",
+    "CxxToolchainInfo",
+    "LinkerType",
+)
+load("@prelude//cxx:cxx_utility.bzl", "cxx_attrs_get_allow_cache_upload")
 load("@prelude//linking:execution_preference.bzl", "LinkExecutionPreference")
 load(
     "@prelude//linking:link_info.bzl",
     "Archive",
     "ArchiveLinkable",
+    "DepMetadata",
     "LinkArgs",
     "LinkInfo",  # @unused Used as a type
     "ObjectsLinkable",
@@ -33,7 +40,7 @@ def _serialize_linkable(linkable):
         return ("archive", (
             (linkable.archive.artifact, linkable.archive.external_objects),
             linkable.link_whole,
-            linkable.linker_type,
+            linkable.linker_type.value,
             linkable.supports_lto,
         ))
 
@@ -41,7 +48,7 @@ def _serialize_linkable(linkable):
         return ("objects", (
             linkable.objects,
             linkable.link_whole,
-            linkable.linker_type,
+            linkable.linker_type.value,
         ))
 
     if isinstance(linkable, SharedLibLinkable):
@@ -64,7 +71,8 @@ def _serialize_link_info(info: LinkInfo):
         info.post_flags,
         [_serialize_linkable(linkable) for linkable in info.linkables],
         # TODO(agallagher): It appears anon-targets don't allow passing in `label`.
-        [(str(info.label.raw_target()), info.artifacts) for info in external_debug_info],
+        [(stringify_artifact_label(info.label), info.artifacts) for info in external_debug_info],
+        [m.version for m in info.metadata],
     )
 
 def _serialize_link_args(link: LinkArgs):
@@ -106,7 +114,7 @@ def _deserialize_linkable(linkable: (str, typing.Any)) -> typing.Any:
                 external_objects = external_objects,
             ),
             link_whole = link_whole,
-            linker_type = linker_type,
+            linker_type = LinkerType(linker_type),
             supports_lto = supports_lto,
         )
 
@@ -115,7 +123,7 @@ def _deserialize_linkable(linkable: (str, typing.Any)) -> typing.Any:
         return ObjectsLinkable(
             objects = objects,
             link_whole = link_whole,
-            linker_type = linker_type,
+            linker_type = LinkerType(linker_type),
         )
 
     if typ == "shared":
@@ -128,7 +136,7 @@ def _deserialize_linkable(linkable: (str, typing.Any)) -> typing.Any:
     fail("Invalid linkable type: {}".format(typ))
 
 def _deserialize_link_info(actions: AnalysisActions, label: Label, info) -> LinkInfo:
-    name, pre_flags, post_flags, linkables, external_debug_info = info
+    name, pre_flags, post_flags, linkables, external_debug_info, metadata = info
     return LinkInfo(
         name = name,
         pre_flags = pre_flags,
@@ -137,10 +145,11 @@ def _deserialize_link_info(actions: AnalysisActions, label: Label, info) -> Link
         external_debug_info = make_artifact_tset(
             actions = actions,
             infos = [
-                ArtifactInfo(label = label, artifacts = artifacts)
+                ArtifactInfo(label = label, artifacts = artifacts, tags = [])
                 for _label, artifacts in external_debug_info
             ],
         ),
+        metadata = [DepMetadata(version = v) for v in metadata],
     )
 
 def _deserialize_link_args(
@@ -168,7 +177,7 @@ def deserialize_anon_attrs(
         category_suffix = attrs.category_suffix,
         identifier = attrs.identifier,
         enable_distributed_thinlto = attrs.enable_distributed_thinlto,
-        allow_cache_upload = attrs.allow_cache_upload,
+        allow_cache_upload = cxx_attrs_get_allow_cache_upload(attrs),
     )
 
     result_type = CxxLinkResultType(attrs.result_type)
@@ -206,7 +215,7 @@ ANON_ATTRS = {
                                         # ObjectsLinkable
                                         attrs.list(attrs.source()),  # objects
                                         attrs.bool(),  # link_whole
-                                        attrs.string(),  # linker_type
+                                        attrs.enum(LinkerType.values()),  # linker_type
                                     ),
                                     attrs.tuple(
                                         # ArchiveLinkable
@@ -216,7 +225,7 @@ ANON_ATTRS = {
                                             attrs.list(attrs.source()),  # external_objects
                                         ),
                                         attrs.bool(),  # link_whole
-                                        attrs.string(),  # linker_type
+                                        attrs.enum(LinkerType.values()),  # linker_type
                                         attrs.bool(),  # supports_lto
                                     ),
                                     attrs.tuple(
@@ -236,6 +245,8 @@ ANON_ATTRS = {
                                 attrs.list(attrs.source()),  # artifacts
                             ),
                         ),
+                        # metadata
+                        attrs.list(attrs.string()),
                     ),
                 ),
             ),
@@ -244,5 +255,6 @@ ANON_ATTRS = {
     ),
     "output": attrs.string(),
     "result_type": attrs.enum(CxxLinkResultType.values()),
+    "separate_debug_info": attrs.bool(default = False),
     "_cxx_toolchain": attrs.dep(providers = [CxxToolchainInfo]),
 }

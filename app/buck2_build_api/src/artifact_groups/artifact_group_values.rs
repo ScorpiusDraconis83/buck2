@@ -12,10 +12,10 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use buck2_artifact::artifact::artifact_type::Artifact;
-use buck2_core::directory::Directory;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_directory::directory::directory::Directory;
+use buck2_error::BuckErrorContext;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -40,13 +40,13 @@ impl ArtifactGroupValues {
         children: Vec<Self>,
         artifact_fs: &ArtifactFs,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let mut builder = ActionDirectoryBuilder::empty();
 
         for (artifact, value) in values.iter() {
             let path = artifact
                 .resolve_path(artifact_fs)
-                .context("Invalid artifact")?;
+                .buck_error_context("Invalid artifact")?;
             insert_artifact(&mut builder, path.as_ref(), value)?;
         }
 
@@ -58,11 +58,11 @@ impl ArtifactGroupValues {
                 .0
                 .directory
                 .as_ref()
-                .context("TransitiveSetProjection was missing directory!")?;
+                .buck_error_context("TransitiveSetProjection was missing directory!")?;
 
             builder
                 .merge(child_dir.to_builder())
-                .context("Merge failed")?;
+                .buck_error_context("Merge failed")?;
         }
 
         let directory = builder
@@ -88,7 +88,7 @@ impl ArtifactGroupValues {
         &self,
         builder: &mut ActionDirectoryBuilder,
         artifact_fs: &ArtifactFs,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         if let Some(d) = self.0.directory.as_ref() {
             builder.merge(d.to_builder())?;
             return Ok(());
@@ -233,20 +233,18 @@ impl ArtifactGroupValuesDyn for ArtifactGroupValues {
         &self,
         builder: &mut ActionDirectoryBuilder,
         artifact_fs: &ArtifactFs,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         self.add_to_directory(builder, artifact_fs)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use buck2_artifact::actions::key::ActionIndex;
     use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
     use buck2_artifact::artifact::build_artifact::BuildArtifact;
-    use buck2_artifact::deferred::id::DeferredId;
     use buck2_core::configuration::data::ConfigurationData;
-    use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-    use buck2_execute::artifact_value::ArtifactValue;
 
     use super::*;
 
@@ -254,11 +252,7 @@ mod tests {
         let target =
             ConfiguredTargetLabel::testing_parse("cell//pkg:foo", ConfigurationData::testing_new());
 
-        let artifact = BuildArtifact::testing_new(
-            target.dupe(),
-            ForwardRelativePathBuf::unchecked_new(name.to_owned()),
-            DeferredId::testing_new(0),
-        );
+        let artifact = BuildArtifact::testing_new(target.dupe(), name, ActionIndex::new(0));
 
         let value = ArtifactValue::file(DigestConfig::testing_default().empty_file());
 

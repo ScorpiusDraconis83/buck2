@@ -17,6 +17,8 @@
 
 //! Implementations of alloc and unpack traits for string.
 
+use std::convert::Infallible;
+
 use crate::typing::Ty;
 use crate::values::alloc_value::AllocFrozenStringValue;
 use crate::values::alloc_value::AllocStringValue;
@@ -68,6 +70,8 @@ impl<'v> AllocStringValue<'v> for String {
 }
 
 impl StarlarkTypeRepr for char {
+    type Canonical = <String as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         String::starlark_type_repr()
     }
@@ -86,6 +90,8 @@ impl<'v> AllocStringValue<'v> for char {
 }
 
 impl StarlarkTypeRepr for &'_ String {
+    type Canonical = <String as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         String::starlark_type_repr()
     }
@@ -116,21 +122,17 @@ impl<'v> AllocStringValue<'v> for &'_ str {
 }
 
 impl<'v> UnpackValue<'v> for &'v str {
-    fn expected() -> String {
-        "str".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        value.unpack_str()
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(value.unpack_str())
     }
 }
 
 impl<'v> UnpackValue<'v> for String {
-    fn expected() -> String {
-        "str".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        value.unpack_str().map(ToOwned::to_owned)
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(value.unpack_str().map(ToOwned::to_owned))
     }
 }

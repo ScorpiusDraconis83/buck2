@@ -16,12 +16,13 @@ use buck2_core::error::reset_soft_error_counters;
 use buck2_core::error::StructuredErrorOptions;
 use buck2_core::is_open_source;
 use buck2_core::soft_error;
+use buck2_error::buck2_error;
 
 static RESULT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn mock_handler(
     category: &str,
-    err: &anyhow::Error,
+    err: &buck2_error::Error,
     loc: (&str, u32, u32),
     options: StructuredErrorOptions,
 ) {
@@ -57,11 +58,11 @@ fn test_soft_error() {
     let before_error_line = line!();
     let _ignore_hard_error = soft_error!(
         "test_logged_soft_error",
-        anyhow::anyhow!("Should be logged")
+        buck2_error!(buck2_error::ErrorTag::Input, "Should be logged").into(),
     );
     assert_eq!(
         Some(&format!(
-            "({:?}, {}, 30), : Should be logged : test_logged_soft_error : false",
+            "({:?}, {}, 30), : Should be logged : test_logged_soft_error : true",
             file!(),
             before_error_line + 1,
         )),
@@ -79,7 +80,10 @@ fn test_reset_counters() {
     assert_eq!(0, RESULT.lock().unwrap().len(), "Sanity check");
 
     for _ in 0..100 {
-        let _ignore = soft_error!("test_reset_counters", anyhow::anyhow!("Message"));
+        let _ignore = soft_error!(
+            "test_reset_counters",
+            buck2_error!(buck2_error::ErrorTag::Input, "Message").into()
+        );
     }
 
     assert_eq!(
@@ -91,7 +95,10 @@ fn test_reset_counters() {
     reset_soft_error_counters();
 
     for _ in 0..100 {
-        let _ignore = soft_error!("test_reset_counters", anyhow::anyhow!("Message"));
+        let _ignore = soft_error!(
+            "test_reset_counters",
+            buck2_error!(buck2_error::ErrorTag::Input, "Message").into()
+        );
     }
 
     assert_eq!(

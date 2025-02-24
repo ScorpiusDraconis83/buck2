@@ -8,7 +8,7 @@
  */
 
 use allocative::Allocative;
-use anyhow::Context;
+use buck2_error::BuckErrorContext;
 use dupe::Dupe;
 use relative_path::RelativePath;
 
@@ -19,6 +19,7 @@ use crate::fs::paths::forward_rel_path::ForwardRelativePath;
 
 #[derive(buck2_error::Error, Debug)]
 #[error("attempted to strip prefix of two CellPath with different cell names `{0}` and `{1}`")]
+#[buck2(tag = Tier0)]
 struct StripPrefixError(CellName, CellName);
 
 /// Represents a resolvable path corresponding to some path that is relative to the cell
@@ -34,7 +35,7 @@ struct StripPrefixError(CellName, CellName);
     PartialOrd,
     Allocative
 )]
-#[display(fmt = "{}", "self.as_ref()")]
+#[display("{}", self.as_ref())]
 pub struct CellPath {
     cell: CellName,
     path: Box<CellRelativePath>,
@@ -80,7 +81,7 @@ impl CellPath {
     ///     path.join(other)
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn join<P: AsRef<ForwardRelativePath>>(&self, path: P) -> CellPath {
@@ -107,7 +108,7 @@ impl CellPath {
     ///     .map(|p| p.to_owned()),
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn parent(&self) -> Option<CellPathRef> {
@@ -141,7 +142,7 @@ impl CellPath {
     /// );
     /// assert_eq!(ancestors.next(), None);
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn ancestors(&self) -> impl Iterator<Item = CellPathRef> {
@@ -198,13 +199,13 @@ impl CellPath {
     ///     true
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn strip_prefix<'a>(
         &'a self,
         base: CellPathRef,
-    ) -> anyhow::Result<&'a ForwardRelativePath> {
+    ) -> buck2_error::Result<&'a ForwardRelativePath> {
         self.as_ref().strip_prefix(base)
     }
 
@@ -240,9 +241,12 @@ impl CellPath {
     ///     true
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
-    pub fn join_normalized<P: AsRef<RelativePath>>(&self, path: P) -> anyhow::Result<CellPath> {
+    pub fn join_normalized<P: AsRef<RelativePath>>(
+        &self,
+        path: P,
+    ) -> buck2_error::Result<CellPath> {
         Ok(CellPath::new(self.cell, self.path.join_normalized(path)?))
     }
 
@@ -269,11 +273,16 @@ impl CellPath {
     ///     ),
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn starts_with(&self, base: CellPathRef) -> bool {
         self.as_ref().starts_with(base)
+    }
+
+    #[inline]
+    pub fn ends_with(&self, suffix: &ForwardRelativePath) -> bool {
+        self.as_ref().ends_with(suffix)
     }
 
     #[inline]
@@ -299,7 +308,7 @@ impl CellPath {
 }
 
 #[derive(Debug, Clone, Dupe, Copy, Eq, PartialEq, Hash, derive_more::Display)]
-#[display(fmt = "{}//{}", cell, path)]
+#[display("{}//{}", cell, path)]
 pub struct CellPathRef<'a> {
     cell: CellName,
     path: &'a CellRelativePath,
@@ -314,7 +323,7 @@ impl<'a> CellPathRef<'a> {
     pub fn testing_new(path: &str) -> CellPathRef {
         let (cell, path) = path
             .split_once("//")
-            .with_context(|| format!("invalid path: `{}`", path))
+            .with_buck_error_context(|| format!("invalid path: `{}`", path))
             .unwrap();
         CellPathRef {
             cell: CellName::testing_new(cell),
@@ -382,7 +391,12 @@ impl<'a> CellPathRef<'a> {
     }
 
     #[inline]
-    pub fn strip_prefix(&self, base: CellPathRef) -> anyhow::Result<&'a ForwardRelativePath> {
+    pub fn ends_with(&self, suffix: &ForwardRelativePath) -> bool {
+        self.path().ends_with(suffix)
+    }
+
+    #[inline]
+    pub fn strip_prefix(&self, base: CellPathRef) -> buck2_error::Result<&'a ForwardRelativePath> {
         if self.cell != base.cell {
             return Err(StripPrefixError(self.cell, base.cell).into());
         }

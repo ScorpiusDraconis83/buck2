@@ -5,70 +5,21 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@prelude//cxx/user:link_group_map.bzl", "link_group_map_attr")
+load("@prelude//cxx:link_groups_types.bzl", "LINK_GROUP_MAP_ATTR")
+load("@prelude//decls:test_common.bzl", "test_common")
+load("@prelude//linking:types.bzl", "Linkage")
+load("@prelude//rust:clippy_configuration.bzl", "ClippyConfiguration")
 load("@prelude//rust:link_info.bzl", "RustProcMacroPlugin")
 load("@prelude//rust:rust_binary.bzl", "rust_binary_impl", "rust_test_impl")
-load("@prelude//rust:rust_library.bzl", "prebuilt_rust_library_impl", "rust_library_impl")
-load(":common.bzl", "Linkage", "buck", "prelude_rule")
+load("@prelude//rust:rust_library.bzl", "rust_library_impl")
+load(":common.bzl", "buck", "prelude_rule")
 load(":native_common.bzl", "native_common")
 load(":re_test_common.bzl", "re_test_common")
 load(":rust_common.bzl", "rust_common", "rust_target_dep")
 
-prebuilt_rust_library = prelude_rule(
-    name = "prebuilt_rust_library",
-    impl = prebuilt_rust_library_impl,
-    docs = """
-        A prebuilt\\_rust\\_library() specifies a pre-built Rust crate, and any dependencies
-        it may have on other crates (typically also prebuilt).
-
-
-        Note: Buck is currently tested with (and therefore supports) version 1.32.0 of Rust.
-    """,
-    examples = """
-        ```
-
-        prebuilt_rust_library(
-          name = 'dailygreet',
-          rlib = 'libdailygreet.rlib',
-          deps = [
-            ':jinsy',
-          ],
-        )
-
-        prebuilt_rust_library(
-          name = 'jinsy',
-          rlib = 'libarbiter-6337e9cb899bd295.rlib',
-        )
-
-        ```
-    """,
-    further = None,
-    attrs = (
-        # @unsorted-dict-items
-        {
-            "rlib": attrs.source(doc = """
-                Path to the precompiled Rust crate - typically of the form 'libfoo.rlib', or
-                'libfoo-abc123def456.rlib' if it has symbol versioning metadata.
-            """),
-        } |
-        native_common.preferred_linkage(preferred_linkage_type = attrs.enum(Linkage, default = "any")) |
-        rust_common.crate(crate_type = attrs.string(default = "")) |
-        rust_common.deps_arg(is_binary = False) |
-        {
-            "contacts": attrs.list(attrs.string(), default = []),
-            "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
-            "labels": attrs.list(attrs.string(), default = []),
-            "licenses": attrs.list(attrs.source(), default = []),
-            "proc_macro": attrs.bool(default = False),
-        } |
-        rust_common.cxx_toolchain_arg() |
-        rust_common.rust_toolchain_arg()
-    ),
-    uses_plugins = [RustProcMacroPlugin],
-)
-
 def _rust_common_attributes(is_binary: bool):
     return {
+        "clippy_configuration": attrs.option(attrs.dep(providers = [ClippyConfiguration]), default = None),
         "contacts": attrs.list(attrs.string(), default = []),
         "coverage": attrs.bool(default = False),
         "default_host_platform": attrs.option(attrs.configuration_label(), default = None),
@@ -80,7 +31,7 @@ def _rust_common_attributes(is_binary: bool):
         "licenses": attrs.list(attrs.source(), default = []),
         "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source()), sorted = True, default = []),
         "rustdoc_flags": attrs.list(attrs.arg(), default = []),
-        "version_universe": attrs.option(attrs.string(), default = None),
+        "separate_debug_info": attrs.bool(default = False),
         "_exec_os_type": buck.exec_os_type_arg(),
         "_target_os_type": buck.target_os_type_arg(),
     }
@@ -89,7 +40,6 @@ def _rust_binary_attrs_group(prefix: str) -> dict[str, Attr]:
     attrs = (rust_common.deps_arg(is_binary = True) |
              rust_common.named_deps_arg(is_binary = True) |
              rust_common.linker_flags_arg() |
-             rust_common.env_arg() |
              native_common.link_style())
     return {prefix + name: v for name, v in attrs.items()}
 
@@ -102,7 +52,7 @@ _RUST_EXECUTABLE_ATTRIBUTES = {
     "enable_distributed_thinlto": attrs.bool(default = False),
     # Required by the rules but not supported, since Rust is auto-link groups only
     "link_group": attrs.default_only(attrs.option(attrs.string(), default = None)),
-    "link_group_map": link_group_map_attr(),
+    "link_group_map": LINK_GROUP_MAP_ATTR,
     "link_group_min_binary_node_count": attrs.option(attrs.int(), default = None),
     "rpath": attrs.bool(default = False, doc = """
               Set the "rpath" in the executable when using a shared link style.
@@ -120,9 +70,7 @@ rust_binary = prelude_rule(
         If you invoke a build with the `check` flavor, then Buck will invoke rustc
         to check the code (typecheck, produce warnings, etc), but won't generate an executable code.
         When applied to binaries it produces no output; for libraries it produces metadata for
-        consumers of the library. When building with `check`, extra compiler flags from
-        the `rust.rustc_check_flags` are added to the compiler's command line options,
-        to allow for extra warnings, etc.
+        consumers of the library.
 
 
         Note: Buck is currently tested with (and therefore supports) version 1.32.0 of Rust.
@@ -172,6 +120,7 @@ rust_binary = prelude_rule(
         rust_common.rustc_flags_arg() |
         rust_common.crate(crate_type = attrs.option(attrs.string(), default = None)) |
         rust_common.crate_root() |
+        rust_common.env_arg() |
         _rust_binary_attrs_group(prefix = "") |
         _rust_common_attributes(is_binary = True) |
         _RUST_EXECUTABLE_ATTRIBUTES |
@@ -194,9 +143,7 @@ rust_library = prelude_rule(
         If you invoke a build with the `check` flavor, then Buck will invoke rustc
         to check the code (typecheck, produce warnings, etc), but won't generate an executable code.
         When applied to binaries it produces no output; for libraries it produces metadata for
-        consumers of the library. When building with `check`, extra compiler flags from
-        the `rust.rustc_check_flags` are added to the compiler's command line options,
-        to allow for extra warnings, etc.
+        consumers of the library.
 
 
         Note: Buck is currently tested with (and therefore supports) version 1.32.0 of Rust.
@@ -236,13 +183,17 @@ rust_library = prelude_rule(
         # don't have to know whether we're building a rust_binary or a
         # rust_library.
         rust_common.linker_flags_arg() |
+        rust_common.exported_linker_flags_arg() |
         rust_common.env_arg() |
         rust_common.crate(crate_type = attrs.option(attrs.string(), default = None)) |
         rust_common.crate_root() |
-        native_common.preferred_linkage(preferred_linkage_type = attrs.enum(Linkage, default = "any")) |
+        native_common.preferred_linkage(preferred_linkage_type = attrs.enum(Linkage.values(), default = "any")) |
+        native_common.soname() |
+        native_common.link_style() |
         _rust_common_attributes(is_binary = False) |
         {
             "crate_dynamic": attrs.option(attrs.dep(), default = None),
+            "doc_env": rust_common.env_arg()["env"],
             "doctests": attrs.option(attrs.bool(), default = None),
             "proc_macro": attrs.bool(default = False),
             "supports_python_dlopen": attrs.option(attrs.bool(), default = None),
@@ -303,6 +254,7 @@ rust_test = prelude_rule(
     further = None,
     attrs = (
         # @unsorted-dict-items
+        buck.inject_test_env_arg() |
         rust_common.srcs_arg() |
         rust_common.mapped_srcs_arg() |
         rust_common.edition_arg() |
@@ -310,6 +262,9 @@ rust_test = prelude_rule(
         rust_common.rustc_flags_arg() |
         rust_common.crate(crate_type = attrs.option(attrs.string(), default = None)) |
         rust_common.crate_root() |
+        rust_common.default_roots_arg() |
+        rust_common.run_env_arg() |
+        rust_common.build_and_run_env_arg() |
         _rust_binary_attrs_group(prefix = "") |
         _rust_common_attributes(is_binary = True) |
         _RUST_EXECUTABLE_ATTRIBUTES |
@@ -323,13 +278,13 @@ rust_test = prelude_rule(
         re_test_common.test_args() |
         rust_common.cxx_toolchain_arg() |
         rust_common.rust_toolchain_arg() |
-        rust_common.workspaces_arg()
+        rust_common.workspaces_arg() |
+        test_common.attributes()
     ),
     uses_plugins = [RustProcMacroPlugin],
 )
 
 rust_rules = struct(
-    prebuilt_rust_library = prebuilt_rust_library,
     rust_binary = rust_binary,
     rust_library = rust_library,
     rust_test = rust_test,

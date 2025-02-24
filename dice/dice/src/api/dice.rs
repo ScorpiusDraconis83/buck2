@@ -24,19 +24,19 @@
 //!     use dice::{Key, InjectedKey, DiceComputations, DiceDataBuilder, DiceData, DiceTransactionUpdater};
 //!     use std::sync::Arc;
 //!     use allocative::Allocative;
-//! use buck2_futures::cancellation::CancellationContext;
+//!     use buck2_futures::cancellation::CancellationContext;
 //!
 //!     /// A configuration computation that consists of values that are pre-computed outside of DICE
-//!     pub struct InjectConfigs<'compute>(&'compute DiceComputations);
+//!     pub struct InjectConfigs<'compute, 'd>(&'compute mut DiceComputations<'d>);
 //!
-//!     impl<'compute> InjectConfigs<'compute> {
-//!         pub async fn get_config(&self) -> usize {
+//!     impl<'compute, 'd> InjectConfigs<'compute, 'd> {
+//!         pub async fn get_config(&mut self) -> usize {
 //!             self.0.compute(&ConfigKey).await.unwrap()
 //!         }
 //!     }
 //!
 //!     #[derive(Clone, Debug, Display, Eq, Hash, PartialEq, Allocative)]
-//!     #[display(fmt = "{:?}", self)]
+//!     #[display("{:?}", self)]
 //!     struct ConfigKey;
 //!
 //!     #[async_trait]
@@ -48,13 +48,13 @@
 //!         }
 //!     }
 //!
-//!     pub struct MyComputation<'compute>(&'compute DiceComputations);
+//!     pub struct MyComputation<'compute, 'd>(pub &'compute mut DiceComputations<'d>);
 //!
-//!     impl<'compute> MyComputation<'compute> {
+//!     impl<'compute, 'd> MyComputation<'compute, 'd> {
 //!         // declaring a computation function
-//!         pub async fn compute_a(&self, a: usize, s: String) -> Arc<String> {
+//!         pub async fn compute_a(&mut self, a: usize, s: String) -> Arc<String> {
 //!             #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-//!             #[display(fmt = "{:?}", self)]
+//!             #[display("{:?}", self)]
 //!             struct ComputeA(usize, String);
 //!
 //!             #[async_trait]
@@ -63,7 +63,7 @@
 //!
 //!                 async fn compute(&self, ctx: &mut DiceComputations, _cancellations: &CancellationContext) -> Self::Value {
 //!                     // request for other computations on the self
-//!                     let n = ctx.my_computation().compute_b(self.0).await;
+//!                     let n = MyComputation(ctx).compute_b(self.0).await;
 //!                     Arc::new(self.1.repeat(n))
 //!                 }
 //!
@@ -76,13 +76,13 @@
 //!         }
 //!
 //!         // second computation function
-//!         pub async fn compute_b(&self, a: usize) -> usize {
+//!         pub async fn compute_b(&mut self, a: usize) -> usize {
 //!                 self.0.compute(&ComputeB(a)).await.unwrap()
 //!         }
 //!     }
 //!
 //!     #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-//!     #[display(fmt = "{:?}", self)]
+//!     #[display("{:?}", self)]
 //!     struct ComputeB(usize);
 //!
 //!     #[async_trait]
@@ -90,34 +90,11 @@
 //!         type Value = usize;
 //!
 //!         async fn compute(&self, ctx: &mut DiceComputations, cancellations: &CancellationContext) -> Self::Value {
-//!             self.0 + ctx.injected_configs().get_config().await + ctx.global_data().static_data().len()
+//!             self.0 + InjectConfigs(ctx).get_config().await + ctx.global_data().static_data().len()
 //!         }
 //!
 //!         fn equality(x: &Self::Value,y: &Self::Value) -> bool {
 //!             x == y
-//!         }
-//!     }
-//!
-//!     // trait to register the computation to DICE
-//!     pub trait HasMyComputation {
-//!         fn my_computation(&self) -> MyComputation;
-//!     }
-//!
-//!     // attach the declared computation to DICE via the context
-//!     impl HasMyComputation for DiceComputations {
-//!         fn my_computation(&self) -> MyComputation {
-//!             MyComputation(self)
-//!         }
-//!     }
-//!
-//!     // trait to register the precomputed configs to DICE
-//!     pub trait HasInjectedConfig {
-//!         fn injected_configs(&self) -> InjectConfigs;
-//!     }
-//!
-//!     impl HasInjectedConfig for DiceComputations {
-//!         fn injected_configs(&self) -> InjectConfigs {
-//!             InjectConfigs(self)
 //!         }
 //!     }
 //!
@@ -167,21 +144,21 @@
 //! let mut ctx = engine.updater();
 //! ctx.inject_config(0);
 //!
-//! let ctx = rt.block_on(ctx.commit());
+//! let mut ctx = rt.block_on(ctx.commit());
 //!
 //! // request the computation from DICE
 //! rt.block_on(async {
-//!     assert_eq!("aaaaaaaa", &*ctx.my_computation().compute_a(4, "a".into()).await);
+//!     assert_eq!("aaaaaaaa", &*MyComputation(&mut ctx).compute_a(4, "a".into()).await);
 //! });
 //!
 //! let mut ctx = engine.updater();
 //! ctx.inject_config(2);
 //!
-//! let ctx = rt.block_on(ctx.commit());
+//! let mut ctx = rt.block_on(ctx.commit());
 //!
 //! // request the computation from DICE
 //! rt.block_on(async {
-//!     assert_eq!("aaaaaaaaaa", &*ctx.my_computation().compute_a(4, "a".into()).await);
+//!     assert_eq!("aaaaaaaaaa", &*MyComputation(&mut ctx).compute_a(4, "a".into()).await);
 //! });
 //! ```
 
@@ -210,7 +187,7 @@ pub struct Dice {
 
 impl Dice {
     pub fn builder() -> DiceDataBuilder {
-        DiceDataBuilder(DiceDataBuilderImpl::new_legacy())
+        DiceDataBuilder(DiceDataBuilderImpl::new_modern())
     }
 
     pub fn modern() -> DiceDataBuilder {
@@ -255,7 +232,6 @@ impl Dice {
 
     pub fn which_dice(&self) -> WhichDice {
         match self.implementation {
-            DiceImplementation::Legacy(_) => WhichDice::Legacy,
             DiceImplementation::Modern(_) => WhichDice::Modern,
         }
     }

@@ -11,9 +11,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::io::Write;
 use std::path::Path;
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
+use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_event_log::stream_value::StreamValue;
 use serde::Serialize;
@@ -23,6 +26,7 @@ use crate::commands::log::options::EventLogOptions;
 use crate::commands::log::transform_format;
 use crate::commands::log::LogCommandOutputFormat;
 use crate::commands::log::LogCommandOutputFormatWithWriter;
+
 /// Outputs materializations from selected invocation.
 ///
 /// The output is a tab-separated list containing the path,
@@ -36,12 +40,12 @@ pub struct WhatMaterializedCommand {
         long = "sort-by-size",
         short = 's',
         help = "Sort the output by total bytes in ascending order",
-        conflicts_with = "aggregate-by-ext"
+        conflicts_with = "aggregate_by_ext"
     )]
     sort_by_total_bytes: bool,
 
     /// Aggregates the output by file extension
-    #[clap(long, conflicts_with = "sort-by-total-bytes")]
+    #[clap(long, conflicts_with = "sort_by_total_bytes")]
     aggregate_by_ext: bool,
 
     #[clap(
@@ -49,9 +53,9 @@ pub struct WhatMaterializedCommand {
         help = "Which output format to use for this command",
         default_value = "tabulated",
         ignore_case = true,
-        arg_enum
+        value_enum
     )]
-    pub output: LogCommandOutputFormat,
+    output: LogCommandOutputFormat,
 }
 
 #[derive(serde::Serialize)]
@@ -60,14 +64,19 @@ struct Record {
     method: &'static str,
     file_count: u64,
     total_bytes: u64,
+    action_digest: Option<String>,
 }
 
 impl Display for Record {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}\t{}\t{}\t{}",
-            self.path, self.method, self.file_count, self.total_bytes
+            "{}\t{}\t{}\t{}\t{}",
+            self.path,
+            self.method,
+            self.action_digest.as_deref().unwrap_or("none"),
+            self.file_count,
+            self.total_bytes
         )
     }
 }
@@ -127,15 +136,14 @@ impl<'a> From<&'a Record> for AggregatedRecord<'a> {
 fn write_output<T: Display + Serialize>(
     output: &mut LogCommandOutputFormatWithWriter,
     record: &T,
-) -> anyhow::Result<()> {
+) -> Result<(), ClientIoError> {
     match output {
-        LogCommandOutputFormatWithWriter::Tabulated(w) => {
-            Ok(w.write_all(format!("{}\n", record).as_bytes())?)
-        }
+        LogCommandOutputFormatWithWriter::Tabulated(w) => Ok(writeln!(w, "{}", record)?),
         LogCommandOutputFormatWithWriter::Csv(writer) => Ok(writer.serialize(record)?),
         LogCommandOutputFormatWithWriter::Json(w) => {
-            serde_json::to_writer(w, &record)?;
-            buck2_client_ctx::println!("")
+            serde_json::to_writer(w.by_ref(), &record)?;
+            w.write_all("\n".as_bytes())?;
+            Ok(())
         }
     }
 }
@@ -156,71 +164,68 @@ fn get_record(materialization: &buck2_data::MaterializationEnd) -> Record {
         method,
         file_count: materialization.file_count,
         total_bytes: materialization.total_bytes,
+        action_digest: materialization.action_digest.clone(),
     }
 }
 
 impl WhatMaterializedCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self {
             event_log,
             output,
             sort_by_total_bytes,
             aggregate_by_ext,
         } = self;
-        buck2_client_ctx::stdio::print_with_writer::<anyhow::Error, _>(|w| {
-            {
-                let mut output = transform_format(output, w);
-                ctx.with_runtime(async move |ctx| {
-            let log_path = event_log.get(&ctx).await?;
+        buck2_client_ctx::stdio::print_with_writer::<buck2_error::Error, _>(|w| {
+            let mut output = transform_format(output, w);
+            ctx.instant_command_no_log("log-what-materialized", |ctx| async move {
+                let log_path = event_log.get(&ctx).await?;
 
-            let (invocation, mut events) = log_path.unpack_stream().await?;
+                let (invocation, mut events) = log_path.unpack_stream().await?;
 
-            buck2_client_ctx::eprintln!(
-                "Showing materializations from: {}",
-                invocation.display_command_line()
-            )?;
+                buck2_client_ctx::eprintln!(
+                    "Showing materializations from: {}",
+                    invocation.display_command_line()
+                )?;
 
-            let mut records: Vec<Record> = Vec::new();
-            while let Some(event) = events.try_next().await? {
-                match event {
-                    StreamValue::Event(event) => match &event.data {
-                        Some(buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
-                            data: Some(buck2_data::span_end_event::Data::Materialization(m)),
-                            ..
-                        })) if m.success =>
-                        // Only log what has been materialized.
-                        {
-                            let record = get_record(m);
-                            if sort_by_total_bytes || aggregate_by_ext {
-                                records.push(record);
-                            } else {
-                                write_output(&mut output, &record)?;
-                            }
-                        }
-                        _ => {}
-                    },
-                    StreamValue::Result(..) | StreamValue::PartialResult(..) => {}
-                };
-            }
-
-            if aggregate_by_ext {
-                let mut kv: BTreeMap<AggregationKey, AggregatedRecord> = BTreeMap::new();
-                for r in records.iter() {
-                    let v: AggregatedRecord = r.into();
-                    let k = v.get_key();
-                    kv.entry(k).and_modify(|e| e.update(r)).or_insert(v);
+                let mut records: Vec<Record> = Vec::new();
+                while let Some(event) = events.try_next().await? {
+                    match event {
+                        StreamValue::Event(event) => match &event.data {
+                            Some(buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                                                                           data: Some(buck2_data::span_end_event::Data::Materialization(m)),
+                                                                           ..
+                                                                       })) if m.success =>
+                            // Only log what has been materialized.
+                                {
+                                    let record = get_record(m);
+                                    if sort_by_total_bytes || aggregate_by_ext {
+                                        records.push(record);
+                                    } else {
+                                        write_output(&mut output, &record)?;
+                                    }
+                                }
+                            _ => {}
+                        },
+                        StreamValue::Result(..) | StreamValue::PartialResult(..) => {}
+                    };
                 }
-                kv.iter().try_for_each(|(_, v)| write_output(&mut output, v))?;
-            } else if sort_by_total_bytes {
-                records.sort_by(|a, b| a.total_bytes.cmp(&b.total_bytes));
-                records.iter().try_for_each(|r| write_output(&mut output, r))?;
-            }
 
-            anyhow::Ok(())
+                if aggregate_by_ext {
+                    let mut kv: BTreeMap<AggregationKey, AggregatedRecord> = BTreeMap::new();
+                    for r in records.iter() {
+                        let v: AggregatedRecord = r.into();
+                        let k = v.get_key();
+                        kv.entry(k).and_modify(|e| e.update(r)).or_insert(v);
+                    }
+                    kv.iter().try_for_each(|(_, v)| write_output(&mut output, v))?;
+                } else if sort_by_total_bytes {
+                    records.sort_by(|a, b| a.total_bytes.cmp(&b.total_bytes));
+                    records.iter().try_for_each(|r| write_output(&mut output, r))?;
+                }
 
-        })?;
-                anyhow::Ok(())
-            }
+                buck2_error::Ok(())
+            })
         })?;
         ExitResult::success()
     }

@@ -6,6 +6,7 @@
 # of this source tree.
 
 load("@prelude//:paths.bzl", "paths")
+load(":apple_bundle_utility.bzl", "get_apple_versioned_macos_bundle_value_primitive")
 
 # Abstraction of a place in a resulting bundle where file or directory will be copied. Actual value
 # of path relative to bundle root depends on a platform. This class is an implementation detail and
@@ -22,10 +23,10 @@ AppleBundleDestination = enum(
     "headers",
     "modules",
     "quicklook",
-    "watchkitstub",
     "bundleroot",
     "loginitems",
     "appclips",
+    "extensionkit_extensions",
 )
 
 AppleBundleDestinationPaths = record(
@@ -39,10 +40,10 @@ AppleBundleDestinationPaths = record(
     headers = field(str, ""),
     modules = field(str, ""),
     quicklook = field(str, ""),
-    watchkitstub = field(str, ""),
     bundleroot = field(str, ""),
     loginitems = field(str, ""),
     appclips = field(str, ""),
+    extensionkit_extensions = field(str, ""),
 )
 
 _IOSBundleDestinationPaths = AppleBundleDestinationPaths(
@@ -51,8 +52,8 @@ _IOSBundleDestinationPaths = AppleBundleDestinationPaths(
     xpcservices = "XPCServices",
     watchapp = "Watch",
     quicklook = "Library/QuickLook",
-    watchkitstub = "_WatchKitStub",
     appclips = "AppClips",
+    extensionkit_extensions = "Extensions",
 )
 
 _IOSFrameworkBundleDestinationPaths = AppleBundleDestinationPaths(
@@ -74,7 +75,6 @@ _MacOSBundleDestinationPaths = AppleBundleDestinationPaths(
     headers = macOS_content_path,
     modules = macOS_content_path,
     quicklook = paths.join(macOS_content_path, "Library/QuickLook"),
-    watchkitstub = macOS_content_path,
     bundleroot = macOS_content_path,
     loginitems = paths.join(macOS_content_path, "Library/LoginItems"),
 )
@@ -82,10 +82,23 @@ _MacOSBundleDestinationPaths = AppleBundleDestinationPaths(
 _MacOSFrameworkBundleDestinationPaths = AppleBundleDestinationPaths(
     resources = "Resources",
     frameworks = "Frameworks",
+    plugins = "PlugIns",
     xpcservices = "XPCServices",
     metadata = "Resources",
     headers = "Headers",
     modules = "Modules",
+)
+
+macOS_versioned_path = "Versions/A"
+_MacOSVersionedFrameworkBundleDestinationPaths = AppleBundleDestinationPaths(
+    resources = paths.join(macOS_versioned_path, "Resources"),
+    frameworks = paths.join(macOS_versioned_path, "Frameworks"),
+    plugins = paths.join(macOS_versioned_path, "PlugIns"),
+    xpcservices = paths.join(macOS_versioned_path, "XPCServices"),
+    metadata = paths.join(macOS_versioned_path, "Resources"),
+    headers = paths.join(macOS_versioned_path, "Headers"),
+    modules = paths.join(macOS_versioned_path, "Modules"),
+    executables = macOS_versioned_path,
 )
 
 def _get_apple_bundle_destinations_for_sdk_name(name: str) -> AppleBundleDestinationPaths:
@@ -94,15 +107,18 @@ def _get_apple_bundle_destinations_for_sdk_name(name: str) -> AppleBundleDestina
     else:
         return _IOSBundleDestinationPaths
 
-def _get_apple_framework_bundle_destinations_for_sdk_name(name: str) -> AppleBundleDestinationPaths:
-    if name == "macosx" or name == "maccatalyst":
-        return _MacOSFrameworkBundleDestinationPaths
+def _get_apple_framework_bundle_destinations_for_sdk_name(name: str, versioned_macos_bundle: bool) -> AppleBundleDestinationPaths:
+    if name.startswith("mac"):
+        if get_apple_versioned_macos_bundle_value_primitive(name, versioned_macos_bundle):
+            return _MacOSVersionedFrameworkBundleDestinationPaths
+        else:
+            return _MacOSFrameworkBundleDestinationPaths
     else:
         return _IOSFrameworkBundleDestinationPaths
 
-def bundle_relative_path_for_destination(destination: AppleBundleDestination, sdk_name: str, extension: str) -> str:
+def bundle_relative_path_for_destination(destination: AppleBundleDestination, sdk_name: str, extension: str, versioned_macos_bundle: bool) -> str:
     if extension == "framework":
-        bundle_destinations = _get_apple_framework_bundle_destinations_for_sdk_name(sdk_name)
+        bundle_destinations = _get_apple_framework_bundle_destinations_for_sdk_name(sdk_name, versioned_macos_bundle)
     else:
         bundle_destinations = _get_apple_bundle_destinations_for_sdk_name(sdk_name)
 
@@ -112,6 +128,8 @@ def bundle_relative_path_for_destination(destination: AppleBundleDestination, sd
         return bundle_destinations.frameworks
     elif destination.value == "executables":
         return bundle_destinations.executables
+    elif destination.value == "extensionkit_extensions":
+        return bundle_destinations.extensionkit_extensions
     elif destination.value == "plugins":
         return bundle_destinations.plugins
     elif destination.value == "xpcservices":
@@ -126,8 +144,6 @@ def bundle_relative_path_for_destination(destination: AppleBundleDestination, sd
         return bundle_destinations.modules
     elif destination.value == "quicklook":
         return bundle_destinations.quicklook
-    elif destination.value == "watchkitstub":
-        return bundle_destinations.watchkitstub
     elif destination.value == "bundleroot":
         return bundle_destinations.bundleroot
     elif destination.value == "loginitems":

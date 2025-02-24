@@ -10,10 +10,8 @@
 use buck2_build_api::interpreter::rule_defs::transitive_set::transitive_set_definition::register_transitive_set;
 use buck2_core::bzl::ImportPath;
 use buck2_interpreter::file_loader::LoadedModules;
-use buck2_interpreter_for_build::attrs::attrs_global::register_attrs;
 use buck2_interpreter_for_build::interpreter::testing::Tester;
 use buck2_interpreter_for_build::nodes::attr_spec::AttributeSpecExt;
-use buck2_interpreter_for_build::rule::register_rule_function;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::attrs::spec::AttributeSpec;
 use buck2_node::nodes::unconfigured::testing::targets_to_json;
@@ -21,6 +19,7 @@ use indoc::indoc;
 use serde_json::json;
 use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
+use starlark::docs::DocMember;
 use starlark::docs::DocParam;
 use starlark::docs::DocReturn;
 use starlark::docs::DocString;
@@ -30,13 +29,11 @@ use starlark::typing::Ty;
 fn rule_tester() -> Tester {
     let mut tester = Tester::new().unwrap();
     tester.additional_globals(register_transitive_set);
-    tester.additional_globals(register_rule_function);
-    tester.additional_globals(register_attrs);
     tester
 }
 
 #[test]
-fn rule_creates_callable() -> anyhow::Result<()> {
+fn rule_creates_callable() -> buck2_error::Result<()> {
     let mut tester = rule_tester();
     tester.run_starlark_test(indoc!(
         r#"
@@ -183,6 +180,7 @@ fn udr_is_recorded() -> buck2_error::Result<()> {
             "exec_compatible_with": [],
             "src": "root//some/package/file1.java",
             "target_compatible_with": [],
+            "modifiers": [],
             "tests": [],
             "visibility": [],
             "within_view": ["PUBLIC"],
@@ -200,6 +198,7 @@ fn udr_is_recorded() -> buck2_error::Result<()> {
             "exec_compatible_with": [],
             "src": "root//foo:baz",
             "target_compatible_with": [],
+            "modifiers": [],
             "tests": [],
             "visibility": [],
             "within_view": ["PUBLIC"],
@@ -252,10 +251,13 @@ fn udr_rejects_invalid_parameters() {
 
     run(
         missing_name,
-        "Missing parameter `name` for call to foo_binary",
+        "Missing named-only parameter `name` for call to `foo_binary`",
     );
     run(invalid_name, "Invalid target name `bad name`.");
-    run(missing_mandatory, "Missing parameter `mandatory`");
+    run(
+        missing_mandatory,
+        "Missing named-only parameter `mandatory`",
+    );
     run(wrong_type, "coercing attribute `mandatory`");
     run(unknown_param, "Found `unknown` extra named parameter");
     run(
@@ -265,7 +267,7 @@ fn udr_rejects_invalid_parameters() {
 }
 
 #[test]
-fn option_allows_none() -> anyhow::Result<()> {
+fn option_allows_none() -> buck2_error::Result<()> {
     let mut tester = rule_tester();
     tester.run_starlark_test_expecting_error(
         "def test():\n attrs.option(attrs.string(), default = 'test')",
@@ -288,7 +290,7 @@ fn option_allows_none() -> anyhow::Result<()> {
 }
 
 #[test]
-fn returns_documentation() -> anyhow::Result<()> {
+fn returns_documentation() -> buck2_error::Result<()> {
     let bzl = indoc::indoc!(
         r#"def impl(ctx):
             pass
@@ -335,7 +337,7 @@ fn returns_documentation() -> anyhow::Result<()> {
     );
 
     fn arg(name: &str, raw_type: Ty, default: Option<&str>) -> DocParam {
-        DocParam::Arg {
+        DocParam {
             name: name.to_owned(),
             docs: DocString::from_docstring(DocStringKind::Starlark, &format!("{} docs", name)),
             typ: raw_type,
@@ -348,23 +350,23 @@ fn returns_documentation() -> anyhow::Result<()> {
     let mut params = empty_spec
         .signature("foo_binary".to_owned())
         .documentation(empty_spec.starlark_types(), empty_spec.docstrings());
-    params.extend(vec![
+    params.named_only.extend(vec![
         arg("any", Ty::any(), None),
-        arg("arg", Ty::string(), Some("_")),
-        arg("bool", Ty::bool(), Some("_")),
-        arg("default_only", Ty::string(), Some("_")),
-        arg("dep", Ty::string(), Some("_")),
-        arg("dict", Ty::dict(Ty::string(), Ty::bool()), Some("_")),
-        arg("list", Ty::list(Ty::string()), Some("_")),
-        arg("one_of", Ty::union2(Ty::bool(), Ty::string()), Some("_")),
-        arg("option", Ty::union2(Ty::none(), Ty::string()), Some("_")),
+        arg("arg", Ty::string(), Some("...")),
+        arg("bool", Ty::bool(), Some("...")),
+        arg("default_only", Ty::string(), Some("...")),
+        arg("dep", Ty::string(), Some("...")),
+        arg("dict", Ty::dict(Ty::string(), Ty::bool()), Some("...")),
+        arg("list", Ty::list(Ty::string()), Some("...")),
+        arg("one_of", Ty::union2(Ty::bool(), Ty::string()), Some("...")),
+        arg("option", Ty::union2(Ty::none(), Ty::string()), Some("...")),
         arg("query", Ty::string(), None),
-        arg("source", Ty::string(), Some("_")),
-        arg("string", Ty::string(), Some("_")),
-        arg("tuple", Ty::tuple2(Ty::bool(), Ty::string()), Some("_")),
+        arg("source", Ty::string(), Some("...")),
+        arg("string", Ty::string(), Some("...")),
+        arg("tuple", Ty::tuple2(Ty::bool(), Ty::string()), Some("...")),
     ]);
 
-    let expected_docs = DocItem::Function(DocFunction {
+    let expected_docs = DocItem::Member(DocMember::Function(DocFunction {
         docs: DocString::from_docstring(
             DocStringKind::Starlark,
             "Summary for foo_binary\n\nDetails for foo_binary",
@@ -374,8 +376,7 @@ fn returns_documentation() -> anyhow::Result<()> {
             docs: None,
             typ: Ty::none(),
         },
-        as_type: None,
-    });
+    }));
 
     let tester = rule_tester();
     let res = tester.eval_import(
@@ -388,8 +389,7 @@ fn returns_documentation() -> anyhow::Result<()> {
         .get("foo_binary")
         .expect("foo_binary to exist")
         .value()
-        .documentation()
-        .unwrap();
+        .documentation();
 
     assert_eq!(expected_docs, docs);
 

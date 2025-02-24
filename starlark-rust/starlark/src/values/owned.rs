@@ -24,22 +24,24 @@ use dupe::Clone_;
 use dupe::Dupe;
 use dupe::Dupe_;
 
+use crate::cast::transmute;
 use crate::typing::Ty;
 use crate::values::none::NoneType;
+use crate::values::owned_frozen_ref::OwnedFrozenRef;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::AllocFrozenValue;
 use crate::values::FrozenHeap;
 use crate::values::FrozenHeapRef;
 use crate::values::FrozenValue;
 use crate::values::FrozenValueTyped;
-use crate::values::OwnedFrozenRef;
+use crate::values::OwnedRefFrozenRef;
 use crate::values::StarlarkValue;
 use crate::values::Value;
 
 #[derive(Debug, thiserror::Error)]
 enum OwnedError {
     #[error("Expected value of type `{0}` but got `{1}`")]
-    WrongType(&'static str, &'static str),
+    WrongType(&'static str, String),
 }
 
 /// A [`FrozenValue`] along with a [`FrozenHeapRef`] that ensures it is kept alive.
@@ -70,6 +72,8 @@ impl Display for OwnedFrozenValue {
 }
 
 impl StarlarkTypeRepr for OwnedFrozenValue {
+    type Canonical = <FrozenValue as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         FrozenValue::starlark_type_repr()
     }
@@ -136,14 +140,15 @@ impl OwnedFrozenValue {
     }
 
     /// `downcast`, but return an error for human instead of original value.
-    pub fn downcast_anyhow<T: StarlarkValue<'static>>(
+    pub fn downcast_starlark<T: StarlarkValue<'static>>(
         self,
-    ) -> anyhow::Result<OwnedFrozenValueTyped<T>> {
+    ) -> crate::Result<OwnedFrozenValueTyped<T>> {
         match self.downcast() {
             Ok(v) => Ok(v),
-            Err(this) => {
-                Err(OwnedError::WrongType(T::TYPE, this.value.to_value().get_type()).into())
-            }
+            Err(this) => Err(crate::Error::new_value(OwnedError::WrongType(
+                T::TYPE,
+                this.value.to_value().to_string_for_type_error(),
+            ))),
         }
     }
 
@@ -221,7 +226,28 @@ impl<T: StarlarkValue<'static>> Deref for OwnedFrozenValueTyped<T> {
     }
 }
 
-impl<T: StarlarkValue<'static>> OwnedFrozenValueTyped<T> {
+impl<T: for<'a> StarlarkValue<'a>> OwnedFrozenValueTyped<T> {
+    /// Create an [`OwnedFrozenValueTyped`] - generally [`OwnedFrozenValueTyped`]s are obtained
+    /// from downcasting [`OwnedFrozenValue`].
+    ///
+    /// Safe provided the `value` (and any values it points at) are kept alive by the
+    /// `owner`, typically because the value was created on the heap.
+    ///
+    /// ```
+    /// use starlark::values::FrozenHeap;
+    /// use starlark::values::OwnedFrozenValue;
+    /// let heap = FrozenHeap::new();
+    /// let value = heap.alloc("test");
+    /// unsafe { OwnedFrozenValue::new(heap.into_ref(), value) };
+    /// ```
+    pub unsafe fn new<'a>(owner: FrozenHeapRef, value: FrozenValueTyped<'a, T>) -> Self {
+        // SAFETY: The caller has asserted that this heap ref keeps the value alive.
+        let value = unsafe {
+            std::mem::transmute::<FrozenValueTyped<'a, T>, FrozenValueTyped<'static, T>>(value)
+        };
+        Self { owner, value }
+    }
+
     /// Erase the type.
     ///
     /// This operation is unsafe because returned value is not bound by the heap lifetime.
@@ -245,6 +271,11 @@ impl<T: StarlarkValue<'static>> OwnedFrozenValueTyped<T> {
         }
     }
 
+    /// Convert to borrowed ref.
+    pub fn as_owned_ref_frozen_ref(&self) -> OwnedRefFrozenRef<'_, T> {
+        unsafe { OwnedRefFrozenRef::new_unchecked(self.value.as_ref(), &self.owner) }
+    }
+
     /// Convert to an owned ref.
     pub fn into_owned_frozen_ref(self) -> OwnedFrozenRef<T> {
         // SAFETY: Heap matches the value
@@ -261,12 +292,24 @@ impl<T: StarlarkValue<'static>> OwnedFrozenValueTyped<T> {
         self.value.as_ref()
     }
 
+    /// Obtain a reference to the value.
+    ///
+    /// This should return `FrozenValueTyped<'_, T>`, but it is hard to make it work.
+    pub unsafe fn value_typed(&self) -> FrozenValueTyped<'static, T> {
+        self.value
+    }
+
+    /// Extract a [`FrozenValueTyped`] by passing the [`FrozenHeap`] which will keep it alive.
+    pub fn owned_frozen_value_typed(&self, heap: &FrozenHeap) -> FrozenValueTyped<'static, T> {
+        heap.add_reference(&self.owner);
+        self.value
+    }
+
     /// Extract a [`FrozenValue`] by passing the [`FrozenHeap`] which will keep it alive.
     ///
     /// See [`OwnedFrozenValue::owned_frozen_value`].
-    pub unsafe fn owned_frozen_value(&self, heap: &FrozenHeap) -> FrozenValue {
-        heap.add_reference(&self.owner);
-        self.value.to_frozen_value()
+    pub fn owned_frozen_value(&self, heap: &FrozenHeap) -> FrozenValue {
+        self.owned_frozen_value_typed(heap).to_frozen_value()
     }
 
     /// Extract a [`Value`] by passing the [`FrozenHeap`] which will promise to keep it alive.
@@ -274,15 +317,28 @@ impl<T: StarlarkValue<'static>> OwnedFrozenValueTyped<T> {
     /// See [`OwnedFrozenValue::owned_value`].
     pub fn owned_value<'v>(&self, heap: &'v FrozenHeap) -> Value<'v> {
         // Safe because we convert it to a value which is tied to the owning heap
-        unsafe { self.owned_frozen_value(heap).to_value() }
+        self.owned_frozen_value(heap).to_value()
+    }
+
+    /// Extract a reference by passing the [`FrozenHeap`] which will promise to keep it alive.
+    ///
+    /// See [`OwnedFrozenValue::owned_frozen_value`].
+    ///
+    /// Not returning `ValueTyped` because of lifetime issues.
+    pub fn owned_as_ref<'v>(&self, heap: &'v FrozenHeap) -> &'v T {
+        // Keep the reference.
+        self.owned_value(heap);
+
+        // SAFETY: we attached the value to the heap, and we return value with a heap lifetime.
+        unsafe { transmute!(&T, &T, self.as_ref()) }
     }
 
     /// Operate on the [`FrozenValue`] stored inside.
     /// Safe provided you don't store the argument [`FrozenValue`] after the closure has returned.
     /// Using this function is discouraged when possible.
-    pub fn map<U: StarlarkValue<'static>>(
+    pub fn map<U: for<'a> StarlarkValue<'a>>(
         &self,
-        f: impl FnOnce(FrozenValueTyped<T>) -> FrozenValueTyped<U>,
+        f: impl for<'a> FnOnce(FrozenValueTyped<'a, T>) -> FrozenValueTyped<'a, U>,
     ) -> OwnedFrozenValueTyped<U> {
         OwnedFrozenValueTyped {
             owner: self.owner.dupe(),
@@ -291,11 +347,22 @@ impl<T: StarlarkValue<'static>> OwnedFrozenValueTyped<T> {
     }
 
     /// Same as [`map`](OwnedFrozenValue::map) above but with [`Result`]
-    pub fn try_map<U: StarlarkValue<'static>, E>(
+    pub fn try_map<U: for<'a> StarlarkValue<'a>, E>(
         &self,
-        f: impl FnOnce(FrozenValueTyped<T>) -> Result<FrozenValueTyped<U>, E>,
+        f: impl for<'a> FnOnce(FrozenValueTyped<'a, T>) -> Result<FrozenValueTyped<'a, U>, E>,
     ) -> Result<OwnedFrozenValueTyped<U>, E> {
         Ok(OwnedFrozenValueTyped {
+            owner: self.owner.dupe(),
+            value: f(self.value)?,
+        })
+    }
+
+    /// Same as [`map`](OwnedFrozenValue::map) above but with [`Option`]
+    pub fn maybe_map<U: for<'a> StarlarkValue<'a>>(
+        &self,
+        f: impl for<'a> FnOnce(FrozenValueTyped<'a, T>) -> Option<FrozenValueTyped<'a, U>>,
+    ) -> Option<OwnedFrozenValueTyped<U>> {
+        Some(OwnedFrozenValueTyped {
             owner: self.owner.dupe(),
             value: f(self.value)?,
         })

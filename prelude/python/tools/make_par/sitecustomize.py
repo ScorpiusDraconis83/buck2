@@ -6,9 +6,11 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+# pyre-strict
+
 from __future__ import annotations
 
-import importlib
+import itertools
 import multiprocessing.util as mp_util
 import os
 import sys
@@ -20,7 +22,7 @@ from importlib.util import module_from_spec
 lock = threading.Lock()
 
 
-def __patch_spawn(var_names: tuple[str, ...], saved_env: dict[str, str]) -> None:
+def __patch_spawn(var_names: list[str], saved_env: dict[str, str]) -> None:
     std_spawn = mp_util.spawnv_passfds
 
     # pyre-fixme[53]: Captured variable `std_spawn` is not annotated.
@@ -46,19 +48,34 @@ def __patch_spawn(var_names: tuple[str, ...], saved_env: dict[str, str]) -> None
 
 def __clear_env(patch_spawn: bool = True) -> None:
     saved_env = {}
-    darwin_vars = ("DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES")
-    linux_vars = ("LD_LIBRARY_PATH", "LD_PRELOAD")
-    python_vars = ("PYTHONPATH",)
+
+    var_names = [
+        "PYTHONPATH",
+        # We use this env var to tag the process and it's `multiprocessing`
+        # workers.  It's important that we clear it out (so that unrelated sub-
+        # processes don't inherit it), but it can be read via
+        # `/proc/<pid>/environ`.
+        "PAR_INVOKED_NAME_TAG",
+    ]
 
     if sys.platform == "darwin":
-        var_names = darwin_vars + python_vars
+        var_names.extend(
+            [
+                "DYLD_LIBRARY_PATH",
+                "DYLD_INSERT_LIBRARIES",
+            ]
+        )
     else:
-        var_names = linux_vars + python_vars
+        var_names.extend(
+            [
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+            ]
+        )
 
     # Restore the original value of environment variables that we altered
     # as part of the startup process.
     for var in var_names:
-
         curr_val = os.environ.pop(var, None)
         if curr_val is not None:
             saved_env[var] = curr_val
@@ -71,35 +88,21 @@ def __clear_env(patch_spawn: bool = True) -> None:
 
 
 def __startup__() -> None:
-    # ALL STARTUP_* methods will be called here in lexicographic order.
-    startup_functions = sorted(
-        [
-            (name, var)
-            for name, var in os.environ.items()
-            if name.startswith("STARTUP_")
-        ],
-    )
-    for name, var in startup_functions:
-        mod, sep, func = var.partition(":")
-        if sep:
-            try:
-                module = importlib.import_module(mod)
-                getattr(module, func)()
-            except Exception as e:
-                # TODO: Ignoring errors for now. The way to properly fix this should be to make
-                # sure we are still at the same binary that configured `STARTUP_` before importing.
-                warnings.warn(
-                    "Startup function %s (%s:%s) not executed: %s"
-                    % (mod, name, func, e),
-                    stacklevel=1,
-                )
+    try:
+        # pyre-fixme[21]: Could not find module `__par__.__startup_function_loader__`.
+        from __par__.__startup_function_loader__ import load_startup_functions
+
+        load_startup_functions()
+    except Exception:
+        warnings.warn("could not load startup functions", stacklevel=1)
 
 
 def __passthrough_exec_module() -> None:
     # Delegate this module execution to the next module in the path, if any,
     # effectively making this sitecustomize.py a passthrough module.
+    paths = itertools.dropwhile(lambda p: not __file__.startswith(p), sys.path)
     spec = PathFinder.find_spec(
-        __name__, path=[p for p in sys.path if not __file__.startswith(p)]
+        __name__, path=[p for p in paths if not __file__.startswith(p)]
     )
     if spec:
         mod = module_from_spec(spec)

@@ -36,7 +36,7 @@ enum Encoding {
 }
 
 #[derive(Clone, Dupe, Debug, Display, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct EncodingConfig();
 
 impl InjectedKey for EncodingConfig {
@@ -47,9 +47,9 @@ impl InjectedKey for EncodingConfig {
     }
 }
 
-struct Encodings<'c>(&'c mut DiceComputations);
+struct Encodings<'c, 'd>(&'c mut DiceComputations<'d>);
 
-impl<'c> Encodings<'c> {
+impl<'c, 'd> Encodings<'c, 'd> {
     async fn get(&mut self) -> Result<Encoding, Arc<anyhow::Error>> {
         self.0
             .compute(&EncodingConfig())
@@ -58,12 +58,12 @@ impl<'c> Encodings<'c> {
     }
 }
 
-trait HasEncodings {
-    fn encodings(&mut self) -> Encodings;
+trait HasEncodings<'d> {
+    fn encodings<'c>(&'c mut self) -> Encodings<'c, 'd>;
 }
 
-impl HasEncodings for DiceComputations {
-    fn encodings(&mut self) -> Encodings {
+impl<'d> HasEncodings<'d> for DiceComputations<'d> {
+    fn encodings<'c>(&'c mut self) -> Encodings<'c, 'd> {
         Encodings(self)
     }
 }
@@ -78,40 +78,40 @@ impl SetEncodings for DiceTransactionUpdater {
     }
 }
 
-struct Filesystem<'c>(&'c mut DiceComputations);
+struct Filesystem<'c, 'd>(&'c mut DiceComputations<'d>);
 
 #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "File({})", "_0.display()")]
+#[display("File({})", _0.display())]
 struct File(PathBuf);
 
-impl<'c> Filesystem<'c> {
-    async fn read_file(&mut self, file: &Path) -> Result<Arc<String>, Arc<anyhow::Error>> {
-        #[async_trait]
-        impl Key for File {
-            type Value = Result<Arc<String>, Arc<anyhow::Error>>;
-            async fn compute(
-                &self,
-                ctx: &mut DiceComputations,
-                _cancellations: &CancellationContext,
-            ) -> Self::Value {
-                let encoding = ctx.encodings().get().await?;
+#[async_trait]
+impl Key for File {
+    type Value = Result<Arc<String>, Arc<anyhow::Error>>;
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        let encoding = ctx.encodings().get().await?;
 
-                let s = fs::read_to_string(&self.0).unwrap();
+        let s = fs::read_to_string(&self.0).unwrap();
 
-                Ok(Arc::new(match encoding {
-                    Encoding::Utf8 => s,
-                    Encoding::Ascii => s.replace(":-)", "smile"),
-                }))
-            }
+        Ok(Arc::new(match encoding {
+            Encoding::Utf8 => s,
+            Encoding::Ascii => s.replace(":-)", "smile"),
+        }))
+    }
 
-            fn equality(x: &Self::Value, y: &Self::Value) -> bool {
-                match (x, y) {
-                    (Ok(x), Ok(y)) => x == y,
-                    _ => false,
-                }
-            }
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        match (x, y) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
         }
+    }
+}
 
+impl<'c, 'd> Filesystem<'c, 'd> {
+    async fn read_file(&mut self, file: &Path) -> Result<Arc<String>, Arc<anyhow::Error>> {
         self.0
             .compute(&File(file.to_path_buf()))
             .await
@@ -119,12 +119,12 @@ impl<'c> Filesystem<'c> {
     }
 }
 
-trait HasFilesystem<'c> {
-    fn filesystem(&'c mut self) -> Filesystem<'c>;
+trait HasFilesystem<'d> {
+    fn filesystem<'c>(&'c mut self) -> Filesystem<'c, 'd>;
 }
 
-impl<'c> HasFilesystem<'c> for DiceComputations {
-    fn filesystem(&'c mut self) -> Filesystem<'c> {
+impl<'d> HasFilesystem<'d> for DiceComputations<'d> {
+    fn filesystem<'c>(&'c mut self) -> Filesystem<'c, 'd> {
         Filesystem(self)
     }
 }

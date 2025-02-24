@@ -7,33 +7,38 @@
 
 load("@prelude//apple:apple_sdk.bzl", "get_apple_sdk_name")
 load("@prelude//apple:apple_target_sdk_version.bzl", "get_min_deployment_version_for_node")
-load("@prelude//apple:apple_utility.bzl", "has_apple_toolchain")
+load("@prelude//apple:apple_utility.bzl", "get_apple_architecture", "has_apple_toolchain")
 load(
     "@prelude//cxx:argsfiles.bzl",
     "CompileArgsfile",  # @unused Used as a type
 )
 load(
-    "@prelude//cxx:compile.bzl",
+    "@prelude//cxx:cxx_sources.bzl",
     "CxxSrcWithFlags",  # @unused Used as a type
 )
 load("@prelude//cxx:xcode.bzl", "cxx_populate_xcode_attributes")
+load("@prelude//ide_integrations/xcode:data.bzl", "XcodeDataInfoKeys")
 load("@prelude//utils:expect.bzl", "expect")
 
 def apple_populate_xcode_attributes(
         ctx,
         srcs: list[CxxSrcWithFlags],
         argsfiles: dict[str, CompileArgsfile],
-        product_name: str) -> dict[str, typing.Any]:
+        product_name: str,
+        contains_swift_sources: bool = False) -> dict[str, typing.Any]:
     data = cxx_populate_xcode_attributes(ctx = ctx, srcs = srcs, argsfiles = argsfiles, product_name = product_name)
 
+    data[XcodeDataInfoKeys.CONTAINS_SWIFT_SOURCES] = contains_swift_sources
+
     if has_apple_toolchain(ctx):
-        data["sdk"] = get_apple_sdk_name(ctx)
-        data["deployment_version"] = get_min_deployment_version_for_node(ctx)
+        data[XcodeDataInfoKeys.ARCH] = get_apple_architecture(ctx)
+        data[XcodeDataInfoKeys.SDK] = get_apple_sdk_name(ctx)
+        data[XcodeDataInfoKeys.DEPLOYMENT_VERSION] = get_min_deployment_version_for_node(ctx)
 
     if hasattr(ctx.attrs, "swift_version"):
         swift_version = ctx.attrs.swift_version
         if swift_version != None:
-            data["swift_version"] = swift_version
+            data[XcodeDataInfoKeys.SWIFT_VERSION] = swift_version
 
     apple_xcode_data_add_xctoolchain(ctx, data)
     return data
@@ -64,7 +69,3 @@ def _get_attribute_with_output(ctx: AnalysisContext, attr_name: str) -> [Depende
             # So, an empty `DefaultInfo` basically signifies that there's no xctoolchain.
             return dep
     return None
-
-def get_project_root_file(ctx) -> Artifact:
-    content = cmd_args(ctx.label.project_root)
-    return ctx.actions.write("project_root", content, absolute = True)

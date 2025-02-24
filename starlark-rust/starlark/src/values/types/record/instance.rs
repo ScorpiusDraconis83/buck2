@@ -40,16 +40,18 @@ use crate::values::record::record_type::FrozenRecordType;
 use crate::values::record::record_type::RecordType;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Heap;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::Value;
+use crate::values::ValueLifetimeless;
 use crate::values::ValueLike;
 
 /// An actual record.
 #[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
 #[repr(C)]
-pub struct RecordGen<V> {
+pub struct RecordGen<V: ValueLifetimeless> {
     pub(crate) typ: V, // Must be RecordType
     pub(crate) values: Box<[V]>,
 }
@@ -103,20 +105,10 @@ impl<'v, V: ValueLike<'v>> RecordGen<V> {
 }
 
 #[starlark_value(type = Record::TYPE)]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for RecordGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for RecordGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn matches_type(&self, ty: &str) -> bool {
-        if ty == Record::TYPE {
-            return true;
-        }
-        match self.get_record_type() {
-            Either::Left(x) => x.ty_record_data().map(|t| t.name.as_str()) == Some(ty),
-            Either::Right(x) => x.ty_record_data().map(|t| t.name.as_str()) == Some(ty),
-        }
-    }
-
     fn equals(&self, other: Value<'v>) -> crate::Result<bool> {
         match Record::from_value(other) {
             Some(other) if self.typ.equals(other.typ)? => {

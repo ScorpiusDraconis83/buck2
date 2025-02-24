@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use allocative::Allocative;
+use buck2_util::hash::BuckHasher;
 use derive_more::Display;
 use dupe::Dupe;
 use starlark_map::ordered_map::OrderedMap;
@@ -18,12 +19,12 @@ use static_interner::Intern;
 use static_interner::Interner;
 
 use crate::cells::cell_path::CellPath;
-use crate::target::label::TargetLabel;
+use crate::target::label::label::TargetLabel;
 
 #[derive(
     Clone, Debug, Display, Eq, PartialEq, Hash, Ord, PartialOrd, Allocative
 )]
-#[display(fmt = "{name}")]
+#[display("{name}")]
 struct PluginKindInner {
     // The name and cell path aren't used for anything except that they serve as a unique identifier
     // for the plugin kind. This allows us to treat `plugins.kind()` as if it returns a new value
@@ -43,7 +44,7 @@ impl<'a> From<&'a PluginKindInner> for PluginKindInner {
 )]
 pub struct PluginKind(Intern<PluginKindInner>);
 
-static PLUGIN_KIND_INTERNER: Interner<PluginKindInner> = Interner::new();
+static PLUGIN_KIND_INTERNER: Interner<PluginKindInner, BuckHasher> = Interner::new();
 
 impl PluginKind {
     /// Creates a new `PluginKind` instance.
@@ -80,13 +81,16 @@ enum PluginKindSetUnpacked {
 static_assertions::assert_eq_size!(PluginKindSet, usize);
 static_assertions::assert_eq_size!(PluginKindSetUnpacked, [usize; 2]);
 
-static PLUGIN_KIND_SET_INTERNER: Interner<Vec<(PluginKind, bool)>> = Interner::new();
+static PLUGIN_KIND_SET_INTERNER: Interner<Vec<(PluginKind, bool)>, BuckHasher> = Interner::new();
 
 impl PluginKindSet {
     pub const EMPTY: Self = Self::pack(PluginKindSetUnpacked::None);
     pub const ALL: Self = Self::pack(PluginKindSetUnpacked::All);
 
-    pub fn new(pulls: Vec<PluginKind>, pulls_and_pushes: Vec<PluginKind>) -> anyhow::Result<Self> {
+    pub fn new(
+        pulls: Vec<PluginKind>,
+        pulls_and_pushes: Vec<PluginKind>,
+    ) -> buck2_error::Result<Self> {
         if pulls.is_empty() && pulls_and_pushes.is_empty() {
             return Ok(Self::EMPTY);
         }
@@ -223,29 +227,27 @@ impl PluginLists {
         }
     }
 
-    pub fn iter<'a>(
-        &'a self,
-    ) -> impl Iterator<Item = (&'a PluginKind, &'a TargetLabel, &'a PluginListElemKind)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&PluginKind, &TargetLabel, &PluginListElemKind)> {
         self.0
             .iter()
             .flat_map(|(k, v)| v.iter().map(move |t| (k, t.0, t.1)))
     }
 
-    pub fn iter_by_kind<'a>(
-        &'a self,
+    pub fn iter_by_kind(
+        &self,
     ) -> impl Iterator<
         Item = (
-            &'a PluginKind,
-            impl Iterator<Item = (&'a TargetLabel, &'a PluginListElemKind)>,
+            &PluginKind,
+            impl Iterator<Item = (&TargetLabel, &PluginListElemKind)>,
         ),
     > {
         self.0.iter().map(|(k, v)| (k, v.iter()))
     }
 
-    pub fn iter_for_kind<'a>(
-        &'a self,
+    pub fn iter_for_kind(
+        &self,
         kind: &PluginKind,
-    ) -> impl Iterator<Item = (&'a TargetLabel, &'a PluginListElemKind)> {
+    ) -> impl Iterator<Item = (&TargetLabel, &PluginListElemKind)> {
         self.0.get(kind).into_iter().flatten()
     }
 }

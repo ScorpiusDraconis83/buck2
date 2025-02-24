@@ -8,24 +8,24 @@
  */
 
 use std::cell::RefCell;
-use std::fmt::Display;
 use std::io::Write;
 use std::ops::DerefMut;
 use std::rc::Rc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::bxl::build_result::BxlBuildResult;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::StarlarkCommandLineInputs;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_error::buck2_error;
+use buck2_error::starlark_error::from_starlark_with_options;
+use buck2_error::BuckErrorContext;
 use buck2_execute::path::artifact_path::ArtifactPath;
-use buck2_interpreter::error::BuckStarlarkError;
 use derivative::Derivative;
 use derive_more::Display;
 use dupe::Dupe;
@@ -39,9 +39,11 @@ use starlark::collections::SmallSet;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
+use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::dict::Dict;
 use starlark::values::dict::DictRef;
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::ListRef;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
@@ -50,6 +52,7 @@ use starlark::values::starlark_value;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
 use starlark::values::tuple::UnpackTuple;
+use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::AllocValue;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
@@ -57,16 +60,15 @@ use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueError;
 use starlark::values::ValueLike;
-use starlark::StarlarkDocs;
 
-use super::starlark_async::BxlSafeDiceComputations;
+use crate::bxl::starlark_defs::artifacts::ArtifactArg;
 use crate::bxl::starlark_defs::artifacts::EnsuredArtifact;
-use crate::bxl::starlark_defs::artifacts::EnsuredArtifactArg;
 use crate::bxl::starlark_defs::artifacts::EnsuredArtifactGroup;
 use crate::bxl::starlark_defs::build_result::StarlarkBxlBuildResult;
 use crate::bxl::starlark_defs::context::build::StarlarkProvidersArtifactIterable;
+use crate::bxl::starlark_defs::context::starlark_async::BxlDiceComputations;
+use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
 
 #[derive(
     ProvidesStaticType,
@@ -74,27 +76,21 @@ use crate::bxl::starlark_defs::context::build::StarlarkProvidersArtifactIterable
     Display,
     Trace,
     NoSerialize,
-    StarlarkDocs,
     Allocative
 )]
-#[display(fmt = "{:?}", self)]
-#[starlark_docs(directory = "bxl")]
+#[display("{:?}", self)]
 #[derivative(Debug)]
-pub(crate) struct OutputStream<'v> {
+pub(crate) struct OutputStream {
     #[derivative(Debug = "ignore")]
     #[trace(unsafe_ignore)]
     #[allocative(skip)]
-    pub(crate) sink: RefCell<Box<dyn Write>>,
+    pub(crate) sink: Rc<RefCell<dyn Write>>,
     #[trace(unsafe_ignore)]
     artifacts_to_ensure: RefCell<Option<SmallSet<EnsuredArtifactOrGroup>>>,
     #[derivative(Debug = "ignore")]
     pub(crate) project_fs: ProjectRoot,
     #[derivative(Debug = "ignore")]
     pub(crate) artifact_fs: ArtifactFs,
-    #[trace(unsafe_ignore)]
-    #[derivative(Debug = "ignore")]
-    #[allocative(skip)]
-    pub(crate) async_ctx: Rc<RefCell<BxlSafeDiceComputations<'v>>>,
 }
 
 /// We can ensure either an `Artifact` or an `ArtifactGroup`. When we want to ensure a `CommandLineArgLike` object,
@@ -106,19 +102,17 @@ pub(crate) enum EnsuredArtifactOrGroup {
     ArtifactGroup(ArtifactGroup),
 }
 
-impl<'v> OutputStream<'v> {
+impl OutputStream {
     pub(crate) fn new(
         project_fs: ProjectRoot,
         artifact_fs: ArtifactFs,
-        sink: RefCell<Box<dyn Write>>,
-        async_ctx: Rc<RefCell<BxlSafeDiceComputations<'v>>>,
+        sink: Rc<RefCell<dyn Write>>,
     ) -> Self {
         Self {
             sink,
             artifacts_to_ensure: RefCell::new(Some(Default::default())),
             project_fs,
             artifact_fs,
-            async_ctx,
         }
     }
 
@@ -127,18 +121,28 @@ impl<'v> OutputStream<'v> {
     }
 }
 
-#[starlark_value(type = "bxl_output_stream", StarlarkTypeRepr, UnpackValue)]
-impl<'v> StarlarkValue<'v> for OutputStream<'v> {
+#[starlark_value(type = "bxl.OutputStream", StarlarkTypeRepr, UnpackValue)]
+impl<'v> StarlarkValue<'v> for OutputStream {
     fn get_methods() -> Option<&'static Methods> {
         static RES: MethodsStatic = MethodsStatic::new();
         RES.methods(output_stream_methods)
     }
 }
 
-impl<'v> AllocValue<'v> for OutputStream<'v> {
+impl<'v> AllocValue<'v> for OutputStream {
     fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
+}
+
+#[derive(StarlarkTypeRepr, UnpackValue)]
+enum EnsureMultipleArtifactsArg<'v> {
+    None(NoneType),
+    EnsuredArtifactArgs(UnpackList<ArtifactArg<'v>>),
+    ProvidersArtifactIterable(&'v StarlarkProvidersArtifactIterable<'v>),
+    BxlBuildResult(&'v StarlarkBxlBuildResult),
+    Dict(UnpackDictEntries<Value<'v>, &'v StarlarkBxlBuildResult>),
+    CmdLine(ValueAsCommandLineLike<'v>),
 }
 
 /// The output stream for bxl to print values to the console as their result
@@ -153,17 +157,18 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// outputs, the recommendation would be to write them to a file.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_print(ctx):
     ///     ctx.output.print("test")
     /// ```
     fn print<'v>(
-        this: &'v OutputStream<'v>,
+        this: &'v OutputStream,
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(default = " ")] sep: &'v str,
-    ) -> anyhow::Result<NoneType> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
         let mut first = true;
-        let mut write = |d: &dyn Display| -> anyhow::Result<()> {
+        let mut write = |d: &dyn Display| -> buck2_error::Result<()> {
             if !first {
                 write!(this.sink.borrow_mut(), "{}{}", sep, d)?;
             } else {
@@ -174,7 +179,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         };
 
         for arg in args {
-            if let Some(ensured) = <&EnsuredArtifact>::unpack_value(arg) {
+            if let Some(ensured) = <&EnsuredArtifact>::unpack_value(arg)? {
                 let path = get_artifact_path_display(
                     ensured.get_artifact_path(),
                     ensured.abs(),
@@ -182,29 +187,34 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                     &this.artifact_fs,
                 )?;
                 write(&path)?;
-            } else if let Some(ensured) = <&EnsuredArtifactGroup>::unpack_value(arg) {
-                this.async_ctx.borrow_mut().via(|dice| {
-                    ensured
-                        .visit_artifact_path_without_associated_deduped(
-                            |artifact_path, abs| {
-                                let path = get_artifact_path_display(
-                                    artifact_path,
-                                    abs,
-                                    &this.project_fs,
-                                    &this.artifact_fs,
-                                )?;
-                                write(&path)
-                            },
-                            dice,
-                        )
-                        .boxed_local()
-                })?;
+            } else if let Some(ensured) = <&EnsuredArtifactGroup>::unpack_value(arg)? {
+                BxlEvalExtra::from_context(eval)?
+                    .dice
+                    .borrow_mut()
+                    .via(|dice| {
+                        ensured
+                            .visit_artifact_path_without_associated_deduped(
+                                |artifact_path, abs| {
+                                    let path = get_artifact_path_display(
+                                        artifact_path,
+                                        abs,
+                                        &this.project_fs,
+                                        &this.artifact_fs,
+                                    )?;
+                                    write(&path)
+                                },
+                                dice,
+                            )
+                            .boxed_local()
+                    })?;
             } else {
                 write(&arg.to_str())?;
             }
         }
 
-        writeln!(this.sink.borrow_mut())?;
+        if let Err(e) = writeln!(this.sink.borrow_mut()) {
+            return Err(buck2_error::Error::from(e).into());
+        }
 
         Ok(NoneType)
     }
@@ -218,26 +228,27 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// and `pprint`.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_print_json(ctx):
     ///     outputs = {}
     ///     outputs.update({"foo": bar})
     ///     ctx.output.print_json("test")
     /// ```
     fn print_json<'v>(
-        this: &'v OutputStream<'v>,
+        this: &'v OutputStream,
         value: Value<'v>,
         #[starlark(require=named, default=true)] pretty: bool,
-    ) -> anyhow::Result<NoneType> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
         /// A wrapper with a Serialize instance so we can pass down the necessary context.
-        struct SerializeValue<'a, 'v> {
+        struct SerializeValue<'a, 'v, 'd> {
             value: Value<'v>,
             artifact_fs: &'a ArtifactFs,
             project_fs: &'a ProjectRoot,
-            async_ctx: &'a Rc<RefCell<BxlSafeDiceComputations<'v>>>,
+            async_ctx: &'a Rc<RefCell<dyn BxlDiceComputations + 'd>>,
         }
 
-        impl<'a, 'v> SerializeValue<'a, 'v> {
+        impl<'v> SerializeValue<'_, 'v, '_> {
             fn with_value(&self, x: Value<'v>) -> Self {
                 Self {
                     value: x,
@@ -248,12 +259,14 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
             }
         }
 
-        impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
+        impl Serialize for SerializeValue<'_, '_, '_> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: Serializer,
             {
-                if let Some(ensured) = <&EnsuredArtifact>::unpack_value(self.value) {
+                if let Some(ensured) = <&EnsuredArtifact>::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
                     let path = get_artifact_path_display(
                         ensured.get_artifact_path(),
                         ensured.abs(),
@@ -262,7 +275,9 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                     )
                     .map_err(|err| serde::ser::Error::custom(format!("{:#}", err)))?;
                     serializer.serialize_str(&path)
-                } else if let Some(ensured) = <&EnsuredArtifactGroup>::unpack_value(self.value) {
+                } else if let Some(ensured) = <&EnsuredArtifactGroup>::unpack_value(self.value)
+                    .map_err(|e| serde::ser::Error::custom(format!("{:#}", e)))?
+                {
                     let mut seq_ser = serializer.serialize_seq(None)?;
 
                     self.async_ctx
@@ -277,9 +292,13 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                                             self.project_fs,
                                             self.artifact_fs,
                                         )?;
-                                        seq_ser
-                                            .serialize_element(&path)
-                                            .map_err(|err| anyhow::anyhow!(format!("{:#}", err)))?;
+                                        seq_ser.serialize_element(&path).map_err(|err| {
+                                            buck2_error!(
+                                                buck2_error::ErrorTag::Tier0,
+                                                "{}",
+                                                format!("{:#}", err)
+                                            )
+                                        })?;
                                         Ok(())
                                     },
                                     dice,
@@ -318,11 +337,14 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
                 value,
                 artifact_fs: &this.artifact_fs,
                 project_fs: &this.project_fs,
-                async_ctx: &this.async_ctx,
+                async_ctx: &BxlEvalExtra::from_context(eval)?.dice,
             },
         )
-        .context("Error writing to JSON for `write_json`")?;
-        writeln!(this.sink.borrow_mut())?;
+        .buck_error_context("Error writing to JSON for `write_json`")?;
+
+        if let Err(e) = writeln!(this.sink.borrow_mut()) {
+            return Err(buck2_error::Error::from(e).into());
+        }
 
         Ok(NoneType)
     }
@@ -335,7 +357,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// to print its actual path on disk.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_ensure(ctx):
     ///     actions = ctx.bxl_actions().actions
     ///     output = actions.write("my_output", "my_content")
@@ -344,8 +366,8 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn ensure<'v>(
         this: &OutputStream,
-        artifact: EnsuredArtifactArg<'v>,
-    ) -> anyhow::Result<EnsuredArtifact> {
+        artifact: ArtifactArg<'v>,
+    ) -> starlark::Result<EnsuredArtifact> {
         let artifact = artifact.into_ensured_artifact();
         populate_ensured_artifacts(this, EnsuredArtifactOrGroup::Artifact(artifact.clone()))?;
 
@@ -361,7 +383,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     /// So, it is suggested to use this method when you are only ensuring a few individual artifacts that are not stored in an iterable.
     ///
     /// Sample usage:
-    /// ```text
+    /// ```python
     /// def _impl_ensure_multiple(ctx):
     ///     outputs = {}
     ///     for target, value in ctx.build(ctx.cli_args.target).items():
@@ -369,83 +391,84 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     ///     ctx.output.print_json(outputs)
     /// ```
     fn ensure_multiple<'v>(
-        this: &'v OutputStream<'v>,
-        artifacts: Value<'v>,
+        this: &'v OutputStream,
+        // TODO(nga): must be either positional or named.
+        artifacts: EnsureMultipleArtifactsArg<'v>,
         heap: &'v Heap,
-    ) -> anyhow::Result<Value<'v>> {
-        if artifacts.is_none() {
-            Ok(heap.alloc(Vec::<EnsuredArtifact>::new()))
-        } else if let Some(list) = UnpackList::<EnsuredArtifactArg>::unpack_value(artifacts) {
-            let artifacts: Vec<EnsuredArtifact> = list.items.into_try_map(|artifact| {
-                let artifact = artifact.into_ensured_artifact();
-                populate_ensured_artifacts(
-                    this,
-                    EnsuredArtifactOrGroup::Artifact(artifact.clone()),
-                )?;
+    ) -> starlark::Result<Value<'v>> {
+        match artifacts {
+            EnsureMultipleArtifactsArg::None(_) => Ok(heap.alloc(Vec::<EnsuredArtifact>::new())),
+            EnsureMultipleArtifactsArg::EnsuredArtifactArgs(list) => {
+                let artifacts: Vec<EnsuredArtifact> = list.items.into_try_map(|artifact| {
+                    let artifact = artifact.into_ensured_artifact();
+                    populate_ensured_artifacts(
+                        this,
+                        EnsuredArtifactOrGroup::Artifact(artifact.clone()),
+                    )?;
 
-                Ok::<EnsuredArtifact, anyhow::Error>(artifact)
-            })?;
+                    Ok::<EnsuredArtifact, buck2_error::Error>(artifact)
+                })?;
 
-            Ok(heap.alloc(artifacts))
-        } else if let Some(artifact_gen) =
-            <&StarlarkProvidersArtifactIterable>::unpack_value(artifacts)
-        {
-            Ok(heap.alloc(get_artifacts_from_bxl_build_result(
-                artifact_gen
-                    .0
-                    .downcast_ref::<StarlarkBxlBuildResult>()
-                    .unwrap(),
-                this,
-            )?))
-        } else if let Some(bxl_build_result) = <&StarlarkBxlBuildResult>::unpack_value(artifacts) {
-            Ok(heap.alloc(get_artifacts_from_bxl_build_result(bxl_build_result, this)?))
-        } else if let Some(build_result_dict) = <DictRef>::unpack_value(artifacts) {
-            Ok(heap.alloc(Dict::new(
-                build_result_dict
-                    .iter()
-                    .map(|(label, value)| {
-                        if let Some(bxl_build_result) =
-                            <&StarlarkBxlBuildResult>::unpack_value(value)
-                        {
-                            Ok((
-                                label.get_hashed().map_err(BuckStarlarkError::new)?,
-                                heap.alloc(get_artifacts_from_bxl_build_result(
-                                    bxl_build_result,
-                                    this,
-                                )?),
-                            ))
-                        } else {
-                            Err(anyhow::anyhow!(incorrect_parameter_type_error(artifacts)))
-                        }
-                    })
-                    .collect::<anyhow::Result<_>>()?,
-            )))
-        } else if let Some(cmd_line) = ValueAsCommandLineLike::unpack_value(artifacts) {
-            // TODO(nga): we should not be doing that here.
-            //   If we pass random string to this function,
-            //   it will be interpreted as a command line without inputs,
-            //   and this function will return empty `EnsuredArtifactGroup`.
-            let inputs = get_cmd_line_inputs(cmd_line.0)?;
-            let mut result = Vec::new();
-
-            for artifact_group in &inputs.inputs {
-                populate_ensured_artifacts(
-                    this,
-                    EnsuredArtifactOrGroup::ArtifactGroup(artifact_group.dupe()),
-                )?;
-                result.push(artifact_group.dupe());
+                Ok(heap.alloc(artifacts))
             }
+            EnsureMultipleArtifactsArg::ProvidersArtifactIterable(artifact_gen) => {
+                Ok(heap.alloc(get_artifacts_from_bxl_build_result(
+                    artifact_gen
+                        .0
+                        .downcast_ref::<StarlarkBxlBuildResult>()
+                        .unwrap(),
+                    this,
+                )?))
+            }
+            EnsureMultipleArtifactsArg::BxlBuildResult(bxl_build_result) => {
+                Ok(heap.alloc(get_artifacts_from_bxl_build_result(bxl_build_result, this)?))
+            }
+            EnsureMultipleArtifactsArg::Dict(build_result_dict) => Ok(heap.alloc(Dict::new(
+                build_result_dict
+                    .entries
+                    .into_iter()
+                    .map(|(label, bxl_build_result)| {
+                        Ok((
+                            label.get_hashed().map_err(|e| {
+                                from_starlark_with_options(
+                                    e,
+                                    buck2_error::starlark_error::NativeErrorHandling::Unknown,
+                                    false,
+                                )
+                            })?,
+                            heap.alloc(get_artifacts_from_bxl_build_result(
+                                bxl_build_result,
+                                this,
+                            )?),
+                        ))
+                    })
+                    .collect::<buck2_error::Result<_>>()?,
+            ))),
+            EnsureMultipleArtifactsArg::CmdLine(cmd_line) => {
+                // TODO(nga): we should not be doing that here.
+                //   If we pass random string to this function,
+                //   it will be interpreted as a command line without inputs,
+                //   and this function will return empty `EnsuredArtifactGroup`.
+                let inputs = get_cmd_line_inputs(cmd_line.0)?;
+                let mut result = Vec::new();
 
-            Ok(heap.alloc(EnsuredArtifactGroup::new(result, false, heap)))
-        } else {
-            Err(anyhow::anyhow!(incorrect_parameter_type_error(artifacts)))
+                for artifact_group in &inputs.inputs {
+                    populate_ensured_artifacts(
+                        this,
+                        EnsuredArtifactOrGroup::ArtifactGroup(artifact_group.dupe()),
+                    )?;
+                    result.push(artifact_group.dupe());
+                }
+
+                Ok(heap.alloc(EnsuredArtifactGroup::new(result, false, heap)))
+            }
         }
     }
 }
 
 pub(crate) fn get_cmd_line_inputs<'v>(
     cmd_line: &'v dyn CommandLineArgLike,
-) -> anyhow::Result<StarlarkCommandLineInputs> {
+) -> buck2_error::Result<StarlarkCommandLineInputs> {
     let mut visitor = SimpleCommandLineArtifactVisitor::new();
     cmd_line.visit_artifacts(&mut visitor)?;
     let inputs = StarlarkCommandLineInputs {
@@ -459,7 +482,7 @@ pub(crate) fn get_artifact_path_display(
     abs: bool,
     project_fs: &ProjectRoot,
     artifact_fs: &ArtifactFs,
-) -> anyhow::Result<String> {
+) -> buck2_error::Result<String> {
     let resolved = artifact_path.resolve(artifact_fs)?;
     Ok(if abs {
         project_fs.resolve(&resolved).to_string()
@@ -468,17 +491,10 @@ pub(crate) fn get_artifact_path_display(
     })
 }
 
-fn incorrect_parameter_type_error(artifacts: Value) -> ValueError {
-    ValueError::IncorrectParameterTypeWithExpected(
-        "list of artifacts, bxl_built_artifacts_iterable, or command-line-arg-like".to_owned(),
-        artifacts.get_type().to_owned(),
-    )
-}
-
 fn populate_ensured_artifacts(
     output_stream: &OutputStream,
     ensured: EnsuredArtifactOrGroup,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     output_stream
         .artifacts_to_ensure
         .borrow_mut()
@@ -491,10 +507,10 @@ fn populate_ensured_artifacts(
 fn get_artifacts_from_bxl_build_result(
     bxl_build_result: &StarlarkBxlBuildResult,
     output_stream: &OutputStream,
-) -> anyhow::Result<Vec<EnsuredArtifact>> {
+) -> buck2_error::Result<Vec<EnsuredArtifact>> {
     match &bxl_build_result.0 {
         BxlBuildResult::None => Ok(Vec::new()),
-        BxlBuildResult::Built(result) => result
+        BxlBuildResult::Built { result, .. } => result
             .outputs
             .iter()
             .filter_map(|built| {
@@ -516,6 +532,6 @@ fn get_artifacts_from_bxl_build_result(
                 )?;
                 artifact
             })
-            .collect::<anyhow::Result<_>>(),
+            .collect::<buck2_error::Result<_>>(),
     }
 }

@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgWithUniverseOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,23 +19,13 @@ use crate::AuditSubcommand;
     about = "prints out the providers for a target pattern"
 )]
 pub struct AuditProvidersCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
-    #[clap(
-        name = "TARGET_PATTERNS",
-        help = "Patterns to analyze",
-        required = true
-    )]
-    pub patterns: Vec<String>,
-
-    #[clap(long, conflicts_with_all=&["list", "print-debug"])]
+    #[clap(long, conflicts_with_all=&["list", "print_debug"])]
     pub quiet: bool,
 
     #[clap(
         long,
         short = 'l',
-        help = "List the available providers", conflicts_with_all=&["print-debug", "quiet"]
+        help = "List the available providers", conflicts_with_all=&["print_debug", "quiet"]
     )]
     pub list: bool,
 
@@ -44,6 +35,19 @@ pub struct AuditProvidersCommand {
         conflicts_with_all=&["list", "quiet"]
     )]
     pub print_debug: bool,
+
+    #[clap(
+        name = "TARGET_PATTERNS",
+        help = "Patterns to analyze",
+        required = true
+    )]
+    pub patterns: Vec<String>,
+
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgWithUniverseOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

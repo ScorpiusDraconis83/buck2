@@ -19,7 +19,7 @@
 
 use starlark_syntax::slice_vec_ext::SliceExt;
 
-use crate::collections::symbol_map::Symbol;
+use crate::collections::symbol::symbol::Symbol;
 use crate::eval::bc::compiler::expr::write_n_exprs;
 use crate::eval::bc::instr_impl::InstrSetArrayIndex;
 use crate::eval::bc::instr_impl::InstrSetObjectField;
@@ -86,12 +86,12 @@ impl IrSpanned<AssignCompiledValue> {
                     })
                     .ok();
                 if let Some(all_local) = all_local {
-                    let args = bc.heap.alloc_any_slice_display_from_debug(&all_local);
+                    let args = bc.heap.alloc_any_slice(&all_local);
                     bc.write_instr::<InstrUnpack>(span, (value, args));
                 } else {
                     bc.alloc_slots(xs.len() as u32, |slots, bc| {
                         let args: Vec<BcSlotOut> = slots.iter().map(|s| s.to_out()).collect();
-                        let args = bc.heap.alloc_any_slice_display_from_debug(&args);
+                        let args = bc.heap.alloc_any_slice(&args);
                         bc.write_instr::<InstrUnpack>(span, (value, args));
 
                         for (x, slot) in xs.iter().zip(slots.iter()) {

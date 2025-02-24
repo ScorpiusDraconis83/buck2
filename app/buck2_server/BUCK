@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -19,11 +18,16 @@ rust_library(
                 "fbsource//third-party/rust:psutil",
             ],
         ),
+        (
+            "windows",
+            [
+                "fbsource//third-party/rust:winapi",
+            ],
+        ),
     ],
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
         "fbsource//third-party/rust:indoc",
-        "fbsource//third-party/rust:maplit",
         "//buck2/app/buck2_util:buck2_util",
     ],
     deps = [
@@ -37,7 +41,6 @@ rust_library(
         "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:inferno",
-        "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:lsp-server",
         "fbsource//third-party/rust:lsp-types",
         "fbsource//third-party/rust:num_cpus",
@@ -55,17 +58,18 @@ rust_library(
         "fbsource//third-party/rust:tokio-stream",
         "fbsource//third-party/rust:tonic",
         "fbsource//third-party/rust:tracing",
-        # @oss-disable: "//blake3:blake3-constants-rust-nothrift", 
+        # @oss-disable[end= ]: "//blake3:blake3-constants-rust-nothrift",
         "//buck2/allocative/allocative:allocative",
         "//buck2/app/buck2_analysis:buck2_analysis",
         "//buck2/app/buck2_build_api:buck2_build_api",
         "//buck2/app/buck2_build_signals:buck2_build_signals",
+        "//buck2/app/buck2_certs:buck2_certs",
         "//buck2/app/buck2_cli_proto:buck2_cli_proto",
         "//buck2/app/buck2_common:buck2_common",
         "//buck2/app/buck2_configured:buck2_configured",
         "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_data:buck2_data",
-        "//buck2/app/buck2_eden:buck2_eden",
+        # @oss-disable[end= ]: "//buck2/app/buck2_eden:buck2_eden",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_event_observer:buck2_event_observer",
         "//buck2/app/buck2_events:buck2_events",
@@ -83,7 +87,9 @@ rust_library(
         "//buck2/app/buck2_server_ctx:buck2_server_ctx",
         "//buck2/app/buck2_server_starlark_debug:buck2_server_starlark_debug",
         "//buck2/app/buck2_subscription_proto:buck2_subscription_proto",
+        "//buck2/app/buck2_test:buck2_test",
         "//buck2/app/buck2_util:buck2_util",
+        "//buck2/app/buck2_validation:buck2_validation",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
         "//buck2/dice/dice:dice",
         "//buck2/gazebo/dupe:dupe",
@@ -91,7 +97,7 @@ rust_library(
         "//buck2/host_sharing:host_sharing",
         "//buck2/starlark-rust/starlark:starlark",
         "//buck2/starlark-rust/starlark_lsp:starlark_lsp",
-        # @oss-disable: "//common/rust/shed/detect_eden:detect_eden", 
+        # @oss-disable[end= ]: "//common/rust/shed/detect_eden:detect_eden",
         "//common/rust/shed/fbinit:fbinit",
     ],
 )

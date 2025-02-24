@@ -20,10 +20,10 @@ use starlark_map::small_map::SmallMap;
 
 use crate::eval::runtime::profile::csv::CsvWriter;
 use crate::eval::runtime::small_duration::SmallDuration;
+use crate::util::arc_str::ArcStr;
 use crate::values::layout::heap::profile::aggregated::AggregateHeapProfileInfo;
 use crate::values::layout::heap::profile::aggregated::StackFrame;
 use crate::values::layout::heap::profile::alloc_counts::AllocCounts;
-use crate::values::layout::heap::profile::arc_str::ArcStr;
 use crate::values::layout::heap::profile::string_index::StringId;
 use crate::values::layout::heap::profile::string_index::StringIndex;
 
@@ -77,15 +77,12 @@ impl FuncInfo {
 pub(crate) struct HeapSummaryByFunction {
     /// Information about all functions.
     info: SmallMap<ArcStr, FuncInfo>,
-    /// Allocated but unused memory.
-    unused_capacity: usize,
 }
 
 impl HeapSummaryByFunction {
     pub(crate) fn init(stacks: &AggregateHeapProfileInfo) -> HeapSummaryByFunction {
         let mut info = HeapSummaryByFunction {
             info: SmallMap::new(),
-            unused_capacity: stacks.unused_capacity.get(),
         };
         info.init_children(&stacks.root, &ArcStr::new_static("(root)"), &stacks.strings);
         info
@@ -155,32 +152,15 @@ impl HeapSummaryByFunction {
         let mut info = self.info();
         info.sort_by_key(|x| -(x.1.time.nanos as i128));
 
-        let unused_capacity = FuncInfo {
-            calls: 0,
-            callers: SmallMap::new(),
-            time: SmallDuration::default(),
-            time_rec: SmallDuration::default(),
-            alloc: SmallMap::new(),
-        };
-
         enum RowKind {
             Total,
-            UnusedCapacity,
             Func,
         }
 
         let totals_str = ArcStr::new_static("TOTALS");
-        let unused_capacity_str = ArcStr::new_static("UNUSED CAPACITY");
-        let info = [
-            (&totals_str, &totals, RowKind::Total),
-            (
-                &unused_capacity_str,
-                &unused_capacity,
-                RowKind::UnusedCapacity,
-            ),
-        ]
-        .into_iter()
-        .chain(info.into_iter().map(|(k, v)| (k, v, RowKind::Func)));
+        let info = [(&totals_str, &totals, RowKind::Total)]
+            .into_iter()
+            .chain(info.into_iter().map(|(k, v)| (k, v, RowKind::Func)));
 
         let mut csv = CsvWriter::new(
             [
@@ -198,7 +178,7 @@ impl HeapSummaryByFunction {
             .copied()
             .chain(columns.iter().map(|c| c.0)),
         );
-        for (rowname, info, row_kind) in info {
+        for (rowname, info, _row_kind) in info {
             let blank = ArcStr::new_static("");
             let callers = info
                 .callers
@@ -218,16 +198,8 @@ impl HeapSummaryByFunction {
             csv.write_value(info.callers.len());
             csv.write_value(callers.0.as_str());
             csv.write_value(callers.1);
-            match row_kind {
-                RowKind::UnusedCapacity => {
-                    csv.write_value(1);
-                    csv.write_value(self.unused_capacity);
-                }
-                _ => {
-                    csv.write_value(info.alloc_count());
-                    csv.write_value(info.alloc_bytes());
-                }
-            }
+            csv.write_value(info.alloc_count());
+            csv.write_value(info.alloc_bytes());
             for c in &columns {
                 csv.write_value(info.alloc.get(c.0).unwrap_or(&AllocCounts::default()).count);
             }
@@ -241,8 +213,8 @@ impl HeapSummaryByFunction {
 mod tests {
     use crate::environment::Globals;
     use crate::environment::Module;
+    use crate::eval::runtime::profile::mode::ProfileMode;
     use crate::eval::Evaluator;
-    use crate::eval::ProfileMode;
     use crate::syntax::AstModule;
     use crate::syntax::Dialect;
     use crate::values::layout::heap::profile::aggregated::AggregateHeapProfileInfo;
@@ -259,7 +231,7 @@ _ignore = {1: 2}       # allocate a dict in drop
 _ignore = str([1])     # allocate a string in non_drop
         "
             .to_owned(),
-            &Dialect::Extended,
+            &Dialect::AllOptionsInternal,
         )
         .unwrap();
 
@@ -277,8 +249,6 @@ _ignore = str([1])     # allocate a string in non_drop
 
         // Run the assertions.
         info.gen_csv();
-
-        assert!(info.unused_capacity > 0);
 
         let total = FuncInfo::merge(info.info.values());
         // from non-drop heap

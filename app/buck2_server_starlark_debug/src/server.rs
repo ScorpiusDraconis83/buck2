@@ -14,11 +14,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use buck2_core::fs::fs_util;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_interpreter::starlark_debug::StarlarkDebugController;
 use debugserver_types as dap;
@@ -81,6 +82,7 @@ fn capabilities() -> serde_json::Value {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum DebuggerError {
     #[error("SetBreakpointsArguments invalid: {0:?}")]
     InvalidSetBreakpoints(dap::SetBreakpointsArguments),
@@ -162,7 +164,7 @@ impl BuckStarlarkDebuggerServer {
         self: &Arc<Self>,
         handle: &BuckStarlarkDebuggerHandle,
         description: &str,
-    ) -> anyhow::Result<Box<dyn StarlarkDebugController>> {
+    ) -> buck2_error::Result<Box<dyn StarlarkDebugController>> {
         debug!("starting debug-hooked eval {}", description);
         let permit = self.eval_semaphore.dupe().acquire_owned().await?;
         let (send, recv) = oneshot::channel();
@@ -212,7 +214,7 @@ impl BuckStarlarkDebuggerServer {
     }
 
     /// Called to forward along requests from the DAP client.
-    pub(crate) fn send_request(&self, req: dap::Request) -> anyhow::Result<()> {
+    pub(crate) fn send_request(&self, req: dap::Request) -> buck2_error::Result<()> {
         // If the state encountered an error or is shutting down, it may never see this
         // request. But that's okay since in that case it will send back the Shutdown message
         // and that'll make its way back to the client.
@@ -221,7 +223,7 @@ impl BuckStarlarkDebuggerServer {
     }
 
     /// Called when the DAP client has disconnected.
-    pub(crate) fn detach(&self) -> anyhow::Result<()> {
+    pub(crate) fn detach(&self) -> buck2_error::Result<()> {
         self.maybe_to_state(ServerMessage::Detach);
         Ok(())
     }
@@ -301,12 +303,16 @@ struct VariableId(i64);
 impl VariableId {
     const MASK_53_BITS: i64 = (1 << 53) - 1;
 
-    pub fn new(top_frame: bool, thread_id: u32, variable_id: u32) -> anyhow::Result<Self> {
+    pub fn new(top_frame: bool, thread_id: u32, variable_id: u32) -> buck2_error::Result<Self> {
         if thread_id > 0xFFFFF {
-            return Err(anyhow::Error::msg(format!(
-                "Thread ID exceeds 20-bit limit: max is 0xFFFFF, received {}",
-                thread_id
-            )));
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "{}",
+                format!(
+                    "Thread ID exceeds 20-bit limit: max is 0xFFFFF, received {}",
+                    thread_id
+                )
+            ));
         }
         let top_frame_flag = (if top_frame { 1 } else { 0 }) << 52;
         let thread_id_part = ((thread_id as i64) << 32) & 0xFFFFF00000000;
@@ -331,16 +337,17 @@ impl VariableId {
 }
 
 impl TryFrom<i64> for VariableId {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     fn try_from(value: i64) -> Result<Self, Self::Error> {
         if value & VariableId::MASK_53_BITS == value {
             Ok(Self(value))
         } else {
-            Err(anyhow::Error::msg(format!(
-                "value exceeds 53-bit limit. value: {}",
-                value
-            )))
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "{}",
+                format!("value exceeds 53-bit limit. value: {}", value)
+            ))
         }
     }
 }
@@ -355,14 +362,14 @@ impl DebugServer for ServerState {
     fn initialize(
         &mut self,
         _x: dap::InitializeRequestArguments,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
+    ) -> buck2_error::Result<Option<serde_json::Value>> {
         Ok(Some(capabilities()))
     }
 
     fn set_breakpoints(
         &mut self,
         mut x: dap::SetBreakpointsArguments,
-    ) -> anyhow::Result<dap::SetBreakpointsResponseBody> {
+    ) -> buck2_error::Result<dap::SetBreakpointsResponseBody> {
         // buck will use the project-relative paths when parsing asts with the starlark interpreter. We need to match that.
         let source = x
             .source
@@ -375,9 +382,13 @@ impl DebugServer for ServerState {
         x.source.path = Some(source.clone());
 
         // We currently just resolve new breakpoints against the current state of the file. This isn't quite correct, but oh well.
-        let resolved = resolve_breakpoints(&x, &self.get_ast(&project_relative)?)?;
+        let resolved = resolve_breakpoints(&x, &self.get_ast(&project_relative)?)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         for hook_state in self.current_hooks.values() {
-            hook_state.adapter.set_breakpoints(&source, &resolved)?;
+            hook_state
+                .adapter
+                .set_breakpoints(&source, &resolved)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         }
         let response = resolved.to_response();
         self.set_breakpoints.insert(source, resolved);
@@ -387,17 +398,17 @@ impl DebugServer for ServerState {
     fn set_exception_breakpoints(
         &mut self,
         _x: dap::SetExceptionBreakpointsArguments,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         // TODO(cjhopman): This may not make sense in starlark and could be a more informative error. Or possibly we
         // could use it to break on `fail()`.
         Err(StarlarkDebuggerError::Unimplemented.into())
     }
 
-    fn attach(&mut self, _x: dap::AttachRequestArguments) -> anyhow::Result<()> {
+    fn attach(&mut self, _x: dap::AttachRequestArguments) -> buck2_error::Result<()> {
         Ok(())
     }
 
-    fn threads(&mut self) -> anyhow::Result<dap::ThreadsResponseBody> {
+    fn threads(&mut self) -> buck2_error::Result<dap::ThreadsResponseBody> {
         let mut threads = Vec::with_capacity(self.current_hooks.len());
         for hook_state in self
             .current_hooks
@@ -412,16 +423,19 @@ impl DebugServer for ServerState {
         Ok(dap::ThreadsResponseBody { threads })
     }
 
-    fn configuration_done(&mut self) -> anyhow::Result<()> {
+    fn configuration_done(&mut self) -> buck2_error::Result<()> {
         Ok(())
     }
 
     fn stack_trace(
         &mut self,
         x: dap::StackTraceArguments,
-    ) -> anyhow::Result<dap::StackTraceResponseBody> {
+    ) -> buck2_error::Result<dap::StackTraceResponseBody> {
         let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
-        let mut trace_response = hook.adapter.stack_trace(x)?;
+        let mut trace_response = hook
+            .adapter
+            .stack_trace(x)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         for frame in &mut trace_response.stack_frames {
             // rewrite the sources to be absolute (like vscode sent us)
             if let Some(source) = &mut frame.source {
@@ -437,7 +451,7 @@ impl DebugServer for ServerState {
         Ok(trace_response)
     }
 
-    fn scopes(&mut self, x: dap::ScopesArguments) -> anyhow::Result<dap::ScopesResponseBody> {
+    fn scopes(&mut self, x: dap::ScopesArguments) -> buck2_error::Result<dap::ScopesResponseBody> {
         let thread_id = x.frame_id >> 16;
         let frame_id = x.frame_id & 0xFFFF;
         if frame_id != 0 {
@@ -445,7 +459,10 @@ impl DebugServer for ServerState {
         }
 
         let hook = self.find_hook_by_pseudo_thread(thread_id)?;
-        let scopes_info = hook.adapter.scopes()?;
+        let scopes_info = hook
+            .adapter
+            .scopes()
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         Ok(dap::ScopesResponseBody {
             scopes: vec![dap::Scope {
                 name: "Locals".to_owned(),
@@ -468,7 +485,7 @@ impl DebugServer for ServerState {
     fn variables(
         &mut self,
         x: dap::VariablesArguments,
-    ) -> anyhow::Result<dap::VariablesResponseBody> {
+    ) -> buck2_error::Result<dap::VariablesResponseBody> {
         let encoded_variable_id = VariableId::try_from(x.variables_reference)?;
         let thread_id = encoded_variable_id.thread_id();
         // We only understand the TOP_FRAME_LOCALS_ID id
@@ -482,7 +499,10 @@ impl DebugServer for ServerState {
 
         if encoded_variable_id.variable_id() == 0 {
             let hook = self.find_hook_by_pseudo_thread(thread_id.into())?;
-            let vars_info = hook.adapter.variables()?;
+            let vars_info = hook
+                .adapter
+                .variables()
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
             let known_variables = self
                 .variables_by_thread
                 .entry(thread_id)
@@ -508,11 +528,14 @@ impl DebugServer for ServerState {
 
             if let Some(path) = path {
                 let hook = self.find_hook_by_pseudo_thread(thread_id.into())?;
-                let inspect_result = hook.adapter.inspect_variable(path.to_owned())?;
+                let inspect_result = hook
+                    .adapter
+                    .inspect_variable(path.to_owned())
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
                 let current_frame_vars = self
                     .variables_by_thread
                     .get_mut(&thread_id)
-                    .context("variables cache must exist in this codepath")?;
+                    .buck_error_context("variables cache must exist in this codepath")?;
 
                 for child in inspect_result.sub_values {
                     let child_path = path.make_child(child.name.clone());
@@ -534,38 +557,52 @@ impl DebugServer for ServerState {
         Ok(dap::VariablesResponseBody { variables: result })
     }
 
-    fn source(&mut self, _x: dap::SourceArguments) -> anyhow::Result<dap::SourceResponseBody> {
+    fn source(&mut self, _x: dap::SourceArguments) -> buck2_error::Result<dap::SourceResponseBody> {
         Err(StarlarkDebuggerError::Unimplemented.into())
     }
 
-    fn continue_(&mut self, x: ContinueArguments) -> anyhow::Result<dap::ContinueResponseBody> {
+    fn continue_(
+        &mut self,
+        x: ContinueArguments,
+    ) -> buck2_error::Result<dap::ContinueResponseBody> {
         let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
-        hook.adapter.continue_()?;
+        hook.adapter
+            .continue_()
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
 
         Ok(dap::ContinueResponseBody {
             all_threads_continued: Some(false),
         })
     }
 
-    fn next(&mut self, x: dap::NextArguments) -> anyhow::Result<()> {
+    fn next(&mut self, x: dap::NextArguments) -> buck2_error::Result<()> {
         let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
-        hook.adapter.step(StepKind::Over)?;
+        hook.adapter
+            .step(StepKind::Over)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         Ok(())
     }
 
-    fn step_in(&mut self, x: dap::StepInArguments) -> anyhow::Result<()> {
+    fn step_in(&mut self, x: dap::StepInArguments) -> buck2_error::Result<()> {
         let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
-        hook.adapter.step(StepKind::Into)?;
+        hook.adapter
+            .step(StepKind::Into)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         Ok(())
     }
 
-    fn step_out(&mut self, x: dap::StepOutArguments) -> anyhow::Result<()> {
+    fn step_out(&mut self, x: dap::StepOutArguments) -> buck2_error::Result<()> {
         let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
-        hook.adapter.step(StepKind::Out)?;
+        hook.adapter
+            .step(StepKind::Out)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         Ok(())
     }
 
-    fn evaluate(&mut self, x: dap::EvaluateArguments) -> anyhow::Result<dap::EvaluateResponseBody> {
+    fn evaluate(
+        &mut self,
+        x: dap::EvaluateArguments,
+    ) -> buck2_error::Result<dap::EvaluateResponseBody> {
         let frame_id = match x.frame_id {
             Some(v) => v,
             None => {
@@ -623,7 +660,7 @@ impl DebugServer for ServerState {
         }
     }
 
-    fn disconnect(&mut self, _x: dap::DisconnectArguments) -> anyhow::Result<()> {
+    fn disconnect(&mut self, _x: dap::DisconnectArguments) -> buck2_error::Result<()> {
         Ok(())
     }
 }
@@ -644,7 +681,10 @@ impl ServerState {
     }
 
     // The main run loop for the ServerState.
-    async fn run(&mut self, recv: mpsc::UnboundedReceiver<ServerMessage>) -> anyhow::Result<()> {
+    async fn run(
+        &mut self,
+        recv: mpsc::UnboundedReceiver<ServerMessage>,
+    ) -> buck2_error::Result<()> {
         let mut recv = UnboundedReceiverStream::new(recv);
 
         self.to_client
@@ -718,7 +758,7 @@ impl ServerState {
     }
 
     /// Returns `false` on detach to indicate the state thread should stop running.
-    fn handle_message(&mut self, msg: ServerMessage) -> anyhow::Result<bool> {
+    fn handle_message(&mut self, msg: ServerMessage) -> buck2_error::Result<bool> {
         match msg {
             ServerMessage::NewHook {
                 handle,
@@ -726,9 +766,9 @@ impl ServerState {
                 response_channel,
             } => {
                 let resp = self.new_hook(handle, description)?;
-                response_channel
-                    .send(resp)
-                    .map_err(|_| anyhow::anyhow!("channel closed"))?;
+                response_channel.send(resp).map_err(|_| {
+                    buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "channel closed")
+                })?;
             }
             ServerMessage::NewHandle { id, events } => self.new_handle(id, events),
             ServerMessage::DropHook { id } => self.drop_hook(id)?,
@@ -768,7 +808,7 @@ impl ServerState {
         &mut self,
         handle: BuckStarlarkDebuggerHandle,
         description: String,
-    ) -> anyhow::Result<(HookId, Option<Box<dyn DapAdapterEvalHook>>)> {
+    ) -> buck2_error::Result<(HookId, Option<Box<dyn DapAdapterEvalHook>>)> {
         let (hook_id, pseudo_thread_id) = self.next_hook_id();
 
         let client = Box::new(BuckStarlarkDapAdapterClient {
@@ -785,7 +825,10 @@ impl ServerState {
         };
 
         for (source, breakpoints) in &self.set_breakpoints {
-            hook_state.adapter.set_breakpoints(source, breakpoints)?;
+            hook_state
+                .adapter
+                .set_breakpoints(source, breakpoints)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         }
         self.current_hooks.insert(hook_id, hook_state);
 
@@ -804,7 +847,7 @@ impl ServerState {
         self.current_commands.insert(id, CommandState { events });
     }
 
-    fn drop_hook(&mut self, hook_id: HookId) -> anyhow::Result<()> {
+    fn drop_hook(&mut self, hook_id: HookId) -> buck2_error::Result<()> {
         if let Some(state) = self.current_hooks.remove(&hook_id) {
             self.to_client.send(ToClientMessage::Event(dap_event(
                 "thread",
@@ -822,7 +865,7 @@ impl ServerState {
         self.current_commands.remove(&handle_id);
     }
 
-    fn eval_stopped(&mut self, hook_id: HookId) -> anyhow::Result<()> {
+    fn eval_stopped(&mut self, hook_id: HookId) -> buck2_error::Result<()> {
         debug!("eval stopped {}", hook_id);
         let state = self.current_hooks.get_mut(&hook_id).unwrap();
         let top_frame = state.adapter.top_frame();
@@ -853,23 +896,27 @@ impl ServerState {
         self.current_hooks.clear();
     }
 
-    fn find_hook_by_pseudo_thread(&self, thread_id: i64) -> anyhow::Result<&HookState> {
+    fn find_hook_by_pseudo_thread(&self, thread_id: i64) -> buck2_error::Result<&HookState> {
         let thread_id = thread_id as u32;
         for hook_state in self.current_hooks.values() {
             if hook_state.pseudo_thread_id == thread_id {
                 return Ok(hook_state);
             }
         }
-        Err(anyhow::anyhow!("can't find evaluator thread"))
+        Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Tier0,
+            "can't find evaluator thread"
+        ))
     }
 
-    fn get_ast(&self, source: &ProjectRelativePath) -> anyhow::Result<AstModule> {
+    fn get_ast(&self, source: &ProjectRelativePath) -> buck2_error::Result<AstModule> {
         debug!("tried to get ast `{}`", source);
         let abs_path = self.project_root.resolve(source);
-        let content = fs_util::read_to_string_if_exists(abs_path)?
-            .ok_or_else(|| anyhow::anyhow!("file not found: {}", source))?;
-        AstModule::parse(
-            &source.to_string(),
+        let content = fs_util::read_to_string_if_exists(abs_path)?.ok_or_else(|| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "file not found: {}", source)
+        })?;
+        match AstModule::parse(
+            source.as_ref(),
             content,
             &Dialect {
                 enable_def: true,
@@ -881,8 +928,10 @@ impl ServerState {
                 enable_top_level_stmt: true,
                 ..Dialect::Standard
             },
-        )
-        .map_err(starlark::Error::into_anyhow)
+        ) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -896,8 +945,9 @@ struct BuckStarlarkDapAdapterClient {
 }
 
 impl DapAdapterClient for BuckStarlarkDapAdapterClient {
-    fn event_stopped(&self) {
-        self.handle.0.server.event_stopped(self.hook_id)
+    fn event_stopped(&self) -> starlark::Result<()> {
+        self.handle.0.server.event_stopped(self.hook_id);
+        Ok(())
     }
 }
 

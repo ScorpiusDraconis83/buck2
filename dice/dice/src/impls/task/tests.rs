@@ -8,6 +8,7 @@
  */
 
 use std::any::Any;
+use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
 
@@ -17,6 +18,7 @@ use async_trait::async_trait;
 use buck2_futures::cancellation::CancellationContext;
 use buck2_futures::spawner::TokioSpawner;
 use derive_more::Display;
+use dice_error::result::CancellationReason;
 use dupe::Dupe;
 use futures::pin_mut;
 use futures::poll;
@@ -30,10 +32,8 @@ use tokio::sync::Semaphore;
 use crate::api::computations::DiceComputations;
 use crate::api::key::Key;
 use crate::arc::Arc;
-use crate::impls::core::graph::history::CellHistory;
 use crate::impls::key::DiceKey;
 use crate::impls::key::ParentKey;
-use crate::impls::task::dice::MaybeCancelled;
 use crate::impls::task::promise::DiceSyncResult;
 use crate::impls::task::spawn_dice_task;
 use crate::impls::task::sync_dice_task;
@@ -41,7 +41,8 @@ use crate::impls::value::DiceComputedValue;
 use crate::impls::value::DiceKeyValue;
 use crate::impls::value::DiceValidValue;
 use crate::impls::value::MaybeValidDiceValue;
-use crate::result::Cancelled;
+use crate::impls::value::TrackedInvalidationPaths;
+use crate::versions::VersionRanges;
 
 #[derive(Allocative, Clone, Debug, Display, Eq, PartialEq, Hash)]
 struct K;
@@ -77,7 +78,8 @@ async fn simple_task() -> anyhow::Result<()> {
 
             handle.finished(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(2))),
-                Arc::new(CellHistory::empty()),
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             ));
 
             Box::new(()) as Box<dyn Any + Send + 'static>
@@ -89,7 +91,6 @@ async fn simple_task() -> anyhow::Result<()> {
 
     let mut promise = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     assert_eq!(
@@ -137,7 +138,8 @@ async fn not_ready_until_dropped() -> anyhow::Result<()> {
             // wait for the lock too
             handle.finished(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(1))),
-                Arc::new(CellHistory::empty()),
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             ));
 
             sent_finish.notify_one();
@@ -151,7 +153,6 @@ async fn not_ready_until_dropped() -> anyhow::Result<()> {
 
     let promise = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
     pin_mut!(promise);
 
@@ -202,7 +203,6 @@ async fn never_ready_results_in_terminated() -> anyhow::Result<()> {
 
     let promise = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     assert_eq!(
@@ -227,7 +227,8 @@ async fn multiple_promises_all_completes() -> anyhow::Result<()> {
             // wait for the lock too
             handle.finished(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(2))),
-                Arc::new(CellHistory::empty()),
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             ));
 
             Box::new(()) as Box<dyn Any + Send + 'static>
@@ -237,23 +238,18 @@ async fn multiple_promises_all_completes() -> anyhow::Result<()> {
 
     let promise1 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
     let promise2 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 2 }))
-        .not_cancelled()
         .unwrap();
     let promise3 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 3 }))
-        .not_cancelled()
         .unwrap();
     let promise4 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 4 }))
-        .not_cancelled()
         .unwrap();
     let promise5 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 5 }))
-        .not_cancelled()
         .unwrap();
 
     assert_eq!(
@@ -302,18 +298,17 @@ async fn sync_complete_task_completes_promises() -> anyhow::Result<()> {
 
     let mut promise_before = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(poll!(&mut promise_before).is_pending());
 
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| DiceSyncResult::testing(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(2))),
-                Arc::new(CellHistory::empty())
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             )))?
             .value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
@@ -321,7 +316,6 @@ async fn sync_complete_task_completes_promises() -> anyhow::Result<()> {
 
     let promise_after = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(
@@ -350,29 +344,29 @@ async fn sync_complete_task_with_future() -> anyhow::Result<()> {
 
     let mut promise = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(poll!(&mut promise).is_pending());
 
     let v_sync = DiceComputedValue::new(
         MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(2))),
-        Arc::new(CellHistory::empty()),
+        Arc::new(VersionRanges::new()),
+        TrackedInvalidationPaths::clean(),
     );
     let v_async = DiceComputedValue::new(
         MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(99))),
-        Arc::new(CellHistory::empty()),
+        Arc::new(VersionRanges::new()),
+        TrackedInvalidationPaths::clean(),
     );
     let (tx, rx) = oneshot::channel();
 
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| DiceSyncResult {
                 sync_result: v_sync,
                 state_future: rx
-                    .map(|res| { res.map_err(|_| Cancelled).flatten() })
+                    .map(|res| { res.map_err(|_| CancellationReason::ByTest).flatten() })
                     .boxed(),
             })?
             .value()
@@ -382,7 +376,6 @@ async fn sync_complete_task_with_future() -> anyhow::Result<()> {
     // other sync tasks no longer runs
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| panic!("should not run"))?
             .value()
@@ -414,16 +407,13 @@ async fn sync_complete_task_wakes_waiters() -> anyhow::Result<()> {
 
     let mut promise1 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     let mut promise2 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 2 }))
-        .not_cancelled()
         .unwrap();
     let mut promise3 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 3 }))
-        .not_cancelled()
         .unwrap();
 
     assert_eq!(
@@ -469,11 +459,11 @@ async fn sync_complete_task_wakes_waiters() -> anyhow::Result<()> {
 
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| DiceSyncResult::testing(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(1))),
-                Arc::new(CellHistory::empty())
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             )))?
             .value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(1)))
@@ -512,7 +502,8 @@ async fn sync_complete_unfinished_spawned_task() -> anyhow::Result<()> {
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(2),
                     )),
-                    Arc::new(CellHistory::empty()),
+                    Arc::new(VersionRanges::new()),
+                    TrackedInvalidationPaths::clean(),
                 ));
 
                 Box::new(()) as Box<dyn Any + Send + 'static>
@@ -523,16 +514,15 @@ async fn sync_complete_unfinished_spawned_task() -> anyhow::Result<()> {
 
     let promise_before = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| DiceSyncResult::testing(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(1))),
-                Arc::new(CellHistory::empty())
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             )))?
             .value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(1)))
@@ -540,7 +530,6 @@ async fn sync_complete_unfinished_spawned_task() -> anyhow::Result<()> {
 
     let promise_after = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(
@@ -575,7 +564,8 @@ async fn sync_complete_finished_spawned_task() -> anyhow::Result<()> {
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(2),
                     )),
-                    Arc::new(CellHistory::empty()),
+                    Arc::new(VersionRanges::new()),
+                    TrackedInvalidationPaths::clean(),
                 ));
 
                 sem.add_permits(1);
@@ -588,7 +578,6 @@ async fn sync_complete_finished_spawned_task() -> anyhow::Result<()> {
 
     let promise_before = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     let _g = sem.acquire().await.unwrap();
@@ -596,11 +585,11 @@ async fn sync_complete_finished_spawned_task() -> anyhow::Result<()> {
     // actually completes with `2` from the spawn
     assert!(
         task.depended_on_by(ParentKey::None)
-            .not_cancelled()
             .unwrap()
             .sync_get_or_complete(|| DiceSyncResult::testing(DiceComputedValue::new(
                 MaybeValidDiceValue::valid(DiceValidValue::testing_new(DiceKeyValue::<K>::new(1))),
-                Arc::new(CellHistory::empty())
+                Arc::new(VersionRanges::new()),
+                TrackedInvalidationPaths::clean(),
             )))?
             .value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
@@ -608,7 +597,6 @@ async fn sync_complete_finished_spawned_task() -> anyhow::Result<()> {
 
     let promise_after = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
-        .not_cancelled()
         .unwrap();
 
     let polled = futures::poll!(promise_before);
@@ -667,7 +655,6 @@ async fn dropping_all_waiters_cancels_task() {
 
     let promise1 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(task.is_pending());
@@ -675,7 +662,6 @@ async fn dropping_all_waiters_cancels_task() {
 
     let promise2 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     assert!(task.is_pending());
@@ -688,17 +674,16 @@ async fn dropping_all_waiters_cancels_task() {
 
     let promise3 = task
         .depended_on_by(ParentKey::Some(DiceKey { index: 0 }))
-        .not_cancelled()
         .unwrap();
 
     drop(promise2);
     drop(promise3);
 
     match task.depended_on_by(ParentKey::None) {
-        MaybeCancelled::Ok(_) => {
+        Ok(_) => {
             panic!("should be cancelled")
         }
-        MaybeCancelled::Cancelled => {}
+        Err(_) => {}
     }
 
     task.await_termination().await;
@@ -714,13 +699,13 @@ async fn task_that_already_cancelled_returns_cancelled() {
         |_handle| async move { futures::future::pending().await }.boxed()
     });
 
-    task.cancel();
+    task.cancel(CancellationReason::ByTest);
     task.await_termination().await;
 
     match task.depended_on_by(ParentKey::None) {
-        MaybeCancelled::Ok(_) => {
+        Ok(_) => {
             panic!("should be cancelled")
         }
-        MaybeCancelled::Cancelled => {}
+        Err(_) => {}
     }
 }

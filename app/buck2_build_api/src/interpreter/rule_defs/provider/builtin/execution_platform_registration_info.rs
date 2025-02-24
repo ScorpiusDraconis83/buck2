@@ -16,15 +16,25 @@ use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::list::ListRef;
+use starlark::values::list::ListType;
+use starlark::values::none::NoneOr;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::FrozenRef;
+use starlark::values::FrozenValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
+use starlark::values::ValueOf;
+use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueOfUncheckedGeneric;
+use starlark::values::ValueTypedComplex;
 
 use crate::interpreter::rule_defs::provider::builtin::execution_platform_info::ExecutionPlatformInfo;
 use crate::interpreter::rule_defs::provider::builtin::execution_platform_info::FrozenExecutionPlatformInfo;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum ExecutionPlatformRegistrationTypeError {
     #[error("expected a list of ExecutionPlatformInfo, got `{0}` (type `{1}`)")]
     ExpectedListOfPlatforms(String, String),
@@ -40,25 +50,23 @@ enum ExecutionPlatformRegistrationTypeError {
 #[internal_provider(info_creator)]
 #[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
 #[repr(C)]
-pub struct ExecutionPlatformRegistrationInfoGen<V> {
-    #[provider(field_type = Vec<FrozenExecutionPlatformInfo>)]
-    platforms: V,
+pub struct ExecutionPlatformRegistrationInfoGen<V: ValueLifetimeless> {
+    platforms: ValueOfUncheckedGeneric<V, Vec<FrozenExecutionPlatformInfo>>,
     // OneOf<ExecutionPlatformInfo, \"error\", \"unspecified\", None>
     // TODO(nga): specify type more precisely.
-    #[provider(field_type = Value<'v>)]
-    fallback: V,
+    fallback: ValueOfUncheckedGeneric<V, FrozenValue>,
 }
 
 impl FrozenExecutionPlatformRegistrationInfo {
     // TODO(cjhopman): If we impl this on the non-frozen one, we can check validity when constructed rather than only when used.
     pub fn platforms(
         &self,
-    ) -> anyhow::Result<Vec<FrozenRef<'static, FrozenExecutionPlatformInfo>>> {
-        ListRef::from_frozen_value(self.platforms)
+    ) -> buck2_error::Result<Vec<FrozenRef<'static, FrozenExecutionPlatformInfo>>> {
+        ListRef::from_frozen_value(self.platforms.get())
             .ok_or_else(|| {
                 ExecutionPlatformRegistrationTypeError::ExpectedListOfPlatforms(
-                    self.platforms.to_value().to_repr(),
-                    self.platforms.to_value().get_type().to_owned(),
+                    self.platforms.to_value().get().to_repr(),
+                    self.platforms.to_value().get().get_type().to_owned(),
                 )
             })?
             .iter()
@@ -67,20 +75,21 @@ impl FrozenExecutionPlatformRegistrationInfo {
                     .expect("should be frozen")
                     .downcast_frozen_ref::<FrozenExecutionPlatformInfo>()
                     .ok_or_else(|| {
-                        anyhow::anyhow!(ExecutionPlatformRegistrationTypeError::NotAPlatform(
+                        ExecutionPlatformRegistrationTypeError::NotAPlatform(
                             v.to_repr(),
                             v.get_type().to_owned(),
-                        ))
+                        )
+                        .into()
                     })
             })
-            .collect::<anyhow::Result<_>>()
+            .collect::<buck2_error::Result<_>>()
     }
 
-    pub fn fallback(&self) -> anyhow::Result<ExecutionPlatformFallback> {
-        if self.fallback.is_none() {
+    pub fn fallback(&self) -> buck2_error::Result<ExecutionPlatformFallback> {
+        if self.fallback.get().is_none() {
             return Ok(ExecutionPlatformFallback::UseUnspecifiedExec);
         }
-        let fallback = self.fallback.to_value();
+        let fallback = self.fallback.get().to_value();
         if let Some(v) = ExecutionPlatformInfo::from_value(fallback) {
             return Ok(ExecutionPlatformFallback::Platform(
                 v.to_execution_platform()?,
@@ -90,12 +99,11 @@ impl FrozenExecutionPlatformRegistrationInfo {
         match fallback.unpack_str() {
             Some("error") => Ok(ExecutionPlatformFallback::Error),
             Some("use_unspecified") => Ok(ExecutionPlatformFallback::UseUnspecifiedExec),
-            _ => Err(anyhow::anyhow!(
-                ExecutionPlatformRegistrationTypeError::InvalidFallback(
-                    fallback.to_repr(),
-                    fallback.get_type().to_owned(),
-                )
-            )),
+            _ => Err(ExecutionPlatformRegistrationTypeError::InvalidFallback(
+                fallback.to_repr(),
+                fallback.get_type().to_owned(),
+            )
+            .into()),
         }
     }
 }
@@ -103,12 +111,18 @@ impl FrozenExecutionPlatformRegistrationInfo {
 #[starlark_module]
 fn info_creator(globals: &mut GlobalsBuilder) {
     fn ExecutionPlatformRegistrationInfo<'v>(
-        #[starlark(require = named)] platforms: Value<'v>,
-        #[starlark(require = named)] fallback: Option<Value<'v>>,
-    ) -> anyhow::Result<ExecutionPlatformRegistrationInfo<'v>> {
+        #[starlark(require = named)] platforms: ValueOf<
+            'v,
+            ListType<ValueTypedComplex<'v, ExecutionPlatformInfo<'v>>>,
+        >,
+        #[starlark(require = named, default = NoneOr::None)] fallback: NoneOr<Value<'v>>,
+    ) -> starlark::Result<ExecutionPlatformRegistrationInfo<'v>> {
         Ok(ExecutionPlatformRegistrationInfo {
-            platforms,
-            fallback: fallback.unwrap_or_else(Value::new_none),
+            platforms: ValueOfUnchecked::new(platforms.value),
+            fallback: ValueOfUnchecked::new(match fallback {
+                NoneOr::None => Value::new_none(),
+                NoneOr::Other(v) => v,
+            }),
         })
     }
 }

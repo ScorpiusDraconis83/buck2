@@ -26,12 +26,15 @@ use crate::values::dict::value::FrozenDict;
 use crate::values::dict::DictRef;
 use crate::values::list::value::FrozenList;
 use crate::values::list::ListRef;
+use crate::values::set::refs::SetRef;
+use crate::values::set::value::FrozenSet;
 use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::starlark_type_id::StarlarkTypeIdAligned;
 use crate::values::tuple::value::Tuple;
-use crate::values::types::int_or_big::StarlarkIntRef;
+use crate::values::types::int::int_or_big::StarlarkIntRef;
 use crate::values::typing::type_compiled::matcher::TypeMatcher;
 use crate::values::typing::type_compiled::matcher::TypeMatcherBox;
+use crate::values::FreezeResult;
 use crate::values::UnpackValue;
 use crate::values::Value;
 
@@ -172,6 +175,27 @@ impl<K: TypeMatcher, V: TypeMatcher> TypeMatcher for IsDictOf<K, V> {
     }
 }
 
+#[derive(Clone, Copy, Dupe, Allocative, Debug)]
+pub(crate) struct IsSet;
+
+impl TypeMatcher for IsSet {
+    fn matches(&self, value: Value) -> bool {
+        value.starlark_type_id() == StarlarkTypeId::of::<FrozenSet>()
+    }
+}
+
+#[derive(Clone, Allocative, Debug)]
+pub(crate) struct IsSetOf<I: TypeMatcher>(pub(crate) I);
+
+impl<I: TypeMatcher> TypeMatcher for IsSetOf<I> {
+    fn matches(&self, value: Value) -> bool {
+        match SetRef::unpack_value_opt(value) {
+            Some(set) => set.aref.iter().all(|v| self.0.matches(v)),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Allocative, Debug)]
 pub(crate) struct IsAnyOfTwo<A: TypeMatcher, B: TypeMatcher>(pub(crate) A, pub(crate) B);
 
@@ -222,7 +246,7 @@ pub(crate) struct IsInt;
 
 impl TypeMatcher for IsInt {
     fn matches(&self, value: Value) -> bool {
-        StarlarkIntRef::unpack_value(value).is_some()
+        StarlarkIntRef::unpack(value).is_some()
     }
 }
 
@@ -268,6 +292,6 @@ pub(crate) struct IsName(pub(crate) String);
 
 impl TypeMatcher for IsName {
     fn matches(&self, value: Value) -> bool {
-        value.get_ref().matches_type(&self.0)
+        self.0 == value.get_type()
     }
 }
