@@ -18,6 +18,7 @@
 use syn::spanned::Spanned;
 
 use crate::starlark_type_repr::StarlarkTypeReprInput;
+use crate::v_lifetime::find_v_lifetime;
 
 pub(crate) fn derive_unpack_value(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
@@ -27,39 +28,13 @@ pub(crate) fn derive_unpack_value(input: proc_macro::TokenStream) -> proc_macro:
     }
 }
 
-fn find_lifetime(generics: &syn::Generics) -> syn::Result<Option<&syn::Lifetime>> {
-    let mut found_lifetime = None;
-    for lifetime in generics.lifetimes() {
-        if found_lifetime.is_some() {
-            return Err(syn::Error::new_spanned(
-                lifetime,
-                "Only one lifetime parameter is allowed",
-            ));
-        }
-        if !lifetime.bounds.is_empty() {
-            return Err(syn::Error::new_spanned(
-                lifetime,
-                "Lifetime parameter cannot have bounds",
-            ));
-        }
-        if lifetime.lifetime.ident != "v" {
-            return Err(syn::Error::new_spanned(
-                lifetime,
-                "Lifetime parameter must be named 'v'",
-            ));
-        }
-        found_lifetime = Some(&lifetime.lifetime);
-    }
-    Ok(found_lifetime)
-}
-
 fn derive_unpack_value_impl(input: syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let span = input.ident.span();
 
     let input = StarlarkTypeReprInput::parse(input, "UnpackValue")?;
 
     let ident = input.ident;
-    let lifetime = find_lifetime(&input.generics)?;
+    let lifetime = find_v_lifetime(&input.generics)?;
 
     let (_impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
 
@@ -75,21 +50,38 @@ fn derive_unpack_value_impl(input: syn::DeriveInput) -> syn::Result<proc_macro2:
     let branches: Vec<syn::ExprIf> = input
         .enum_variants
         .iter()
-        .map(|(n, t)| {
+        .enumerate()
+        .map(|(i, (n, t))| {
+            let mut map_err: syn::Expr = syn::parse_quote_spanned! { t.span() => starlark::__macro_refs::Either::Left(e) };
+            for _ in 0..i {
+                map_err = syn::parse_quote_spanned! { t.span() => starlark::__macro_refs::Either::Right(#map_err) };
+            }
             syn::parse_quote_spanned! { t.span() =>
-                if let Some(x) = <#t as starlark::values::UnpackValue<'v>>::unpack_value(value) {
-                    return Some(#ident::#n(x));
+                if let Some(x) = <#t as starlark::values::UnpackValue<'v>>::unpack_value_impl(value).map_err(|e| #map_err)? {
+                    return std::result::Result::Ok(Some(#ident::#n(x)));
                 }
             }
         })
         .collect::<Vec<_>>();
 
+    // `Either<A::Error, Either<B::Error, Either<C::Error, Infallible>>>`
+    let mut error: syn::Type = syn::parse_quote_spanned! { span => std::convert::Infallible };
+    for variant in input.enum_variants.iter().rev() {
+        let t = &variant.1;
+        error = syn::parse_quote_spanned! { variant.1.span() =>
+            starlark::__macro_refs::Either<<#t as starlark::values::UnpackValue<'v>>::Error, #error>
+        };
+    }
+
     let trait_impl: syn::ItemImpl = syn::parse_quote_spanned! { span =>
+        #[allow(clippy::all)]
         impl #impl_generics starlark::values::UnpackValue<'v> for #ident #type_generics #where_clause {
-            fn unpack_value(value: starlark::values::Value<'v>) -> std::option::Option<Self> {
+            type Error = #error;
+
+            fn unpack_value_impl(value: starlark::values::Value<'v>) -> std::result::Result<std::option::Option<Self>, Self::Error> {
                 #(#branches)*
                 let _unused_when_enum_is_empty = value;
-                None
+                std::result::Result::Ok(None)
             }
         }
     };

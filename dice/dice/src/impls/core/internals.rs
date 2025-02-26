@@ -7,8 +7,14 @@
  * of this source tree.
  */
 
+use std::thread;
+
+use dice_error::result::CancellableResult;
+use dice_error::result::CancellationReason;
 use gazebo::prelude::SliceExt;
 
+use super::graph::types::RejectedReason;
+use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::arc::Arc;
 use crate::impls::cache::SharedCache;
@@ -21,18 +27,19 @@ use crate::impls::core::graph::types::VersionedGraphResult;
 use crate::impls::core::versions::introspection::VersionIntrospectable;
 use crate::impls::core::versions::VersionEpoch;
 use crate::impls::core::versions::VersionTracker;
+use crate::impls::deps::graph::SeriesParallelDeps;
 use crate::impls::key::DiceKey;
 use crate::impls::task::dice::DiceTask;
 use crate::impls::task::dice::TerminationObserver;
 use crate::impls::transaction::ChangeType;
 use crate::impls::value::DiceComputedValue;
 use crate::impls::value::DiceValidValue;
+use crate::impls::value::TrackedInvalidationPaths;
 use crate::metrics::Metrics;
-use crate::result::CancellableResult;
-use crate::result::Cancelled;
 use crate::versions::VersionNumber;
 
 /// Core state of DICE, holding the actual graph and version information
+#[derive(allocative::Allocative)]
 pub(super) struct CoreState {
     version_tracker: VersionTracker,
     graph: VersionedGraph,
@@ -50,13 +57,13 @@ impl CoreState {
 
     pub(super) fn update_state(
         &mut self,
-        updates: impl IntoIterator<Item = (DiceKey, ChangeType)>,
+        updates: impl IntoIterator<Item = (DiceKey, ChangeType, InvalidationSourcePriority)>,
     ) -> VersionNumber {
         let version_update = self.version_tracker.write();
         let v = version_update.version();
 
         let mut changes_recorded = false;
-        for (key, change) in updates {
+        for (key, change, invalidation_priority) in updates {
             changes_recorded |= self.graph.invalidate(
                 VersionedGraphKey::new(v, key),
                 match change {
@@ -65,6 +72,7 @@ impl CoreState {
                     #[cfg(test)]
                     ChangeType::TestingSoftDirty => InvalidateKind::Invalidate,
                 },
+                invalidation_priority,
             );
         }
         if changes_recorded {
@@ -92,7 +100,11 @@ impl CoreState {
     }
 
     pub(super) fn lookup_key(&mut self, key: VersionedGraphKey) -> VersionedGraphResult {
-        self.graph.get(key)
+        if self.version_tracker.should_reject(key.v) {
+            VersionedGraphResult::Rejected(RejectedReason::RejectedDueToGraphClear)
+        } else {
+            self.graph.get(key)
+        }
     }
 
     pub(super) fn update_computed(
@@ -102,16 +114,18 @@ impl CoreState {
         storage: StorageType,
         value: DiceValidValue,
         reusability: ValueReusable,
-        deps: Arc<Vec<DiceKey>>,
+        deps: Arc<SeriesParallelDeps>,
+        invalidation_paths: TrackedInvalidationPaths,
     ) -> CancellableResult<DiceComputedValue> {
         if self.version_tracker.is_relevant(key.v, epoch) {
             debug!(msg = "update graph entry", k = ?key.k, v = %key.v, v_epoch = %epoch);
-
-            Ok(self.graph.update(key, value, reusability, deps, storage).0)
+            Ok(self
+                .graph
+                .update(key, value, reusability, deps, storage, invalidation_paths)
+                .0)
         } else {
             debug!(msg = "update is rejected due to outdated epoch", k = ?key.k, v = %key.v, v_epoch = %epoch);
-
-            Err(Cancelled)
+            Err(CancellationReason::OutdatedEpoch)
         }
     }
 
@@ -124,12 +138,15 @@ impl CoreState {
     }
 
     pub(super) fn unstable_drop_everything(&mut self) {
-        self.version_tracker.write().commit();
+        self.version_tracker.clear();
 
         // Do the actual drop on a different thread because we may have to drop a lot of stuff
         // here.
-        let map = std::mem::take(&mut self.graph.last_n);
-        std::thread::spawn(move || drop(map));
+        let map = std::mem::take(&mut self.graph.nodes);
+        thread::Builder::new()
+            .name("dice-drop-everything".to_owned())
+            .spawn(move || drop(map))
+            .expect("failed to spawn thread");
     }
 
     pub(super) fn metrics(&self) -> Metrics {
@@ -143,7 +160,7 @@ impl CoreState {
         }
 
         Metrics {
-            key_count: self.graph.last_n.len(),
+            key_count: self.graph.nodes.len(),
             currently_active_key_count: currently_running_key_count,
             active_transaction_count: active_transaction_count as u32, // probably won't support more than u32 transactions
         }
@@ -166,15 +183,16 @@ mod tests {
     use buck2_futures::cancellation::CancellationContext;
     use buck2_futures::spawner::TokioSpawner;
     use derive_more::Display;
+    use dice_error::result::CancellationReason;
     use dupe::Dupe;
     use futures::FutureExt;
     use tokio::sync::Semaphore;
 
     use crate::api::computations::DiceComputations;
+    use crate::api::key::InvalidationSourcePriority;
     use crate::api::key::Key;
     use crate::arc::Arc;
     use crate::impls::cache::DiceTaskRef;
-    use crate::impls::core::graph::history::CellHistory;
     use crate::impls::core::internals::CoreState;
     use crate::impls::key::DiceKey;
     use crate::impls::key::ParentKey;
@@ -185,19 +203,29 @@ mod tests {
     use crate::impls::value::DiceKeyValue;
     use crate::impls::value::DiceValidValue;
     use crate::impls::value::MaybeValidDiceValue;
+    use crate::impls::value::TrackedInvalidationPaths;
     use crate::versions::VersionNumber;
+    use crate::versions::VersionRanges;
 
     #[test]
     fn update_state_gets_next_version() {
         let mut core = CoreState::new();
 
         assert_eq!(
-            core.update_state([(DiceKey { index: 0 }, ChangeType::Invalidate)]),
+            core.update_state([(
+                DiceKey { index: 0 },
+                ChangeType::Invalidate,
+                InvalidationSourcePriority::Normal
+            )]),
             VersionNumber::new(1)
         );
 
         assert_eq!(
-            core.update_state([(DiceKey { index: 1 }, ChangeType::Invalidate)]),
+            core.update_state([(
+                DiceKey { index: 1 },
+                ChangeType::Invalidate,
+                InvalidationSourcePriority::Normal
+            )]),
             VersionNumber::new(2)
         );
     }
@@ -235,7 +263,8 @@ mod tests {
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(val),
                     )),
-                    Arc::new(CellHistory::empty()),
+                    Arc::new(VersionRanges::new()),
+                    TrackedInvalidationPaths::clean(),
                 ));
 
                 Box::new(()) as Box<dyn Any + Send>
@@ -243,11 +272,7 @@ mod tests {
             .boxed()
         });
 
-        task.depended_on_by(ParentKey::None)
-            .not_cancelled()
-            .unwrap()
-            .await
-            .unwrap();
+        task.depended_on_by(ParentKey::None).unwrap().await.unwrap();
 
         task
     }
@@ -260,7 +285,7 @@ mod tests {
             }
             .boxed()
         });
-        finished_cancelling_tasks.cancel();
+        finished_cancelling_tasks.cancel(CancellationReason::ByTest);
 
         finished_cancelling_tasks.await_termination().await;
 

@@ -52,6 +52,7 @@ message SpanStartEvent {
     CommandStart command = 50;
     ActionExecutionStart action_execution = 51;
     AnalysisStart analysis = 52;
+    AnalysisResolveQueriesStart analysis_resolve_queries = 5201;
     LoadBuildFileStart load = 53;
     ExecutorStageStart executor_stage = 54;
     TestDiscoveryStart test_discovery = 55;
@@ -83,9 +84,9 @@ message SpanStartEvent {
     ReleaseLocalResourcesStart release_local_resources = 81;
     // Measure total time it takes to ensure BXL artifacts.
     BxlEnsureArtifactsStart bxl_ensure_artifacts = 82;
-    CreateOutputHashesFileStart create_output_hashes_file = 84;
     ActionErrorHandlerExecutionStart action_error_handler_execution = 85;
     CqueryUniverseBuildStart cquery_universe_build = 87;
+    DepFileUploadStart dep_file_upload = 88;
     // Used in Buck unit tests.
     FakeStart fake = 999;
   }
@@ -102,6 +103,7 @@ message SpanEndEvent {
     CommandEnd command = 50;
     ActionExecutionEnd action_execution = 51;
     AnalysisEnd analysis = 52;
+    AnalysisResolveQueriesEnd analysis_resolve_queries = 5201;
     LoadBuildFileEnd load = 53;
     ExecutorStageEnd executor_stage = 54;
     TestDiscoveryEnd test_discovery = 55;
@@ -133,9 +135,9 @@ message SpanEndEvent {
     SetupLocalResourcesEnd local_resources = 81;
     ReleaseLocalResourcesEnd release_local_resources = 82;
     BxlEnsureArtifactsEnd bxl_ensure_artifacts = 83;
-    CreateOutputHashesFileEnd create_output_hashes_file = 85;
     ActionErrorHandlerExecutionEnd action_error_handler_execution = 86;
     CqueryUniverseBuildEnd cquery_universe_build = 87;
+    DepFileUploadEnd dep_file_upload = 88;
     // Used in Buck unit tests.
     FakeEnd fake = 999;
   }
@@ -178,9 +180,14 @@ message CommandOptions {
   uint64 concurrency = 1;
 }
 
+message CellHasNewConfigs {
+  // We fire this event whenever configs are changed or loaded for a new cell
+  // for which configs had not previously been loaded.
+  string cell = 1;
+}
 // An event that represents a single point in time.
 message InstantEvent {
-  reserved 2, 8, 9, 12, 13, 22, 24;
+  reserved 2, 8, 9, 12, 13, 22, 24, 38, 41;
 
   oneof data {
     StructuredError structured_error = 1;
@@ -250,13 +257,109 @@ message InstantEvent {
     ConcurrentCommands concurrent_commands = 32;
 
     // Info coming from the `buck2 debug persist-event-log` subprocess
-    PersistSubprocess persist_subprocess = 33;
+    PersistEventLogSubprocess persist_event_log_subprocess = 33;
 
     // An action error encountered during the build
     ActionError action_error = 34;
 
     ConsoleWarning console_warning = 35;
+
+    MaterializerCommand materializer_command = 36;
+
+    CleanStaleResult clean_stale_result = 37;
+    InstallFinished install_finished = 39;
+
+    SystemInfo system_info = 40;
+
+    VersionControlRevision version_control_revision = 42;
+
+    TargetCfg target_cfg = 43;
+
+    // Just something for us to be able to easily propagate out internal
+    // information. Used for testing.
+    QuickUnstableE2eData unstable_e2e_data = 44;
+
+    /// Notification that execution of all tests for a given command is
+    /// finished.
+    EndOfTestResults end_of_test_results = 45;
+
+    // Event sent when creating a new configuration.
+    ConfigurationCreated configuration_created = 46;
+
+    // Tracks values of external buckconfigs
+    BuckconfigInputValues buckconfig_input_values = 47;
+
+    CellHasNewConfigs cell_has_new_configs = 48;
+
+    // Previous command, but only logged if external configs changed
+    PreviousCommandWithMismatchedConfig
+        previous_command_with_mismatched_config = 49;
   }
+}
+
+message PreviousCommandWithMismatchedConfig {
+  repeated string sanitized_argv = 1;
+  string trace_id = 2;
+}
+
+message ConfigurationCreated {
+  ConfigurationWithConstraints cfg = 1;
+}
+
+message EndOfTestResults {
+  int32 exit_code = 1;
+}
+
+message BuckconfigInputValues {
+  // Buckconfigs are computed by joining together values from a number of
+  // different inputs (repo, well-known directories, CLI). Each of these is
+  // represented as a component, and they are applied in the given order,
+  // with later components overriding earlier ones
+  repeated BuckconfigComponent components = 1;
+}
+
+message BuckconfigComponent {
+  oneof data {
+    ConfigValue config_value = 1;
+    ConfigFile config_file = 2;
+    GlobalExternalConfig global_external_config_file = 3;
+  }
+}
+
+message ConfigValue {
+  string section = 1;
+  string key = 2;
+  string value = 3;
+  optional string cell = 4;
+  // whether config is provided by the command line (either single arg or config
+  // flag). Set to false for values coming from external buckconfigs (e.g.
+  // /etc/buckconfig.d or $home_dir/.buckconfig.local)
+  bool is_cli = 5;
+}
+
+message ConfigFile {
+  oneof data {
+    // If the config file is project relative (except .buckconfig.local), the
+    // path of the file. We only store the path, not actual values of
+    // project-relative buckconfigs because they are huge/costly to store
+    string project_relative_path = 1;
+    // If the config file is external or project-relative .buckconfig.local, we
+    // store all the config values in a list along with the path the file is
+    // originating from
+    GlobalExternalConfig global_external_config = 2;
+  }
+}
+
+message GlobalExternalConfig {
+  repeated ConfigValue values = 1;
+  string origin_path = 2;
+}
+
+// This should only be used as a mechanism to easily get information into the
+// event log for e2e tests.
+message QuickUnstableE2eData {
+  string key = 1;
+  string data = 2;
 }
 
 message DebugAdapterStoppedEval {
@@ -287,6 +390,8 @@ message DiceKeyState {
   uint32 finished = 2;
   uint32 check_deps_started = 3;
   uint32 check_deps_finished = 4;
+  uint32 compute_started = 5;
+  uint32 compute_finished = 6;
 }
 
 message RemoteExecutionSessionCreated {
@@ -346,7 +451,7 @@ message StructuredError {
   // users. If true, it won't get logged to console
   bool quiet = 5;
   // If this was a soft error, its category.
-  optional string soft_error_category = 6;
+  optional SoftError soft_error_category = 6;
   // Whether a tracking task should be created for this error.
   optional bool task = 7;
   // Is this error indicative of needing to restart the daemon?
@@ -356,6 +461,8 @@ message StructuredError {
   // Is this error indicative of the RE action cache returning corrupted
   // results?
   bool action_cache_is_corrupted = 10;
+  // Whether the error should be converted to a hard error in the future.
+  bool deprecation = 11;
 }
 
 message CriticalPathEntry {
@@ -384,9 +491,16 @@ message CriticalPathEntry2 {
       BxlFunctionKey bxl_key = 3;
       AnonTarget anon_target = 4;
     }
+
+    ActionExecutionKind execution_kind = 5;
+
+    optional string target_rule_type_name = 6;
+    optional string action_digest = 7;
+    optional CommandInvalidationInfo invalidation_info = 8;
   }
 
-  message Materialization {
+  // This is for materializing the final outputs at the end of the build
+  message FinalMaterialization {
     string path = 1;
 
     oneof owner {
@@ -398,6 +512,13 @@ message CriticalPathEntry2 {
 
   message ComputeCriticalPath {}
 
+  /// Tracks time spent on the critical path (i.e. not accounted by other
+  /// categories) such as early command processing (time spent synchronizing and
+  /// waiting for concurrent commands)
+  message GenericEntry {
+    string kind = 1;
+  }
+
   message Load {
     string package = 1;
   }
@@ -408,9 +529,9 @@ message CriticalPathEntry2 {
 
   repeated uint64 span_ids = 1;
 
-  // The duration we used to compute the critical path. This will be one of the
-  // durations below, but to ensure not every callsite has to know which one we
-  // chose, we expose it here.
+  // The duration we used to compute the critical path. This tracks total
+  // duration, but to ensure not every callsite has to know which one we chose,
+  // we expose it here.
   google.protobuf.Duration duration = 2;
 
   // The subset of the duration for this entry whose runtime is controlled by
@@ -432,10 +553,11 @@ message CriticalPathEntry2 {
   oneof entry {
     Analysis analysis = 100;
     ActionExecution action_execution = 101;
-    Materialization materialization = 102;
+    FinalMaterialization final_materialization = 102;
     ComputeCriticalPath compute_critical_path = 103;
     Load load = 104;
     Listing listing = 105;
+    GenericEntry generic_entry = 106;
   }
 }
 
@@ -453,8 +575,6 @@ message BuildGraphExecutionInfo {
   // The actions that made up the critical path, in chronological order, in a
   // new format. We will have either that, or critical_path;
   repeated CriticalPathEntry2 critical_path2 = 5;
-  // Whether the aggregation is done using total duration or not.
-  bool uses_total_duration = 6;
   // The backend that was use to produce the critical path.
   optional string backend_name = 7;
   // The command.
@@ -476,10 +596,50 @@ message TestDiscovery {
 // Result of invoking buck2 rage
 message RageResult {
   reserved 1 to 8;
+  // TODO iguridi: remove string_data and int_data
   map<string, string> string_data = 9;
   map<string, uint64> int_data = 10;
+
   google.protobuf.Timestamp timestamp = 11;
   google.protobuf.Duration command_duration = 12;
+
+  optional string command = 13;
+  optional string buck2_revision = 14;
+  optional string username = 15;
+  optional string hostname = 16;
+  optional string os = 17;
+  optional string os_version = 18;
+
+  string dice_dump = 19;
+  string materializer_state = 20;
+  string materializer_fsck = 21;
+  string thread_dump = 22;
+  string daemon_stderr_dump = 23;
+  string hg_snapshot_id = 24;
+  string invocation_id = 25;
+  string event_log_dump = 26;
+  string re_logs = 27;
+
+  optional int64 daemon_uptime_s = 28;
+}
+
+message VersionControlRevision {
+  // 40 characters hash.
+  optional string hg_revision = 1;
+  // Here are the possible values:
+  // True: Has local changes that are not committed.
+  // False: All changes committed and can be identified by revision hash.
+  // Unset: Unknown state.
+  optional bool has_local_changes = 2;
+  optional string command_error = 3;
+}
+
+// Event sent during build commands
+// providing information about global configuration options.
+message TargetCfg {
+  // resolved target platforms
+  repeated string target_platforms = 1;
+  repeated string cli_modifiers = 2;
 }
 
 // A snapshot of current system state, with useful info.
@@ -550,6 +710,14 @@ message Snapshot {
   optional uint64 malloc_bytes_active = 8;
   // (stats.allocated) Total number of bytes allocated by the application
   optional uint64 malloc_bytes_allocated = 9;
+  //  Total number of bytes of used disk space on machine
+  optional uint64 used_disk_space_bytes = 10;
+
+  // Host system CPU time since command start.
+  optional uint64 host_cpu_usage_system_ms = 12;
+
+  // Host user CPU time since command start.
+  optional uint64 host_cpu_usage_user_ms = 13;
 
   uint64 dice_key_count = 101;
   // the number of keys actively present in the per transaction cache
@@ -563,10 +731,20 @@ message Snapshot {
   optional uint64 sink_successes = 105;
   // Cumulative count of messages that failed to be emitted.
   optional uint64 sink_failures = 106;
+  // These are only stored in snapshot events, but not written to scuba.
+  optional uint64 sink_failures_invalid_request = 1201;
+  optional uint64 sink_failures_unauthorized = 1202;
+  optional uint64 sink_failures_rate_limited = 1203;
+  optional uint64 sink_failures_pushed_back = 1204;
+  optional uint64 sink_failures_enqueue_failed = 1205;
+  optional uint64 sink_failures_internal_error = 1206;
+  optional uint64 sink_failures_timed_out = 1207;
+  optional uint64 sink_failures_unknown = 1208;
   // Current number of messages queued up to be submitted.
   optional uint64 sink_buffer_depth = 107;
   // Cumulative count of messages that were dropped (i.e. not even processed).
   optional uint64 sink_dropped = 108;
+  optional uint64 sink_bytes_written = 111;
 
   // Network statistics for "interesting" network interfaces.
   map<string, NetworkInterfaceStats> network_interface_stats = 109;
@@ -577,6 +755,32 @@ message Snapshot {
   uint64 deferred_materializer_declares_reused = 201;
 
   optional UnixSystemStats unix_system_stats = 300;
+
+  uint64 zdb_download_queries = 400;
+  uint64 zdb_download_bytes = 401;
+  uint64 zdb_upload_queries = 402;
+  uint64 zdb_upload_bytes = 403;
+
+  uint64 zgateway_download_queries = 410;
+  uint64 zgateway_download_bytes = 411;
+  uint64 zgateway_upload_queries = 412;
+  uint64 zgateway_upload_bytes = 413;
+
+  uint64 manifold_download_queries = 420;
+  uint64 manifold_download_bytes = 421;
+  uint64 manifold_upload_queries = 422;
+  uint64 manifold_upload_bytes = 423;
+
+  uint64 hedwig_download_queries = 430;
+  uint64 hedwig_download_bytes = 431;
+  uint64 hedwig_upload_queries = 432;
+  uint64 hedwig_upload_bytes = 433;
+
+  // Local cache hits and misses stats
+  int64 local_cache_hits_files = 434;
+  int64 local_cache_hits_bytes = 435;
+  int64 local_cache_misses_files = 436;
+  int64 local_cache_misses_bytes = 437;
 
   // Client side metrics.
 
@@ -619,6 +823,7 @@ message TestResult {
   google.protobuf.Duration duration = 7; // Optional
   string details = 8; // Required
   ConfiguredTargetLabel target_label = 9;
+  optional uint64 max_memory_used_bytes = 10;
 }
 
 // At the beginning of discovery, the test orchestrator will advertise
@@ -665,6 +870,9 @@ message CommandStart {
     TraceIoCommandStart trace = 37;
     ConfiguredTargetsCommandStart ctargets = 38;
     StarlarkDebugAttachCommandStart starlark_debug_attach = 39;
+    ExplainCommandStart explain = 40;
+    ExpandExternalCellsCommandStart expand_external_cell = 41;
+    CompleteCommandStart complete = 42;
   }
 }
 
@@ -718,6 +926,8 @@ message TestCommandStart {}
 
 message DocsCommandStart {}
 
+message ExplainCommandStart {}
+
 message CleanCommandStart {}
 
 message InstallCommandStart {}
@@ -727,6 +937,10 @@ message MaterializeCommandStart {}
 message FileStatusCommandStart {}
 
 message ProfileCommandStart {}
+
+message ExpandExternalCellsCommandStart {}
+
+message CompleteCommandStart {}
 
 message CommandEnd {
   reserved 3;
@@ -751,6 +965,9 @@ message CommandEnd {
     TraceIoCommandEnd trace = 37;
     ConfiguredTargetsCommandEnd ctargets = 38;
     StarlarkDebugAttachCommandEnd starlark_debug_attach = 39;
+    ExplainCommandEnd explain = 40;
+    ExpandExternalCellsCommandEnd expand_external_cell = 41;
+    CompleteCommandEnd complete = 42;
   }
 
   bool is_success = 2;
@@ -808,20 +1025,44 @@ message TestCommandEnd {
 
 message DocsCommandEnd {}
 
+message ExplainCommandEnd {}
+
 message CleanCommandEnd {
   optional CleanStaleStats clean_stale_stats = 1;
 }
 
 message CleanStaleStats {
+  reserved 7;
   uint64 stale_artifact_count = 1;
   uint64 stale_bytes = 2;
   uint64 retained_artifact_count = 3;
   uint64 retained_bytes = 4;
   uint64 untracked_artifact_count = 5;
   uint64 untracked_bytes = 6;
-  uint64 cleaned_path_count = 7;
   uint64 cleaned_artifact_count = 8;
   uint64 cleaned_bytes = 9;
+  uint64 total_duration_s = 10;
+  uint64 scan_duration_s = 11;
+  uint64 clean_duration_s = 12;
+}
+
+enum CleanStaleResultKind {
+  FINISHED = 0;
+  INTERRUPTED = 1;
+  FAILED = 2;
+  SKIPPED_DRY_RUN = 3;
+  SKIPPED_NO_GEN_DIR = 4;
+  SKIPPED_DEFER_WRITE_DISABLED = 5;
+  SKIPPED_SQLITE_DISABLED = 6;
+}
+
+message CleanStaleResult {
+  map<string, string> metadata = 1;
+  CleanStaleResultKind kind = 2;
+  optional ErrorReport error = 3;
+  CleanStaleStats stats = 4;
+  // Set if clean stale is invoked as a command
+  optional string command_uuid = 5;
 }
 
 message InstallCommandEnd {
@@ -833,6 +1074,10 @@ message MaterializeCommandEnd {}
 message FileStatusCommandEnd {}
 
 message ProfileCommandEnd {}
+
+message ExpandExternalCellsCommandEnd {}
+
+message CompleteCommandEnd {}
 
 message LoadPackageStart {
   string path = 1;
@@ -854,7 +1099,11 @@ message LoadBuildFileEnd {
   optional string error = 3;
   // Peak allocated memory in starlark mutable heap during evaluation of BUCK
   // file.
-  uint64 starlark_peak_allocated_bytes = 4;
+  optional uint64 starlark_peak_allocated_bytes = 4;
+  // Number of CPU instructions during evaluation of BUCK file.
+  optional uint64 cpu_instruction_count = 5;
+  // Number of targets
+  optional uint64 target_count = 6;
 }
 
 message SharedTaskStart {
@@ -920,6 +1169,8 @@ enum ActionExecutionKind {
   // This action was served by a remote execution service's action cache based
   // on a dep file based key.
   ACTION_EXECUTION_KIND_REMOTE_DEP_FILE_CACHE = 9;
+  // This action was served via a local action cache
+  ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE = 10;
 }
 
 // A name for a particular action, suitable for offline analytics and user
@@ -966,6 +1217,7 @@ message CommandExecutionDetails {
 
   CommandExecutionKind command_kind = 5;
   CommandExecutionMetadata metadata = 13;
+  optional string additional_message = 14;
 }
 
 message CommandExecutionKind {
@@ -1029,6 +1281,8 @@ message CommandExecution {
 
   message Failure {}
 
+  message WorkerFailure {}
+
   message Timeout {
     google.protobuf.Duration duration = 1;
   }
@@ -1052,6 +1306,7 @@ message CommandExecution {
     Timeout timeout = 4;
     Error error = 5;
     Cancelled cancelled = 7;
+    WorkerFailure worker_failure = 8;
   }
 }
 
@@ -1148,6 +1403,20 @@ message ActionExecutionEnd {
 
   // Additional diagnostics, if an action error handler was provided
   optional ActionErrorDiagnostics error_diagnostics = 38;
+
+  optional uint64 input_files_bytes = 39;
+
+  optional CommandInvalidationInfo invalidation_info = 40;
+
+  // Name of the rule type that was executed by this action
+  optional string target_rule_type_name = 41;
+}
+
+message CommandInvalidationInfo {
+  message InvalidationSource {}
+
+  optional InvalidationSource changed_any = 1;
+  optional InvalidationSource changed_file = 2;
 }
 
 message ActionError {
@@ -1249,6 +1518,7 @@ message AnalysisStart {
   oneof target {
     ConfiguredTargetLabel standard_target = 1;
     AnonTarget anon_target = 3;
+    DynamicLambdaOwner dynamic_lambda = 4;
   }
   string rule = 2;
 }
@@ -1257,19 +1527,28 @@ message AnalysisEnd {
   oneof target {
     ConfiguredTargetLabel standard_target = 1;
     AnonTarget anon_target = 4;
+    DynamicLambdaOwner dynamic_lambda = 5;
   }
   string rule = 3;
   AnalysisProfile profile = 2;
+  optional uint64 declared_actions = 6;
+  optional uint64 declared_artifacts = 7;
 }
 
 message AnalysisStageStart {
+  reserved 1;
   oneof stage {
-    google.protobuf.Empty resolve_queries = 1;
     google.protobuf.Empty evaluate_rule = 2;
   }
 }
 
 message AnalysisStageEnd {}
+
+message AnalysisResolveQueriesStart {
+  ConfiguredTargetLabel standard_target = 1;
+}
+
+message AnalysisResolveQueriesEnd {}
 
 message ExecutorStageStart {
   oneof stage {
@@ -1296,6 +1575,7 @@ message CacheQuery {
 message CacheHit {
   string action_digest = 1;
   optional string action_key = 3;
+  CacheType cache_type = 4;
 }
 
 message ReStage {
@@ -1309,6 +1589,8 @@ message ReStage {
     ReWorkerUpload worker_upload = 9;
     ReUnknown unknown = 10;
     MaterializeFailedInputs materialize_failed_inputs = 11;
+    ReBeforeAction before_action_execution = 12;
+    ReAfterAction after_action_execution = 13;
   }
 }
 
@@ -1318,6 +1600,7 @@ message ReExecute {
   string action_digest = 1;
   RePlatform platform = 2;
   optional string action_key = 3;
+  string use_case = 4;
 }
 
 message RePlatform {
@@ -1332,17 +1615,28 @@ message ReDownload {}
 
 message ReQueue {
   string action_digest = 1;
+  string use_case = 2;
 }
 
 message ReWorkerDownload {
   string action_digest = 1;
+  string use_case = 2;
 }
 
 message ReWorkerUpload {
   string action_digest = 1;
+  string use_case = 2;
 }
 
 message ReUnknown {
+  string action_digest = 1;
+}
+
+message ReBeforeAction {
+  string action_digest = 1;
+}
+
+message ReAfterAction {
   string action_digest = 1;
 }
 
@@ -1404,6 +1698,7 @@ message TestDiscoveryStart {
 message TestDiscoveryEnd {
   string suite_name = 1;
   CommandExecution command_report = 2;
+  bool re_cache_enabled = 3;
 }
 
 message TestRunStart {
@@ -1423,8 +1718,8 @@ enum FileWatcherProvider {
   WATCHMAN = 0;
   // The Rust `notify` crate
   RUST_NOTIFY = 1;
-
   FS_HASH_CRAWLER = 2;
+  EDEN_FS = 3;
 }
 
 enum FileWatcherEventType {
@@ -1464,6 +1759,8 @@ message FileWatcherStats {
   // Present on a fresh instance. This is a bit duplicative of field 1
   // (`fresh_instance`), but we keep that for backwards compatibility.
   optional FreshInstance fresh_instance_data = 9;
+  // Timestamp in seconds of the 'Branched From Revision' commit
+  optional uint64 branched_from_revision_timestamp = 11;
 }
 
 message FreshInstance {
@@ -1518,6 +1815,17 @@ message Configuration {
   string full_name = 2;
 }
 
+message Constraint {
+  string setting = 1;
+  string value = 2;
+}
+
+// A configuration with all the constraints associated with it.
+message ConfigurationWithConstraints {
+  string full_name = 1;
+  repeated Constraint constraint = 2;
+}
+
 // A target label, consisting of a package and a name.
 message TargetLabel {
   string package = 1;
@@ -1530,7 +1838,7 @@ message BuildArtifact {
 }
 
 // A target pattern, representing a set of targets. See
-// `<https://buck.build/concept/build_target_pattern.html#content>` for Buck's
+// `<https://buck2.build/docs/concepts/target_pattern>` for Buck's
 // documentation on target patterns.
 message TargetPattern {
   string value = 1;
@@ -1603,9 +1911,12 @@ message RemoteCommand {
   optional string remote_dep_file_key = 6;
 
   // Project relative paths to the materialized inputs for failed
-
   // actions, if `--materialize-failed-inputs` was passed to build options
   repeated string materialized_inputs_for_failed = 7;
+
+  // Project relative paths to the materialized outputs for failed actions, if
+  // `--unstable_materialize_failed_action_outputs` was passed to build options
+  repeated string materialized_outputs_for_failed_actions = 8;
 }
 
 message RemoteCommandDetails {
@@ -1648,10 +1959,28 @@ message TypedMetadata {
   map<string, string> strings = 2;
 }
 
+// Why current command started buckd.
+enum DaemonWasStartedReason {
+  UNKNOWN_REASON = 0;
+  CONSTRAINT_MISMATCH_VERSION = 1;
+  CONSTRAINT_MISMATCH_USER_VERSION = 2;
+  CONSTRAINT_MISMATCH_STARTUP_CONFIG = 3;
+  CONSTRAINT_REJECT_DAEMON_ID = 4;
+  CONSTRAINT_MISMATCH_TRACE_IO = 5;
+  CONSTRAINT_MISMATCH_MATERIALIZER_STATE_IDENTITY = 6;
+  COULD_NOT_CONNECT_TO_DAEMON = 11;
+  TIMED_OUT_CONNECTING_TO_DAEMON = 12;
+  TIMEOUT_CALCULATION_ERROR = 13;
+  NO_BUCKD_INFO = 14;
+  COULD_NOT_LOAD_BUCKD_INFO = 15;
+  // `buckd.info` exists, but buckd is not running.
+  NO_DAEMON_PROCESS = 16;
+}
+
 // This is the origin for every sample in buck2_builds scuba table
 // It's sent from the client to Scribe at the end of each invocation
 message InvocationRecord {
-  reserved 1, 22, 27, 28, 36, 61, 62, 66, 77;
+  reserved 1, 22, 27, 28, 36, 61, 62, 66, 77, 88, 89;
 
   // Optional - present if ever sent to client.
   // Will be missing on a cancelled build.
@@ -1690,7 +2019,8 @@ message InvocationRecord {
   // If any, the name of the RE experiment config that was used by the RE
   // client in this build.
   string re_experiment_name = 23;
-  // Minimum build count among the targets that were involved in the command
+  // Minimum successful builds among the build counts for each target
+  // involved in the command.
   uint64 min_build_count_since_rebase = 24;
   // The number of cache uploads done by this build.
   uint64 cache_upload_count = 25;
@@ -1731,6 +2061,8 @@ message InvocationRecord {
   optional uint64 system_total_memory_bytes = 46;
   // Information of file changes provided by file watcher
   FileWatcherStats file_watcher_stats = 47;
+  // How long did we spend querying the file watcher
+  optional uint64 file_watcher_duration_ms = 83;
   // Time elapsed from a build's start until the last action ends execution.
   optional uint64 time_to_last_action_execution_end_ms = 48;
   // Isolation directory.
@@ -1741,12 +2073,13 @@ message InvocationRecord {
   optional uint64 sink_success_count = 51;
   optional uint64 sink_failure_count = 52;
   optional uint64 sink_dropped_count = 53;
+  optional uint64 sink_bytes_written = 101;
   optional uint64 sink_max_buffer_depth = 54;
   // Version number of watchman
   optional string watchman_version = 55;
   optional string command_name = 56;
   // Any soft errors we hit during this invocation.
-  repeated string soft_error_categories = 57;
+  repeated SoftError soft_error_categories = 57;
   // Version number of EdenFS if mount is EdenFS
   optional string eden_version = 58;
   // Duration of when the concurrent command is blocking
@@ -1769,21 +2102,122 @@ message InvocationRecord {
   repeated string concurrent_command_ids = 74;
   // The client has failed to connect to the daemon.
   optional bool daemon_connection_failure = 75;
+  // Daemon was started by this command.
+  // Unset if the the command connected to existing daemon or did not start one.
+  optional DaemonWasStartedReason daemon_was_started = 751;
   // Metadata provided by the client. Unlike TypedMetadata, this won't become
   // its own column in Scuba, all those entries will land in a NormVector.
   repeated ClientMetadata client_metadata = 76;
   // The errors that occured during the command.
   repeated ProcessedErrorReport errors = 79;
+  // The most interesting error tag that occurred during the command.
+  // Uppercase of `ErrorTag` enum variant, e.g. `STARLARK_FAIL`.
+  optional string best_error_tag = 82;
   // Cache hit rate as it appears in the console
   float cache_hit_rate = 78;
   repeated string target_rule_type_names = 80;
   // Time elapsed from a build's start until first test discovery begins.
   optional uint64 time_to_first_test_discovery_ms = 81;
+  // Tracks whether buckconfigs were invalidated between invocations (e.g. due
+  // to modefile changes or another buck command in between)
+  // For the first command after daemon start or for the first time these
+  // configs are observed in each state (cell, command etc.), it will be set
+  // to true.
+  optional bool new_configs_used = 84;
+  // Max sustained RE download speed
+  optional uint64 re_max_download_speed = 85;
+  // Max sustained RE upload speed
+  optional uint64 re_max_upload_speed = 91;
+  // Optional - for install commands, the time elapsed between the last
+  // materialization event and the last install event.
+  google.protobuf.Duration install_duration = 86;
+  // Peak process memory which is max of RSS and malloc-active bytes
+  optional uint64 peak_process_memory_bytes = 87;
+  optional uint64 event_log_manifold_ttl_s = 90;
+  optional uint64 peak_used_disk_space_bytes = 92;
+  optional uint64 total_disk_space_bytes = 93;
+  // Average RE download speed
+  optional uint64 re_avg_download_speed = 94;
+  // Average RE upload speed
+  optional uint64 re_avg_upload_speed = 95;
+  // The number of dep file uploads done by this build.
+  uint64 dep_file_upload_count = 96;
+  // The number of dep file uploads attempted by this build.
+  uint64 dep_file_upload_attempt_count = 97;
+  // Minimum attempted builds among the build counts for each target
+  // involved in the command.
+  uint64 min_attempted_build_count_since_rebase = 98;
+  // Metadata about devices installed to by an install command.
+  repeated DeviceMetadata install_device_metadata = 99;
+  // The category key for the error with best error tag.
+  optional string best_error_category_key = 100;
+  // The list of active network devices
+  repeated NetworkKind active_networks_kinds = 102;
+  // Configuration used during the build command.
+  optional TargetCfg target_cfg = 103;
+  // Source code revision where invocation happened
+  optional VersionControlRevision version_control_revision = 104;
+
+  // A subset of the expanded argv containing config flags. When a config flag
+  // is from an argfile in the project, it will be represented with the argfile
+  // rather than the raw config flag. The flags and argfiles here will be in a
+  // normalized form.
+  repeated string representative_config_flags = 105;
+
+  // Detailed per-backend RE stats.
+  optional uint64 zdb_download_queries = 200;
+  optional uint64 zdb_download_bytes = 201;
+  optional uint64 zdb_upload_queries = 202;
+  optional uint64 zdb_upload_bytes = 203;
+
+  optional uint64 zgateway_download_queries = 210;
+  optional uint64 zgateway_download_bytes = 211;
+  optional uint64 zgateway_upload_queries = 212;
+  optional uint64 zgateway_upload_bytes = 213;
+
+  optional uint64 manifold_download_queries = 220;
+  optional uint64 manifold_download_bytes = 221;
+  optional uint64 manifold_upload_queries = 222;
+  optional uint64 manifold_upload_bytes = 223;
+
+  optional uint64 hedwig_download_queries = 230;
+  optional uint64 hedwig_download_bytes = 231;
+  optional uint64 hedwig_upload_queries = 232;
+  optional uint64 hedwig_upload_bytes = 233;
+
+  // If `errors` is not empty, the category of the error
+  // assumed to have triggered the command failure.
+  optional string error_category = 234;
+
+  // Larger subsystem where the best error originated, derived from best_tag.
+  optional string best_error_source_area = 235;
+
+  // Local cache hits and misses stats
+  optional int64 local_cache_hits_files = 236;
+  optional int64 local_cache_hits_bytes = 237;
+  optional int64 local_cache_misses_files = 238;
+  optional int64 local_cache_misses_bytes = 239;
+
+  // Total number of files materialized.
+  optional uint64 materialization_files = 240;
+  // How many loads were executed
+  optional uint64 load_count = 241;
+  // Time elapsed from a build's start until first test run begins.
+  optional uint64 time_to_first_test_run_ms = 242;
+
+  // UUID of the previous command stored only if external configs are different
+  optional string previous_uuid_with_mismatched_config = 243;
+  optional string file_watcher = 244;
 }
 
 // Record event sent directly to scribe.
 message BuildGraphStats {
   repeated BuildTarget build_targets = 1;
+}
+
+message SoftError {
+  string category = 1;
+  bool is_quiet = 2;
 }
 
 message BuildTarget {
@@ -1799,25 +2233,18 @@ message ClientMetadata {
   string value = 2;
 }
 
-enum CacheUploadReason {
-  // The action was executed locally
-  LOCAL_EXECUTION = 0;
-  // The action has dep files that can be cached
-  DEP_FILE = 1;
-}
-
 message CacheUploadStart {
+  reserved 4;
   // A unique key identifying this action within the build.
   ActionKey key = 1;
   // A pair of category and identifier describing this action.
   ActionName name = 2;
   // The digest of the action being uploaded.
   string action_digest = 3;
-  // Reason for why this upload took place
-  CacheUploadReason reason = 4;
 }
 
 message CacheUploadEnd {
+  reserved 10;
   // A unique key identifying this action within the build.
   ActionKey key = 1;
   // A pair of category and identifier describing this action.
@@ -1836,8 +2263,31 @@ message CacheUploadEnd {
   optional uint64 output_bytes = 8;
   // If a RE error occurred, the error code.
   optional string re_error_code = 9;
-  // Reason for why this upload took place
-  CacheUploadReason reason = 10;
+}
+
+message DepFileUploadStart {
+  // A unique key identifying this action within the build.
+  ActionKey key = 1;
+  // A pair of category and identifier describing this action.
+  ActionName name = 2;
+  // The dep file key, or digest of the dep file action
+  string remote_dep_file_key = 3;
+}
+
+message DepFileUploadEnd {
+  // A unique key identifying this action within the build.
+  ActionKey key = 1;
+  // A pair of category and identifier describing this action.
+  ActionName name = 2;
+  // The dep file key, or digest of the dep file action
+  string remote_dep_file_key = 3;
+  // Whether the upload was actually completed. This may be false if it wasn't
+  // representable in RE, or if an error occurred.
+  bool success = 4;
+  // An error, if any occurred.
+  string error = 5;
+  // If a RE error occurred, the error code.
+  optional string re_error_code = 9;
 }
 
 message CreateOutputSymlinksStart {};
@@ -1845,10 +2295,6 @@ message CreateOutputSymlinksStart {};
 message CreateOutputSymlinksEnd {
   uint64 created = 1;
 };
-
-message CreateOutputHashesFileStart {};
-
-message CreateOutputHashesFileEnd {};
 
 message InstallEventInfoStart {
   string artifact_name = 1;
@@ -1941,8 +2387,7 @@ message DiceEqualityCheck {
 message NoActiveDiceState {}
 
 message ErrorReport {
-  optional buck.data.error.ErrorCategory category = 1;
-  optional buck.data.error.ErrorType typ = 2;
+  reserved 1, 2;
   // The error message that is shown to users on the CLI
   string message = 3;
   // If different from `message`, the error messsage that is shown to the
@@ -1955,19 +2400,39 @@ message ErrorReport {
   // source file, but the exact format is not guaranteed.
   optional string source_location = 5;
   repeated buck.data.error.ErrorTag tags = 6;
+  repeated string sub_error_categories = 7;
+  optional string category_key = 8;
 }
 
-// Identical to `ErrorReport`, but with the typ and tags converted to strings.
+// Identical to `ErrorReport`, but with the tags converted to strings.
 // This makes it easy to change those enums without having to worry about uses
 // of this protobuf definition outside of buck2. Currently used in the
 // invocation record and nowhere else.
 message ProcessedErrorReport {
-  optional buck.data.error.ErrorCategory category = 1;
-  optional string typ = 2;
+  reserved 2;
+  optional buck.data.error.ErrorTier tier = 1;
   string message = 3;
   optional string telemetry_message = 4;
   optional string source_location = 5;
   repeated string tags = 6;
+  // `buck2_error` crate has logic of selecting the most interesting error tag
+  // among all error tags. This is such tag.
+  optional string best_tag = 7;
+  repeated string sub_error_categories = 8;
+  optional string category_key = 9;
+  optional string category = 10;
+  optional string source_area = 11;
+}
+
+message CommandReport {
+  // A globally-unique ID (UUIDv4) to ensure it's for the right command.
+  string trace_id = 1;
+  // Command ExitCode
+  uint32 exit_code = 2;
+  // List of error messages seen during the command execution
+  repeated string error_messages = 3;
+  // Error messages produced while finalizing event logging.
+  repeated string finalizing_error_messages = 4;
 }
 
 message MaterializerStateInfo {
@@ -1983,8 +2448,14 @@ message ConcurrentCommands {
   repeated string trace_ids = 1;
 }
 
-message PersistSubprocess {
-  repeated string errors = 1;
+message PersistEventLogSubprocess {
+  repeated string local_error_messages = 1;
+  optional string local_error_category = 2;
+  bool local_success = 3;
+  repeated string remote_error_messages = 4;
+  optional string remote_error_category = 5;
+  bool remote_success = 6;
+  map<string, string> metadata = 8;
 }
 
 message StarlarkFailNoStacktrace {
@@ -2026,6 +2497,14 @@ message DynamicLambdaStart {
   }
 }
 
+message DynamicLambdaOwner {
+  oneof owner {
+    ConfiguredTargetLabel target_label = 1;
+    BxlFunctionKey bxl_key = 2;
+    AnonTarget anon_target = 3;
+  }
+}
+
 message DeferredEvaluationEnd {}
 
 // Wraps the RE upload stage of execution to report useful data on network
@@ -2034,9 +2513,15 @@ message DeferredEvaluationEnd {}
 // dedicated spans.
 message ReUploadStart {}
 
+message ReUploadMetrics {
+  uint64 digests_uploaded = 1;
+  uint64 bytes_uploaded = 2;
+}
+
 message ReUploadEnd {
   optional uint64 digests_uploaded = 1;
   optional uint64 bytes_uploaded = 2;
+  map<string, ReUploadMetrics> stats_by_extension = 3;
 }
 
 message ConnectToInstallerStart {
@@ -2044,6 +2529,29 @@ message ConnectToInstallerStart {
 }
 
 message ConnectToInstallerEnd {}
+
+message DeviceMetadata {
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+  repeated Entry entry = 1;
+}
+
+message InstallFinished {
+  google.protobuf.Duration duration = 1;
+  repeated DeviceMetadata device_metadata = 2;
+}
+
+message SystemInfo {
+  optional uint64 system_total_memory_bytes = 1;
+  optional uint64 memory_pressure_threshold_percent = 2;
+  optional uint64 total_disk_space_bytes = 3;
+  optional uint64 remaining_disk_space_threshold_gb = 4;
+  optional uint64 min_re_download_bytes_threshold = 5;
+  optional uint64 avg_re_download_bytes_per_sec_threshold = 6;
+  optional string optin_vpn_check_targets_regex = 8;
+}
 
 message CpuCounter {
   uint64 count = 1;
@@ -2056,11 +2564,19 @@ message CommandExecutionStats {
   optional uint64 cpu_instructions_kernel = 2;
   optional CpuCounter userspace_events = 3;
   optional CpuCounter kernel_events = 4;
+  optional uint64 memory_peak = 5;
+}
+
+enum NetworkKind {
+  WI_FI = 0;
+  ETHERNET = 1;
+  UNKNOWN_NET_KIND = 2;
 }
 
 message NetworkInterfaceStats {
   uint64 tx_bytes = 1;
   uint64 rx_bytes = 2;
+  NetworkKind network_kind = 3;
 }
 
 message TraceIoCommandStart {}
@@ -2079,4 +2595,29 @@ message ReleaseLocalResourcesEnd {}
 
 message RestartConfiguration {
   bool enable_restarter = 1;
+}
+
+// Events capturing commands to the deferred materializer.
+// Currently only enabled with `-c buck2.verbose_materializer_event_log=true`.
+// Events are reported by the command processor, so they are logged
+// when they are processed by the materializer, not when they are sent
+// to the materializer
+message MaterializerCommand {
+  message Declare {
+    string path = 1;
+  }
+
+  message Ensure {
+    repeated string paths = 1;
+  }
+
+  message InvalidateFilePaths {
+    repeated string paths = 1;
+  }
+
+  oneof data {
+    Declare declare = 1;
+    Ensure ensure = 2;
+    InvalidateFilePaths invalidate_file_paths = 3;
+  }
 }

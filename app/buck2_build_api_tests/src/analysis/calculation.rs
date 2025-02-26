@@ -12,33 +12,30 @@ use std::sync::Arc;
 
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
-use buck2_build_api::deferred::types::testing::DeferredAnalysisResultExt;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::default_info::DefaultInfoCallable;
 use buck2_build_api::interpreter::rule_defs::provider::callable::register_provider;
 use buck2_build_api::interpreter::rule_defs::provider::registration::register_builtin_providers;
 use buck2_build_api::keep_going::HasKeepGoing;
 use buck2_build_api::spawner::BuckSpawner;
 use buck2_common::dice::data::testing::SetTestingIoProvider;
-use buck2_common::legacy_configs::LegacyBuckConfig;
-use buck2_common::legacy_configs::LegacyBuckConfigs;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::package_listing::listing::testing::PackageListingExt;
 use buck2_common::package_listing::listing::PackageListing;
-use buck2_configured::configuration::calculation::ExecutionPlatformsKey;
+use buck2_configured::execution::ExecutionPlatformsKey;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
-use buck2_core::cells::alias::NonEmptyCellAlias;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::CellAliasResolver;
-use buck2_core::cells::CellsAggregator;
+use buck2_core::cells::CellResolver;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::fs::project::ProjectRootTemp;
-use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::package::PackageLabel;
 use buck2_core::provider::id::testing::ProviderIdExt;
 use buck2_core::provider::id::ProviderId;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::SetDigestConfig;
@@ -47,7 +44,6 @@ use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::file_loader::LoadedModules;
 use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
-use buck2_interpreter_for_build::attrs::attrs_global::register_attrs;
 use buck2_interpreter_for_build::interpreter::calculation::InterpreterResultsKey;
 use buck2_interpreter_for_build::interpreter::configuror::BuildInterpreterConfiguror;
 use buck2_interpreter_for_build::interpreter::dice_calculation_delegate::testing::EvalImportKey;
@@ -59,41 +55,29 @@ use dice::UserComputationData;
 use dupe::Dupe;
 use indoc::indoc;
 use itertools::Itertools;
-use maplit::hashmap;
 use starlark_map::ordered_map::OrderedMap;
 
 #[tokio::test]
 async fn test_analysis_calculation() -> anyhow::Result<()> {
     let bzlfile = ImportPath::testing_new("cell//pkg:foo.bzl");
-    let resolver = {
-        let mut cells = CellsAggregator::new();
-        cells.add_cell_entry(
-            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".to_owned())),
-            NonEmptyCellAlias::new("root".to_owned()).unwrap(),
-            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("".to_owned())),
-        )?;
-        cells.add_cell_entry(
-            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".to_owned())),
-            NonEmptyCellAlias::new("cell".to_owned()).unwrap(),
-            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".to_owned())),
-        )?;
-        cells.make_cell_resolver()?
-    };
-    let configs = LegacyBuckConfigs::new(hashmap![
-        CellName::testing_new("root") =>
-        LegacyBuckConfig::empty(),
-        CellName::testing_new("cell") =>
-        LegacyBuckConfig::empty(),
+    let resolver = CellResolver::testing_with_names_and_paths(&[
+        (
+            CellName::testing_new("root"),
+            CellRootPathBuf::testing_new(""),
+        ),
+        (
+            CellName::testing_new("cell"),
+            CellRootPathBuf::testing_new("cell"),
+        ),
     ]);
     let mut interpreter = Tester::with_cells((
         CellAliasResolver::new(CellName::testing_new("cell"), HashMap::new())?,
         resolver.dupe(),
-        configs.dupe(),
+        LegacyBuckConfig::empty(),
     ))?;
     interpreter.additional_globals(register_rule_function);
     interpreter.additional_globals(register_provider);
     interpreter.additional_globals(register_builtin_providers);
-    interpreter.additional_globals(register_attrs);
     let module = interpreter
         .eval_import(
             &bzlfile,
@@ -177,15 +161,11 @@ async fn test_analysis_calculation() -> anyhow::Result<()> {
             None,
             false,
             false,
-            |_| {},
-            |_| {},
-            |_| {},
-            |_| {},
             None,
+            Arc::new(ConcurrentTargetLabelInterner::default()),
         )?,
-        configs,
     )?;
-    let dice = dice.commit().await;
+    let mut dice = dice.commit().await;
 
     let analysis = dice
         .get_analysis_result(
@@ -195,12 +175,13 @@ async fn test_analysis_calculation() -> anyhow::Result<()> {
         .await?
         .require_compatible()?;
 
-    assert_eq!(analysis.testing_deferred().get_registered().len(), 0);
+    assert_eq!(analysis.analysis_values().iter_actions().count(), 0);
 
     assert_eq!(
         analysis
             .providers()
-            .provider_collection()
+            .unwrap()
+            .value()
             .provider_names()
             .iter()
             .sorted()
@@ -211,7 +192,8 @@ async fn test_analysis_calculation() -> anyhow::Result<()> {
     assert_eq!(
         analysis
             .providers()
-            .provider_collection()
+            .unwrap()
+            .value()
             .get_provider_raw(&ProviderId::testing_new(bzlfile.path().clone(), "FooInfo"))
             .is_some(),
         true
@@ -219,7 +201,8 @@ async fn test_analysis_calculation() -> anyhow::Result<()> {
     assert_eq!(
         analysis
             .providers()
-            .provider_collection()
+            .unwrap()
+            .value()
             .get_provider_raw(DefaultInfoCallable::provider_id())
             .is_some(),
         true

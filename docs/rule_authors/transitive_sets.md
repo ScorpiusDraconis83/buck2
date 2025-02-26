@@ -3,6 +3,8 @@ id: transitive_sets
 title: Transitive Sets
 ---
 
+import { FbInternalOnly } from 'docusaurus-plugin-internaldocs-fb/internal';
+
 Transitive sets enable the propagation of data up dependency trees in a manner
 that is both efficient in Starlark code (low cost of creation, low memory usage)
 and efficient for execution by Buck (edges can be shared instead of having each
@@ -19,7 +21,7 @@ Examples of where transitive sets are useful include:
 First, you need to declare your transitive set type, then you can use it, as
 follows:
 
-```starlark
+```python
 # This is the type
 MySet = transitive_set()
 
@@ -50,7 +52,7 @@ list of all the node's individual projected values.
 
 Following is an example:
 
-```starlark
+```python
 # Declare the projection
 def project_as_define(value: str):
   return cmd_args(value, format = "-D{}")
@@ -85,7 +87,7 @@ the node's individual projected values.
 
 Following is an example:
 
-```starlark
+```python
 # Declare the projection
 def project_as_json(value: str):
   return struct(key = "foo", value = value)
@@ -126,7 +128,7 @@ flowchart TD
   qux --> bar
 ```
 
-```starlark
+```python
 set1 = ctx.actions.tset(MySet, value = "foo")
 set2 = ctx.actions.tset(MySet, value = "bar", children = [set1])
 set3 = ctx.actions.tset(MySet, value = "qux", children = [set1, set2])
@@ -151,8 +153,8 @@ and an optional value for the current node (the value will be `None` when you
 create a set and you don't pass a `value`), and you need to merge them together
 to produce this node's value:
 
-```starlark
-def link_info_has_default_filelist(children: ["bool"], infos: ["LinkInfos", None]):
+```python
+def link_info_has_default_filelist(children: list[bool], infos: LinkInfos | None):
     if infos:
         info = infos.default
         if info.filelist:
@@ -181,7 +183,7 @@ in doing so you'll lose a lot of the performance benefits.
 
 For example:
 
-```starlark
+```python
 set1 = ctx.actions.tset(MySet, value = "foo")
 set2 = ctx.actions.tset(MySet, value = "bar", children = [set1])
 set3 = ctx.actions.tset(MySet, value = "qux", children = [set1, set2])
@@ -208,7 +210,7 @@ A few different traversal orders are supported with the `ordering` attribute:
 
 For example:
 
-```starlark src=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs
+```python src=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs
 set1 = ctx.actions.tset(MySet, value = "foo")
 set2 = ctx.actions.tset(MySet, value = "bar", children = [set1])
 set3 = ctx.actions.tset(MySet, value = "qux", children = [set1, set2])
@@ -242,7 +244,7 @@ flowchart TD
 
 This is verified by the test:
 
-```starlark src=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs title=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs
+```python src=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs title=fbcode/buck2/app/buck2_build_api_tests/src/interpreter/transitive_set/tests.rs
 # Test all orderings which show up in the table.
 assert_eq(list(set3.traverse()), ["qux", "foo", "bar"])
 assert_eq(list(set3.traverse(ordering = "preorder")), ["qux", "foo", "bar"])
@@ -255,8 +257,15 @@ assert_eq(list(set3.traverse(ordering = "bfs")), ["qux", "foo", "bar"])
 
 ## Implementation details
 
-### Projection evaluation
+### Performance
 
-Projections are evaluated eagerly for each node of your transitive set. This
-means that if your projection throws an error, you'll find out when creating a
-set via `ctx.actions.tset`.
+The performance benefits of tsets arise due to:
+
+- **Caching**: projections and reductions are cached.
+- **Lazy Evaluation**: projection traversals are evaluated lazily.
+
+### Evaluation
+
+Projections and reductions are evaluated eagerly for each node of your
+transitive set. This means that if your projection throws an error, you'll find
+out when creating a set via `ctx.actions.tset`.

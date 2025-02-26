@@ -8,7 +8,6 @@
  */
 
 use buck2_core::soft_error;
-use thiserror::Error;
 
 #[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize)]
 pub struct CommonAttributeArgs {
@@ -45,12 +44,12 @@ pub struct CommonAttributeArgs {
          long,
          group = "output_attribute_flags",
          value_name = "ATTRIBUTE",
-         // without limiting number_of_values, clap will read all space-separated values
+         // without limiting num_args, clap will read all space-separated values
          // after the flag, we want to require that each value be preceded individually by the flag.
-         number_of_values = 1,
+         num_args = 1,
          // If the output_all_attributes flag (-A) is set, use "" to select all
-         default_value_if("output_all_attributes", None, Some("")),
-         default_value_if("output_basic_attributes", None, Some("^(buck\\.package|buck\\.type|[^\\.]*)$")),
+         default_value_if("output_all_attributes", "true", Some("")),
+         default_value_if("output_basic_attributes", "true", Some("^(buck\\.package|buck\\.type|[^\\.]*)$")),
      )]
     output_attribute: Vec<String>,
 
@@ -59,14 +58,15 @@ pub struct CommonAttributeArgs {
     /// List of space-separated attributes to output, --output-attributes attr1 attr2.
     #[clap(
         long,
-        multiple_values = true,
+        num_args = 1..,
         value_name = "ATTRIBUTE",
         group = "output_attribute_flags"
     )]
     output_attributes: Vec<String>,
 }
 
-#[derive(Error, Debug)]
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum ArgErrors {
     #[error("`--output-attributes` is deprecated, use `--output-attribute` instead")]
     OutputAttributesDeprecated,
@@ -77,11 +77,12 @@ enum ArgErrors {
 }
 
 impl CommonAttributeArgs {
-    pub fn get(&self) -> anyhow::Result<Vec<String>> {
+    pub fn get(&self) -> buck2_error::Result<Vec<String>> {
         if !self.output_attributes.is_empty() {
             soft_error!(
                 "output_attributes",
-                ArgErrors::OutputAttributesDeprecated.into()
+                ArgErrors::OutputAttributesDeprecated.into(),
+                deprecation: true,
             )?;
         }
 

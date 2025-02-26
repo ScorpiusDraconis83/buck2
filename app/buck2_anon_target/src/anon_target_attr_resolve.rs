@@ -17,23 +17,23 @@ use buck2_analysis::attrs::resolve::attr_type::dep::DepAttrTypeExt;
 use buck2_analysis::attrs::resolve::ctx::AttrResolutionContext;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
+use buck2_build_api::anon_target::AnonTargetDependentAnalysisResults;
 use buck2_build_api::artifact_groups::promise::PromiseArtifact;
+use buck2_build_api::artifact_groups::promise::PromiseArtifactAttr;
 use buck2_build_api::artifact_groups::promise::PromiseArtifactResolveError;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkArtifact;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkPromiseArtifact;
-use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
-use buck2_build_api::keep_going;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_promise_artifact::StarlarkPromiseArtifact;
+use buck2_build_api::keep_going::KeepGoing;
 use buck2_core::package::PackageLabel;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_interpreter::error::BuckStarlarkError;
 use buck2_interpreter::types::configured_providers_label::StarlarkProvidersLabel;
 use buck2_node::attrs::attr_type::dep::DepAttrType;
 use buck2_node::attrs::attr_type::query::ResolvedQueryLiterals;
 use buck2_node::attrs::configured_traversal::ConfiguredAttrTraversal;
 use dice::DiceComputations;
 use dupe::Dupe;
-use futures::stream::FuturesUnordered;
+use futures::FutureExt;
 use starlark::values::dict::Dict;
 use starlark::values::tuple::AllocTuple;
 use starlark::values::Value;
@@ -43,7 +43,6 @@ use crate::anon_target_attr::AnonTargetAttr;
 use crate::anon_targets::get_artifact_from_anon_target_analysis;
 use crate::anon_targets::AnonTargetKey;
 use crate::anon_targets::AnonTargetsError;
-use crate::promise_artifacts::PromiseArtifactAttr;
 
 // No macros in anon targets, so query results are empty. Execution platform resolution should
 // always be inherited from the anon target.
@@ -52,18 +51,18 @@ pub(crate) struct AnonTargetAttrResolutionContext<'v> {
     pub(crate) rule_analysis_attr_resolution_ctx: RuleAnalysisAttrResolutionContext<'v>,
 }
 
-pub trait AnonTargetAttrResolution {
+pub(crate) trait AnonTargetAttrResolution {
     fn resolve<'v>(
         &self,
         pkg: PackageLabel,
         ctx: &AnonTargetAttrResolutionContext<'v>,
-    ) -> anyhow::Result<Vec<Value<'v>>>;
+    ) -> buck2_error::Result<Vec<Value<'v>>>;
 
     fn resolve_single<'v>(
         &self,
         pkg: PackageLabel,
         ctx: &AnonTargetAttrResolutionContext<'v>,
-    ) -> anyhow::Result<Value<'v>>;
+    ) -> buck2_error::Result<Value<'v>>;
 }
 
 impl AnonTargetAttrResolution for AnonTargetAttr {
@@ -77,7 +76,7 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
         &self,
         pkg: PackageLabel,
         ctx: &AnonTargetAttrResolutionContext<'v>,
-    ) -> anyhow::Result<Vec<Value<'v>>> {
+    ) -> buck2_error::Result<Vec<Value<'v>>> {
         Ok(vec![self.resolve_single(pkg, ctx)?])
     }
 
@@ -87,7 +86,7 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
         &self,
         pkg: PackageLabel,
         anon_resolution_ctx: &AnonTargetAttrResolutionContext<'v>,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> buck2_error::Result<Value<'v>> {
         let ctx = &anon_resolution_ctx.rule_analysis_attr_resolution_ctx;
         match self {
             AnonTargetAttr::Bool(v) => Ok(Value::new_bool(v.0)),
@@ -98,14 +97,14 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
             AnonTargetAttr::List(list) => {
                 let mut values = Vec::with_capacity(list.len());
                 for v in list.iter() {
-                    values.append(&mut v.resolve(pkg.dupe(), anon_resolution_ctx)?);
+                    values.append(&mut v.resolve(pkg, anon_resolution_ctx)?);
                 }
                 Ok(ctx.heap().alloc(values))
             }
             AnonTargetAttr::Tuple(list) => {
                 let mut values = Vec::with_capacity(list.len());
                 for v in list.iter() {
-                    values.append(&mut v.resolve(pkg.dupe(), anon_resolution_ctx)?);
+                    values.append(&mut v.resolve(pkg, anon_resolution_ctx)?);
                 }
                 Ok(ctx.heap().alloc(AllocTuple(values)))
             }
@@ -113,19 +112,17 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
                 let mut res = SmallMap::with_capacity(dict.len());
                 for (k, v) in dict.iter() {
                     res.insert_hashed(
-                        k.resolve_single(pkg.dupe(), anon_resolution_ctx)?
-                            .get_hashed()
-                            .map_err(BuckStarlarkError::new)?,
-                        v.resolve_single(pkg.dupe(), anon_resolution_ctx)?,
+                        k.resolve_single(pkg, anon_resolution_ctx)?.get_hashed()?,
+                        v.resolve_single(pkg, anon_resolution_ctx)?,
                     );
                 }
                 Ok(ctx.heap().alloc(Dict::new(res)))
             }
             AnonTargetAttr::None => Ok(Value::new_none()),
             AnonTargetAttr::OneOf(box l, _) => l.resolve_single(pkg, anon_resolution_ctx),
-            AnonTargetAttr::Dep(d) => DepAttrType::resolve_single(ctx, d),
+            AnonTargetAttr::Dep(d) => Ok(DepAttrType::resolve_single(ctx, d)?),
             AnonTargetAttr::Artifact(d) => Ok(ctx.heap().alloc(StarlarkArtifact::new(d.clone()))),
-            AnonTargetAttr::Arg(a) => a.resolve(ctx, &pkg),
+            AnonTargetAttr::Arg(a) => Ok(a.resolve(ctx, pkg)?),
             AnonTargetAttr::PromiseArtifact(promise_artifact_attr) => {
                 let promise_id = promise_artifact_attr.id.clone();
                 // We validated that the analysis contains the promise artifact id earlier
@@ -138,7 +135,7 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
                 if let Some(expected_short_path) = &promise_artifact_attr.short_path {
                     artifact.get_path().with_short_path(|artifact_short_path| {
                         if artifact_short_path != expected_short_path {
-                            Err(anyhow::Error::from(
+                            Err(buck2_error::Error::from(
                                 PromiseArtifactResolveError::ShortPathMismatch(
                                     expected_short_path.clone(),
                                     artifact_short_path.to_string(),
@@ -167,7 +164,7 @@ impl AnonTargetAttrResolution for AnonTargetAttr {
                 Ok(ctx.heap().alloc(fulfilled_promise_artifact))
             }
             AnonTargetAttr::Label(label) => {
-                Ok(ctx.heap().alloc(StarlarkProvidersLabel::new(label.clone())))
+                Ok(ctx.heap().alloc(StarlarkProvidersLabel::new(label.dupe())))
             }
         }
     }
@@ -179,26 +176,22 @@ pub(crate) struct AnonTargetDependents {
     pub(crate) promise_artifacts: Vec<PromiseArtifactAttr>,
 }
 
-// Container for analysis results of the anon target dependents.
-pub(crate) struct AnonTargetDependentAnalysisResults<'v> {
-    pub(crate) dep_analysis_results:
-        HashMap<&'v ConfiguredTargetLabel, FrozenProviderCollectionValue>,
-    pub(crate) promised_artifacts: HashMap<&'v PromiseArtifactAttr, Artifact>,
-}
-
 pub(crate) trait AnonTargetAttrTraversal {
-    fn promise_artifact(&mut self, promise_artifact: &PromiseArtifactAttr) -> anyhow::Result<()>;
+    fn promise_artifact(
+        &mut self,
+        promise_artifact: &PromiseArtifactAttr,
+    ) -> buck2_error::Result<()>;
 }
 
 impl AnonTargetDependents {
     pub(crate) fn get_dependents(
         anon_target: &AnonTargetKey,
-    ) -> anyhow::Result<AnonTargetDependents> {
+    ) -> buck2_error::Result<AnonTargetDependents> {
         struct DepTraversal(Vec<ConfiguredTargetLabel>);
         struct PromiseArtifactTraversal(Vec<PromiseArtifactAttr>);
 
         impl ConfiguredAttrTraversal for DepTraversal {
-            fn dep(&mut self, dep: &ConfiguredProvidersLabel) -> anyhow::Result<()> {
+            fn dep(&mut self, dep: &ConfiguredProvidersLabel) -> buck2_error::Result<()> {
                 self.0.push(dep.target().dupe());
                 Ok(())
             }
@@ -207,7 +200,7 @@ impl AnonTargetDependents {
                 &mut self,
                 _query: &str,
                 _resolved_literals: &ResolvedQueryLiterals<ConfiguredProvidersLabel>,
-            ) -> anyhow::Result<()> {
+            ) -> buck2_error::Result<()> {
                 Err(AnonTargetsError::QueryMacroNotSupported.into())
             }
         }
@@ -216,7 +209,7 @@ impl AnonTargetDependents {
             fn promise_artifact(
                 &mut self,
                 promise_artifact: &PromiseArtifactAttr,
-            ) -> anyhow::Result<()> {
+            ) -> buck2_error::Result<()> {
                 self.0.push(promise_artifact.clone());
                 Ok(())
             }
@@ -236,35 +229,36 @@ impl AnonTargetDependents {
 
     pub(crate) async fn get_analysis_results<'v>(
         &'v self,
-        dice: &'v DiceComputations,
-    ) -> anyhow::Result<AnonTargetDependentAnalysisResults<'v>> {
-        let dep_analysis_results: HashMap<_, _> = keep_going::try_join_all(
-            dice,
-            self.deps
-                .iter()
-                .map(async move |dep| {
-                    let res = dice
-                        .get_analysis_result(dep)
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<AnonTargetDependentAnalysisResults<'v>> {
+        let dep_analysis_results =
+            KeepGoing::try_compute_join_all(dice, self.deps.iter(), |ctx, dep| {
+                async move {
+                    ctx.get_analysis_result(dep)
                         .await
-                        .and_then(|v| v.require_compatible());
-                    res.map(|x| (dep, x.providers().dupe()))
-                })
-                .collect::<FuturesUnordered<_>>(),
-        )
-        .await?;
-
-        let promised_artifacts: HashMap<_, _> = keep_going::try_join_all(
-            dice,
-            self.promise_artifacts
-                .iter()
-                .map(async move |promise_artifact_attr| {
-                    get_artifact_from_anon_target_analysis(&promise_artifact_attr.id, dice)
-                        .await
-                        .map(|artifact| (promise_artifact_attr, artifact))
-                })
-                .collect::<FuturesUnordered<_>>(),
-        )
-        .await?;
+                        .and_then(|v| v.require_compatible())
+                        .map(|r| (dep, r))
+                }
+                .boxed()
+            })
+            .await?;
+        let promised_artifacts: HashMap<_, _> = {
+            KeepGoing::try_compute_join_all(
+                dice,
+                self.promise_artifacts.iter(),
+                |ctx, promise_artifact_attr| {
+                    async move {
+                        get_artifact_from_anon_target_analysis(&promise_artifact_attr.id, ctx)
+                            .await
+                            .map(|artifact| (promise_artifact_attr, artifact))
+                    }
+                    .boxed()
+                },
+            )
+        }
+        .await?
+        .into_iter()
+        .collect();
 
         Ok(AnonTargetDependentAnalysisResults {
             dep_analysis_results,

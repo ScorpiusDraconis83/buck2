@@ -26,23 +26,23 @@ use std::path::PathBuf;
 use itertools::Either;
 use lsp_types::Url;
 use starlark::analysis::AstModuleLint;
-use starlark::docs::get_registered_starlark_docs;
-use starlark::docs::render_docs_as_code;
-use starlark::docs::Doc;
-use starlark::docs::DocItem;
 use starlark::docs::DocModule;
 use starlark::environment::FrozenModule;
 use starlark::environment::Globals;
 use starlark::environment::Module;
 use starlark::errors::EvalMessage;
 use starlark::eval::Evaluator;
+use starlark::eval::FileLoader;
 use starlark::syntax::AstModule;
 use starlark::syntax::Dialect;
+use starlark::StarlarkResultExt;
 use starlark_lsp::error::eval_message_to_lsp_diagnostic;
 use starlark_lsp::server::LspContext;
 use starlark_lsp::server::LspEvalResult;
 use starlark_lsp::server::LspUrl;
 use starlark_lsp::server::StringLiteralResult;
+
+use crate::suppression::GlobLintSuppression;
 
 #[derive(Debug)]
 pub(crate) enum ContextMode {
@@ -66,8 +66,17 @@ pub(crate) struct Context {
     pub(crate) print_non_none: bool,
     pub(crate) prelude: Vec<FrozenModule>,
     pub(crate) module: Option<Module>,
+    pub(crate) dialect: Dialect,
+    pub(crate) globals: Globals,
     pub(crate) builtin_docs: HashMap<LspUrl, String>,
     pub(crate) builtin_symbols: HashMap<String, LspUrl>,
+    pub(crate) suppression_rules: Vec<GlobLintSuppression>,
+}
+
+impl FileLoader for Context {
+    fn load(&self, path: &str) -> starlark::Result<FrozenModule> {
+        self.load_path(Path::new(path))
+    }
 }
 
 /// The outcome of evaluating (checking, parsing or running) given starlark code.
@@ -97,61 +106,54 @@ impl Context {
         print_non_none: bool,
         prelude: &[PathBuf],
         module: bool,
+        dialect: Dialect,
+        globals: Globals,
+        suppression_rules: Vec<GlobLintSuppression>,
     ) -> anyhow::Result<Self> {
-        let globals = globals();
-        let prelude: Vec<_> = prelude
-            .iter()
-            .map(|x| {
-                let env = Module::new();
-                {
-                    let mut eval = Evaluator::new(&env);
-                    let module = AstModule::parse_file(x, &dialect())
-                        .map_err(starlark::Error::into_anyhow)?;
-                    eval.eval_module(module, &globals)
-                        .map_err(starlark::Error::into_anyhow)?;
-                }
-                env.freeze()
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let mut builtin_docs: HashMap<LspUrl, String> = HashMap::new();
+        let mut builtin_symbols: HashMap<String, LspUrl> = HashMap::new();
+        for (name, item) in globals.documentation().members {
+            let uri = Url::parse(&format!("starlark:/{name}.bzl"))?;
+            let uri = LspUrl::try_from(uri)?;
+            builtin_docs.insert(uri.clone(), item.render_as_code(&name));
+            builtin_symbols.insert(name, uri);
+        }
 
-        let module = if module {
-            Some(Self::new_module(&prelude))
+        let mut ctx = Self {
+            mode,
+            print_non_none,
+            prelude: Vec::new(),
+            module: None,
+            dialect,
+            globals,
+            builtin_docs,
+            builtin_symbols,
+            suppression_rules,
+        };
+
+        ctx.prelude = prelude
+            .iter()
+            .map(|x| ctx.load_path(x))
+            .collect::<starlark::Result<_>>()
+            .into_anyhow_result()?;
+
+        ctx.module = if module {
+            Some(Self::new_module(&ctx.prelude))
         } else {
             None
         };
-        let mut builtins: HashMap<LspUrl, Vec<Doc>> = HashMap::new();
-        let mut builtin_symbols: HashMap<String, LspUrl> = HashMap::new();
-        for doc in get_registered_starlark_docs() {
-            let uri = Self::url_for_doc(&doc);
-            builtin_symbols.insert(doc.id.name.clone(), uri.clone());
-            builtins.entry(uri).or_default().push(doc);
-        }
-        let builtin_docs = builtins
-            .into_iter()
-            .map(|(u, ds)| (u, render_docs_as_code(&ds)))
-            .collect();
 
-        Ok(Self {
-            mode,
-            print_non_none,
-            prelude,
-            module,
-            builtin_docs,
-            builtin_symbols,
-        })
+        Ok(ctx)
     }
 
-    fn url_for_doc(doc: &Doc) -> LspUrl {
-        let url = match &doc.item {
-            DocItem::Module(_) => Url::parse("starlark:/native/builtins.bzl").unwrap(),
-            DocItem::Object(_) => {
-                Url::parse(&format!("starlark:/native/builtins/{}.bzl", doc.id.name)).unwrap()
-            }
-            DocItem::Function(_) | DocItem::Property(_) => {
-                Url::parse("starlark:/native/builtins.bzl").unwrap()
-            }
-        };
-        LspUrl::try_from(url).unwrap()
+    fn load_path(&self, path: &Path) -> starlark::Result<FrozenModule> {
+        let env = Module::new();
+        let mut eval = Evaluator::new(&env);
+        eval.set_loader(self);
+        let module = AstModule::parse_file(path, &self.dialect).into_anyhow_result()?;
+        eval.eval_module(module, &self.globals)?;
+        drop(eval);
+        Ok(env.freeze()?)
     }
 
     fn new_module(prelude: &[FrozenModule]) -> Module {
@@ -167,7 +169,7 @@ impl Context {
         let mut errors = Either::Left(iter::empty());
         let final_ast = match self.mode {
             ContextMode::Check => {
-                warnings = Either::Right(self.check(&ast));
+                warnings = Either::Right(self.check(file, &ast));
                 Some(ast)
             }
             ContextMode::Run => {
@@ -205,7 +207,7 @@ impl Context {
         let file = "expression";
         Self::err(
             file,
-            AstModule::parse(file, content, &dialect())
+            AstModule::parse(file, content, &self.dialect)
                 .map(|module| self.go(file, module))
                 .map_err(Into::into),
         )
@@ -228,7 +230,7 @@ impl Context {
     ) -> EvalResult<impl Iterator<Item = EvalMessage>> {
         Self::err(
             filename,
-            AstModule::parse(filename, content, &dialect())
+            AstModule::parse(filename, content, &self.dialect)
                 .map(|module| self.go(filename, module))
                 .map_err(Into::into),
         )
@@ -244,11 +246,11 @@ impl Context {
             }
         };
         let mut eval = Evaluator::new(module);
+        eval.set_loader(self);
         eval.enable_terminal_breakpoint_console();
-        let globals = globals();
         Self::err(
             file,
-            eval.eval_module(ast, &globals)
+            eval.eval_module(ast, &self.globals)
                 .map(|v| {
                     if self.print_non_none && !v.is_none() {
                         println!("{}", v);
@@ -262,7 +264,13 @@ impl Context {
         )
     }
 
-    fn check(&self, module: &AstModule) -> impl Iterator<Item = EvalMessage> {
+    fn is_suppressed(&self, file: &str, issue: &str) -> bool {
+        self.suppression_rules
+            .iter()
+            .any(|rule| rule.is_suppressed(file, issue))
+    }
+
+    fn check(&self, file: &str, module: &AstModule) -> impl Iterator<Item = EvalMessage> {
         let globals = if self.prelude.is_empty() {
             None
         } else {
@@ -280,10 +288,9 @@ impl Context {
             Some(globals)
         };
 
-        module
-            .lint(globals.as_ref())
-            .into_iter()
-            .map(EvalMessage::from)
+        let mut lints = module.lint(globals.as_ref());
+        lints.retain(|issue| !self.is_suppressed(file, &issue.short_name));
+        lints.into_iter().map(EvalMessage::from)
     }
 }
 
@@ -375,12 +382,4 @@ impl LspContext for Context {
     fn get_environment(&self, _uri: &LspUrl) -> DocModule {
         DocModule::default()
     }
-}
-
-pub(crate) fn globals() -> Globals {
-    Globals::extended_internal()
-}
-
-pub(crate) fn dialect() -> Dialect {
-    Dialect::Extended
 }

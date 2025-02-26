@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -23,11 +24,17 @@ use dupe::Clone_;
 use dupe::Copy_;
 use dupe::Dupe_;
 use either::Either;
+use starlark_syntax::value_error;
 
 use crate::typing::Ty;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::AllocValue;
 use crate::values::ComplexValue;
+use crate::values::Freeze;
+use crate::values::FreezeError;
+use crate::values::FreezeResult;
+use crate::values::Freezer;
+use crate::values::FrozenValueTyped;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::Tracer;
@@ -62,6 +69,18 @@ where
         }
     }
 
+    /// Downcast.
+    pub fn new_err(value: Value<'v>) -> crate::Result<Self> {
+        match Self::new(value) {
+            Some(v) => Ok(v),
+            None => Err(value_error!(
+                "Expected value of type `{}`, got: `{}`",
+                T::TYPE,
+                value.to_string_for_type_error()
+            )),
+        }
+    }
+
     /// Get the value back.
     #[inline]
     pub fn to_value(self) -> Value<'v> {
@@ -88,6 +107,8 @@ where
     T: ComplexValue<'v>,
     T::Frozen: StarlarkValue<'static>,
 {
+    type Canonical = <T as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         T::starlark_type_repr()
     }
@@ -109,8 +130,10 @@ where
     T: ComplexValue<'v>,
     T::Frozen: StarlarkValue<'static>,
 {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        Self::new(value)
+    type Error = Infallible;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(Self::new(value))
     }
 }
 
@@ -146,48 +169,37 @@ where
     }
 }
 
+impl<'v, T> Freeze for ValueTypedComplex<'v, T>
+where
+    T: ComplexValue<'v>,
+    T::Frozen: StarlarkValue<'static>,
+{
+    type Frozen = FrozenValueTyped<'static, T::Frozen>;
+
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
+        FrozenValueTyped::new_err(self.0.freeze(freezer)?)
+            .map_err(|e| FreezeError::new(format!("{e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use allocative::Allocative;
     use anyhow::Context;
     use either::Either;
     use starlark_derive::starlark_module;
-    use starlark_derive::Freeze;
-    use starlark_derive::NoSerialize;
-    use starlark_derive::Trace;
 
     use crate as starlark;
-    use crate::any::ProvidesStaticType;
     use crate::assert::Assert;
     use crate::const_frozen_string;
     use crate::environment::GlobalsBuilder;
+    use crate::tests::util::TestComplexValue;
     use crate::values::layout::complex::ValueTypedComplex;
-    use crate::values::starlark_value;
-    use crate::values::StarlarkValue;
     use crate::values::Value;
-    use crate::values::ValueLike;
-
-    #[derive(
-        Trace,
-        Freeze,
-        Debug,
-        derive_more::Display,
-        Allocative,
-        ProvidesStaticType,
-        NoSerialize
-    )]
-    struct TestValueOfComplex<V>(V);
-
-    #[starlark_value(type = "test_value_of_complex")]
-    impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TestValueOfComplex<V> where
-        Self: ProvidesStaticType<'v>
-    {
-    }
 
     #[starlark_module]
     fn test_module(globals: &mut GlobalsBuilder) {
         fn test_unpack<'v>(
-            v: ValueTypedComplex<'v, TestValueOfComplex<Value<'v>>>,
+            v: ValueTypedComplex<'v, TestComplexValue<Value<'v>>>,
         ) -> anyhow::Result<&'v str> {
             Ok(match v.unpack() {
                 Either::Left(v) => v.0.unpack_str().context("not a string")?,
@@ -202,8 +214,8 @@ mod tests {
         a.globals_add(test_module);
         a.setup_eval(|eval| {
             let s = eval.heap().alloc("test1");
-            let x = eval.heap().alloc_complex(TestValueOfComplex(s));
-            let y = eval.frozen_heap().alloc_simple(TestValueOfComplex(
+            let x = eval.heap().alloc(TestComplexValue(s));
+            let y = eval.frozen_heap().alloc(TestComplexValue(
                 const_frozen_string!("test2").to_frozen_value(),
             ));
             eval.module().set("x", x);

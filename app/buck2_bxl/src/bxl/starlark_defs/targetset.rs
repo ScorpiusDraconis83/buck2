@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use std::convert::Infallible;
 use std::ops::Deref;
 
 use allocative::Allocative;
@@ -15,11 +16,16 @@ use buck2_query::query::syntax::simple::eval::set::TargetSet;
 use derive_more::Display;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
+use starlark::environment::Methods;
+use starlark::environment::MethodsBuilder;
+use starlark::environment::MethodsStatic;
+use starlark::starlark_module;
 use starlark::typing::Ty;
 use starlark::values::starlark_value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::AllocValue;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
@@ -56,20 +62,24 @@ impl<Node: QueryTarget + AllocNode> StarlarkTargetSet<Node> {
 impl<Node: QueryTarget> Freeze for StarlarkTargetSet<Node> {
     type Frozen = StarlarkTargetSet<Node>;
 
-    fn freeze(self, _freezer: &starlark::values::Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, _freezer: &starlark::values::Freezer) -> FreezeResult<Self::Frozen> {
         Ok(self)
     }
 }
 
 impl<'v, Node: NodeLike> StarlarkTypeRepr for &'v StarlarkTargetSet<Node> {
+    type Canonical = Self;
+
     fn starlark_type_repr() -> Ty {
         StarlarkTargetSet::<Node>::starlark_type_repr()
     }
 }
 
 impl<'v, Node: NodeLike> UnpackValue<'v> for &'v StarlarkTargetSet<Node> {
-    fn unpack_value(x: Value<'v>) -> Option<Self> {
-        StarlarkTargetSet::from_value(x)
+    type Error = Infallible;
+
+    fn unpack_value_impl(x: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(StarlarkTargetSet::from_value(x))
     }
 }
 
@@ -82,6 +92,11 @@ impl<'v, Node: NodeLike> AllocValue<'v> for StarlarkTargetSet<Node> {
 #[starlark_value(type = "target_set")]
 impl<'v, Node: NodeLike> StarlarkValue<'v> for StarlarkTargetSet<Node> {
     type Canonical = Self;
+
+    fn get_methods() -> Option<&'static Methods> {
+        static RES: MethodsStatic = MethodsStatic::new();
+        RES.methods(starlark_target_set_methods)
+    }
 
     fn iterate_collect(&self, heap: &'v Heap) -> starlark::Result<Vec<Value<'v>>> {
         Ok(self.iter(heap).collect())
@@ -137,6 +152,13 @@ impl<Node: QueryTarget> From<TargetSet<Node>> for StarlarkTargetSet<Node> {
     }
 }
 
+impl<Node: QueryTarget> FromIterator<Node> for StarlarkTargetSet<Node> {
+    fn from_iter<Iter: IntoIterator<Item = Node>>(iter: Iter) -> Self {
+        let targets = TargetSet::from_iter(iter);
+        Self(targets)
+    }
+}
+
 impl<Node: QueryTarget> Deref for StarlarkTargetSet<Node> {
     type Target = TargetSet<Node>;
 
@@ -150,3 +172,47 @@ impl<Node: NodeLike> StarlarkTargetSet<Node> {
         ValueLike::downcast_ref::<Self>(x)
     }
 }
+
+/// A set-like object for managing buck2 target nodes.
+/// It can be either `ConfiguredTargetSet` or `UnConfiguredTargetSet` where contains either [`ConfiguredTargetNode`](../ConfiguredTargetNode) or [`UnconfiguredTargetNode`](../UnconfiguredTargetNode) respectively.
+///
+/// It provides common set operations for target nodes.
+/// It supports iteration, indexing, addition (union), subtraction (difference), equality comparison, and intersection operations.
+///
+/// Operations:
+/// * `+`  : Union of two TargetSets
+/// * `-`  : Difference between two TargetSets
+/// * `==` : Equality comparison
+/// * `&` : Intersection of two TargetSets
+/// * `[]` : Index access
+/// * `len()`: Number of targets in set
+/// * `iter()`: Iteration over targets
+/// * constructor: [`bxl.ctarget_set()`](../#ctarget_set) for `ConfiguredTargetSet` and [`bxl.utarget_set()`](../#utarget_set) for `UnconfiguredTargetSet`
+///
+/// Example:
+/// ```python
+/// # Combine sets
+/// all_targets = targets1 + targets2  # Union
+///
+/// # Remove targets
+/// remaining = targets1 - targets2    # Difference
+///
+/// # Check if sets are equal
+/// if targets1 == targets2:
+///     print("Sets contain same targets")
+///
+/// # Iterate through targets
+/// for target in targets1:
+///    print(target)
+///
+///  # Get target by index
+/// first_target = targets1[0]
+///
+/// # Get number of targets
+/// count = len(targets1)
+///
+/// # Intersection of sets
+/// common = targets1 & targets2
+/// ```
+#[starlark_module]
+fn starlark_target_set_methods(builder: &mut MethodsBuilder) {}

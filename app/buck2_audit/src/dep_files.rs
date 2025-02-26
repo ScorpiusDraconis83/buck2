@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,9 +19,6 @@ use crate::AuditSubcommand;
     about = "prints out the select files for a command"
 )]
 pub struct AuditDepFilesCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     #[clap(help = "Target to query dep files for")]
     pub pattern: String,
 
@@ -29,6 +27,12 @@ pub struct AuditDepFilesCommand {
 
     #[clap(help = "Action identifier")]
     pub identifier: Option<String>,
+
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

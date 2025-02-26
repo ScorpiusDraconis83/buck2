@@ -12,18 +12,17 @@ use std::sync::Arc;
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_common::dice::cells::HasCellResolver;
-use buck2_core::bzl::ImportPath;
-use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::configuration::data::ConfigurationData;
-use buck2_error::Context;
-use buck2_interpreter::paths::package::PackageFilePath;
+use buck2_core::package::PackageLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_error::BuckErrorContext;
 use buck2_interpreter_for_build::interpreter::package_file_calculation::EvalPackageFile;
 use buck2_node::cfg_constructor::CfgConstructorCalculationImpl;
 use buck2_node::cfg_constructor::CfgConstructorImpl;
-use buck2_node::cfg_constructor::CFG_CONSTRUCTOR_CALCULATION_IMPL;
 use buck2_node::metadata::value::MetadataValue;
 use buck2_node::nodes::unconfigured::TargetNodeRef;
+use buck2_node::rule_type::RuleType;
 use buck2_node::super_package::SuperPackage;
 use derive_more::Display;
 use dice::CancellationContext;
@@ -32,67 +31,76 @@ use dice::Key;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
 
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
+enum CalculationCfgConstructorError {
+    #[error(
+        "Usage of both `modifiers` attribute and modifiers in metadata is not allowed for target `{0}`"
+    )]
+    TargetModifiersAttrAndMetadataNotAllowed(TargetLabel),
+}
+
 pub struct CfgConstructorCalculationInstance;
 
 async fn get_cfg_constructor_uncached(
-    ctx: &DiceComputations,
-) -> anyhow::Result<Option<Arc<dyn CfgConstructorImpl>>> {
+    ctx: &mut DiceComputations<'_>,
+) -> buck2_error::Result<Option<Arc<dyn CfgConstructorImpl>>> {
     let root_cell = ctx.get_cell_resolver().await?.root_cell();
-    let package_file_path =
-        PackageFilePath::for_dir(CellPathRef::new(root_cell, CellRelativePath::empty()));
+    let package_label = PackageLabel::new(root_cell, CellRelativePath::empty());
     // This returns empty super package if `PACKAGE` file does not exist.
-    let super_package = ctx.eval_package_file(&package_file_path).await?;
+    let super_package = ctx.eval_package_file(package_label).await?;
     Ok(super_package.cfg_constructor().duped())
+}
+
+async fn get_cfg_constructor(
+    ctx: &mut DiceComputations<'_>,
+) -> buck2_error::Result<Option<Arc<dyn CfgConstructorImpl>>> {
+    #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+    struct GetCfgConstructorKey;
+
+    #[async_trait]
+    impl Key for GetCfgConstructorKey {
+        type Value = buck2_error::Result<Option<Arc<dyn CfgConstructorImpl>>>;
+
+        async fn compute(
+            &self,
+            ctx: &mut DiceComputations,
+            _cancellations: &CancellationContext,
+        ) -> Self::Value {
+            get_cfg_constructor_uncached(ctx)
+                .await
+                .map_err(buck2_error::Error::from)
+        }
+
+        fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
+            false
+        }
+    }
+
+    ctx.compute(&GetCfgConstructorKey)
+        .await?
+        .map_err(buck2_error::Error::from)
 }
 
 #[async_trait]
 impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
-    async fn get_cfg_constructor(
-        &self,
-        ctx: &DiceComputations,
-    ) -> anyhow::Result<Option<Arc<dyn CfgConstructorImpl>>> {
-        #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-        struct GetCfgConstructorKey;
-
-        #[async_trait]
-        impl Key for GetCfgConstructorKey {
-            type Value = buck2_error::Result<Option<Arc<dyn CfgConstructorImpl>>>;
-
-            async fn compute(
-                &self,
-                ctx: &mut DiceComputations,
-                _cancellations: &CancellationContext,
-            ) -> Self::Value {
-                get_cfg_constructor_uncached(ctx)
-                    .await
-                    .map_err(buck2_error::Error::from)
-            }
-
-            fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
-                false
-            }
-        }
-
-        ctx.compute(&GetCfgConstructorKey)
-            .await?
-            .map_err(anyhow::Error::from)
-    }
-
     async fn eval_cfg_constructor(
         &self,
-        ctx: &DiceComputations,
+        ctx: &mut DiceComputations<'_>,
         target: TargetNodeRef<'_>,
         super_package: &SuperPackage,
         cfg: ConfigurationData,
         cli_modifiers: &Arc<Vec<String>>,
-    ) -> anyhow::Result<ConfigurationData> {
+        rule_type: &RuleType,
+    ) -> buck2_error::Result<ConfigurationData> {
         #[derive(Clone, Display, Dupe, Debug, Eq, Hash, PartialEq, Allocative)]
-        #[display(fmt = "CfgConstructorInvocationKey")]
+        #[display("CfgConstructorInvocationKey")]
         struct CfgConstructorInvocationKey {
             package_cfg_modifiers: Option<MetadataValue>,
             target_cfg_modifiers: Option<MetadataValue>,
             cfg: ConfigurationData,
             cli_modifiers: Arc<Vec<String>>,
+            rule_type: RuleType,
         }
 
         #[async_trait]
@@ -104,12 +112,9 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
                 ctx: &mut DiceComputations,
                 _cancellations: &CancellationContext,
             ) -> Self::Value {
-                let cfg_constructor_calculation = CFG_CONSTRUCTOR_CALCULATION_IMPL.get()?;
-                // Invoke eval fn from global instance of cfg constructors
-                let cfg_constructor = cfg_constructor_calculation
-                    .get_cfg_constructor(ctx)
-                    .await?
-                    .context("Internal error: Global cfg constructor instance should exist")?;
+                let cfg_constructor = get_cfg_constructor(ctx).await?.buck_error_context(
+                    "Internal error: Global cfg constructor instance should exist",
+                )?;
                 cfg_constructor
                     .eval(
                         ctx,
@@ -117,6 +122,7 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
                         self.package_cfg_modifiers.as_ref(),
                         self.target_cfg_modifiers.as_ref(),
                         &self.cli_modifiers,
+                        &self.rule_type,
                     )
                     .await
                     .map_err(buck2_error::Error::from)
@@ -130,17 +136,33 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
             }
         }
 
-        let Some(cfg_constructor) = self.get_cfg_constructor(ctx).await? else {
+        let Some(cfg_constructor) = get_cfg_constructor(ctx).await? else {
             // To facilitate rollout of modifiers, return original configuration if
             // no cfg constructors are available.
             return Ok(cfg);
         };
         let modifier_key = cfg_constructor.key();
         let package_cfg_modifiers = super_package
-            .package_values()
-            .get_package_value_json(modifier_key)?
+            .cfg_modifiers()
+            .map(|m| m.to_value())
             .map(MetadataValue::new);
-        let target_cfg_modifiers = target.metadata()?.and_then(|m| m.get(modifier_key)).duped();
+
+        let metadata_modifiers = target.metadata()?.and_then(|m| m.get(modifier_key));
+        let target_modifiers = target.target_modifiers()?;
+        let target_cfg_modifiers = match (metadata_modifiers, target_modifiers) {
+            (None, Some(t)) if !t.is_empty() => Some(MetadataValue(t.as_json())),
+            (Some(_), Some(t)) if !t.is_empty() => {
+                return Err(
+                    CalculationCfgConstructorError::TargetModifiersAttrAndMetadataNotAllowed(
+                        target.label().dupe(),
+                    )
+                    .into(),
+                );
+            }
+            (Some(m), _) => Some(m.dupe()),
+            _ => None,
+        };
+
         // If there are no PACKAGE/target/cli modifiers, return the original configuration without computing DICE call
         // TODO(scottcao): This is just for rollout purpose. Remove once modifier is rolled out
         if package_cfg_modifiers.is_none()
@@ -155,13 +177,8 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
             target_cfg_modifiers,
             cfg,
             cli_modifiers: cli_modifiers.dupe(),
+            rule_type: rule_type.dupe(),
         };
         Ok(ctx.compute(&key).await??)
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct CfgConstructorLocation {
-    pub import_path: ImportPath,
-    pub function: String,
 }

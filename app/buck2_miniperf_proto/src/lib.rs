@@ -31,11 +31,13 @@ pub struct MiniperfCounters {
     /// Total instructions executed.
     pub user_instructions: MiniperfCounter,
     pub kernel_instructions: MiniperfCounter,
+    /// Action peak memory
+    pub memory_peak: Option<u64>,
 }
 
 impl MiniperfOutput {
     // This is the size we expect this record to take if the command worked out fine.
-    pub const EXPECTED_SIZE: usize = 60;
+    pub const EXPECTED_SIZE: usize = 69;
 }
 
 /// The fields here come straight out of `perf_event_open`. The count is
@@ -79,7 +81,7 @@ impl MiniperfCounter {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]
@@ -117,6 +119,7 @@ mod test {
             counters: Ok(MiniperfCounters {
                 user_instructions: max_counter,
                 kernel_instructions: max_counter,
+                memory_peak: Some(u64::MAX),
             }),
         };
 

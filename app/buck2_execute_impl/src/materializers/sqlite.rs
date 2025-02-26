@@ -11,19 +11,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_common::external_symlink::ExternalSymlink;
 use buck2_common::file_ops::FileDigest;
 use buck2_common::file_ops::FileMetadata;
 use buck2_common::file_ops::TrackedFileDigest;
 use buck2_common::sqlite::KeyValueSqliteTable;
-use buck2_core::directory::DirectoryEntry;
 use buck2_core::fs::fs_util;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::paths::file_name::FileName;
+use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::Symlink;
@@ -40,8 +43,8 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::materializers::deferred::ArtifactMetadata;
-use crate::materializers::deferred::DirectoryMetadata;
+use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
+use crate::materializers::deferred::artifact_tree::DirectoryMetadata;
 
 #[derive(Display, Allocative, Clone, From, PartialEq, Eq, Debug)]
 pub struct MaterializerStateIdentity(String);
@@ -59,6 +62,7 @@ const IDENTITY_KEY: &str = "timestamp_on_initialization";
 pub type MaterializerState = Vec<(ProjectRelativePathBuf, (ArtifactMetadata, DateTime<Utc>))>;
 
 #[derive(buck2_error::Error, Debug, PartialEq, Eq)]
+#[buck2(tag = Tier0)]
 pub(crate) enum ArtifactMetadataSqliteConversionError {
     #[error("Internal error: expected field `{}` to be not null for artifact type '{}'", .field, .artifact_type)]
     ExpectedNotNull {
@@ -188,35 +192,35 @@ impl From<&ArtifactMetadata> for ArtifactMetadataSqliteEntry {
 fn convert_artifact_metadata(
     sqlite_entry: ArtifactMetadataSqliteEntry,
     digest_config: DigestConfig,
-) -> anyhow::Result<ArtifactMetadata> {
+) -> buck2_error::Result<ArtifactMetadata> {
     fn digest(
         size: Option<u64>,
         entry_hash: Option<Vec<u8>>,
         entry_hash_kind: Option<u8>,
         artifact_type: &str,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<TrackedFileDigest> {
-        let size = size.ok_or_else(|| {
-            anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
-                field: "size".to_owned(),
-                artifact_type: artifact_type.to_owned()
-            })
+    ) -> buck2_error::Result<TrackedFileDigest> {
+        let size = size.ok_or_else(|| ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+            field: "size".to_owned(),
+            artifact_type: artifact_type.to_owned(),
         })?;
-        let entry_hash = entry_hash.ok_or_else(|| {
-            anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+        let entry_hash =
+            entry_hash.ok_or_else(|| ArtifactMetadataSqliteConversionError::ExpectedNotNull {
                 field: "entry_hash".to_owned(),
-                artifact_type: artifact_type.to_owned()
-            })
-        })?;
+                artifact_type: artifact_type.to_owned(),
+            })?;
         let entry_hash_kind = entry_hash_kind.ok_or_else(|| {
-            anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+            ArtifactMetadataSqliteConversionError::ExpectedNotNull {
                 field: "entry_hash_kind".to_owned(),
-                artifact_type: artifact_type.to_owned()
-            })
+                artifact_type: artifact_type.to_owned(),
+            }
         })?;
         let entry_hash_kind = entry_hash_kind
             .try_into()
-            .with_context(|| format!("Invalid entry_hash_kind: `{}`", entry_hash_kind))?;
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+            .with_buck_error_context(|| {
+                format!("Invalid entry_hash_kind: `{}`", entry_hash_kind)
+            })?;
 
         let file_digest = FileDigest::from_digest_bytes(entry_hash_kind, &entry_hash, size)?;
         Ok(TrackedFileDigest::new(
@@ -236,7 +240,7 @@ fn convert_artifact_metadata(
             )?,
             total_size: sqlite_entry
                 .directory_size
-                .context("Missing directory size")?,
+                .buck_error_context("Missing directory size")?,
         }),
         "file" => DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
             digest: digest(
@@ -247,21 +251,19 @@ fn convert_artifact_metadata(
                 digest_config,
             )?,
             is_executable: sqlite_entry.file_is_executable.ok_or_else(|| {
-                anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+                ArtifactMetadataSqliteConversionError::ExpectedNotNull {
                     field: "file_is_executable".to_owned(),
-                    artifact_type: sqlite_entry.artifact_type.clone()
-                })
+                    artifact_type: sqlite_entry.artifact_type.clone(),
+                }
             })?,
         })),
         "symlink" => {
             let symlink = Symlink::new(
                 sqlite_entry
                     .symlink_target
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
-                            field: "symlink_target".to_owned(),
-                            artifact_type: sqlite_entry.artifact_type.clone()
-                        })
+                    .ok_or_else(|| ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+                        field: "symlink_target".to_owned(),
+                        artifact_type: sqlite_entry.artifact_type.clone(),
                     })?
                     .into(),
             );
@@ -271,25 +273,22 @@ fn convert_artifact_metadata(
             let external_symlink = ExternalSymlink::new(
                 sqlite_entry
                     .symlink_target
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(ArtifactMetadataSqliteConversionError::ExpectedNotNull {
-                            field: "symlink_target".to_owned(),
-                            artifact_type: sqlite_entry.artifact_type.clone()
-                        })
+                    .ok_or_else(|| ArtifactMetadataSqliteConversionError::ExpectedNotNull {
+                        field: "symlink_target".to_owned(),
+                        artifact_type: sqlite_entry.artifact_type.clone(),
                     })?
                     .into(),
-                None,
+                ForwardRelativePathBuf::default(),
             )?;
             DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(Arc::new(
                 external_symlink,
             )))
         }
         artifact_type => {
-            return Err(anyhow::anyhow!(
-                ArtifactMetadataSqliteConversionError::UnknownArtifactType(
-                    artifact_type.to_owned()
-                )
-            ));
+            return Err(ArtifactMetadataSqliteConversionError::UnknownArtifactType(
+                artifact_type.to_owned(),
+            )
+            .into());
         }
     };
 
@@ -305,7 +304,7 @@ impl MaterializerStateSqliteTable {
         Self { connection }
     }
 
-    pub(crate) fn create_table(&self) -> anyhow::Result<()> {
+    pub(crate) fn create_table(&self) -> buck2_error::Result<()> {
         let sql = format!(
             "CREATE TABLE {} (
                 path                    TEXT NOT NULL PRIMARY KEY,
@@ -324,7 +323,7 @@ impl MaterializerStateSqliteTable {
         self.connection
             .lock()
             .execute(&sql, [])
-            .with_context(|| format!("creating sqlite table {}", STATE_TABLE_NAME))?;
+            .with_buck_error_context(|| format!("creating sqlite table {}", STATE_TABLE_NAME))?;
         Ok(())
     }
 
@@ -333,7 +332,7 @@ impl MaterializerStateSqliteTable {
         path: &ProjectRelativePath,
         metadata: &ArtifactMetadata,
         timestamp: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let entry: ArtifactMetadataSqliteEntry = metadata.into();
         static SQL: Lazy<String> = Lazy::new(|| {
             format!(
@@ -358,7 +357,7 @@ impl MaterializerStateSqliteTable {
                     timestamp.timestamp(),
                 ],
             )
-            .with_context(|| {
+            .with_buck_error_context(|| {
                 format!(
                     "inserting `{}` into sqlite table {}",
                     path, STATE_TABLE_NAME
@@ -370,7 +369,7 @@ impl MaterializerStateSqliteTable {
     pub(crate) fn update_access_times(
         &self,
         updates: Vec<&ProjectRelativePathBuf>,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         let mut conn = self.connection.lock();
         let tx = conn.transaction()?;
         for chunk in updates.chunks(100) {
@@ -382,7 +381,9 @@ impl MaterializerStateSqliteTable {
             );
             tracing::trace!(sql = %sql, chunk = ?chunk, "updating last_access_times");
             tx.execute(&sql, rusqlite::params_from_iter(chunk.map(|p| p.as_str())))
-                .with_context(|| format!("updating sqlite table {}", STATE_TABLE_NAME))?;
+                .with_buck_error_context(|| {
+                    format!("updating sqlite table {}", STATE_TABLE_NAME)
+                })?;
         }
         tx.commit()?;
         Ok(())
@@ -391,7 +392,7 @@ impl MaterializerStateSqliteTable {
     pub(crate) fn read_all(
         &self,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<MaterializerState> {
+    ) -> buck2_error::Result<MaterializerState> {
         static SQL: Lazy<String> = Lazy::new(|| {
             format!(
                 "SELECT path, artifact_type, digest_size, entry_hash, entry_hash_kind, file_is_executable, symlink_target, directory_size, last_access_time FROM {}",
@@ -421,11 +422,13 @@ impl MaterializerStateSqliteTable {
                 },
             )?
             .collect::<Result<Vec<_>, _>>()
-            .with_context(|| format!("reading from sqlite table {}", STATE_TABLE_NAME))?;
+            .with_buck_error_context(|| {
+                format!("reading from sqlite table {}", STATE_TABLE_NAME)
+            })?;
 
         result
             .into_try_map(
-                |(path, entry, last_access_time)| -> anyhow::Result<(
+                |(path, entry, last_access_time)| -> buck2_error::Result<(
                     ProjectRelativePathBuf,
                     (ArtifactMetadata, DateTime<Utc>),
                 )> {
@@ -434,14 +437,16 @@ impl MaterializerStateSqliteTable {
                     let timestamp = Utc
                         .timestamp_opt(last_access_time, 0)
                         .single()
-                        .with_context(|| "invalid timestamp")?;
+                        .with_buck_error_context(|| "invalid timestamp")?;
                     Ok((path, (metadata, timestamp)))
                 },
             )
-            .with_context(|| format!("error reading row of sqlite table {}", STATE_TABLE_NAME))
+            .with_buck_error_context(|| {
+                format!("error reading row of sqlite table {}", STATE_TABLE_NAME)
+            })
     }
 
-    pub(crate) fn delete(&self, paths: Vec<ProjectRelativePathBuf>) -> anyhow::Result<usize> {
+    pub(crate) fn delete(&self, paths: Vec<ProjectRelativePathBuf>) -> buck2_error::Result<usize> {
         if paths.is_empty() {
             return Ok(0);
         }
@@ -465,7 +470,9 @@ impl MaterializerStateSqliteTable {
                     &sql,
                     rusqlite::params_from_iter(chunk.iter().map(|p| p.as_str())),
                 )
-                .with_context(|| format!("deleting from sqlite table {}", STATE_TABLE_NAME))?;
+                .with_buck_error_context(|| {
+                    format!("deleting from sqlite table {}", STATE_TABLE_NAME)
+                })?;
         }
 
         Ok(rows_deleted)
@@ -473,6 +480,7 @@ impl MaterializerStateSqliteTable {
 }
 
 #[derive(buck2_error::Error, Debug, PartialEq, Eq)]
+#[buck2(tag = Input)]
 enum MaterializerStateSqliteDbError {
     #[error("Path {} does not exist", .0)]
     PathDoesNotExist(AbsNormPathBuf),
@@ -500,13 +508,15 @@ pub struct MaterializerStateSqliteDb {
 impl MaterializerStateSqliteDb {
     const DB_FILENAME: &'static str = "db.sqlite";
 
-    fn new(tables: MaterializerStateTables) -> anyhow::Result<Self> {
+    fn new(tables: MaterializerStateTables) -> buck2_error::Result<Self> {
         let identity = tables
             .created_by_table
             .get(IDENTITY_KEY)
-            .context("Error reading creation metadata")?
+            .buck_error_context("Error reading creation metadata")?
             .map(MaterializerStateIdentity)
-            .with_context(|| format!("Identity key is missing in db: `{}`", IDENTITY_KEY))?;
+            .with_buck_error_context(|| {
+                format!("Identity key is missing in db: `{}`", IDENTITY_KEY)
+            })?;
 
         Ok(Self { tables, identity })
     }
@@ -530,7 +540,7 @@ impl MaterializerStateSqliteDb {
         io_executor: Arc<dyn BlockingExecutor>,
         digest_config: DigestConfig,
         reject_identity: Option<&MaterializerStateIdentity>,
-    ) -> anyhow::Result<(Self, anyhow::Result<MaterializerState>)> {
+    ) -> buck2_error::Result<(Self, buck2_error::Result<MaterializerState>)> {
         io_executor
             .execute_io_inline(|| {
                 Self::initialize_impl(
@@ -550,17 +560,17 @@ impl MaterializerStateSqliteDb {
         mut current_instance_metadata: HashMap<String, String>,
         digest_config: DigestConfig,
         reject_identity: Option<&MaterializerStateIdentity>,
-    ) -> anyhow::Result<(Self, anyhow::Result<MaterializerState>)> {
+    ) -> buck2_error::Result<(Self, buck2_error::Result<MaterializerState>)> {
         let timestamp_on_initialization = Utc::now().to_rfc3339();
         current_instance_metadata.insert(IDENTITY_KEY.to_owned(), timestamp_on_initialization);
 
         let db_path = materializer_state_dir.join(FileName::unchecked_new(Self::DB_FILENAME));
 
-        let result: anyhow::Result<(Self, MaterializerState)> = try {
+        let result: buck2_error::Result<(Self, MaterializerState)> = try {
             // try reading the existing db, if it exists.
             if !db_path.exists() {
-                Err(anyhow::anyhow!(
-                    MaterializerStateSqliteDbError::PathDoesNotExist(db_path.clone())
+                Err(MaterializerStateSqliteDbError::PathDoesNotExist(
+                    db_path.clone(),
                 ))?
             }
 
@@ -622,7 +632,7 @@ impl MaterializerStateSqliteDb {
                     .last_read_by_table
                     .insert_all(current_instance_metadata)?;
 
-                Ok((Self::new(tables)?, Err(e)))
+                Ok((Self::new(tables)?, Err(e.into())))
             }
         }
     }
@@ -653,7 +663,7 @@ struct MaterializerStateTables {
 
 impl MaterializerStateTables {
     /// Given path to sqlite DB, opens and returns a new connection to the DB.
-    fn open(path: &AbsNormPath) -> anyhow::Result<Self> {
+    fn open(path: &AbsNormPath) -> buck2_error::Result<Self> {
         let connection = Connection::open(path)?;
         // TODO: make this work on Windows too
         if cfg!(unix) {
@@ -694,7 +704,7 @@ impl MaterializerStateTables {
         })
     }
 
-    fn create_all_tables(&self) -> anyhow::Result<()> {
+    fn create_all_tables(&self) -> buck2_error::Result<()> {
         self.materializer_state_table.create_table()?;
         self.versions_table.create_table()?;
         self.created_by_table.create_table()?;
@@ -703,20 +713,33 @@ impl MaterializerStateTables {
     }
 }
 
+#[allow(unused)] // Used by test modules
+pub(crate) fn testing_materializer_state_sqlite_db(
+    fs: &ProjectRoot,
+    versions: HashMap<String, String>,
+    metadata: HashMap<String, String>,
+    reject_identity: Option<&MaterializerStateIdentity>,
+) -> buck2_error::Result<(
+    MaterializerStateSqliteDb,
+    buck2_error::Result<MaterializerState>,
+)> {
+    MaterializerStateSqliteDb::initialize_impl(
+        fs.resolve(ProjectRelativePath::unchecked_new(
+            "buck-out/v2/cache/materializer_state",
+        )),
+        versions,
+        metadata,
+        DigestConfig::testing_default(),
+        reject_identity,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use assert_matches::assert_matches;
-    use buck2_common::file_ops::FileMetadata;
-    use buck2_common::file_ops::TrackedFileDigest;
-    use buck2_core::directory::DirectoryEntry;
-    use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
-    use buck2_core::fs::project_rel_path::ProjectRelativePath;
-    use buck2_execute::digest_config::DigestConfig;
     use buck2_execute::directory::new_symlink;
-    use buck2_execute::directory::ActionDirectoryMember;
 
     use super::*;
 
@@ -888,23 +911,6 @@ mod tests {
         assert_eq!(artifacts, state.into_iter().collect::<HashMap<_, _>>());
     }
 
-    fn testing_materializer_state_sqlite_db(
-        fs: &ProjectRoot,
-        versions: HashMap<String, String>,
-        metadata: HashMap<String, String>,
-        reject_identity: Option<&MaterializerStateIdentity>,
-    ) -> anyhow::Result<(MaterializerStateSqliteDb, anyhow::Result<MaterializerState>)> {
-        MaterializerStateSqliteDb::initialize_impl(
-            fs.resolve(ProjectRelativePath::unchecked_new(
-                "buck-out/v2/cache/materializer_state",
-            )),
-            versions,
-            metadata,
-            DigestConfig::testing_default(),
-            reject_identity,
-        )
-    }
-
     // Only implementing for tests, actual code should use `matches_entry` (and not check total_size)
     impl PartialEq for DirectoryMetadata {
         fn eq(&self, other: &DirectoryMetadata) -> bool {
@@ -919,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_sqlite_db() -> anyhow::Result<()> {
+    fn test_initialize_sqlite_db() -> buck2_error::Result<()> {
         fn testing_metadatas() -> Vec<HashMap<String, String>> {
             let metadata = buck2_events::metadata::collect();
             let mut metadatas = vec![metadata; 5];
@@ -964,14 +970,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_matches!(
-                loaded_state,
-                Err(e) => {
-                    assert_matches!(
-                        e.downcast_ref::<MaterializerStateSqliteDbError>(),
-                        Some(MaterializerStateSqliteDbError::PathDoesNotExist(_path)));
-                }
-            );
+            assert!(loaded_state.is_err());
+            if let Err(e) = loaded_state {
+                assert!(e.category_key().ends_with("PathDoesNotExist"));
+            }
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[0]);
             assert_metadata_matches(db.tables.last_read_by_table.read_all()?, &metadatas[0]);
 
@@ -1002,18 +1004,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_matches!(
-                loaded_state,
-                Err(e) => {
-                    assert_matches!(
-                        e.downcast_ref::<MaterializerStateSqliteDbError>(),
-                        Some(MaterializerStateSqliteDbError::VersionMismatch {
-                            expected: _expected,
-                            found: _found,
-                            path: _path,
-                    }));
-                }
-            );
+            assert!(loaded_state.is_err());
+            if let Err(e) = loaded_state {
+                assert!(e.category_key().ends_with("VersionMismatch"));
+            }
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[2]);
             assert_metadata_matches(db.tables.last_read_by_table.read_all()?, &metadatas[2]);
 
@@ -1050,16 +1044,10 @@ mod tests {
                 Some(&identity),
             )
             .unwrap();
-            assert_matches!(
-                loaded_state,
-                Err(e) => {
-                    assert_matches!(
-                        e.downcast_ref::<MaterializerStateSqliteDbError>(),
-                        Some(MaterializerStateSqliteDbError::RejectedIdentity {
-                            ..
-                    }));
-                }
-            );
+            assert!(loaded_state.is_err());
+            if let Err(e) = loaded_state {
+                assert!(e.category_key().ends_with("RejectedIdentity"));
+            }
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[4]);
             assert_metadata_matches(db.tables.last_read_by_table.read_all()?, &metadatas[4]);
         }
@@ -1068,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_many() -> anyhow::Result<()> {
+    fn test_delete_many() -> buck2_error::Result<()> {
         let conn = Connection::open_in_memory()?;
 
         let table = MaterializerStateSqliteTable::new(Arc::new(Mutex::new(conn)));

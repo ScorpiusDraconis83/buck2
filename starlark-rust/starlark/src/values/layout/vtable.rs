@@ -40,7 +40,7 @@ use crate::eval::Evaluator;
 use crate::private::Private;
 use crate::typing::Ty;
 use crate::values::demand::Demand;
-use crate::values::int::PointerI32;
+use crate::values::int::pointer_i32::PointerI32;
 use crate::values::layout::avalue::AValue;
 use crate::values::layout::avalue::BlackHole;
 use crate::values::layout::const_type_id::ConstTypeId;
@@ -50,6 +50,7 @@ use crate::values::layout::value_alloc_size::ValueAllocSize;
 use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::traits::StarlarkValueVTable;
 use crate::values::traits::StarlarkValueVTableGet;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
@@ -124,7 +125,7 @@ pub(crate) struct AValueVTable {
     // `AValue`
     pub(crate) is_str: bool,
     memory_size: fn(StarlarkValueRawPtr) -> ValueAllocSize,
-    heap_freeze: fn(StarlarkValueRawPtr, &Freezer) -> anyhow::Result<FrozenValue>,
+    heap_freeze: fn(StarlarkValueRawPtr, &Freezer) -> FreezeResult<FrozenValue>,
     heap_copy: for<'v> fn(StarlarkValueRawPtr, &Tracer<'v>) -> Value<'v>,
 
     // `StarlarkValue` supertraits.
@@ -134,9 +135,9 @@ pub(crate) struct AValueVTable {
     allocative: unsafe fn(StarlarkValueRawPtr) -> *const dyn Allocative,
 }
 
-struct GetTypeId<'v, T: StarlarkValue<'v> + ?Sized>(PhantomData<&'v T>);
+struct GetTypeId<'v, T: StarlarkValue<'v>>(PhantomData<&'v T>);
 
-impl<'v, T: StarlarkValue<'v> + ?Sized> GetTypeId<'v, T> {
+impl<'v, T: StarlarkValue<'v>> GetTypeId<'v, T> {
     const TYPE_ID: ConstTypeId = ConstTypeId::of::<<T as ProvidesStaticType>::StaticType>();
     const STARLARK_TYPE_ID: StarlarkTypeId = StarlarkTypeId::of::<T>();
 }
@@ -174,10 +175,7 @@ impl AValueVTable {
                 let this = unsafe { &*this.value_ptr::<BlackHole>() };
                 this as *const dyn Debug
             },
-            erased_serde_serialize: |this| {
-                let this = unsafe { &*this.value_ptr::<BlackHole>() };
-                this as *const dyn erased_serde::Serialize
-            },
+            erased_serde_serialize: |_this| unreachable!(),
             allocative: |this| {
                 let this = unsafe { &*this.value_ptr::<BlackHole>() };
                 this as *const dyn Allocative
@@ -189,19 +187,19 @@ impl AValueVTable {
     pub(crate) const fn new<'v, T: AValue<'v>>() -> &'static AValueVTable {
         &AValueVTable {
             drop_in_place: |p| unsafe {
-                ptr::drop_in_place(p.value_ptr::<T>());
+                ptr::drop_in_place(p.value_ptr::<T::StarlarkValue>());
             },
             is_str: T::IS_STR,
             memory_size: |p| unsafe {
-                let p = &*p.value_ptr::<T>();
-                T::alloc_size_for_extra_len(p.extra_len())
+                let p = &*p.value_ptr::<T::StarlarkValue>();
+                T::alloc_size_for_extra_len(T::extra_len(p))
             },
             heap_freeze: |p, freezer| unsafe {
-                let p = &mut *AValueRepr::from_payload_ptr_mut(p.value_ptr::<T>());
+                let p = &mut *AValueRepr::from_payload_ptr_mut(p.value_ptr::<T::StarlarkValue>());
                 T::heap_freeze(p, transmute!(&Freezer, &Freezer, freezer))
             },
             heap_copy: |p, tracer| unsafe {
-                let p = &mut *AValueRepr::from_payload_ptr_mut(p.value_ptr::<T>());
+                let p = &mut *AValueRepr::from_payload_ptr_mut(p.value_ptr::<T::StarlarkValue>());
                 let value = T::heap_copy(p, transmute!(&Tracer, &Tracer, tracer));
                 transmute!(Value, Value, value)
             },
@@ -303,7 +301,7 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) unsafe fn heap_freeze(self, freezer: &Freezer) -> anyhow::Result<FrozenValue> {
+    pub(crate) unsafe fn heap_freeze(self, freezer: &Freezer) -> FreezeResult<FrozenValue> {
         (self.vtable.heap_freeze)(self.value, freezer)
     }
 
@@ -313,7 +311,7 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn documentation(self) -> Option<DocItem> {
+    pub(crate) fn documentation(self) -> DocItem {
         (self.vtable.starlark_value.documentation)(self.value)
     }
 
@@ -521,16 +519,6 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn invoke_method(
-        self,
-        this: Value<'v>,
-        args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> crate::Result<Value<'v>> {
-        (self.vtable.starlark_value.invoke_method)(self.value, this, args, eval, Private)
-    }
-
-    #[inline]
     pub(crate) fn name_for_call_stack(self, me: Value<'v>) -> String {
         (self.vtable.starlark_value.name_for_call_stack)(self.value, me)
     }
@@ -539,7 +527,7 @@ impl<'v> AValueDyn<'v> {
     pub(crate) fn export_as(
         self,
         variable_name: &str,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<()> {
         (self.vtable.starlark_value.export_as)(self.value, variable_name, eval)
     }
@@ -557,11 +545,6 @@ impl<'v> AValueDyn<'v> {
     #[inline]
     pub(crate) fn write_hash(self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
         (self.vtable.starlark_value.write_hash)(self.value, hasher)
-    }
-
-    #[inline]
-    pub(crate) fn matches_type(self, t: &str) -> bool {
-        (self.vtable.starlark_value.matches_type)(self.value, t)
     }
 
     #[inline]
@@ -606,7 +589,7 @@ impl<'v> AValueDynFull<'v> {
     pub(crate) fn invoke(
         self,
         args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
         (self.avalue.vtable.starlark_value.invoke)(self.avalue.value, self.value, args, eval)
     }

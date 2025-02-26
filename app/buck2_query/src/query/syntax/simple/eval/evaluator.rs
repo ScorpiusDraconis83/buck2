@@ -44,7 +44,7 @@ impl<'e, Env: QueryEnvironment> QueryEvaluator<'e, Env> {
         self.functions
     }
 
-    async fn resolve_literal(&self, literal: &str) -> anyhow::Result<TargetSet<Env::Target>> {
+    async fn resolve_literal(&self, literal: &str) -> buck2_error::Result<TargetSet<Env::Target>> {
         self.env.eval_literals(&[literal]).await
     }
 
@@ -68,7 +68,7 @@ impl<'e, Env: QueryEnvironment> QueryEvaluator<'e, Env> {
             Expr::BinaryOpSequence(left, exprs) => {
                 let (left, rights) = futures::future::try_join(
                     self.eval(left),
-                    futures::future::try_join_all(exprs.iter().map(|(op, expr)| async move {
+                    buck2_util::future::try_join_all(exprs.iter().map(|(op, expr)| async move {
                         let value = self.eval(expr).await?;
                         Ok((op, value))
                     })),
@@ -120,7 +120,7 @@ impl<'e, Env: QueryEnvironment> QueryEvaluator<'e, Env> {
     pub async fn eval_query<'a>(
         &self,
         query: &str,
-    ) -> anyhow::Result<QueryEvaluationValue<Env::Target>> {
+    ) -> buck2_error::Result<QueryEvaluationValue<Env::Target>> {
         let parsed_query = parse_expr(query)?;
         match self.eval_parsed_query(&parsed_query).await {
             Ok(v) => Ok(v.value),
@@ -134,7 +134,7 @@ impl<'e, Env: QueryEnvironment> QueryEvaluator<'e, Env> {
     ) -> QueryResult<QueryEvaluationValue<Env::Target>> {
         self.eval(expr)
             .await?
-            .async_into_map_res(async move |value| {
+            .async_into_map_res(|value| async move {
                 match value {
                     // A top-level string we treat as a target pattern and resolve it. This allows something like
                     // `buck2 query //lib/...` to resolve to the corresponding targets.

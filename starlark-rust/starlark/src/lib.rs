@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! A [Starlark interpreter in Rust](https://github.com/facebookexperimental/starlark-rust).
+//! A [Starlark interpreter in Rust](https://github.com/facebook/starlark-rust).
 //! Starlark is a deterministic version of Python, with [a specification](https://github.com/bazelbuild/starlark/blob/master/spec.md),
 //! used by (amongst others) the [Buck](https://buck.build) and [Bazel](https://bazel.build) build systems.
 //!
@@ -293,7 +293,7 @@
 //! quadratic
 //! "#;
 //!
-//! let ast = AstModule::parse("quadratic.star", content.to_owned(), &Dialect::Extended)?;
+//! let ast = AstModule::parse("quadratic.star", content.to_owned(), &Dialect::Standard)?;
 //! let globals = Globals::standard();
 //! let module = Module::new();
 //! let mut eval = Evaluator::new(&module);
@@ -393,6 +393,7 @@
 // Features we use
 #![allow(stable_features)]
 #![allow(unknown_lints)] // for clippy::tuple_array_conversions
+#![cfg_attr(rust_nightly, allow(internal_features))]
 #![cfg_attr(rust_nightly, feature(const_type_id))]
 #![cfg_attr(rust_nightly, feature(core_intrinsics))]
 #![cfg_attr(rust_nightly, feature(cfg_sanitize))]
@@ -407,6 +408,7 @@
 #![allow(clippy::float_cmp)]
 #![allow(clippy::if_same_then_else)]
 #![allow(clippy::len_without_is_empty)]
+#![allow(clippy::manual_map)]
 #![allow(clippy::manual_range_contains)]
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::missing_safety_doc)]
@@ -421,16 +423,17 @@
 #![allow(clippy::wrong_self_convention)]
 // FIXME: Temporary
 #![allow(clippy::useless_transmute)] // Seems to be a clippy bug, but we should be using less transmute anyway
+#![allow(clippy::zero_repeat_side_effects)]
 #![deny(missing_docs)]
 
 mod macros;
 
 pub use starlark_derive::starlark_module;
-pub use starlark_derive::StarlarkDocs;
 pub use starlark_syntax::codemap;
 pub use starlark_syntax::Error;
 pub use starlark_syntax::ErrorKind;
 pub use starlark_syntax::Result;
+pub use starlark_syntax::StarlarkResultExt;
 pub use stdlib::PrintHandler;
 
 pub mod analysis;
@@ -451,6 +454,7 @@ pub mod typing;
 pub(crate) mod cast;
 mod hint;
 mod stdlib;
+pub mod util;
 pub mod values;
 pub mod wasm;
 
@@ -469,15 +473,4 @@ pub mod __macro_refs {
     pub use crate::coerce::coerce;
 }
 
-/// __derive_refs allows us to reference other crates in starlark_derive without users needing to be
-///  aware of those dependencies. We make them public here and then can reference them like
-///  `starlark::__derive_refs::foo`.
-#[doc(hidden)]
-pub mod __derive_refs {
-    pub mod serde {
-        pub use serde::ser::Error;
-        pub use serde::Serialize;
-        pub use serde::Serializer;
-    }
-    pub use inventory;
-}
+pub mod __derive_refs;

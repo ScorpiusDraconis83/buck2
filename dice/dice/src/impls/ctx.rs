@@ -10,45 +10,47 @@
 use std::any::Any;
 use std::future::Future;
 use std::ops::Deref;
-use std::pin::Pin;
+use std::ops::DerefMut;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_futures::owning_future::OwningFuture;
 use derivative::Derivative;
+use dice_error::result::CancellableResult;
+use dice_error::result::CancellationReason;
+use dice_error::DiceError;
+use dice_error::DiceResult;
 use dupe::Dupe;
 use futures::future::BoxFuture;
-use futures::future::Either;
 use futures::FutureExt;
 use futures::TryFutureExt;
-use gazebo::variants::UnpackVariants;
+use itertools::Either;
 use parking_lot::Mutex;
-use parking_lot::MutexGuard;
+use typed_arena::Arena;
 
 use crate::api::activation_tracker::ActivationData;
 use crate::api::computations::DiceComputations;
-use crate::api::computations::DiceComputationsParallel;
 use crate::api::data::DiceData;
-use crate::api::error::DiceResult;
+use crate::api::invalidation_tracking::DiceKeyTrackedInvalidationPaths;
 use crate::api::key::Key;
 use crate::api::projection::ProjectionKey;
 use crate::api::user_data::UserComputationData;
 use crate::ctx::DiceComputationsImpl;
+use crate::ctx::LinearRecomputeDiceComputationsImpl;
 use crate::impls::cache::DiceTaskRef;
 use crate::impls::cache::SharedCache;
 use crate::impls::core::state::CoreStateHandle;
 use crate::impls::core::versions::VersionEpoch;
-use crate::impls::dep_trackers::RecordingDepsTracker;
+use crate::impls::deps::RecordedDeps;
+use crate::impls::deps::RecordingDepsTracker;
 use crate::impls::dice::DiceModern;
 use crate::impls::evaluator::AsyncEvaluator;
 use crate::impls::evaluator::SyncEvaluator;
 use crate::impls::events::DiceEventDispatcher;
-use crate::impls::incremental::IncrementalEngine;
 use crate::impls::key::CowDiceKeyHashed;
 use crate::impls::key::DiceKey;
 use crate::impls::key::ParentKey;
 use crate::impls::opaque::OpaqueValueModern;
-use crate::impls::task::dice::MaybeCancelled;
 use crate::impls::task::promise::DicePromise;
 use crate::impls::task::sync_dice_task;
 use crate::impls::task::PreviouslyCancelledTask;
@@ -57,17 +59,13 @@ use crate::impls::transaction::TransactionUpdater;
 use crate::impls::user_cycle::KeyComputingUserCycleDetectorData;
 use crate::impls::user_cycle::UserCycleDetectorData;
 use crate::impls::value::DiceComputedValue;
-use crate::impls::value::DiceValidity;
-use crate::impls::value::MaybeValidDiceValue;
-use crate::owned::Owned;
-use crate::owned::Ref;
-use crate::result::CancellableResult;
-use crate::result::Cancelled;
+use crate::impls::value::TrackedInvalidationPaths;
+use crate::impls::worker::project_for_key;
+use crate::impls::worker::DiceTaskWorker;
 use crate::transaction_update::DiceTransactionUpdaterImpl;
 use crate::versions::VersionNumber;
-use crate::DiceError;
 use crate::DiceTransactionUpdater;
-use crate::HashSet;
+use crate::LinearRecomputeDiceComputations;
 use crate::UserCycleDetectorGuard;
 
 /// Context that is the base for which all requests start from
@@ -75,22 +73,16 @@ use crate::UserCycleDetectorGuard;
 pub(crate) struct BaseComputeCtx {
     // we need to give off references of `DiceComputation` so hold this for now, but really once we
     // get rid of the enum, we just hold onto the base data directly and do some ref casts
-    data: DiceComputations,
+    data: DiceComputations<'static>,
     live_version_guard: ActiveTransactionGuard,
 }
 
 impl Clone for BaseComputeCtx {
     fn clone(&self) -> Self {
-        Self {
-            data: match &self.data.0 {
-                DiceComputationsImpl::Legacy(_) => {
-                    unreachable!("wrong dice")
-                }
-                DiceComputationsImpl::Modern(ctx) => {
-                    DiceComputations(DiceComputationsImpl::Modern(ctx.clone_for_base()))
-                }
-            },
-            live_version_guard: self.live_version_guard.dupe(),
+        match &self.data.0 {
+            DiceComputationsImpl::Modern(modern) => {
+                BaseComputeCtx::clone_for(modern, self.live_version_guard.dupe())
+            }
         }
     }
 }
@@ -105,14 +97,28 @@ impl BaseComputeCtx {
         live_version_guard: ActiveTransactionGuard,
     ) -> Self {
         Self {
-            data: DiceComputations(DiceComputationsImpl::Modern(ModernComputeCtx::Regular(
-                PerComputeCtx::new(
-                    ParentKey::None,
+            data: DiceComputations(DiceComputationsImpl::Modern(ModernComputeCtx::new(
+                ParentKey::None,
+                KeyComputingUserCycleDetectorData::Untracked,
+                AsyncEvaluator {
                     per_live_version_ctx,
                     user_data,
                     dice,
-                    KeyComputingUserCycleDetectorData::Untracked,
-                ),
+                },
+            ))),
+            live_version_guard,
+        }
+    }
+
+    fn clone_for(
+        modern: &ModernComputeCtx<'_>,
+        live_version_guard: ActiveTransactionGuard,
+    ) -> BaseComputeCtx {
+        Self {
+            data: DiceComputations(DiceComputationsImpl::Modern(ModernComputeCtx::new(
+                ParentKey::None,
+                KeyComputingUserCycleDetectorData::Untracked,
+                modern.ctx_data().async_evaluator.clone(),
             ))),
             live_version_guard,
         }
@@ -124,62 +130,54 @@ impl BaseComputeCtx {
 
     pub(crate) fn into_updater(self) -> DiceTransactionUpdater {
         DiceTransactionUpdater(match self.data.0 {
-            DiceComputationsImpl::Legacy(_) => unreachable!("modern dice"),
             DiceComputationsImpl::Modern(delegate) => {
-                DiceTransactionUpdaterImpl::Modern(match delegate {
-                    ModernComputeCtx::Regular(ctx) => ctx.into_updater(),
-                    ModernComputeCtx::Parallel(_) => {
-                        unreachable!("base context can never hold any but the regular context")
-                    }
-                })
+                DiceTransactionUpdaterImpl::Modern(delegate.into_updater())
             }
         })
     }
 
-    pub(crate) fn as_computations(&self) -> &DiceComputations {
+    pub(crate) fn as_computations(&self) -> &DiceComputations<'static> {
         &self.data
     }
 
-    pub(crate) fn as_computations_mut(&mut self) -> &mut DiceComputations {
+    pub(crate) fn as_computations_mut(&mut self) -> &mut DiceComputations<'static> {
         &mut self.data
     }
 }
 
 impl Deref for BaseComputeCtx {
-    type Target = ModernComputeCtx;
+    type Target = ModernComputeCtx<'static>;
 
     fn deref(&self) -> &Self::Target {
         match &self.data.0 {
-            DiceComputationsImpl::Legacy(_) => {
-                unreachable!("legacy dice instead of modern")
-            }
             DiceComputationsImpl::Modern(ctx) => ctx,
         }
     }
 }
 
-/// Context that is available from the `DiceComputation`s for modern dice calculations
-#[derive(Allocative, UnpackVariants)]
-pub(crate) enum ModernComputeCtx {
-    /// The standard context given to a Key
-    Regular(PerComputeCtx),
-    /// The context when we are in the lambdas of a `compute_many` of a Key
-    Parallel(PerParallelComputeCtx),
+impl DerefMut for BaseComputeCtx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.data.0 {
+            DiceComputationsImpl::Modern(ctx) => ctx,
+        }
+    }
 }
 
-impl ModernComputeCtx {
+impl<'d> ModernComputeCtx<'d> {
     /// Gets all the result of of the given computation key.
     /// recorded as dependencies of the current computation for which this
     /// context is for.
     pub(crate) fn compute<'a, K>(
-        &'a self,
+        &'a mut self,
         key: &K,
     ) -> impl Future<Output = DiceResult<<K as Key>::Value>> + 'a
     where
         K: Key,
+        Self: 'a,
     {
-        self.compute_opaque(key)
-            .map(|r| r.map(|opaque| opaque.into_value()))
+        let (ctx_data, dep_trackers) = self.unpack();
+        Self::compute_opaque_impl(ctx_data, key)
+            .map(move |r| r.map(|opaque| Self::opaque_into_value_impl(dep_trackers, opaque)))
     }
 
     /// Compute "opaque" value where the value is only accessible via projections.
@@ -193,155 +191,245 @@ impl ModernComputeCtx {
     where
         K: Key,
     {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.compute_opaque(key).left_future(),
-            ModernComputeCtx::Parallel(ctx) => ctx.compute_opaque(key).right_future(),
-        }
-        .map(move |cancellable_result| {
+        Self::compute_opaque_impl(self.ctx_data(), key)
+    }
+
+    fn compute_opaque_impl<'a, K>(
+        ctx_data: &CoreCtx,
+        key: &K,
+    ) -> impl Future<Output = DiceResult<OpaqueValueModern<K>>> + 'a
+    where
+        K: Key,
+    {
+        ctx_data.compute_opaque(key).map(move |cancellable_result| {
             let cancellable = cancellable_result.map(move |(dice_key, dice_value)| {
-                OpaqueValueModern::new(self, dice_key, dice_value.value().dupe())
+                let (value, invalidation_paths) = dice_value.into_parts();
+                OpaqueValueModern::new(dice_key, value, invalidation_paths)
             });
 
-            cancellable.map_err(|_| DiceError::cancelled())
+            cancellable.map_err(DiceError::cancelled)
         })
     }
 
-    /// Compute many tasks that can be ran in parallel without depending on each other
+    /// Computes all the given tasks in parallel, returning an unordered Stream
     pub(crate) fn compute_many<'a, T: 'a>(
-        &'a self,
+        &'a mut self,
         computes: impl IntoIterator<
-            Item = impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
+            Item = impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
         >,
-    ) -> Vec<
-        Either<
-            Pin<Box<OwningFuture<T, DiceComputationsParallel<'a>>>>,
-            impl Future<Output = T> + 'a,
-        >,
-    > {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx
-                .compute_many(computes)
-                .map(|f| f.left_future().right_future())
-                .collect(),
-            ModernComputeCtx::Parallel(ctx) => ctx
-                .compute_many(computes)
-                .map(|f| f.right_future().right_future())
-                .collect(),
-        }
+    ) -> Vec<impl Future<Output = T> + 'a> {
+        let iter = computes.into_iter();
+        let parallel = self.parallel_builder(iter.size_hint().0);
+        iter.map(|func| parallel.compute(func)).collect()
     }
 
     pub(crate) fn compute2<'a, T: 'a, U: 'a>(
-        &'a self,
-        compute1: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        compute2: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, U> + Send,
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, U> + Send,
     ) -> (impl Future<Output = T> + 'a, impl Future<Output = U> + 'a) {
-        match self {
-            ModernComputeCtx::Regular(ctx) => {
-                let (f1, f2) = ctx.compute2(compute1, compute2);
+        let parallel = self.parallel_builder(2);
+        (parallel.compute(compute1), parallel.compute(compute2))
+    }
 
-                (f1.left_future(), f2.left_future())
+    pub(crate) fn compute3<'a, T: 'a, U: 'a, V: 'a>(
+        &'a mut self,
+        compute1: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
+        compute2: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, U> + Send,
+        compute3: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, V> + Send,
+    ) -> (
+        impl Future<Output = T> + 'a,
+        impl Future<Output = U> + 'a,
+        impl Future<Output = V> + 'a,
+    ) {
+        let parallel = self.parallel_builder(3);
+
+        (
+            parallel.compute(compute1),
+            parallel.compute(compute2),
+            parallel.compute(compute3),
+        )
+    }
+
+    pub(crate) fn with_linear_recompute<'a, T, Fut: Future<Output = T> + 'a>(
+        &'a mut self,
+        func: impl FnOnce(LinearRecomputeDiceComputations<'a>) -> Fut + 'a,
+    ) -> impl Future<Output = T> + 'a {
+        let (ctx_data, self_dep_trackers) = self.unpack();
+        let dep_trackers = Arc::new(Mutex::new(RecordingDepsTracker::new(
+            // TODO(cjhopman): if inspected during the with_linear_recompute, this will be missing some invalidation paths.
+            TrackedInvalidationPaths::clean(),
+        )));
+        let fut = func(LinearRecomputeDiceComputations(
+            LinearRecomputeDiceComputationsImpl::Modern(LinearRecomputeModern {
+                ctx_data,
+                dep_trackers: dep_trackers.dupe(),
+            }),
+        ));
+
+        fut.map(move |v| {
+            let mut self_dep_trackers = self_dep_trackers.lock();
+            let dep_trackers = Arc::into_inner(dep_trackers)
+                .unwrap()
+                .into_inner()
+                .collect_deps();
+            let validity = dep_trackers.deps_validity;
+            for k in dep_trackers.deps.iter_keys() {
+                self_dep_trackers.record(k, validity, TrackedInvalidationPaths::clean())
             }
-            ModernComputeCtx::Parallel(ctx) => {
-                let (f1, f2) = ctx.compute2(compute1, compute2);
-                (f1.right_future(), f2.right_future())
-            }
-        }
+            self_dep_trackers.update_invalidation_paths(dep_trackers.invalidation_paths.dupe());
+            v
+        })
     }
 
-    /// Compute "projection" based on deriving value
-    pub(crate) fn project<K>(
-        &self,
-        key: &K,
-        base_key: DiceKey,
-        base: MaybeValidDiceValue,
-    ) -> DiceResult<K::Value>
-    where
-        K: ProjectionKey,
-    {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.project(key, base_key, base),
-            ModernComputeCtx::Parallel(ctx) => ctx.project(key, base_key, base),
-        }
+    pub(crate) fn opaque_into_value<K: Key>(&mut self, opaque: OpaqueValueModern<K>) -> K::Value {
+        Self::opaque_into_value_impl(self.unpack().1, opaque)
     }
 
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
-    pub(crate) fn global_data(&self) -> &DiceData {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.global_data(),
-            ModernComputeCtx::Parallel(ctx) => ctx.global_data(),
-        }
+    fn opaque_into_value_impl<K: Key>(
+        deps: DepsTrackerHolder,
+        opaque: OpaqueValueModern<K>,
+    ) -> K::Value {
+        let OpaqueValueModern {
+            derive_from_key,
+            derive_from,
+            invalidation_paths,
+            ..
+        } = opaque;
+
+        deps.lock()
+            .record(derive_from_key, derive_from.validity(), invalidation_paths);
+
+        derive_from
+            .downcast_maybe_transient::<K::Value>()
+            .expect("type mismatch")
+            .dupe()
     }
 
-    /// Data that is static for the lifetime of the current request context. This lifetime is
-    /// the lifetime of the top-level `DiceComputation` used for all requests.
-    /// The data is also specific to each request context, so multiple concurrent requests can
-    /// each have their own individual data.
-    pub(crate) fn per_transaction_data(&self) -> &UserComputationData {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.per_transaction_data(),
-            ModernComputeCtx::Parallel(ctx) => ctx.per_transaction_data(),
-        }
-    }
-
-    pub(crate) fn get_version(&self) -> VersionNumber {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.get_version(),
-            ModernComputeCtx::Parallel(ctx) => ctx.get_version(),
-        }
-    }
-
-    pub(super) fn dep_trackers(&self) -> MutexGuard<'_, RecordingDepsTracker> {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.dep_trackers(),
-            ModernComputeCtx::Parallel(ctx) => ctx.dep_trackers(),
-        }
-    }
-
-    pub(crate) fn store_evaluation_data<T: Send + Sync + 'static>(
-        &self,
-        value: T,
-    ) -> DiceResult<()> {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.store_evaluation_data(value),
-            ModernComputeCtx::Parallel(ctx) => ctx.store_evaluation_data(value),
-        }
-    }
-
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<&T>> {
-        match self {
-            ModernComputeCtx::Regular(ctx) => ctx.cycle_guard(),
-            ModernComputeCtx::Parallel(ctx) => ctx.cycle_guard(),
-        }
+    pub(crate) fn get_invalidation_paths(&mut self) -> DiceKeyTrackedInvalidationPaths {
+        let (normal, high) = {
+            let mut dep_trackers = self.dep_trackers();
+            let paths = dep_trackers.invalidation_paths();
+            (paths.get_normal(), paths.get_high())
+        };
+        DiceKeyTrackedInvalidationPaths::new(
+            self.ctx_data().async_evaluator.dice.dupe(),
+            normal,
+            high,
+        )
     }
 }
 
-impl ModernComputeCtx {
-    pub(crate) fn clone_for_base(&self) -> ModernComputeCtx {
+impl<'a> From<ModernComputeCtx<'a>> for DiceComputations<'a> {
+    fn from(value: ModernComputeCtx<'a>) -> Self {
+        DiceComputations(DiceComputationsImpl::Modern(value))
+    }
+}
+
+pub(crate) struct LinearRecomputeModern<'a> {
+    ctx_data: &'a CoreCtx,
+    dep_trackers: Arc<Mutex<RecordingDepsTracker>>,
+}
+
+impl LinearRecomputeModern<'_> {
+    pub(crate) fn get(&self) -> DiceComputations<'_> {
+        ModernComputeCtx::Linear {
+            ctx_data: self.ctx_data,
+            dep_trackers: &self.dep_trackers,
+        }
+        .into()
+    }
+}
+
+/// This is used to create the ctx for each individual parallel compute (from compute_many/compute_join/compute2/etc).
+///
+/// For the Normal case, each parallel ctx will be expected to record its deps into a RecordedDeps allocated in the arena.
+///
+/// For the Linear case, each parallel ctx will record deps into the shared RecordingDepsTracker.
+pub(crate) enum ModernComputeCtxParallelBuilder<'a> {
+    Normal {
+        ctx_data: &'a CoreCtx,
+        tracker_arena: &'a Arena<RecordedDeps>,
+        invalidation_paths: &'a TrackedInvalidationPaths,
+    },
+    Linear {
+        ctx_data: &'a CoreCtx,
+        dep_trackers: &'a Mutex<RecordingDepsTracker>,
+    },
+}
+impl<'a> ModernComputeCtxParallelBuilder<'a> {
+    fn compute<T: 'a>(
+        &self,
+        func: impl for<'x> FnOnce(&'x mut DiceComputations<'a>) -> BoxFuture<'x, T> + Send,
+    ) -> impl Future<Output = T> + 'a {
         match self {
-            ModernComputeCtx::Regular(ctx) => ModernComputeCtx::Regular(PerComputeCtx::new(
-                ParentKey::None,
-                ctx.ctx_data.async_evaluator.per_live_version_ctx.dupe(),
-                ctx.ctx_data.async_evaluator.user_data.dupe(),
-                ctx.ctx_data.async_evaluator.dice.dupe(),
-                KeyComputingUserCycleDetectorData::Untracked,
-            )),
-            ModernComputeCtx::Parallel(_) => {
-                unreachable!("parallel context should never be held by the base ctx")
-            }
+            ModernComputeCtxParallelBuilder::Normal {
+                ctx_data,
+                tracker_arena,
+                invalidation_paths,
+            } => OwningFuture::new(
+                (
+                    tracker_arena.alloc(RecordedDeps::new()),
+                    ModernComputeCtx::Parallel {
+                        ctx_data,
+                        dep_trackers: RecordingDepsTracker::new((*invalidation_paths).dupe()),
+                    }
+                    .into(),
+                ),
+                |(_, ctx)| func(ctx),
+            )
+            .map_taking_data(|v, (this_deps, ctx)| match ctx.0 {
+                DiceComputationsImpl::Modern(ModernComputeCtx::Parallel {
+                    dep_trackers, ..
+                }) => {
+                    *this_deps = dep_trackers.collect_deps();
+                    v
+                }
+                _ => unreachable!(),
+            })
+            .left_future(),
+            ModernComputeCtxParallelBuilder::Linear {
+                ctx_data,
+                dep_trackers,
+            } => OwningFuture::new(
+                ModernComputeCtx::Linear {
+                    ctx_data,
+                    dep_trackers,
+                }
+                .into(),
+                func,
+            )
+            .right_future(),
         }
     }
 }
 
 /// Context given to the `compute` function of a `Key`.
 #[derive(Allocative)]
-pub(crate) struct PerComputeCtx {
-    dep_trackers: Mutex<RecordingDepsTracker>, // If we make PerComputeCtx &mut, we can get rid of this mutex after some refactoring
-    ctx_data: Owned<CoreCtx>,
+pub(crate) enum ModernComputeCtx<'a> {
+    /// The initial ctx for a key computation.
+    Owned {
+        ctx_data: CoreCtx,
+        dep_trackers: RecordingDepsTracker,
+    },
+    /// The ctx within a compute_many/compute_join/try_compute_join.
+    Parallel {
+        #[allocative(skip)]
+        ctx_data: &'a CoreCtx,
+        #[allocative(skip)]
+        dep_trackers: RecordingDepsTracker,
+    },
+    /// The ctx within a with_linear_recompute.
+    Linear {
+        #[allocative(skip)]
+        ctx_data: &'a CoreCtx,
+        #[allocative(skip)]
+        dep_trackers: &'a Mutex<RecordingDepsTracker>,
+    },
 }
 
 #[derive(Allocative)]
-struct CoreCtx {
+pub(crate) struct CoreCtx {
     async_evaluator: AsyncEvaluator,
     parent_key: ParentKey,
     #[allocative(skip)]
@@ -351,288 +439,136 @@ struct CoreCtx {
     evaluation_data: Mutex<EvaluationData>,
 }
 
-impl PerComputeCtx {
-    pub(crate) fn new(
-        parent_key: ParentKey,
-        per_live_version_ctx: SharedLiveTransactionCtx,
-        user_data: Arc<UserComputationData>,
-        dice: Arc<DiceModern>,
-        cycles: KeyComputingUserCycleDetectorData,
-    ) -> Self {
-        Self {
-            dep_trackers: Mutex::new(RecordingDepsTracker::new()),
-            ctx_data: Owned::new(CoreCtx {
-                async_evaluator: AsyncEvaluator {
-                    per_live_version_ctx,
-                    user_data,
-                    dice,
-                },
-                parent_key,
-                cycles,
-                evaluation_data: Mutex::new(EvaluationData::none()),
-            }),
+impl ModernComputeCtx<'static> {
+    fn into_owned(self) -> (CoreCtx, RecordingDepsTracker) {
+        match self {
+            ModernComputeCtx::Owned {
+                ctx_data,
+                dep_trackers,
+            } => (ctx_data, dep_trackers),
+            _ => unreachable!(),
         }
     }
-
-    /// Compute "opaque" value where the value is only accessible via projections.
-    /// Projections allow accessing derived results from the "opaque" value,
-    /// where the dependency of reading a projection is the projection value rather
-    /// than the entire opaque value.
-    pub(crate) fn compute_opaque<'a, K>(
-        &'a self,
-        key: &K,
-    ) -> impl Future<Output = CancellableResult<(DiceKey, DiceComputedValue)>> + 'a
-    where
-        K: Key,
-    {
-        self.ctx_data.compute_opaque(key)
-    }
-
-    /// Compute many tasks that can be ran in parallel without depending on each other
-    pub(crate) fn compute_many<'a, T: 'a>(
-        &'a self,
-        computes: impl IntoIterator<
-            Item = impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        >,
-    ) -> impl Iterator<Item = impl Future<Output = T> + 'a> {
-        computes.into_iter().map(|work| {
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.as_ref())),
-                ))),
-                |ctx| work(ctx),
-            )
-            .map_taking_data(|res, ctx| {
-                // TODO record structured dependencies instead of flat list
-                self.dep_trackers.lock().record_parallel_ctx_deps(
-                    ctx.0
-                        .0
-                        .into_modern()
-                        .expect("modern dice")
-                        .into_parallel()
-                        .expect("parallel ctx")
-                        .dep_trackers
-                        .into_inner(),
-                );
-
-                res
-            })
-        })
-    }
-
-    pub(crate) fn compute2<'a, T: 'a, U: 'a>(
-        &'a self,
-        compute1: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        compute2: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, U> + Send,
-    ) -> (impl Future<Output = T> + 'a, impl Future<Output = U> + 'a) {
-        (
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.as_ref())),
-                ))),
-                compute1,
-            )
-            .map_taking_data(|res, ctx| {
-                // TODO record structured dependencies instead of flat list
-                self.dep_trackers.lock().record_parallel_ctx_deps(
-                    ctx.0
-                        .0
-                        .into_modern()
-                        .expect("modern dice")
-                        .into_parallel()
-                        .expect("parallel ctx")
-                        .dep_trackers
-                        .into_inner(),
-                );
-
-                res
-            }),
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.as_ref())),
-                ))),
-                compute2,
-            )
-            .map_taking_data(|res, ctx| {
-                // TODO record structured dependencies instead of flat list
-                self.dep_trackers.lock().record_parallel_ctx_deps(
-                    ctx.0
-                        .0
-                        .into_modern()
-                        .expect("modern dice")
-                        .into_parallel()
-                        .expect("parallel ctx")
-                        .dep_trackers
-                        .into_inner(),
-                );
-
-                res
-            }),
-        )
-    }
-
-    /// Compute "projection" based on deriving value
-    pub(crate) fn project<K>(
-        &self,
-        key: &K,
-        base_key: DiceKey,
-        base: MaybeValidDiceValue,
-    ) -> DiceResult<K::Value>
-    where
-        K: ProjectionKey,
-    {
-        self.ctx_data
-            .project(key, base_key, base, &self.dep_trackers)
-    }
-
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
-    pub(crate) fn global_data(&self) -> &DiceData {
-        self.ctx_data.global_data()
-    }
-
-    /// Data that is static for the lifetime of the current request context. This lifetime is
-    /// the lifetime of the top-level `DiceComputation` used for all requests.
-    /// The data is also specific to each request context, so multiple concurrent requests can
-    /// each have their own individual data.
-    pub(crate) fn per_transaction_data(&self) -> &UserComputationData {
-        self.ctx_data.per_transaction_data()
-    }
-
-    pub(crate) fn get_version(&self) -> VersionNumber {
-        self.ctx_data.get_version()
-    }
-
-    pub(crate) fn into_updater(self) -> TransactionUpdater {
-        self.ctx_data.unwrap_inner().unwrap().into_updater()
-    }
-
-    pub(super) fn dep_trackers(&self) -> MutexGuard<'_, RecordingDepsTracker> {
-        self.dep_trackers.lock()
-    }
-
-    pub(crate) fn store_evaluation_data<T: Send + Sync + 'static>(
-        &self,
-        value: T,
-    ) -> DiceResult<()> {
-        self.ctx_data.store_evaluation_data(value)
-    }
-
     pub(crate) fn finalize(
         self,
     ) -> (
-        (HashSet<DiceKey>, DiceValidity),
+        RecordedDeps,
         EvaluationData,
         KeyComputingUserCycleDetectorData,
     ) {
-        let data = self.ctx_data.unwrap_inner().unwrap();
+        let (data, dep_trackers) = self.into_owned();
         (
-            self.dep_trackers.into_inner().collect_deps(),
+            dep_trackers.collect_deps(),
             data.evaluation_data.into_inner(),
             data.cycles,
         )
     }
 
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<&T>> {
-        self.ctx_data.cycle_guard()
+    pub(crate) fn into_updater(self) -> TransactionUpdater {
+        self.into_owned().0.into_updater()
     }
 }
 
-/// Context given to the lambdas of the `compute_many` function of a `Key`.
-#[derive(Allocative)]
-pub(crate) struct PerParallelComputeCtx {
-    dep_trackers: Mutex<RecordingDepsTracker>, // If we make PerComputeCtx &mut, we can get rid of this mutex after some refactoring
-    ctx_data: Ref<CoreCtx>, // this ref is alive while the main context is alive, which should be the case
+struct DepsTrackerHolder<'a>(Either<&'a mut RecordingDepsTracker, &'a Mutex<RecordingDepsTracker>>);
+impl<'a> DepsTrackerHolder<'a> {
+    fn lock(self) -> impl DerefMut<Target = RecordingDepsTracker> + 'a {
+        self.0.map_right(|v| v.lock())
+    }
 }
 
-impl PerParallelComputeCtx {
-    fn new(ctx_data: Ref<CoreCtx>) -> Self {
-        Self {
-            dep_trackers: Mutex::new(RecordingDepsTracker::new()),
-            ctx_data,
+impl ModernComputeCtx<'_> {
+    pub(crate) fn new(
+        parent_key: ParentKey,
+        cycles: KeyComputingUserCycleDetectorData,
+        async_evaluator: AsyncEvaluator,
+    ) -> ModernComputeCtx<'static> {
+        ModernComputeCtx::Owned {
+            dep_trackers: RecordingDepsTracker::new(TrackedInvalidationPaths::clean()),
+            ctx_data: CoreCtx {
+                async_evaluator,
+                parent_key,
+                cycles,
+                evaluation_data: Mutex::new(EvaluationData::none()),
+            },
         }
     }
 
-    /// Compute "opaque" value where the value is only accessible via projections.
-    /// Projections allow accessing derived results from the "opaque" value,
-    /// where the dependency of reading a projection is the projection value rather
-    /// than the entire opaque value.
-    pub(crate) fn compute_opaque<'a, K>(
-        &'a self,
-        key: &K,
-    ) -> impl Future<Output = CancellableResult<(DiceKey, DiceComputedValue)>> + 'a
-    where
-        K: Key,
-    {
-        self.ctx_data
-            .maybe_access(|ctx| ctx.compute_opaque(key))
-            .expect("only alive while main PerComputeCtx is alive")
+    fn parallel_builder<'a>(&'a mut self, size_hint: usize) -> ModernComputeCtxParallelBuilder<'a> {
+        match self {
+            ModernComputeCtx::Owned {
+                ctx_data,
+                dep_trackers,
+            } => {
+                let (tracker_arena, invalidation_paths) = dep_trackers.push_parallel(size_hint);
+                ModernComputeCtxParallelBuilder::Normal {
+                    ctx_data,
+                    tracker_arena,
+                    invalidation_paths,
+                }
+            }
+            ModernComputeCtx::Parallel {
+                ctx_data,
+                dep_trackers,
+            } => {
+                let (tracker_arena, invalidation_paths) = dep_trackers.push_parallel(size_hint);
+                ModernComputeCtxParallelBuilder::Normal {
+                    ctx_data,
+                    tracker_arena,
+                    invalidation_paths,
+                }
+            }
+            ModernComputeCtx::Linear {
+                ctx_data,
+                dep_trackers,
+            } => ModernComputeCtxParallelBuilder::Linear {
+                ctx_data,
+                dep_trackers,
+            },
+        }
     }
 
-    /// Compute many tasks that can be ran in parallel without depending on each other
-    pub(crate) fn compute_many<'a: 'i, 'i, T: 'a>(
-        &'a self,
-        computes: impl IntoIterator<
-            Item = impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        > + 'i,
-    ) -> impl Iterator<Item = impl Future<Output = T> + 'a> + 'i {
-        computes.into_iter().map(|work| {
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.dupe())),
-                ))),
-                |ctx| work(ctx),
-            )
-        })
+    fn ctx_data(&self) -> &CoreCtx {
+        match self {
+            ModernComputeCtx::Owned { ctx_data, .. } => ctx_data,
+            ModernComputeCtx::Parallel { ctx_data, .. } => ctx_data,
+            ModernComputeCtx::Linear { ctx_data, .. } => ctx_data,
+        }
     }
 
-    pub(crate) fn compute2<'a, T: 'a, U: 'a>(
-        &'a self,
-        compute1: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, T> + Send,
-        compute2: impl for<'x> FnOnce(&'x mut DiceComputationsParallel<'a>) -> BoxFuture<'x, U> + Send,
-    ) -> (impl Future<Output = T> + 'a, impl Future<Output = U> + 'a) {
-        (
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.dupe())),
-                ))),
-                compute1,
+    fn unpack(&mut self) -> (&CoreCtx, DepsTrackerHolder) {
+        match self {
+            ModernComputeCtx::Owned {
+                ctx_data,
+                dep_trackers,
+            } => (ctx_data, DepsTrackerHolder(Either::Left(dep_trackers))),
+            ModernComputeCtx::Parallel {
+                ctx_data,
+                dep_trackers,
+            } => (
+                ctx_data,
+                DepsTrackerHolder(Either::Left(&mut *dep_trackers)),
             ),
-            OwningFuture::new(
-                DiceComputationsParallel::new(DiceComputations(DiceComputationsImpl::Modern(
-                    ModernComputeCtx::Parallel(PerParallelComputeCtx::new(self.ctx_data.dupe())),
-                ))),
-                compute2,
-            ),
-        )
+            ModernComputeCtx::Linear {
+                ctx_data,
+                dep_trackers,
+            } => (ctx_data, DepsTrackerHolder(Either::Right(dep_trackers))),
+        }
     }
 
     /// Compute "projection" based on deriving value
-    pub(crate) fn project<K>(
-        &self,
-        key: &K,
-        base_key: DiceKey,
-        base: MaybeValidDiceValue,
-    ) -> DiceResult<K::Value>
-    where
-        K: ProjectionKey,
-    {
-        self.ctx_data
-            .maybe_access(|ctx| ctx.project(key, base_key, base, &self.dep_trackers))
-            .expect("only alive while main PerComputeCtx is alive")
+    pub(crate) fn projection<K: Key, P: ProjectionKey<DeriveFromKey = K>>(
+        &mut self,
+        derive_from: &OpaqueValueModern<K>,
+        key: &P,
+    ) -> DiceResult<P::Value> {
+        let (ctx_data, dep_trackers) = self.unpack();
+        ctx_data.project(key, derive_from, dep_trackers)
     }
 
     /// Data that is static per the entire lifetime of Dice. These data are initialized at the
     /// time that Dice is initialized via the constructor.
     pub(crate) fn global_data(&self) -> &DiceData {
-        unsafe {
-            // SAFETY: lifetime of the parallel context ensures we hold it less than the main
-            // PerComputeCtx keeping the data alive
-            self.ctx_data
-                .deref()
-                .expect("only alive while main PerComputeCtx is alive")
-        }
-        .global_data()
+        self.ctx_data().global_data()
     }
 
     /// Data that is static for the lifetime of the current request context. This lifetime is
@@ -640,44 +576,27 @@ impl PerParallelComputeCtx {
     /// The data is also specific to each request context, so multiple concurrent requests can
     /// each have their own individual data.
     pub(crate) fn per_transaction_data(&self) -> &UserComputationData {
-        unsafe {
-            // SAFETY: lifetime of the parallel context ensures we hold it less than the main
-            // PerComputeCtx keeping the data alive
-            self.ctx_data
-                .deref()
-                .expect("only alive while main PerComputeCtx is alive")
-        }
-        .per_transaction_data()
+        self.ctx_data().per_transaction_data()
     }
 
     pub(crate) fn get_version(&self) -> VersionNumber {
-        self.ctx_data
-            .maybe_access(|ctx| ctx.get_version())
-            .expect("only alive while main PerComputeCtx is alive")
+        self.ctx_data().get_version()
     }
 
-    pub(super) fn dep_trackers(&self) -> MutexGuard<'_, RecordingDepsTracker> {
-        self.dep_trackers.lock()
+    #[allow(unused)] // used in test
+    pub(super) fn dep_trackers(&mut self) -> impl DerefMut<Target = RecordingDepsTracker> + '_ {
+        self.unpack().1.lock()
     }
 
     pub(crate) fn store_evaluation_data<T: Send + Sync + 'static>(
         &self,
         value: T,
     ) -> DiceResult<()> {
-        self.ctx_data
-            .maybe_access(|ctx| ctx.store_evaluation_data(value))
-            .expect("only alive while main PerComputeCtx is alive")
+        self.ctx_data().store_evaluation_data(value)
     }
 
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<&T>> {
-        unsafe {
-            // SAFETY: lifetime of the parallel context ensures we hold it less than the main
-            // PerComputeCtx keeping the data alive
-            self.ctx_data
-                .deref()
-                .expect("only alive while main PerComputeCtx is alive")
-        }
-        .cycle_guard()
+    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<Arc<T>>> {
+        self.ctx_data().cycle_guard()
     }
 }
 
@@ -712,21 +631,17 @@ impl CoreCtx {
     }
 
     /// Compute "projection" based on deriving value
-    pub(crate) fn project<K>(
+    fn project<B: Key, K: ProjectionKey<DeriveFromKey = B>>(
         &self,
         key: &K,
-        base_key: DiceKey,
-        base: MaybeValidDiceValue,
-        dep_trackers: &Mutex<RecordingDepsTracker>,
-    ) -> DiceResult<K::Value>
-    where
-        K: ProjectionKey,
-    {
+        base: &OpaqueValueModern<B>,
+        dep_trackers: DepsTrackerHolder,
+    ) -> DiceResult<K::Value> {
         let dice_key = self
             .async_evaluator
             .dice
             .key_index
-            .index(CowDiceKeyHashed::proj_ref(base_key, key));
+            .index(CowDiceKeyHashed::proj_ref(base.derive_from_key, key));
 
         let r = self
             .async_evaluator
@@ -738,7 +653,8 @@ impl CoreCtx {
                 SyncEvaluator::new(
                     self.async_evaluator.user_data.dupe(),
                     self.async_evaluator.dice.dupe(),
-                    base,
+                    base.derive_from.dupe(),
+                    base.invalidation_paths.dupe(),
                 ),
                 DiceEventDispatcher::new(
                     self.async_evaluator.user_data.tracker.dupe(),
@@ -748,10 +664,14 @@ impl CoreCtx {
 
         let r = match r {
             Ok(r) => r,
-            Err(_cancelled) => return Err(DiceError::cancelled()),
+            Err(reason) => return Err(DiceError::cancelled(reason)),
         };
 
-        dep_trackers.lock().record(dice_key, r.value().validity());
+        dep_trackers.lock().record(
+            dice_key,
+            r.value().validity(),
+            r.invalidation_paths().dupe(),
+        );
 
         Ok(r.value()
             .downcast_maybe_transient::<K::Value>()
@@ -796,7 +716,7 @@ impl CoreCtx {
         Ok(())
     }
 
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<&T>> {
+    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<Arc<T>>> {
         self.cycles.cycle_guard()
     }
 }
@@ -832,18 +752,15 @@ impl SharedLiveTransactionCtx {
         eval: &AsyncEvaluator,
         cycles: UserCycleDetectorData,
     ) -> impl Future<Output = CancellableResult<DiceComputedValue>> {
-        match self.cache.get(key) {
-            DiceTaskRef::Computed(result) => {
-                DicePromise::ready(result).left_future()
-            }
+        let res: CancellableResult<DicePromise> = match self.cache.get(key) {
+            DiceTaskRef::Computed(result) => Ok(DicePromise::ready(result)),
             DiceTaskRef::Occupied(mut occupied) => {
                 match occupied.get().depended_on_by(parent_key) {
-                    MaybeCancelled::Ok(promise) => {
+                    Ok(promise) => {
                         debug!(msg = "shared state is waiting on existing task", k = ?key, v = ?self.version, v_epoch = ?self.version_epoch);
-
-                        promise
-                    },
-                    MaybeCancelled::Cancelled => {
+                        Ok(promise)
+                    }
+                    Err(_reason) => {
                         debug!(msg = "shared state has a cancelled task, spawning new one", k = ?key, v = ?self.version, v_epoch = ?self.version_epoch);
 
                         let eval = eval.dupe();
@@ -853,26 +770,20 @@ impl SharedLiveTransactionCtx {
                         );
 
                         take_mut::take(occupied.get_mut(), |previous| {
-                            IncrementalEngine::spawn_for_key(
+                            DiceTaskWorker::spawn(
                                 key,
                                 self.version_epoch,
                                 eval,
                                 cycles,
                                 events,
-                                 Some(PreviouslyCancelledTask {
-                                    previous,
-                                }),
+                                Some(PreviouslyCancelledTask { previous }),
                             )
                         });
 
-                        occupied
-                            .get()
-                            .depended_on_by(parent_key)
-                            .not_cancelled()
-                            .expect("just created")
+                        // While we wouldn't have canceled the task, it could've already finished with a canceled result.
+                        occupied.get().depended_on_by(parent_key)
                     }
                 }
-                .left_future()
             }
             DiceTaskRef::Vacant(vacant) => {
                 debug!(msg = "shared state is empty, spawning new task", k = ?key, v = ?self.version, v_epoch = ?self.version_epoch);
@@ -881,35 +792,31 @@ impl SharedLiveTransactionCtx {
                 let events =
                     DiceEventDispatcher::new(eval.user_data.tracker.dupe(), eval.dice.dupe());
 
-                let task = IncrementalEngine::spawn_for_key(
-                    key,
-                    self.version_epoch,
-                    eval,
-                    cycles,
-                    events,
-                    None,
-                );
+                let task =
+                    DiceTaskWorker::spawn(key, self.version_epoch, eval, cycles, events, None);
 
-                let fut = task
-                    .depended_on_by(parent_key)
-                    .not_cancelled()
-                    .expect("just created");
-
-                vacant.insert(task);
-
-                fut.left_future()
+                // While we wouldn't have canceled the task, it could've already finished with a canceled result.
+                let result = task.depended_on_by(parent_key);
+                if result.is_ok() {
+                    vacant.insert(task);
+                }
+                result
             }
-            DiceTaskRef::TransactionCancelled => {
+            DiceTaskRef::TransactionCancelled => Err(CancellationReason::TransactionCancelled),
+        };
+
+        match res {
+            Ok(v) => v.left_future(),
+            Err(reason) => {
                 let v = self.version;
                 let v_epoch = self.version_epoch;
                 async move {
                     debug!(msg = "computing shared state is cancelled", k = ?key, v = ?v, v_epoch = ?v_epoch);
                     tokio::task::yield_now().await;
-
-                    Err(Cancelled)
+                    Err(reason)
                 }
                     .right_future()
-            },
+            }
         }
     }
 
@@ -922,12 +829,12 @@ impl SharedLiveTransactionCtx {
         eval: SyncEvaluator,
         events: DiceEventDispatcher,
     ) -> CancellableResult<DiceComputedValue> {
-        let promise = match self.cache.get(key) {
+        let result = match self.cache.get(key) {
             DiceTaskRef::Computed(value) => DicePromise::ready(value),
             DiceTaskRef::Occupied(mut occupied) => {
                 match occupied.get().depended_on_by(parent_key) {
-                    MaybeCancelled::Ok(promise) => promise,
-                    MaybeCancelled::Cancelled => {
+                    Ok(promise) => promise,
+                    Err(_reason) => {
                         let task = unsafe {
                             // SAFETY: task completed below by `IncrementalEngine::project_for_key`
                             sync_dice_task(key)
@@ -935,11 +842,7 @@ impl SharedLiveTransactionCtx {
 
                         *occupied.get_mut() = task;
 
-                        occupied
-                            .get()
-                            .depended_on_by(parent_key)
-                            .not_cancelled()
-                            .expect("just created")
+                        occupied.get().depended_on_by(parent_key)?
                     }
                 }
             }
@@ -949,12 +852,7 @@ impl SharedLiveTransactionCtx {
                     sync_dice_task(key)
                 };
 
-                vacant
-                    .insert(task)
-                    .value()
-                    .depended_on_by(parent_key)
-                    .not_cancelled()
-                    .expect("just created")
+                vacant.insert(task).value().depended_on_by(parent_key)?
             }
             DiceTaskRef::TransactionCancelled => {
                 // for projection keys, these are cheap and synchronous computes that should never
@@ -964,15 +862,13 @@ impl SharedLiveTransactionCtx {
                     sync_dice_task(key)
                 };
 
-                task.depended_on_by(parent_key)
-                    .not_cancelled()
-                    .expect("just created")
+                task.depended_on_by(parent_key)?
             }
         };
 
-        IncrementalEngine::project_for_key(
+        project_for_key(
             state,
-            promise,
+            result,
             key,
             self.version,
             self.version_epoch,
@@ -1012,14 +908,18 @@ pub(crate) mod testing {
 
     impl SharedLiveTransactionCtx {
         pub(crate) fn inject(&self, k: DiceKey, v: DiceComputedValue) {
+            // TODO(cjhopman): We should delete this. tests using it are doing weird things and
+            // causing the transaction cache to be out of sync with what is possible in real
+            // execution and it makes things really difficult to reason about. These tests
+            // should be constructing the states they want to test via valid interactions
+            // with things.
             let task = unsafe {
                 // SAFETY: completed immediately below
                 sync_dice_task(k)
             };
             let _r = task
                 .depended_on_by(ParentKey::None)
-                .not_cancelled()
-                .expect("just created")
+                .unwrap()
                 .sync_get_or_complete(|| DiceSyncResult::testing(v));
 
             match self.cache.get(k) {

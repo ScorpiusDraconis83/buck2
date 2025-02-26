@@ -19,13 +19,13 @@ use async_trait::async_trait;
 use buck2_futures::cancellation::CancellationContext;
 use derivative::Derivative;
 use derive_more::Display;
+use dice_error::DiceErrorImpl;
 use dupe::Dupe;
 use futures::FutureExt;
 use tokio::sync::oneshot;
 
 use crate::api::computations::DiceComputations;
 use crate::api::cycles::DetectCycles;
-use crate::api::error::DiceErrorImpl;
 use crate::api::injected::InjectedKey;
 use crate::api::key::Key;
 use crate::api::user_data::UserComputationData;
@@ -33,11 +33,12 @@ use crate::impls::dice::DiceModern;
 use crate::versions::VersionNumber;
 use crate::Dice;
 use crate::DiceData;
+use crate::DynKey;
 use crate::UserCycleDetector;
 use crate::UserCycleDetectorGuard;
 
 #[derive(Clone, Dupe, Debug, Display, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct Foo(i32);
 
 #[async_trait]
@@ -51,7 +52,7 @@ impl InjectedKey for Foo {
 
 #[derive(Clone, Dupe, Debug, Derivative, Allocative, Display)]
 #[derivative(PartialEq, Eq, Hash)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 #[allocative(skip)]
 struct KeyThatRuns {
     #[derivative(Hash = "ignore", PartialEq = "ignore")]
@@ -90,7 +91,7 @@ async fn set_injected_multiple_times_per_commit() -> anyhow::Result<()> {
         ctx.changed_to(vec![(Foo(0), 0)])?;
         ctx.changed_to(vec![(Foo(1), 1)])?;
 
-        let ctx = ctx.commit().await;
+        let mut ctx = ctx.commit().await;
         assert_eq!(ctx.compute(&Foo(0)).await?, 0);
         assert_eq!(ctx.compute(&Foo(1)).await?, 1);
     }
@@ -133,7 +134,7 @@ async fn set_injected_with_no_change_no_new_ctx() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct K(i32);
 
 #[async_trait]
@@ -176,7 +177,7 @@ fn dice_computations_are_parallel() {
 
     #[derive(Clone, Debug, Display, Derivative, Allocative)]
     #[derivative(Hash, PartialEq, Eq)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct Blocking {
         index: usize,
         #[derivative(PartialEq = "ignore", Hash = "ignore")]
@@ -237,7 +238,7 @@ async fn different_data_per_compute_ctx() {
     struct U(usize);
 
     #[derive(Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Allocative)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct DataRequest(u8);
     #[async_trait]
     impl Key for DataRequest {
@@ -268,9 +269,9 @@ async fn different_data_per_compute_ctx() {
         d
     };
 
-    let ctx0 = dice.updater_with_data(per_cmd_data0).commit().await;
+    let mut ctx0 = dice.updater_with_data(per_cmd_data0).commit().await;
 
-    let ctx1 = dice.updater_with_data(per_cmd_data1).commit().await;
+    let mut ctx1 = dice.updater_with_data(per_cmd_data1).commit().await;
 
     let request0 = ctx0.compute(&DataRequest(0));
     let request1 = ctx1.compute(&DataRequest(1));
@@ -312,7 +313,7 @@ fn invalid_update() {
 }
 
 #[derive(Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative)]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct Fib(u8);
 
 #[async_trait]
@@ -331,11 +332,11 @@ impl Key for Fib {
             return Ok(self.0 as u64);
         }
         let (a, b) = {
-            let (a, b) = ctx.compute2(
+            ctx.compute2(
                 |ctx| ctx.compute(&Fib(self.0 - 2)).boxed(),
                 |ctx| ctx.compute(&Fib(self.0 - 1)).boxed(),
-            );
-            futures::future::join(a, b).await
+            )
+            .await
         };
         match (a, b) {
             (Ok(a), Ok(b)) => Ok(a? + b?),
@@ -369,22 +370,19 @@ struct CycleDetectorGuard {
 }
 
 impl UserCycleDetector for CycleDetector {
-    fn start_computing_key(
-        &self,
-        key: &dyn std::any::Any,
-    ) -> Option<Box<dyn UserCycleDetectorGuard>> {
+    fn start_computing_key(&self, key: &DynKey) -> Option<Arc<dyn UserCycleDetectorGuard>> {
         let f = key.downcast_ref::<Fib>().unwrap();
         self.events
             .lock()
             .unwrap()
             .push(CycleDetectorEvents::Start(*f));
-        Some(Box::new(CycleDetectorGuard {
+        Some(Arc::new(CycleDetectorGuard {
             key: *f,
             events: self.events.dupe(),
         }))
     }
 
-    fn finished_computing_key(&self, key: &dyn std::any::Any) {
+    fn finished_computing_key(&self, key: &DynKey) {
         let f = key.downcast_ref::<Fib>().unwrap();
         self.events
             .lock()
@@ -394,16 +392,12 @@ impl UserCycleDetector for CycleDetector {
 }
 
 impl UserCycleDetectorGuard for CycleDetectorGuard {
-    fn add_edge(&self, key: &dyn std::any::Any) {
+    fn add_edge(&self, key: &DynKey) {
         let f = key.downcast_ref::<Fib>().unwrap();
         self.events
             .lock()
             .unwrap()
             .push(CycleDetectorEvents::Edge(self.key, *f))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn type_name(&self) -> &'static str {
@@ -424,7 +418,7 @@ fn user_cycle_detector_receives_events() -> anyhow::Result<()> {
             })),
             ..Default::default()
         };
-        let ctx = dice.updater_with_data(user_data).commit().await;
+        let mut ctx = dice.updater_with_data(user_data).commit().await;
         let res = ctx.compute(&Fib(20)).await?.expect("should succeed");
         assert_eq!(res, 6765);
 
@@ -490,7 +484,7 @@ async fn dropping_request_future_cancels_execution() {
 
     #[derive(Clone, Dupe, Debug, Derivative, Allocative, Display)]
     #[derivative(PartialEq, Eq, Hash)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     #[allocative(skip)]
     struct KeyThatShouldntRun {
         #[derivative(Hash = "ignore", PartialEq = "ignore")]
@@ -531,7 +525,7 @@ async fn dropping_request_future_cancels_execution() {
 
     let dice = DiceModern::builder().build(DetectCycles::Disabled);
 
-    let ctx = dice.updater().commit().await;
+    let mut ctx = dice.updater().commit().await;
 
     let key = KeyThatShouldntRun {
         barrier1: barrier1.dupe(),
@@ -565,7 +559,7 @@ async fn dropping_request_future_doesnt_cancel_if_multiple_requests_active() {
     let barrier2 = Arc::new(tokio::sync::Semaphore::new(0));
     let is_ran = Arc::new(AtomicBool::new(false));
 
-    let key = KeyThatRuns {
+    let key = &KeyThatRuns {
         barrier1: barrier1.dupe(),
         barrier2: barrier2.dupe(),
         is_ran: is_ran.dupe(),
@@ -573,9 +567,11 @@ async fn dropping_request_future_doesnt_cancel_if_multiple_requests_active() {
 
     let dice = DiceModern::builder().build(DetectCycles::Disabled);
 
-    let ctx = dice.updater().commit().await;
-    let req1 = ctx.compute(&key);
-    let req2 = ctx.compute(&key);
+    let mut ctx = dice.updater().commit().await;
+    let (req1, req2) = ctx.compute2(
+        |ctx| ctx.compute(key).boxed(),
+        |ctx| ctx.compute(key).boxed(),
+    );
 
     // ensure that the key starts computing
     let _b = barrier1.acquire().await;
@@ -602,7 +598,7 @@ async fn user_cycle_detector_is_present_modern() -> anyhow::Result<()> {
 
 async fn user_cycle_detector_is_present(dice: Arc<Dice>) -> anyhow::Result<()> {
     #[derive(Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct AccessCycleGuardKey;
 
     #[async_trait]
@@ -632,22 +628,15 @@ async fn user_cycle_detector_is_present(dice: Arc<Dice>) -> anyhow::Result<()> {
     struct AccessCycleDetectorGuard;
 
     impl UserCycleDetector for AccessCycleDetector {
-        fn start_computing_key(
-            &self,
-            _key: &dyn std::any::Any,
-        ) -> Option<Box<dyn UserCycleDetectorGuard>> {
-            Some(Box::new(AccessCycleDetectorGuard))
+        fn start_computing_key(&self, _key: &DynKey) -> Option<Arc<dyn UserCycleDetectorGuard>> {
+            Some(Arc::new(AccessCycleDetectorGuard))
         }
 
-        fn finished_computing_key(&self, _key: &dyn std::any::Any) {}
+        fn finished_computing_key(&self, _key: &DynKey) {}
     }
 
     impl UserCycleDetectorGuard for AccessCycleDetectorGuard {
-        fn add_edge(&self, _key: &dyn std::any::Any) {}
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
+        fn add_edge(&self, _key: &DynKey) {}
 
         fn type_name(&self) -> &'static str {
             std::any::type_name::<Self>()
@@ -658,7 +647,7 @@ async fn user_cycle_detector_is_present(dice: Arc<Dice>) -> anyhow::Result<()> {
         cycle_detector: Some(Arc::new(AccessCycleDetector)),
         ..Default::default()
     };
-    let ctx = dice.updater_with_data(user_data).commit().await;
+    let mut ctx = dice.updater_with_data(user_data).commit().await;
     Ok(ctx.compute(&AccessCycleGuardKey).await?)
 }
 
@@ -666,7 +655,7 @@ async fn user_cycle_detector_is_present(dice: Arc<Dice>) -> anyhow::Result<()> {
 async fn test_dice_usable_after_cancellations() {
     let dice = DiceModern::builder().build(DetectCycles::Disabled);
 
-    let ctx = dice.updater().commit().await;
+    let mut ctx = dice.updater().commit().await;
 
     let barrier1 = Arc::new(tokio::sync::Semaphore::new(0));
     let barrier2 = Arc::new(tokio::sync::Semaphore::new(0));
@@ -691,7 +680,7 @@ async fn test_dice_usable_after_cancellations() {
 
     assert!(!is_ran.load(Ordering::Acquire));
 
-    let ctx = dice.updater().commit().await;
+    let mut ctx = dice.updater().commit().await;
 
     // req2 still succeed. Note that due to dice caching, even if we make a new key, the same
     // instance would be used, so just use the same one.

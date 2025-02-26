@@ -13,7 +13,7 @@ use starlark::starlark_module;
 
 // TODO(nga): drop it, and only use `regex` function.
 #[starlark_module]
-pub fn register_regex(builder: &mut GlobalsBuilder) {
+pub(crate) fn register_regex(builder: &mut GlobalsBuilder) {
     /// Test if a regular expression matches a string. Fails if the regular expression
     /// is malformed.
     ///
@@ -26,9 +26,9 @@ pub fn register_regex(builder: &mut GlobalsBuilder) {
     fn regex_match(
         #[starlark(require = pos)] regex: &str,
         #[starlark(require = pos)] str: &str,
-    ) -> anyhow::Result<bool> {
-        let re = Regex::new(regex)?;
-        Ok(re.is_match(str)?)
+    ) -> starlark::Result<bool> {
+        let re = Regex::new(regex).map_err(buck2_error::Error::from)?;
+        Ok(re.is_match(str).map_err(buck2_error::Error::from)?)
     }
 }
 

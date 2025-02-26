@@ -39,7 +39,6 @@ fn creates_providers() -> anyhow::Result<()> {
     assert_eq('provider[FooInfo](fields={"bar": provider_field(typing.Any, default=None), "baz": provider_field(typing.Any, default=None)})', repr(FooInfo2))
 
     def test():
-        assert_eq(FooInfo.type, "FooInfo")
         assert_eq('provider[FooInfo](fields={"bar": provider_field(typing.Any, default=None), "baz": provider_field(typing.Any, default=None)})', repr(FooInfo))
         assert_eq('provider[FooInfo](fields={"bar": provider_field(typing.Any, default=None), "baz": provider_field(typing.Any, default=None)})', repr(FooInfo2))
 
@@ -61,7 +60,7 @@ fn creates_providers() -> anyhow::Result<()> {
         assert_eq("bar_2", foo_2.bar)
         assert_eq(None, foo_2.baz)
 
-        assert_eq("{\"bar\":\"bar_1\",\"baz\":\"baz_1\"}", foo_1.to_json())
+        assert_eq("{\"bar\":\"bar_1\",\"baz\":\"baz_1\"}", json.encode(foo_1))
     "#
     ))?;
 

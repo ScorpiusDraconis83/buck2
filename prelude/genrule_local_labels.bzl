@@ -10,7 +10,7 @@ Handle labels used to opt-out genrules from running remotely.
 """
 
 # Some rules have to be run locally for various reasons listed next to the label.
-_GENRULE_LOCAL_LABELS = {label: True for label in [
+_GENRULE_LOCAL_LABELS = set([
     # Used for buck2 tests that want to run locally
     "buck2_test_local_exec",
 
@@ -94,6 +94,12 @@ _GENRULE_LOCAL_LABELS = {label: True for label in [
     # (https://fb.workplace.com/groups/1042353022615812/posts/1849505965233843/).
     "uses_php",
 
+    # Uses the `libX11-devel` package which is not available on RE.
+    "uses_x11",
+
+    # Unity license client needs to be set up on RE workers for this to work, and maybe further debugging.
+    "uses_unity",
+
     # mksquashfs isn't available in RE, so run these locally
     # (https://fb.workplace.com/groups/buck2users/permalink/3023630007893360/)
     "uses_mksquashfs",
@@ -170,10 +176,12 @@ _GENRULE_LOCAL_LABELS = {label: True for label in [
 
     # Some Qt genrules don't support RE yet
     "qt_moc",
-    "qt_qrc_gen",
-    "qt_qrc_compile",
-    "qt_qsb_gen",
     "qt_qmlcachegen",
+    "qt_qrc_compile",
+    "qt_qrc_gen",
+    "qt_qsb_gen",
+    "qt_rcc",
+    "qt_uic",
 
     # use local jar
     "uses_jar",
@@ -201,7 +209,26 @@ _GENRULE_LOCAL_LABELS = {label: True for label in [
 
     # Uses Apple's codesign command which might not be in RE
     "uses_codesign",
-]}
+
+    # Uses jf which is not on RE
+    "uses_jf",
+
+    # On Messenger Desktop few targets are massive and take much longer on RE than
+    # locally to build on Windows. This is a mitigation until we can break down these
+    # targets
+    "zeratul_windows_capacity_hog",
+
+    # The compilation databases produced by Buck have paths relative to the root of
+    # fbsource. This isn't compatible with RE.
+    "uses_compilation_database",
+
+    # Uses checkpolicy which is not on RE
+    "uses_checkpolicy",
+
+    # Need to build sgw containers on devserver and not on RE
+    # We pull base image from internet
+    "sgw_build_containers",
+])
 
 def genrule_labels_require_local(labels):
     for label in labels:

@@ -7,8 +7,9 @@
  * of this source tree.
  */
 
-// We'd love to use fs-err instead, but that code gives bad error messages and doesn't wrap all functions.
-// Various bugs have been raised - if they all get fixed we can migrate.
+/// Buck2 having full control over how FS IO works is beneficial for implementing
+/// IO counters and retry policies that are optimized for Buck2 and the EdenFS
+/// virtualized file system.
 use std::borrow::Cow;
 use std::env;
 use std::fs;
@@ -20,7 +21,9 @@ use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::Context as _;
+use buck2_error::buck2_error;
+use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use relative_path::RelativePath;
 use relative_path::RelativePathBuf;
 
@@ -30,42 +33,128 @@ use crate::fs::paths::abs_norm_path::AbsNormPathBuf;
 use crate::fs::paths::abs_path::AbsPath;
 use crate::io_counters::IoCounterGuard;
 use crate::io_counters::IoCounterKey;
+use crate::soft_error;
 
-pub fn symlink<P, Q>(original: P, link: Q) -> anyhow::Result<()>
+impl IoError {
+    pub fn categorize_for_source_file(self) -> buck2_error::Error {
+        if self.e.kind() == io::ErrorKind::NotFound {
+            buck2_error::Error::from(self).tag([ErrorTag::Input]).into()
+        } else {
+            self.into()
+        }
+    }
+}
+
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = IoSystem)]
+#[error("{op}")]
+pub struct IoError {
+    op: String,
+    #[source]
+    e: io::Error,
+}
+
+fn is_retryable(err: &io::Error) -> bool {
+    cfg!(target_os = "macos")
+        && (err.kind() == io::ErrorKind::TimedOut
+            || err.kind() == io::ErrorKind::StaleNetworkFileHandle)
+}
+
+static MAX_IO_ATTEMPTS: u32 = 3;
+
+fn with_retries<T>(mut func: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut attempts = 0;
+    let mut last_error_kind: Option<std::io::ErrorKind> = None;
+
+    loop {
+        match func() {
+            Ok(v) => {
+                if let Some(err) = last_error_kind {
+                    // Solely for logging, we don't want to error if the value wasn't "thrown"
+                    soft_error!(
+                        "fs_io_succeeded_after_retry",
+                        buck2_error!(buck2_error::ErrorTag::Input, "{}", err.to_string()),
+                        quiet: true
+                    )
+                    .ok();
+                }
+                return Ok(v);
+            }
+            Err(e) if is_retryable(&e) => {
+                last_error_kind = Some(e.kind());
+                attempts += 1;
+                if attempts >= MAX_IO_ATTEMPTS {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+macro_rules! make_error_with_retry {
+    ($val:expr, $context:expr $(,)?) => {{
+        match crate::fs::fs_util::with_retries(|| $val) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(IoError { op: $context, e }),
+        }
+    }};
+}
+
+macro_rules! make_buck2_error {
+    ($val:expr, $context:expr $(,)?) => {{ ($val).with_buck_error_context(|| $context) }};
+}
+
+fn if_exists<T>(r: io::Result<T>) -> io::Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn symlink<P, Q>(original: P, link: Q) -> buck2_error::Result<()>
 where
     P: AsRef<Path>,
     Q: AsRef<AbsPath>,
 {
     let _guard = IoCounterKey::Symlink.guard();
-    symlink_impl(original.as_ref(), link.as_ref()).with_context(|| {
+    make_buck2_error!(
+        symlink_impl(original.as_ref(), link.as_ref()),
         format!(
             "symlink(original={}, link={})",
             original.as_ref().display(),
             link.as_ref().display()
-        )
-    })
+        ),
+    )
 }
 
 #[cfg(unix)]
-fn symlink_impl(original: &Path, link: &AbsPath) -> anyhow::Result<()> {
+fn symlink_impl(original: &Path, link: &AbsPath) -> buck2_error::Result<()> {
     std::os::unix::fs::symlink(original, link.as_maybe_relativized()).map_err(|e| e.into())
 }
 
 /// Create symlink on Windows.
 #[cfg(windows)]
-fn symlink_impl(original: &Path, link: &AbsPath) -> anyhow::Result<()> {
+fn symlink_impl(original: &Path, link: &AbsPath) -> buck2_error::Result<()> {
     use std::io::ErrorKind;
 
     use common_path::common_path;
 
-    fn permission_check(result: io::Result<()>) -> anyhow::Result<()> {
+    fn permission_check(result: io::Result<()>) -> buck2_error::Result<()> {
         match result {
             // Standard issue on Windows machines, so hint at the resolution, as it is not obvious.
             // Unfortunately this doesn't have an `ErrorKind`, so have to do it with substring matching.
-            Err(e) if e.to_string().contains("privilege is not held") => Err(anyhow::anyhow!(e)
+            Err(e) if e.to_string().contains("privilege is not held") => {
+                Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Environment,
+                    "{}",
+                    e.to_string()
+                )
                 .context(
                     "Perhaps you need to turn on 'Developer Mode' in Windows to enable symlinks.",
-                )),
+                ))
+            }
             Err(e) => Err(e.into()),
             Ok(_) => Ok(()),
         }
@@ -79,7 +168,12 @@ fn symlink_impl(original: &Path, link: &AbsPath) -> anyhow::Result<()> {
     } else {
         Cow::Owned(
             link.parent()
-                .ok_or_else(|| anyhow::anyhow!("Expected path with a parent in symlink target"))?
+                .ok_or_else(|| {
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Tier0,
+                        "Expected path with a parent in symlink target"
+                    )
+                })?
                 .join(original),
         )
     };
@@ -102,7 +196,7 @@ fn symlink_impl(original: &Path, link: &AbsPath) -> anyhow::Result<()> {
             let from_common = target_abspath.strip_prefix(&common_path)?;
             let common_canonicalized = common_path
                 .canonicalize()
-                .context(format!("Failed to get canonical path of {:?}", common_path))?;
+                .buck_error_context(format!("Failed to get canonical path of {:?}", common_path))?;
             common_canonicalized.join(from_common)
         } else {
             target_abspath
@@ -123,53 +217,60 @@ fn symlink_impl(original: &Path, link: &AbsPath) -> anyhow::Result<()> {
     }
 }
 
-pub fn set_current_dir<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn set_current_dir<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
     assert_cwd_is_not_set()?;
-    env::set_current_dir(path.as_ref())
-        .with_context(|| format!("set_current_dir({})", P::as_ref(&path).display()))
+    make_buck2_error!(
+        env::set_current_dir(path.as_ref()),
+        format!("set_current_dir({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn create_dir_all<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn create_dir_all<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::MkDir.guard();
-    fs::create_dir_all(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("create_dir_all({})", P::as_ref(&path).display()))?;
-    Ok(())
+    make_error_with_retry!(
+        fs::create_dir_all(path.as_ref().as_maybe_relativized()),
+        format!("create_dir_all({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn create_dir<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn create_dir<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::MkDir.guard();
-    fs::create_dir(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("create_dir({})", P::as_ref(&path).display()))?;
-    Ok(())
+    make_error_with_retry!(
+        fs::create_dir(path.as_ref().as_maybe_relativized()),
+        format!("create_dir({})", P::as_ref(&path).display())
+    )
 }
 
 /// Create directory if not exists.
 ///
 /// Fail if exists but is not a directory or creation failed.
-pub fn create_dir_if_not_exists<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn create_dir_if_not_exists<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let path = path.as_ref();
     let _guard = IoCounterKey::MkDir.guard();
-    let e = match fs::create_dir(path.as_maybe_relativized())
-        .with_context(|| format!("create_dir({})", path.display()))
-    {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
+    make_error_with_retry!(
+        {
+            let e = match fs::create_dir(path.as_maybe_relativized()) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
 
-    match symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                Ok(())
-            } else {
-                // File exists but not a directory, return original error.
-                Err(e)
+            match symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.is_dir() {
+                        Ok(())
+                    } else {
+                        // File exists but not a directory, return original error.
+                        Err(e)
+                    }
+                }
+                Err(_) => {
+                    // `lstat` failed, means something like permission denied, return original error.
+                    Err(e)
+                }
             }
-        }
-        Err(_) => {
-            // `lstat` failed, means something like permission denied, return original error.
-            Err(e)
-        }
-    }
+        },
+        format!("create_dir({})", path.display())
+    )
 }
 
 /// `DirEntry` which is known to contain absolute path.
@@ -210,122 +311,149 @@ impl Iterator for ReadDir {
     }
 }
 
-pub fn read_dir<P: AsRef<AbsNormPath>>(path: P) -> anyhow::Result<ReadDir> {
+pub fn read_dir<P: AsRef<AbsNormPath>>(path: P) -> Result<ReadDir, IoError> {
     let _guard = IoCounterKey::ReadDir.guard();
-    fs::read_dir(path.as_ref())
-        .with_context(|| format!("read_dir({})", P::as_ref(&path).display()))
-        .map(|read_dir| ReadDir { read_dir, _guard })
+    make_error_with_retry!(
+        fs::read_dir(path.as_ref()),
+        format!("read_dir({})", P::as_ref(&path).display()),
+    )
+    .map(|read_dir| ReadDir { read_dir, _guard })
 }
 
-pub fn read_dir_if_exists<P: AsRef<AbsNormPath>>(path: P) -> anyhow::Result<Option<ReadDir>> {
+pub fn read_dir_if_exists<P: AsRef<AbsNormPath>>(path: P) -> Result<Option<ReadDir>, IoError> {
     let _guard = IoCounterKey::ReadDir.guard();
-    let read_dir = fs::read_dir(path.as_ref());
-    let read_dir = match read_dir {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("read_dir_if_exists({})", P::as_ref(&path).display()));
-        }
-        Ok(x) => x,
-    };
-    Ok(Some(ReadDir { read_dir, _guard }))
+    make_error_with_retry!(
+        if_exists(fs::read_dir(path.as_ref())),
+        format!("read_dir_if_exists({})", P::as_ref(&path).display()),
+    )
+    .map(|opt| opt.map(|read_dir| ReadDir { read_dir, _guard }))
 }
 
-pub fn try_exists<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<bool> {
+pub fn try_exists<P: AsRef<AbsPath>>(path: P) -> Result<bool, IoError> {
     let _guard = IoCounterKey::Stat.guard();
-    fs::try_exists(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("try_exists({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        path.as_ref().as_maybe_relativized().try_exists(),
+        format!("try_exists({})", P::as_ref(&path).display())
+    )
 }
 
-pub fn remove_file<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn remove_file<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::Remove.guard();
-    remove_file_impl(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("remove_file({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        remove_file_impl(path.as_ref().as_maybe_relativized()),
+        format!("remove_file({})", P::as_ref(&path).display()),
+    )
 }
 
 #[cfg(unix)]
-fn remove_file_impl(path: &Path) -> anyhow::Result<()> {
-    fs::remove_file(path)?;
-    Ok(())
+fn remove_file_impl(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
 }
 
 #[cfg(windows)]
-fn remove_file_impl(path: &Path) -> anyhow::Result<()> {
+#[allow(clippy::permissions_set_readonly_false)]
+fn remove_file_impl(path: &Path) -> io::Result<()> {
+    use std::io::ErrorKind;
     use std::os::windows::fs::FileTypeExt;
 
     let file_type = path.symlink_metadata()?.file_type();
     if !file_type.is_symlink() || file_type.is_symlink_file() {
-        fs::remove_file(path)?;
+        match fs::remove_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Some tools may set readonly attribute on files in buck-out
+                // which causes `Access is denied` error on Windows.
+                // Try to remove readonly attribute and retry.
+                if e.kind() == ErrorKind::PermissionDenied {
+                    let mut perms = fs::metadata(path)?.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        fs::set_permissions(path, perms)?;
+                        fs::remove_file(path)
+                    } else {
+                        Err(e)
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+        }
     } else {
-        fs::remove_dir(path)?;
+        fs::remove_dir(path)
     }
-    Ok(())
 }
 
-pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> anyhow::Result<u64> {
+pub fn copy<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<u64, IoError> {
     let _guard = IoCounterKey::Copy.guard();
-    fs::copy(
-        from.as_ref().as_maybe_relativized(),
-        to.as_ref().as_maybe_relativized(),
-    )
-    .with_context(|| {
+    make_error_with_retry!(
+        fs::copy(
+            from.as_ref().as_maybe_relativized(),
+            to.as_ref().as_maybe_relativized(),
+        ),
         format!(
             "copy(from={}, to={})",
             P::as_ref(&from).display(),
             Q::as_ref(&to).display()
-        )
-    })
-}
-
-pub fn read_link<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<PathBuf> {
-    let _guard = IoCounterKey::ReadLink.guard();
-    fs::read_link(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("read_link({})", P::as_ref(&path).display()))
-}
-
-pub fn rename<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> anyhow::Result<()> {
-    let _guard = IoCounterKey::Rename.guard();
-    fs::rename(
-        from.as_ref().as_maybe_relativized(),
-        to.as_ref().as_maybe_relativized(),
+        ),
     )
-    .with_context(|| {
+}
+
+pub fn read_link<P: AsRef<AbsPath>>(path: P) -> Result<PathBuf, IoError> {
+    let _guard = IoCounterKey::ReadLink.guard();
+    make_error_with_retry!(
+        fs::read_link(path.as_ref().as_maybe_relativized()),
+        format!("read_link({})", P::as_ref(&path).display()),
+    )
+}
+
+pub fn rename<P: AsRef<AbsPath>, Q: AsRef<AbsPath>>(from: P, to: Q) -> Result<(), IoError> {
+    let _guard = IoCounterKey::Rename.guard();
+    make_error_with_retry!(
+        fs::rename(
+            from.as_ref().as_maybe_relativized(),
+            to.as_ref().as_maybe_relativized(),
+        ),
         format!(
             "rename(from={}, to={})",
             P::as_ref(&from).display(),
             Q::as_ref(&to).display()
-        )
-    })?;
-    Ok(())
+        ),
+    )
 }
 
-pub fn write<P: AsRef<AbsPath>, C: AsRef<[u8]>>(path: P, contents: C) -> anyhow::Result<()> {
+pub fn write<P: AsRef<AbsPath>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<(), IoError> {
     let _guard = IoCounterKey::Write.guard();
-    fs::write(path.as_ref().as_maybe_relativized(), &contents)
-        .with_context(|| format!("write({}, _)", P::as_ref(&path).display()))?;
-    Ok(())
+    make_error_with_retry!(
+        fs::write(path.as_ref().as_maybe_relativized(), &contents),
+        format!("write({}, _)", P::as_ref(&path).display()),
+    )
 }
 
-pub fn metadata<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<fs::Metadata> {
+pub fn metadata<P: AsRef<AbsPath>>(path: P) -> Result<fs::Metadata, IoError> {
     let _guard = IoCounterKey::Stat.guard();
-    fs::metadata(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("metadata({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        fs::metadata(path.as_ref().as_maybe_relativized()),
+        format!("metadata({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn symlink_metadata<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<fs::Metadata> {
+pub fn symlink_metadata<P: AsRef<AbsPath>>(path: P) -> Result<fs::Metadata, IoError> {
     let _guard = IoCounterKey::Stat.guard();
-    fs::symlink_metadata(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("symlink_metadata({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        fs::symlink_metadata(path.as_ref().as_maybe_relativized()),
+        format!("symlink_metadata({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn set_permissions<P: AsRef<AbsPath>>(path: P, perm: fs::Permissions) -> anyhow::Result<()> {
+pub fn set_permissions<P: AsRef<AbsPath>>(path: P, perm: fs::Permissions) -> Result<(), IoError> {
     let _guard = IoCounterKey::Chmod.guard();
-    fs::set_permissions(path.as_ref().as_maybe_relativized(), perm)
-        .with_context(|| format!("set_permissions({}, _)", P::as_ref(&path).display()))?;
-    Ok(())
+    make_error_with_retry!(
+        fs::set_permissions(path.as_ref().as_maybe_relativized(), perm.clone()),
+        format!("set_permissions({}, _)", P::as_ref(&path).display()),
+    )
 }
 
-pub fn set_executable<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn set_executable<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<()> {
     let path = path.as_ref();
 
     #[cfg(unix)]
@@ -347,43 +475,38 @@ pub fn set_executable<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn remove_dir_all<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::RmDirAll.guard();
-    fs::remove_dir_all(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("remove_dir_all({})", P::as_ref(&path).display()))?;
-    Ok(())
+    make_error_with_retry!(
+        fs::remove_dir_all(path.as_ref().as_maybe_relativized()),
+        format!("remove_dir_all({})", P::as_ref(&path).display()),
+    )
 }
 
 /// `None` if file does not exist.
 pub fn symlink_metadata_if_exists<P: AsRef<AbsPath>>(
     path: P,
-) -> anyhow::Result<Option<fs::Metadata>> {
+) -> Result<Option<fs::Metadata>, IoError> {
     let _guard = IoCounterKey::Stat.guard();
-    match fs::symlink_metadata(path.as_ref().as_maybe_relativized()) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => {
-            Err(err).with_context(|| format!("symlink_metadata({})", path.as_ref().display()))
-        }
-    }
-}
-
-/// Like fs::exists but gives you the metadata. More efficient than calling `symlink_metadata().ok()` (no anyhow, no backtrace) or `exists()` (one stat call).
-pub fn symlink_metadata_if_available<P: AsRef<AbsPath>>(path: P) -> Option<fs::Metadata> {
-    let _guard = IoCounterKey::Stat.guard();
-    fs::symlink_metadata(path.as_ref().as_maybe_relativized()).ok()
+    make_error_with_retry!(
+        if_exists(fs::symlink_metadata(path.as_ref().as_maybe_relativized())),
+        format!("symlink_metadata({})", path.as_ref().display())
+    )
 }
 
 /// Remove whatever exists at `path`, be it a file, directory, pipe, broken symlink, etc.
 /// Do nothing if `path` does not exist.
-pub fn remove_all<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
-    let guard = IoCounterKey::RmDirAll.guard();
-    let metadata = match symlink_metadata_if_exists(&path)? {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    drop(guard);
+pub fn remove_all<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
+    // There are no counters because every function called here has its own counter.
+    let metadata = match symlink_metadata_if_exists(&path) {
+        Ok(None) => return Ok(()),
+        Ok(Some(s)) => Ok(s),
+        // `NotADirectory` means we are trying to delete a path (e.g. "/foo/bar") that has a subpath
+        // pointing to a regular file (e.g. "/foo"). In this case do not fail and behave similarly to as
+        // when path we are trying to delete does not exist.
+        Err(e) if e.e.kind() == io::ErrorKind::NotADirectory => return Ok(()),
+        Err(e) => Err(e),
+    }?;
 
     let r = if metadata.is_dir() {
         remove_dir_all(&path)
@@ -397,72 +520,167 @@ pub fn remove_all<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
     r
 }
 
-pub fn read<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<Vec<u8>> {
+pub fn read<P: AsRef<AbsPath>>(path: P) -> Result<Vec<u8>, IoError> {
     let _guard = IoCounterKey::Read.guard();
-    fs::read(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("read({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        fs::read(path.as_ref().as_maybe_relativized()),
+        format!("read({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn read_to_string<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<String> {
+pub fn read_to_string<P: AsRef<AbsPath>>(path: P) -> Result<String, IoError> {
     let _guard = IoCounterKey::Read.guard();
-    fs::read_to_string(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("read_to_string({})", P::as_ref(&path).display()))
-}
-
-/// Read a file, if it exists. Returns `None` when the file does not exist.
-pub fn read_to_string_if_exists<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<Option<String>> {
-    let _guard = IoCounterKey::Read.guard();
-    match fs::read_to_string(path.as_ref().as_maybe_relativized()) {
-        Ok(d) => Ok(Some(d)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::from(e).context(format!(
-            "read_to_string_if_exists({})",
-            P::as_ref(&path).display()
-        ))),
-    }
+    make_error_with_retry!(
+        fs::read_to_string(path.as_ref().as_maybe_relativized()),
+        format!("read_to_string({})", P::as_ref(&path).display()),
+    )
 }
 
 /// Read a file, if it exists. Returns `None` when the file does not exist.
-pub fn read_if_exists<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn read_to_string_if_exists<P: AsRef<AbsPath>>(path: P) -> Result<Option<String>, IoError> {
     let _guard = IoCounterKey::Read.guard();
-    match fs::read(path.as_ref().as_maybe_relativized()) {
-        Ok(d) => Ok(Some(d)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::from(e)
-            .context(format!("read_if_exists({})", P::as_ref(&path).display()))),
-    }
+    make_error_with_retry!(
+        if_exists(fs::read_to_string(path.as_ref().as_maybe_relativized())),
+        format!("read_to_string_if_exists({})", P::as_ref(&path).display()),
+    )
 }
 
-pub fn canonicalize<P: AsRef<Path>>(path: P) -> anyhow::Result<AbsNormPathBuf> {
+/// Read a file, if it exists. Returns `None` when the file does not exist.
+pub fn read_if_exists<P: AsRef<AbsPath>>(path: P) -> Result<Option<Vec<u8>>, IoError> {
+    let _guard = IoCounterKey::Read.guard();
+    make_error_with_retry!(
+        if_exists(fs::read(path.as_ref().as_maybe_relativized())),
+        format!("read_if_exists({})", P::as_ref(&path).display()),
+    )
+}
+
+pub fn canonicalize<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<AbsNormPathBuf> {
     let _guard = IoCounterKey::Canonicalize.guard();
-    let path = dunce::canonicalize(&path)
-        .with_context(|| format!("canonicalize({})", P::as_ref(&path).display()))?;
+    let path = make_error_with_retry!(
+        dunce::canonicalize(path.as_ref()),
+        format!("canonicalize({})", P::as_ref(&path).display()),
+    )?;
     AbsNormPathBuf::new(path)
 }
 
-pub fn canonicalize_if_exists<P: AsRef<Path>>(path: P) -> anyhow::Result<Option<AbsNormPathBuf>> {
+pub fn canonicalize_if_exists<P: AsRef<AbsPath>>(
+    path: P,
+) -> buck2_error::Result<Option<AbsNormPathBuf>> {
     let _guard = IoCounterKey::Canonicalize.guard();
-    match dunce::canonicalize(&path) {
-        Ok(path) => Some(AbsNormPathBuf::new(path)).transpose(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e).context(format!(
-            "canonicalize_if_exists({})",
-            P::as_ref(&path).display()
-        ))),
-    }
+    let path = make_error_with_retry!(
+        if_exists(dunce::canonicalize(path.as_ref())),
+        format!("canonicalize_if_exists({})", P::as_ref(&path).display()),
+    )?;
+    path.map(AbsNormPathBuf::new).transpose()
 }
 
 /// Convert Windows UNC path to regular path.
-pub fn simplified(path: &AbsPath) -> anyhow::Result<&AbsPath> {
+pub fn simplified(path: &AbsPath) -> buck2_error::Result<&AbsPath> {
     let path = dunce::simplified(path.as_ref());
     // This should not fail, but better not panic.
     AbsPath::new(path)
 }
 
-pub fn remove_dir<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<()> {
+pub fn remove_dir<P: AsRef<AbsPath>>(path: P) -> Result<(), IoError> {
     let _guard = IoCounterKey::RmDir.guard();
-    fs::remove_dir(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("remove_dir({})", P::as_ref(&path).display()))
+    make_error_with_retry!(
+        fs::remove_dir(path.as_ref().as_maybe_relativized()),
+        format!("remove_dir({})", P::as_ref(&path).display()),
+    )
+}
+
+pub struct DiskSpaceStats {
+    pub free_space: u64,
+    pub total_space: u64,
+}
+
+/// Free and total disk space on given path. Path does not have to be disk root.
+/// When the path does not exist, the behavior is not specified.
+pub fn disk_space_stats<P: AsRef<AbsPath>>(path: P) -> buck2_error::Result<DiskSpaceStats> {
+    #[cfg(not(windows))]
+    fn disk_space_stats_impl(path: &Path) -> buck2_error::Result<DiskSpaceStats> {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        use buck2_error::conversion::from_any_with_tag;
+
+        let path_c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+            .with_buck_error_context(|| format!("Failed to convert path to CString: {:?}", path))?;
+        let mut statvfs = unsafe { MaybeUninit::<libc::statvfs>::zeroed().assume_init() };
+        unsafe {
+            let r = libc::statvfs(path_c.as_ptr(), &mut statvfs);
+            if r != 0 {
+                let e = io::Error::last_os_error();
+                return Err(IoError {
+                    op: format!("statvfs({})", path.display()),
+                    e,
+                }
+                .into());
+            }
+        }
+        let fr_size = u64::from(statvfs.f_frsize);
+        let free_space = u64::from(statvfs.f_bavail)
+            .checked_mul(fr_size)
+            .with_buck_error_context(|| {
+                format!(
+                    "Multiplication overflow for statvfs free space for `{}`",
+                    path.display()
+                )
+            })?;
+
+        let total_space = u64::from(statvfs.f_blocks)
+            .checked_mul(fr_size)
+            .with_buck_error_context(|| {
+                format!(
+                    "Multiplication overflow for statvfs total space for `{}`",
+                    path.display()
+                )
+            })?;
+        Ok(DiskSpaceStats {
+            free_space,
+            total_space,
+        })
+    }
+
+    #[cfg(windows)]
+    fn disk_space_stats_impl(path: &Path) -> buck2_error::Result<DiskSpaceStats> {
+        use std::mem::MaybeUninit;
+        use std::ptr;
+
+        use buck2_util::os::win::os_str::os_str_to_wide_null_term;
+
+        let path_c = os_str_to_wide_null_term(path.as_os_str());
+
+        unsafe {
+            let mut free_bytes =
+                MaybeUninit::<winapi::shared::ntdef::ULARGE_INTEGER>::zeroed().assume_init();
+            let mut total_bytes =
+                MaybeUninit::<winapi::shared::ntdef::ULARGE_INTEGER>::zeroed().assume_init();
+            let r = winapi::um::fileapi::GetDiskFreeSpaceExW(
+                path_c.as_ptr(),
+                &mut free_bytes as *mut _,  // lpFreeBytesAvailableToCaller
+                &mut total_bytes as *mut _, // lpTotalNumberOfBytes
+                ptr::null_mut(),            // lpTotalNumberOfFreeBytes
+            );
+            if r == 0 {
+                let e = io::Error::last_os_error();
+                return Err(IoError {
+                    op: format!("GetDiskFreeSpaceExW({})", path.display()),
+                    e,
+                }
+                .into());
+            }
+            Ok(DiskSpaceStats {
+                free_space: *free_bytes.QuadPart(),
+                total_space: *total_bytes.QuadPart(),
+            })
+        }
+    }
+
+    let _guard = IoCounterKey::Stat.guard();
+    disk_space_stats_impl(path.as_ref())
 }
 
 pub struct FileWriteGuard {
@@ -480,14 +698,39 @@ impl Write for FileWriteGuard {
     }
 }
 
-pub fn create_file<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<FileWriteGuard> {
+pub fn create_file<P: AsRef<AbsPath>>(path: P) -> Result<FileWriteGuard, IoError> {
     let guard = IoCounterKey::Write.guard();
-    let file = File::create(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("create_file({})", P::as_ref(&path).display()))?;
+    let file = make_error_with_retry!(
+        File::create(path.as_ref().as_maybe_relativized()),
+        format!("create_file({})", P::as_ref(&path).display()),
+    )?;
     Ok(FileWriteGuard {
         file,
         _guard: guard,
     })
+}
+
+fn create_file_if_not_exists_impl<P: AsRef<AbsPath>>(
+    path: P,
+) -> Result<Option<FileWriteGuard>, io::Error> {
+    let guard = IoCounterKey::Write.guard();
+    match File::create_new(path.as_ref().as_maybe_relativized()) {
+        Ok(file) => Ok(Some(FileWriteGuard {
+            file,
+            _guard: guard,
+        })),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn create_file_if_not_exists<P: AsRef<AbsPath>>(
+    path: P,
+) -> Result<Option<FileWriteGuard>, IoError> {
+    make_error_with_retry!(
+        create_file_if_not_exists_impl(&path),
+        format!("create_file_if_not_exists({})", P::as_ref(&path).display()),
+    )
 }
 
 pub struct FileReadGuard {
@@ -501,21 +744,38 @@ impl Read for FileReadGuard {
     }
 }
 
-pub fn open_file<P: AsRef<AbsPath>>(path: P) -> anyhow::Result<FileReadGuard> {
+pub fn open_file<P: AsRef<AbsPath>>(path: P) -> Result<FileReadGuard, IoError> {
     let guard = IoCounterKey::Read.guard();
-    let file = File::open(path.as_ref().as_maybe_relativized())
-        .with_context(|| format!("open_file({})", P::as_ref(&path).display()))?;
+    let file = make_error_with_retry!(
+        File::open(path.as_ref().as_maybe_relativized()),
+        format!("open_file({})", P::as_ref(&path).display()),
+    )?;
     Ok(FileReadGuard {
         file,
         _guard: guard,
     })
 }
 
+pub fn open_file_if_exists<P: AsRef<AbsPath>>(path: P) -> Result<Option<FileReadGuard>, IoError> {
+    let guard = IoCounterKey::Read.guard();
+    let Some(file) = make_error_with_retry!(
+        if_exists(File::open(path.as_ref().as_maybe_relativized())),
+        format!("open_file({})", P::as_ref(&path).display()),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FileReadGuard {
+        file,
+        _guard: guard,
+    }))
+}
+
 // Create a relative path in a cross-patform way, we need this since RelativePath fails when
 // converting backslashes which means windows paths end up failing. RelativePathBuf doesn't have
 // this problem and we can easily coerce it into a RelativePath.
 // TODO(T143971518) Avoid RelativePath usage in buck2
-pub fn relative_path_from_system(path: &Path) -> anyhow::Result<Cow<'_, RelativePath>> {
+pub fn relative_path_from_system(path: &Path) -> buck2_error::Result<Cow<'_, RelativePath>> {
     let res = if cfg!(windows) {
         Cow::Owned(RelativePathBuf::from_path(path)?)
     } else {
@@ -526,6 +786,7 @@ pub fn relative_path_from_system(path: &Path) -> anyhow::Result<Cow<'_, Relative
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::fs::File;
     use std::io;
@@ -533,6 +794,7 @@ mod tests {
     use std::path::PathBuf;
 
     use assert_matches::assert_matches;
+    use buck2_error::ErrorTag;
     use relative_path::RelativePath;
 
     use crate::fs::fs_util;
@@ -546,12 +808,14 @@ mod tests {
     use crate::fs::fs_util::symlink;
     use crate::fs::fs_util::symlink_metadata;
     use crate::fs::fs_util::write;
+    use crate::fs::fs_util::IoError;
+    use crate::fs::fs_util::MAX_IO_ATTEMPTS;
     use crate::fs::paths::abs_norm_path::AbsNormPath;
     use crate::fs::paths::abs_path::AbsPath;
     use crate::fs::paths::forward_rel_path::ForwardRelativePath;
 
     #[test]
-    fn if_exists_read_dir() -> anyhow::Result<()> {
+    fn if_exists_read_dir() -> buck2_error::Result<()> {
         let binding = std::env::temp_dir();
         let existing_path = AbsNormPath::new(&binding)?;
         let res = read_dir_if_exists(existing_path)?;
@@ -563,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_remove_symlink_dir() -> anyhow::Result<()> {
+    fn create_and_remove_symlink_dir() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = tempdir.path().join("root");
         let root = AbsPath::new(&root)?;
@@ -588,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_remove_symlink_file() -> anyhow::Result<()> {
+    fn create_and_remove_symlink_file() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = tempdir.path().join("root");
         let root = AbsPath::new(&root)?;
@@ -613,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symlink_with_target_length_over_max_path() -> anyhow::Result<()> {
+    fn test_symlink_with_target_length_over_max_path() -> buck2_error::Result<()> {
         // In Windows, the maximum length of a path is 260.
         // To allow extended path lengths, canonicalize the paths
         // so that they are prefixed with '\\?'
@@ -652,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn symlink_to_file_which_doesnt_exist() -> anyhow::Result<()> {
+    fn symlink_to_file_which_doesnt_exist() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let symlink_path = root.join("symlink");
@@ -664,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn symlink_to_symlinked_dir() -> anyhow::Result<()> {
+    fn symlink_to_symlinked_dir() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let dir_path = root.join("dir");
@@ -682,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn relative_symlink_to_nonexistent_file() -> anyhow::Result<()> {
+    fn relative_symlink_to_nonexistent_file() -> buck2_error::Result<()> {
         // tmp -- dir1 (exists) -- file1 (doesn't exist)
         //     \
         //      \ symlink1 to dir1/file1
@@ -698,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn relative_symlink_to_nonexistent_dir() -> anyhow::Result<()> {
+    fn relative_symlink_to_nonexistent_dir() -> buck2_error::Result<()> {
         // tmp -- dir1 (doesn't exists) -- file1 (doesn't exist)
         //     \
         //      \ dir2 -- relative_symlink1 to ../dir1/file1
@@ -721,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn relative_symlink_from_symlinked_dir_windows() -> anyhow::Result<()> {
+    fn relative_symlink_from_symlinked_dir_windows() -> buck2_error::Result<()> {
         use crate::fs::fs_util::read_link;
 
         if !cfg!(windows) {
@@ -800,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_symlink_to_nonexistent_file_in_nonexistent_dir() -> anyhow::Result<()> {
+    fn absolute_symlink_to_nonexistent_file_in_nonexistent_dir() -> buck2_error::Result<()> {
         // tmp -- dir1 (doesn't exists) -- file1 (doesn't exist)
         //     \
         //      \ symlink1 to /tmp/dir1/file1
@@ -816,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_file_removes_symlink_to_directory() -> anyhow::Result<()> {
+    fn remove_file_removes_symlink_to_directory() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let symlink_path = root.join("symlink_dir");
@@ -836,18 +1100,18 @@ mod tests {
     }
 
     #[test]
-    fn remove_file_does_not_remove_directory() -> anyhow::Result<()> {
+    fn remove_file_does_not_remove_directory() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let dir_path = root.join("dir");
         create_dir_all(AbsPath::new(&dir_path)?)?;
         assert_matches!(remove_file(&dir_path), Err(..));
-        assert!(fs::try_exists(&dir_path)?);
+        assert!(dir_path.try_exists()?);
         Ok(())
     }
 
     #[test]
-    fn remove_file_broken_symlink() -> anyhow::Result<()> {
+    fn remove_file_broken_symlink() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let symlink_path = tempdir.path().join("symlink");
         let symlink_path = AbsPath::new(&symlink_path)?;
@@ -861,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_file_non_existing_file() -> anyhow::Result<()> {
+    fn remove_file_non_existing_file() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let file_path = root.join("file_doesnt_exist");
@@ -870,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_nonexistent() -> anyhow::Result<()> {
+    fn remove_all_nonexistent() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         remove_all(root.join("nonexistent"))?;
@@ -878,34 +1142,34 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_regular() -> anyhow::Result<()> {
+    fn remove_all_regular() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let path = root.join("file");
         fs::write(&path, b"regular")?;
         remove_all(&path)?;
-        assert!(!fs::try_exists(&path)?);
+        assert!(!path.try_exists()?);
         Ok(())
     }
 
     #[test]
-    fn remove_all_dir() -> anyhow::Result<()> {
+    fn remove_all_dir() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let path = root.join("dir");
         fs::create_dir(&path)?;
         fs::write(path.join("file"), b"regular file in a dir")?;
         remove_all(&path)?;
-        assert!(!fs::try_exists(&path)?);
+        assert!(!path.try_exists()?);
         Ok(())
     }
 
     #[test]
-    fn remove_all_broken_symlink() -> anyhow::Result<()> {
-        fn ls(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    fn remove_all_broken_symlink() -> buck2_error::Result<()> {
+        fn ls(path: &Path) -> buck2_error::Result<Vec<PathBuf>> {
             let mut entries = fs::read_dir(path)?
                 .map(|entry| Ok(entry.map(|entry| entry.path())?))
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                .collect::<buck2_error::Result<Vec<_>>>()?;
             entries.sort();
             Ok(entries)
         }
@@ -926,14 +1190,26 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn remove_dir_all_does_not_remove_file() -> anyhow::Result<()> {
+    fn remove_all_path_contains_regular_file() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let regular_file = root.join("foo");
+        fs_util::write(&regular_file, b"data")?;
+        let path = root.join("foo/bar");
+        assert!(remove_all(&path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_dir_all_does_not_remove_file() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let file_path = root.join("file");
         fs::write(&file_path, b"File content")?;
         assert!(remove_dir_all(&file_path).is_err());
-        assert!(fs::try_exists(&file_path)?);
+        assert!(file_path.try_exists()?);
         Ok(())
     }
 
@@ -962,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_to_string_if_exists() -> anyhow::Result<()> {
+    fn test_read_to_string_if_exists() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let f1 = root.join("f1");
@@ -979,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_if_exists() -> anyhow::Result<()> {
+    fn test_read_if_exists() -> buck2_error::Result<()> {
         let tempdir = tempfile::tempdir()?;
         let root = AbsPath::new(tempdir.path())?;
         let f1 = root.join("f1");
@@ -997,7 +1273,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn test_windows_relative_path() -> anyhow::Result<()> {
+    fn test_windows_relative_path() -> buck2_error::Result<()> {
         assert_eq!(
             fs_util::relative_path_from_system(Path::new("foo\\bar"))?,
             RelativePath::new("foo/bar")
@@ -1007,7 +1283,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_relative_path() -> anyhow::Result<()> {
+    fn test_relative_path() -> buck2_error::Result<()> {
         assert_eq!(
             fs_util::relative_path_from_system(Path::new("foo/bar"))?,
             RelativePath::new("foo/bar")
@@ -1030,5 +1306,135 @@ mod tests {
             let mode = fs_util::metadata(&path).unwrap().permissions().mode();
             assert_eq!(0o111, mode & 0o111);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_all_removes_readonly_path() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let path = root.join("foo/bar/link");
+        fs_util::create_dir_all(path.parent().unwrap())?;
+        fs_util::write(&path, b"data")?;
+        let mut perm = fs_util::metadata(&path)?.permissions();
+        perm.set_readonly(true);
+        fs_util::set_permissions(&path, perm)?;
+        fs_util::remove_all(&path)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_file_if_not_exists() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let path = root.join("foo.txt");
+        let _file = fs_util::create_file_if_not_exists(&path)?.unwrap();
+        assert!(fs_util::create_file_if_not_exists(path)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_disk_space_stats() -> buck2_error::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = AbsPath::new(tempdir.path())?;
+        let disk_space = fs_util::disk_space_stats(&root)?;
+        assert!(disk_space.total_space > disk_space.free_space);
+        Ok(())
+    }
+
+    static TEST_FILE_CONTENT: &str = "test";
+
+    fn check_io_with_retry(
+        path: &Path,
+        error_kind: std::io::ErrorKind,
+        expected_attempts: u32,
+        should_succeed: bool,
+    ) {
+        let mut attempts: u32 = 0;
+        let mut open_fn = |p: &Path| -> io::Result<File> {
+            attempts += 1;
+            if attempts >= MAX_IO_ATTEMPTS {
+                std::fs::File::open(p)
+            } else {
+                Err(io::Error::new(error_kind, error_kind.to_string()))
+            }
+        };
+        let io_result = make_error_with_retry!(open_fn(path), format!("test123"));
+
+        if should_succeed {
+            let mut file = io_result.unwrap();
+            assert_eq!(attempts, expected_attempts);
+            let mut buf = String::new();
+            io::Read::read_to_string(&mut file, &mut buf).unwrap();
+            assert_eq!(buf, TEST_FILE_CONTENT);
+        } else {
+            assert_eq!(io_result.err().map(|e| e.e.kind()).unwrap(), error_kind);
+            assert_eq!(attempts, expected_attempts);
+        }
+    }
+
+    fn get_test_path(name: &str, tempdir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = tempdir.path().join(name);
+        std::fs::write(&path, TEST_FILE_CONTENT).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_retry_io() -> buck2_error::Result<()> {
+        use std::io::ErrorKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut test_cases = HashMap::new();
+        // The behavior of these test cases varies by platform
+        let should_succeed = cfg!(target_os = "macos");
+        let expected_attempts = if should_succeed { MAX_IO_ATTEMPTS } else { 1 };
+        test_cases.insert(
+            get_test_path("test_timeout", &tempdir),
+            (ErrorKind::TimedOut, expected_attempts, should_succeed),
+        );
+        test_cases.insert(
+            get_test_path("test_stale", &tempdir),
+            (
+                ErrorKind::StaleNetworkFileHandle,
+                expected_attempts,
+                should_succeed,
+            ),
+        );
+
+        // These test cases should behave the same on all platforms
+        test_cases.insert(
+            get_test_path("test_too_many_args", &tempdir),
+            (ErrorKind::ArgumentListTooLong, 1, false),
+        );
+        test_cases.insert(
+            get_test_path("test_permission_denied", &tempdir),
+            (ErrorKind::PermissionDenied, 1, false),
+        );
+
+        for (test_path, results) in test_cases {
+            check_io_with_retry(&test_path, results.0, results.1, results.2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_io_error_tag() -> buck2_error::Result<()> {
+        let fail_fn = || -> io::Result<File> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test error, always fails",
+            ))
+        };
+
+        let file = make_error_with_retry!(fail_fn(), format!("should fail"));
+        let buck2_error = buck2_error::Error::from(file.err().unwrap());
+
+        assert_eq!(
+            buck2_error.tags(),
+            &[ErrorTag::IoPermissionDenied, ErrorTag::IoSystem]
+        );
+        Ok(())
     }
 }

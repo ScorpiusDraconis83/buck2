@@ -52,7 +52,7 @@ struct GlobalConfig {
 
 /// "Evaluate" a file.
 #[derive(Debug, derive_more::Display, Clone, Hash, PartialEq, Eq, Allocative)]
-#[display(fmt = "{}", name)]
+#[display("{}", name)]
 struct FileKey {
     name: String,
 }
@@ -75,10 +75,13 @@ impl Key for FileKey {
         // which is the result of file evaluation.
         // We are testing that file evaluation is not invalidated
         // if unrelated configurations changed.
-        let value = config
-            .projection(&ConfigPropertyKey {
-                key: "x".to_owned(),
-            })
+        let value = ctx
+            .projection(
+                &config,
+                &ConfigPropertyKey {
+                    key: "x".to_owned(),
+                },
+            )
             .map_err(|e| Arc::new(anyhow::anyhow!(e)))?;
         // Record we executed this computation.
         ctx.global_data()
@@ -106,7 +109,7 @@ impl Key for FileKey {
     Eq,
     Allocative
 )]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct ConfigKey;
 
 #[async_trait]
@@ -143,7 +146,7 @@ impl Key for ConfigKey {
 
 /// One "property" of the "configuration".
 #[derive(Debug, derive_more::Display, Clone, Hash, PartialEq, Eq, Allocative)]
-#[display(fmt = "{}", key)]
+#[display("{}", key)]
 struct ConfigPropertyKey {
     key: String,
 }
@@ -200,7 +203,7 @@ async fn smoke() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    let ctx = ctx.commit().await;
+    let mut ctx = ctx.commit().await;
 
     let file = ctx
         .compute(&FileKey {
@@ -233,7 +236,7 @@ async fn smoke() -> anyhow::Result<()> {
     data.data.set(GlobalConfig {
         config: HashMap::from_iter([("x".to_owned(), "X".to_owned())]),
     });
-    let ctx = dice.updater_with_data(data).commit().await;
+    let mut ctx = dice.updater_with_data(data).commit().await;
 
     let file = ctx
         .compute(&FileKey {
@@ -265,7 +268,7 @@ async fn smoke() -> anyhow::Result<()> {
             ("y".to_owned(), "Y".to_owned()),
         ]),
     });
-    let ctx = dice.updater_with_data(data).commit().await;
+    let mut ctx = dice.updater_with_data(data).commit().await;
 
     let file = ctx
         .compute(&FileKey {

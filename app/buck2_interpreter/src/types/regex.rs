@@ -18,13 +18,15 @@ use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
+use starlark::starlark_module;
+use starlark::starlark_simple_value;
 use starlark::typing::Ty;
 use starlark::values::starlark_value;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 
 /// Wrapper for `regex::Regex`.
-#[derive(ProvidesStaticType, Debug, NoSerialize, StarlarkDocs, Allocative)]
+#[derive(ProvidesStaticType, Debug, NoSerialize, Allocative)]
 pub enum BuckStarlarkRegex {
     // TODO(nga): do not skip.
     //   And this is important because regex can have a lot of cache.
@@ -40,7 +42,7 @@ impl BuckStarlarkRegex {
         }
     }
 
-    fn is_match(&self, s: &str) -> anyhow::Result<bool> {
+    fn is_match(&self, s: &str) -> buck2_error::Result<bool> {
         match self {
             BuckStarlarkRegex::Regular(r) => Ok(r.is_match(s)),
             BuckStarlarkRegex::Fancy(r) => Ok(r.is_match(s)?),
@@ -81,8 +83,8 @@ fn regex_methods(builder: &mut MethodsBuilder) {
     fn r#match(
         this: &BuckStarlarkRegex,
         #[starlark(require = pos)] str: &str,
-    ) -> anyhow::Result<bool> {
-        this.is_match(str)
+    ) -> starlark::Result<bool> {
+        Ok(this.is_match(str)?)
     }
 }
 
@@ -92,10 +94,14 @@ pub fn register_buck_regex(builder: &mut GlobalsBuilder) {
     fn regex<'v>(
         #[starlark(require = pos)] regex: &str,
         #[starlark(require = named, default = false)] fancy: bool,
-    ) -> anyhow::Result<BuckStarlarkRegex> {
+    ) -> starlark::Result<BuckStarlarkRegex> {
         match fancy {
-            false => Ok(BuckStarlarkRegex::Regular(regex::Regex::new(regex)?)),
-            true => Ok(BuckStarlarkRegex::Fancy(fancy_regex::Regex::new(regex)?)),
+            false => Ok(BuckStarlarkRegex::Regular(
+                regex::Regex::new(regex).map_err(buck2_error::Error::from)?,
+            )),
+            true => Ok(BuckStarlarkRegex::Fancy(
+                fancy_regex::Regex::new(regex).map_err(buck2_error::Error::from)?,
+            )),
         }
     }
 }

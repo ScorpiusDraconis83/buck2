@@ -17,12 +17,12 @@ use buck2_cli_proto::targets_request;
 use buck2_cli_proto::targets_request::TargetHashFileMode;
 use buck2_cli_proto::targets_request::TargetHashGraphType;
 use buck2_cli_proto::TargetsResponse;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
 use buck2_core::cells::CellResolver;
 use buck2_core::fs::paths::abs_path::AbsPath;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
 use buck2_node::load_patterns::load_patterns;
 use buck2_node::load_patterns::MissingTargetBehavior;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
@@ -37,7 +37,6 @@ use dupe::OptionDupedExt;
 use crate::commands::targets::fmt::Stats;
 use crate::commands::targets::fmt::TargetFormatter;
 use crate::commands::targets::fmt::TargetInfo;
-use crate::commands::targets::mk_error;
 use crate::target_hash::TargetHashes;
 use crate::target_hash::TargetHashesFileMode;
 
@@ -53,7 +52,7 @@ impl TargetHashOptions {
         request: &targets_request::Other,
         cell_resolver: &CellResolver,
         fs: &ProjectRoot,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let file_mode = TargetHashFileMode::from_i32(request.target_hash_file_mode)
             .expect("buck cli should send valid target hash file mode");
         let file_mode = match file_mode {
@@ -65,7 +64,7 @@ impl TargetHashOptions {
                         let path = AbsPath::new(Path::new(&path))?;
                         cell_resolver.get_cell_path_from_abs_path(path, fs)
                     })
-                    .collect::<anyhow::Result<_>>()?;
+                    .collect::<buck2_error::Result<_>>()?;
                 TargetHashesFileMode::PathsOnly(modified_paths)
             }
             TargetHashFileMode::PathsAndContents => TargetHashesFileMode::PathsAndContents,
@@ -84,42 +83,47 @@ impl TargetHashOptions {
 
 pub(crate) async fn targets_batch(
     server_ctx: &dyn ServerCommandContextTrait,
-    dice: DiceTransaction,
+    mut dice: DiceTransaction,
     formatter: &dyn TargetFormatter,
     parsed_patterns: Vec<ParsedPattern<TargetPatternExtra>>,
     global_cfg_options: &GlobalCfgOptions,
     hash_options: TargetHashOptions,
     keep_going: bool,
-) -> anyhow::Result<TargetsResponse> {
-    let results = load_patterns(&dice, parsed_patterns, MissingTargetBehavior::Fail).await?;
+) -> buck2_error::Result<TargetsResponse> {
+    let results = &load_patterns(&mut dice, parsed_patterns, MissingTargetBehavior::Fail).await?;
 
-    let target_hashes = match hash_options.graph_type {
-        TargetHashGraphType::Configured => Some(
-            TargetHashes::compute::<ConfiguredTargetNode, _>(
-                dice.dupe(),
-                ConfiguredTargetNodeLookup(&dice),
-                results.iter_loaded_targets_by_package().collect(),
-                global_cfg_options,
-                hash_options.file_mode,
-                hash_options.fast_hash,
-                hash_options.recursive,
-            )
-            .await?,
-        ),
-        TargetHashGraphType::Unconfigured => Some(
-            TargetHashes::compute::<TargetNode, _>(
-                dice.dupe(),
-                TargetNodeLookup(&dice),
-                results.iter_loaded_targets_by_package().collect(),
-                global_cfg_options,
-                hash_options.file_mode,
-                hash_options.fast_hash,
-                hash_options.recursive,
-            )
-            .await?,
-        ),
-        _ => None,
-    };
+    let target_hashes = dice
+        .dupe()
+        .with_linear_recompute(|linear_ctx| async move {
+            match hash_options.graph_type {
+                TargetHashGraphType::Configured => buck2_error::Ok(Some(
+                    TargetHashes::compute::<ConfiguredTargetNode, _>(
+                        dice.dupe(),
+                        ConfiguredTargetNodeLookup(&linear_ctx),
+                        results.iter_loaded_targets_by_package().collect(),
+                        global_cfg_options,
+                        hash_options.file_mode,
+                        hash_options.fast_hash,
+                        hash_options.recursive,
+                    )
+                    .await?,
+                )),
+                TargetHashGraphType::Unconfigured => Ok(Some(
+                    TargetHashes::compute::<TargetNode, _>(
+                        dice.dupe(),
+                        TargetNodeLookup(&linear_ctx),
+                        results.iter_loaded_targets_by_package().collect(),
+                        global_cfg_options,
+                        hash_options.file_mode,
+                        hash_options.fast_hash,
+                        hash_options.recursive,
+                    )
+                    .await?,
+                )),
+                _ => Ok(None),
+            }
+        })
+        .await?;
 
     let mut buffer = String::new();
     formatter.begin(&mut buffer);
@@ -151,14 +155,14 @@ pub(crate) async fn targets_batch(
                 }
             }
             Err(e) => {
-                stats.errors += 1;
+                stats.add_error(e);
                 let mut stderr = String::new();
 
                 if needs_separator {
                     formatter.separator(&mut buffer);
                 }
                 needs_separator = true;
-                formatter.package_error(package.dupe(), &e.dupe().into(), &mut buffer, &mut stderr);
+                formatter.package_error(package.dupe(), e, &mut buffer, &mut stderr);
 
                 server_ctx.stderr()?.write_all(stderr.as_bytes())?;
 
@@ -169,8 +173,8 @@ pub(crate) async fn targets_batch(
         }
     }
     formatter.end(&stats, &mut buffer);
-    if !keep_going && stats.errors != 0 {
-        Err(mk_error(stats.errors))
+    if !keep_going && let Some(e) = stats.to_error() {
+        Err(e)
     } else {
         Ok(TargetsResponse {
             error_count: stats.errors,

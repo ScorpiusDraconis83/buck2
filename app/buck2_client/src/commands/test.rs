@@ -7,19 +7,23 @@
  * of this source tree.
  */
 
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_cli_proto::CounterWithExamples;
 use buck2_cli_proto::TestRequest;
 use buck2_cli_proto::TestSessionOptions;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::build::CommonBuildOptions;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
+use buck2_client_ctx::common::timeout::CommonTimeoutOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
-use buck2_client_ctx::common::CommonBuildOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::final_console::FinalConsole;
 use buck2_client_ctx::output_destination_arg::OutputDestinationArg;
@@ -29,8 +33,10 @@ use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::superconsole::test::span_from_build_failure_count;
 use buck2_client_ctx::subscribers::superconsole::test::TestCounterColumn;
 use buck2_core::fs::fs_util;
-use buck2_core::fs::working_dir::WorkingDir;
-use gazebo::prelude::*;
+use buck2_core::fs::working_dir::AbsWorkingDir;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use superconsole::Line;
 use superconsole::Span;
 
@@ -39,10 +45,10 @@ use crate::commands::build::print_build_result;
 fn forward_output_to_path(
     output: &str,
     path_arg: &PathArg,
-    working_dir: &WorkingDir,
-) -> anyhow::Result<()> {
+    working_dir: &AbsWorkingDir,
+) -> buck2_error::Result<()> {
     fs_util::write(path_arg.resolve(working_dir), output)
-        .context("Failed to write test executor output to path")
+        .buck_error_context("Failed to write test executor output to path")
 }
 
 fn print_error_counter(
@@ -50,7 +56,7 @@ fn print_error_counter(
     counter: &CounterWithExamples,
     error_type: &str,
     symbol: &str,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     if counter.count > 0 {
         console.print_error(&format!("{} {}", counter.count, error_type))?;
         for test_name in &counter.example_tests {
@@ -68,15 +74,9 @@ fn print_error_counter(
 #[derive(Debug, clap::Parser)]
 #[clap(name = "test", about = "Build and test the specified targets")]
 pub struct TestCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
-    #[clap(flatten)]
-    build_opts: CommonBuildOptions,
-
     #[clap(
         long = "exclude",
-        multiple_values = true,
+        num_args = 1..,
         help = "Labels on targets to exclude from tests"
     )]
     exclude: Vec<String>,
@@ -86,7 +86,7 @@ pub struct TestCommand {
         alias = "labels",
         help = "Labels on targets to include from tests. Prefixing with `!` means to exclude. First match wins unless overridden by `always-exclude` flag.\n\
 If include patterns are present, regardless of whether exclude patterns are present, then all targets are by default excluded unless explicitly included.",
-        multiple_values = true
+        num_args=1..,
     )]
     include: Vec<String>,
 
@@ -103,16 +103,6 @@ If include patterns are present, regardless of whether exclude patterns are pres
     )]
     build_filtered_targets: bool, // TODO(bobyf) this flag should always override the buckconfig option when we use it
 
-    /// This option does nothing. It is here to keep compatibility with Buck1 and ci
-    #[allow(unused)] // for v1 compat
-    #[clap(long = "deep")]
-    deep: bool,
-
-    // ignored. only for e2e tests. compatibility with v1.
-    #[clap(long = "xml")]
-    #[allow(unused)] // for v1 compat
-    xml: Option<String>,
-
     /// Will allow tests that are compatible with RE (setup to run from the repo root and
     /// use relative paths) to run from RE.
     #[clap(long, group = "re_options", alias = "unstable-allow-tests-on-re")]
@@ -123,26 +113,7 @@ If include patterns are present, regardless of whether exclude patterns are pres
     #[clap(long, group = "re_options", alias = "unstable-force-tests-on-re")]
     unstable_allow_all_tests_on_re: bool,
 
-    // NOTE: the field below is given a different name from the test runner's `timeout` to avoid
-    // confusion between the two parameters.
-    /// How long to execute tests for. If the timeout is exceeded, Buck2 will exit
-    /// as quickly as possible and not run further tests. In-flight tests will be
-    /// cancelled. The test orchestrator will be allowed to shut down gracefully.
-    ///
-    /// The exit code is controlled by the test orchestrator (which normally should report zero for
-    /// this).
-    ///
-    /// The format is a concatenation of time spans (separated by spaces). Each time span is an
-    /// integer number and a suffix.
-    ///
-    /// Relevant supported suffixes: seconds, second, sec, s, minutes, minute, min, m, hours, hour,
-    /// hr, h
-    ///
-    /// For example: `5m 10s`, `500s`.
-    #[clap(long = "overall-timeout")]
-    timeout: Option<humantime::Duration>,
-
-    #[clap(name = "TARGET_PATTERNS", help = "Patterns to test")]
+    #[clap(name = "TARGET_PATTERNS", help = "Patterns to test", value_hint = clap::ValueHint::Other)]
     patterns: Vec<String>,
 
     /// Writes the test executor stdout to the provided path
@@ -155,6 +126,11 @@ If include patterns are present, regardless of whether exclude patterns are pres
     /// By default the test executor's stdout stream is captured
     #[clap(long)]
     test_executor_stdout: Option<OutputDestinationArg>,
+
+    /// Normally testing will follow the `tests` attribute of all targets, to find their associated tests.
+    /// When passed, this flag will disable that, and only run the directly supplied targets.
+    #[clap(long)]
+    ignore_tests_attribute: bool,
 
     /// Writes the test executor stderr to the provided path
     ///
@@ -175,6 +151,26 @@ If include patterns are present, regardless of whether exclude patterns are pres
     /// buck2 test //foo:bar -- --env PRIVATE_KEY=123
     #[clap(name = "TEST_EXECUTOR_ARGS", raw = true)]
     test_executor_args: Vec<String>,
+
+    /// This option does nothing. It is here to keep compatibility with Buck1 and ci
+    #[clap(long = "deep", hide = true)]
+    _deep: bool,
+
+    // ignored. only for e2e tests. compatibility with v1.
+    #[clap(long = "xml", hide = true)]
+    _xml: Option<String>,
+
+    #[clap(flatten)]
+    build_opts: CommonBuildOptions,
+
+    #[clap(flatten)]
+    target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    timeout_options: CommonTimeoutOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 #[async_trait]
@@ -184,8 +180,9 @@ impl StreamingCommand for TestCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let context = ctx.client_context(matches, &self)?;
         let response = buckd
@@ -193,9 +190,8 @@ impl StreamingCommand for TestCommand {
             .test(
                 TestRequest {
                     context: Some(context),
-                    target_patterns: self
-                        .patterns
-                        .map(|pat| buck2_data::TargetPattern { value: pat.clone() }),
+                    target_patterns: self.patterns.clone(),
+                    target_cfg: Some(self.target_cfg.target_cfg()),
                     test_executor_args: self.test_executor_args,
                     excluded_labels: self.exclude,
                     included_labels: self.include,
@@ -210,17 +206,11 @@ impl StreamingCommand for TestCommand {
                         force_use_project_relative_paths: self.unstable_allow_all_tests_on_re,
                         force_run_from_project_root: self.unstable_allow_all_tests_on_re,
                     }),
-                    timeout: self
-                        .timeout
-                        .map(|t| {
-                            let t: std::time::Duration = t.into();
-                            t.try_into()
-                        })
-                        .transpose()
-                        .context("Invalid `timeout`")?,
+                    timeout: self.timeout_options.overall_timeout()?,
+                    ignore_tests_attribute: self.ignore_tests_attribute,
                 },
-                ctx.stdin()
-                    .console_interaction_stream(&self.common_opts.console_opts),
+                events_ctx,
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 &mut NoPartialResultHandler,
             )
             .await??;
@@ -233,11 +223,23 @@ impl StreamingCommand for TestCommand {
         let listing_failed = statuses
             .listing_failed
             .as_ref()
-            .context("Missing `listing_failed`")?;
-        let passed = statuses.passed.as_ref().context("Missing `passed`")?;
-        let failed = statuses.failed.as_ref().context("Missing `failed`")?;
-        let fatals = statuses.fatals.as_ref().context("Missing `fatals`")?;
-        let skipped = statuses.skipped.as_ref().context("Missing `skipped`")?;
+            .buck_error_context("Missing `listing_failed`")?;
+        let passed = statuses
+            .passed
+            .as_ref()
+            .buck_error_context("Missing `passed`")?;
+        let failed = statuses
+            .failed
+            .as_ref()
+            .buck_error_context("Missing `failed`")?;
+        let fatals = statuses
+            .fatals
+            .as_ref()
+            .buck_error_context("Missing `fatals`")?;
+        let skipped = statuses
+            .skipped
+            .as_ref()
+            .buck_error_context("Missing `skipped`")?;
 
         let console = self.common_opts.console_opts.final_console();
         print_build_result(&console, &response.errors)?;
@@ -248,22 +250,22 @@ impl StreamingCommand for TestCommand {
         // command).
         let build_errors = response
             .errors
-            .iter()
-            .filter(|e| e.typ != Some(buck2_data::error::ErrorType::UserDeadlineExpired as _))
+            .into_iter()
+            .filter(|e| !e.tags().any(|t| t == ErrorTag::TestDeadlineExpired))
             .collect::<Vec<_>>();
 
         if !build_errors.is_empty() {
             console.print_error(&format!("{} BUILDS FAILED", build_errors.len()))?;
         }
 
-        // TODO(nmj): Might make sense for us to expose the event ctx, and use its
-        //            handle_stdout method, instead of raw buck2_client::println!s here.
-        // TODO: also remove the duplicate information when the above is done.
-
         let mut line = Line::default();
         line.push(Span::new_unstyled_lossy("Tests finished: "));
         if listing_failed.count > 0 {
-            line.push(TestCounterColumn::LISTING_FAIL.to_span_from_test_statuses(statuses)?);
+            line.push(
+                TestCounterColumn::LISTING_FAIL
+                    .to_span_from_test_statuses(statuses)
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?,
+            );
             line.push(Span::new_unstyled_lossy(". "));
         }
         let columns = [
@@ -273,10 +275,17 @@ impl StreamingCommand for TestCommand {
             TestCounterColumn::SKIP,
         ];
         for column in columns {
-            line.push(column.to_span_from_test_statuses(statuses)?);
+            line.push(
+                column
+                    .to_span_from_test_statuses(statuses)
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?,
+            );
             line.push(Span::new_unstyled_lossy(". "));
         }
-        line.push(span_from_build_failure_count(build_errors.len())?);
+        line.push(
+            span_from_build_failure_count(build_errors.len())
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?,
+        );
         eprint_line(&line)?;
 
         print_error_counter(&console, listing_failed, "LISTINGS FAILED", "⚠")?;
@@ -298,12 +307,16 @@ impl StreamingCommand for TestCommand {
             Some(OutputDestinationArg::Stream) => {
                 console.print_error(&response.executor_stderr)?;
             }
-            _ => {}
+            None => {}
+        }
+
+        if let Some(build_report) = response.serialized_build_report {
+            buck2_client_ctx::println!("{}", build_report)?;
         }
 
         let exit_result = if !build_errors.is_empty() {
             // If we had build errors, those take precedence and we return their exit code.
-            ExitResult::from_errors(build_errors.iter().copied())
+            ExitResult::from_errors(&build_errors)
         } else if let Some(exit_code) = response.exit_code {
             // Otherwise, use the exit code from Tpx.
             ExitResult::status_extended(exit_code)
@@ -329,11 +342,15 @@ impl StreamingCommand for TestCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }

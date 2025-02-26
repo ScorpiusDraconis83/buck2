@@ -12,9 +12,9 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use allocative::Allocative;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_util::arc_str::ThinArcSlice;
 use dupe::Dupe;
 use gazebo::prelude::SliceExt;
@@ -26,7 +26,7 @@ pub enum VisibilityError {
     #[error(
         "`{0}` is not visible to `{1}` (run `buck2 uquery --output-attribute visibility {0}` to check the visibility)"
     )]
-    #[buck2(user)]
+    #[buck2(input, tag = Visibility)]
     NotVisibleTo(TargetLabel, TargetLabel),
 }
 
@@ -42,7 +42,7 @@ impl VisibilityPattern {
 }
 
 #[derive(derive_more::Display)]
-#[display(fmt = "\"{}\"", _0)]
+#[display("\"{}\"", _0)]
 struct VisibilityPatternQuoted<'a>(&'a VisibilityPattern);
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Dupe, Allocative)]
@@ -125,7 +125,10 @@ impl Display for VisibilityPatternList {
 }
 
 impl AnyMatches for VisibilityPatternList {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         match self {
             VisibilityPatternList::Public => filter(VisibilityPattern::PUBLIC),
             VisibilityPatternList::List(patterns) => {
@@ -203,13 +206,19 @@ impl Display for WithinViewSpecification {
 }
 
 impl AnyMatches for VisibilitySpecification {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         self.0.any_matches(filter)
     }
 }
 
 impl AnyMatches for WithinViewSpecification {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         self.0.any_matches(filter)
     }
 }

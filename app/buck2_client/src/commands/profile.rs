@@ -9,82 +9,48 @@
 
 use std::time::Duration;
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_cli_proto::profile_request::ProfileOpts;
-use buck2_cli_proto::profile_request::Profiler;
-use buck2_cli_proto::target_profile::Action;
+use buck2_cli_proto::target_profile;
 use buck2_cli_proto::BxlProfile;
 use buck2_cli_proto::ProfileRequest;
 use buck2_cli_proto::ProfileResponse;
 use buck2_cli_proto::TargetProfile;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::target_cfg::TargetCfgWithUniverseOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::path_arg::PathArg;
 use buck2_client_ctx::streaming::BuckSubcommand;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
+use buck2_error::buck2_error;
+use buck2_error::BuckErrorContext;
 use dupe::Dupe;
-use gazebo::prelude::VecExt;
 
 use super::bxl::BxlCommandOptions;
 
 #[derive(Debug, clap::Parser)]
-#[clap(about = "Profiling mechanisms")]
+#[clap(about = "Run starlark profiler")]
 pub enum ProfileCommand {
-    #[clap(about = "Profile analysis")]
-    Analysis(BuckProfileOptions),
-
-    #[clap(about = "Profile loading")]
-    Loading(BuckProfileOptions),
-
-    #[clap(about = "Profile BXL script")]
-    Bxl(BxlProfileOptions),
-}
-
-pub enum ProfileOptionsType {
-    BuckProfileOptions {
-        opts: AnalysisLoadProfileOptions,
-        action: Action,
-    },
-    BxlProfileOptions {
-        opts: BxlCommandOptions,
-    },
+    Analysis(ProfileAnalysisCommand),
+    Loading(ProfileLoadingCommand),
+    Bxl(ProfileBxlCommand),
 }
 
 impl ProfileCommand {
-    pub fn exec(self, matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
-        let submatches = matches.subcommand().expect("subcommand not found").1;
-        match self {
-            Self::Analysis(opts) => ProfileSubcommand {
-                opts: ProfileOptionsType::BuckProfileOptions {
-                    opts: opts.buck_opts,
-                    action: Action::Analysis,
-                },
-                profile_common_opts: opts.profile_common_opts,
-            },
-            Self::Loading(opts) => ProfileSubcommand {
-                opts: ProfileOptionsType::BuckProfileOptions {
-                    opts: opts.buck_opts,
-                    action: Action::Loading,
-                },
-                profile_common_opts: opts.profile_common_opts,
-            },
-            Self::Bxl(opts) => ProfileSubcommand {
-                opts: ProfileOptionsType::BxlProfileOptions {
-                    opts: opts.bxl_opts,
-                },
-                profile_common_opts: opts.profile_common_opts,
-            },
-        }
-        .exec(submatches, ctx)
+    pub fn exec(self, matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
+        let submatches = matches.unwrap_subcommand();
+        ProfileSubcommand { subcommand: self }.exec(submatches, ctx)
     }
 
     pub fn sanitize_argv(&self, argv: Argv) -> SanitizedArgv {
@@ -92,9 +58,11 @@ impl ProfileCommand {
     }
 }
 
-#[derive(clap::ValueEnum, Dupe, Clone, Debug)]
-enum BuckProfileMode {
+#[derive(clap::ValueEnum, Dupe, Clone, Copy, Debug)]
+pub(crate) enum BuckProfileMode {
     TimeFlame,
+    HeapAllocated,
+    HeapRetained,
     HeapFlameAllocated,
     HeapFlameRetained,
     HeapSummaryAllocated,
@@ -103,10 +71,13 @@ enum BuckProfileMode {
     Bytecode,
     BytecodePairs,
     Typecheck,
+    Coverage,
+    None,
 }
 
+/// Profile BXL script.
 #[derive(Debug, clap::Parser)]
-pub struct BxlProfileOptions {
+pub struct ProfileBxlCommand {
     #[clap(flatten)]
     bxl_opts: BxlCommandOptions,
 
@@ -114,17 +85,29 @@ pub struct BxlProfileOptions {
     profile_common_opts: ProfileCommonOptions,
 }
 
+/// Profile `BUCK` file evaluation.
 #[derive(Debug, clap::Parser)]
-pub struct BuckProfileOptions {
+pub struct ProfileLoadingCommand {
     #[clap(flatten)]
-    buck_opts: AnalysisLoadProfileOptions,
+    buck_opts: AnalysisOrLoadProfileOptions,
 
     #[clap(flatten)]
     profile_common_opts: ProfileCommonOptions,
 }
 
+/// Profile analysis.
 #[derive(Debug, clap::Parser)]
-pub struct AnalysisLoadProfileOptions {
+pub struct ProfileAnalysisCommand {
+    #[clap(flatten)]
+    buck_opts: AnalysisOrLoadProfileOptions,
+
+    #[clap(flatten)]
+    profile_common_opts: ProfileCommonOptions,
+}
+
+/// Common options for `profile loading` and `profile analysis`.
+#[derive(Debug, clap::Parser)]
+struct AnalysisOrLoadProfileOptions {
     #[clap(value_name = "TARGET_PATTERNS")]
     target_patterns: Vec<String>,
 
@@ -134,11 +117,9 @@ pub struct AnalysisLoadProfileOptions {
     recursive: bool,
 }
 
+/// Common options for three profile subcommands.
 #[derive(Debug, clap::Parser)]
-pub struct ProfileCommonOptions {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
+struct ProfileCommonOptions {
     /// Output file path for profile data.
     ///
     /// File will be created if it does not exist, and overwritten if it does.
@@ -147,7 +128,7 @@ pub struct ProfileCommonOptions {
 
     /// Profile mode.
     ///
-    /// Memory profiling modes have suffixes either `-allocated` or `retained`.
+    /// Memory profiling modes have suffixes either `-allocated` or `-retained`.
     ///
     /// `-retained` means memory kept in frozen starlark heap after analysis complete.
     /// `-retained` does not work when profiling loading,
@@ -157,24 +138,43 @@ pub struct ProfileCommonOptions {
     /// `-allocated` means allocated memory, including memory which is later garbage collected.
     #[clap(long, value_enum)]
     mode: BuckProfileMode,
+
+    #[clap(flatten)]
+    target_cfg: TargetCfgWithUniverseOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
-pub struct ProfileSubcommand {
-    opts: ProfileOptionsType,
-    profile_common_opts: ProfileCommonOptions,
+struct ProfileSubcommand {
+    subcommand: ProfileCommand,
 }
 
-fn profile_mode_to_profile(mode: &BuckProfileMode) -> Profiler {
+pub(crate) fn profile_mode_to_profile(mode: BuckProfileMode) -> buck2_cli_proto::ProfileMode {
     match mode {
-        BuckProfileMode::TimeFlame => Profiler::TimeFlame,
-        BuckProfileMode::HeapFlameAllocated => Profiler::HeapFlameAllocated,
-        BuckProfileMode::HeapFlameRetained => Profiler::HeapFlameRetained,
-        BuckProfileMode::HeapSummaryAllocated => Profiler::HeapSummaryAllocated,
-        BuckProfileMode::HeapSummaryRetained => Profiler::HeapSummaryRetained,
-        BuckProfileMode::Statement => Profiler::Statement,
-        BuckProfileMode::Bytecode => Profiler::Bytecode,
-        BuckProfileMode::BytecodePairs => Profiler::BytecodePairs,
-        BuckProfileMode::Typecheck => Profiler::Typecheck,
+        BuckProfileMode::TimeFlame => buck2_cli_proto::ProfileMode::TimeFlame,
+        BuckProfileMode::HeapAllocated => buck2_cli_proto::ProfileMode::HeapAllocated,
+        BuckProfileMode::HeapRetained => buck2_cli_proto::ProfileMode::HeapRetained,
+        BuckProfileMode::HeapFlameAllocated => buck2_cli_proto::ProfileMode::HeapFlameAllocated,
+        BuckProfileMode::HeapFlameRetained => buck2_cli_proto::ProfileMode::HeapFlameRetained,
+        BuckProfileMode::HeapSummaryAllocated => buck2_cli_proto::ProfileMode::HeapSummaryAllocated,
+        BuckProfileMode::HeapSummaryRetained => buck2_cli_proto::ProfileMode::HeapSummaryRetained,
+        BuckProfileMode::Statement => buck2_cli_proto::ProfileMode::Statement,
+        BuckProfileMode::Bytecode => buck2_cli_proto::ProfileMode::Bytecode,
+        BuckProfileMode::BytecodePairs => buck2_cli_proto::ProfileMode::BytecodePairs,
+        BuckProfileMode::Typecheck => buck2_cli_proto::ProfileMode::Typecheck,
+        BuckProfileMode::Coverage => buck2_cli_proto::ProfileMode::Coverage,
+        BuckProfileMode::None => buck2_cli_proto::ProfileMode::None,
+    }
+}
+
+impl ProfileSubcommand {
+    fn common_opts(&self) -> &ProfileCommonOptions {
+        match &self.subcommand {
+            ProfileCommand::Analysis(analysis) => &analysis.profile_common_opts,
+            ProfileCommand::Loading(loading) => &loading.profile_common_opts,
+            ProfileCommand::Bxl(bxl) => &bxl.profile_common_opts,
+        }
     }
 }
 
@@ -185,64 +185,94 @@ impl StreamingCommand for ProfileSubcommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let context = ctx.client_context(matches, &self)?;
 
-        let destination_path = self.profile_common_opts.output.resolve(&ctx.working_dir);
+        let destination_path = self.common_opts().output.resolve(&ctx.working_dir);
 
-        let profile_mode = &self.profile_common_opts.mode;
+        let profile_mode = self.common_opts().mode;
 
         let destination_path = destination_path.into_string()?;
 
-        let console_opts = ctx.stdin().console_interaction_stream(self.console_opts());
+        let console_opts = ctx.console_interaction_stream(self.console_opts());
 
-        let response = match self.opts {
-            ProfileOptionsType::BuckProfileOptions { opts, action } => {
-                let target_opts = TargetProfile {
-                    target_patterns: opts
-                        .target_patterns
-                        .into_map(|value| buck2_data::TargetPattern { value }),
-                    recursive: opts.recursive,
-                    action: action.into(),
-                };
+        let profiler = profile_mode_to_profile(profile_mode);
 
-                buckd
-                    .with_flushing()
-                    .profile(
-                        ProfileRequest {
-                            context: Some(context),
-                            profile_opts: Some(ProfileOpts::TargetProfile(target_opts)),
-                            destination_path,
-                            profiler: profile_mode_to_profile(profile_mode).into(),
-                        },
-                        console_opts,
-                        &mut NoPartialResultHandler,
-                    )
-                    .await??
-            }
-            ProfileOptionsType::BxlProfileOptions { opts } => {
-                let bxl_opts = BxlProfile {
-                    bxl_label: opts.bxl_label,
-                    bxl_args: opts.bxl_args,
-                };
-
-                buckd
-                    .with_flushing()
-                    .profile(
-                        ProfileRequest {
-                            context: Some(context),
-                            profile_opts: Some(ProfileOpts::BxlProfile(bxl_opts)),
-                            destination_path,
-                            profiler: profile_mode_to_profile(profile_mode).into(),
-                        },
-                        console_opts,
-                        &mut NoPartialResultHandler,
-                    )
-                    .await??
+        let profile_opts = match &self.subcommand {
+            ProfileCommand::Loading(loading) => ProfileOpts::TargetProfile(TargetProfile {
+                target_patterns: loading.buck_opts.target_patterns.clone(),
+                action: target_profile::Action::Loading as i32,
+                target_cfg: Some(
+                    loading
+                        .profile_common_opts
+                        .target_cfg
+                        .target_cfg
+                        .target_cfg(),
+                ),
+                target_universe: loading
+                    .profile_common_opts
+                    .target_cfg
+                    .target_universe
+                    .clone(),
+                recursive: loading.buck_opts.recursive,
+            }),
+            ProfileCommand::Analysis(analysis) => ProfileOpts::TargetProfile(TargetProfile {
+                target_patterns: analysis.buck_opts.target_patterns.clone(),
+                action: target_profile::Action::Analysis as i32,
+                target_cfg: Some(
+                    analysis
+                        .profile_common_opts
+                        .target_cfg
+                        .target_cfg
+                        .target_cfg(),
+                ),
+                target_universe: analysis
+                    .profile_common_opts
+                    .target_cfg
+                    .target_universe
+                    .clone(),
+                recursive: analysis.buck_opts.recursive,
+            }),
+            ProfileCommand::Bxl(bxl) => {
+                if !bxl
+                    .profile_common_opts
+                    .target_cfg
+                    .target_universe
+                    .is_empty()
+                {
+                    return Err::<(), _>(buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "BXL profile does not support target universe"
+                    ))
+                    .into();
+                }
+                ProfileOpts::BxlProfile(BxlProfile {
+                    bxl_label: bxl.bxl_opts.bxl_label.clone(),
+                    bxl_args: bxl.bxl_opts.bxl_args.clone(),
+                    target_cfg: Some(bxl.profile_common_opts.target_cfg.target_cfg.target_cfg()),
+                })
             }
         };
+
+        let request = ProfileRequest {
+            context: Some(context),
+            profile_opts: Some(profile_opts),
+            destination_path,
+            profile_mode: profiler as i32,
+        };
+
+        let response = buckd
+            .with_flushing()
+            .profile(
+                request,
+                events_ctx,
+                console_opts,
+                &mut NoPartialResultHandler,
+            )
+            .await??;
 
         let ProfileResponse {
             elapsed,
@@ -250,16 +280,18 @@ impl StreamingCommand for ProfileSubcommand {
         } = response;
 
         let elapsed = elapsed
-            .context("Missing duration")
+            .buck_error_context("Missing duration")
             .and_then(|d| {
-                Duration::try_from(d).map_err(|_| anyhow::anyhow!("Duration is negative"))
+                Duration::try_from(d).map_err(|_| {
+                    buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "Duration is negative")
+                })
             })
-            .context("Elapsed is invalid")?;
+            .buck_error_context("Elapsed is invalid")?;
 
         buck2_client_ctx::println!(
             "Starlark {:?} profile has been written to {}",
             profile_mode,
-            self.profile_common_opts.output.display(),
+            self.common_opts().output.display(),
         )?;
         buck2_client_ctx::println!("Elapsed: {:.3}s", elapsed.as_secs_f64())?;
         buck2_client_ctx::println!("Total retained bytes: {}", total_retained_bytes)?;
@@ -268,14 +300,18 @@ impl StreamingCommand for ProfileSubcommand {
     }
 
     fn console_opts(&self) -> &CommonConsoleOptions {
-        &self.profile_common_opts.common_opts.console_opts
+        &self.common_opts().common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
-        &self.profile_common_opts.common_opts.event_log_opts
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
+        &self.common_opts().common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
-        &self.profile_common_opts.common_opts.config_opts
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
+        &self.common_opts().common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts().common_opts.starlark_opts
     }
 }

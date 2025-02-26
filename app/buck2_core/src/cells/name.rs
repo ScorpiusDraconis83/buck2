@@ -11,14 +11,15 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use allocative::Allocative;
+use buck2_util::hash::BuckHasher;
 use derive_more::Display;
 use dupe::Dupe;
 use equivalent::Equivalent;
-use fnv::FnvHasher;
 use static_interner::Intern;
 use static_interner::Interner;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
 enum CellNameError {
     #[error("Cell name must be non-empty")]
     Empty,
@@ -49,7 +50,7 @@ impl<'a> From<CellNameDataRef<'a>> for CellNameData {
     }
 }
 
-static INTERNER: Interner<CellNameData, FnvHasher> = Interner::new();
+static INTERNER: Interner<CellNameData, BuckHasher> = Interner::new();
 
 /// A 'CellName' is a canonicalized, human-readable name that corresponds to a
 /// 'CellInstance'. There should be a one to one mapping between a 'CellName'
@@ -70,7 +71,7 @@ impl CellName {
     /// This function is unchecked because it does not validate that the cell points
     /// to an existing cell. This function should only be used when creating
     /// repository cells at startup.
-    pub fn unchecked_new(name: &str) -> anyhow::Result<CellName> {
+    pub fn unchecked_new(name: &str) -> buck2_error::Result<CellName> {
         if name.is_empty() {
             return Err(CellNameError::Empty.into());
         }

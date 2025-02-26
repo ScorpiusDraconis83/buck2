@@ -13,15 +13,24 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_common::file_ops::FileDigest;
 use buck2_core::buck2_env;
-use buck2_core::directory::unordered_entry_walk;
-use buck2_core::directory::DirectoryEntry;
+use buck2_core::fs::fs_util;
+use buck2_core::fs::fs_util::IoError;
+use buck2_core::fs::fs_util::ReadDir;
+use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::directory_iterator::DirectoryIteratorPathStack;
+use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_directory::directory::walk::unordered_entry_walk;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest::CasDigestFromReExt;
 use buck2_execute::digest::CasDigestToReExt;
 use buck2_execute::digest_config::DigestConfig;
@@ -32,7 +41,10 @@ use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::IoRequest;
 use buck2_execute::execute::clean_output_paths::cleanup_path;
 use buck2_execute::materialize::http::http_download;
+use buck2_execute::materialize::materializer::CasNotFoundError;
+use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_execute::output_size::OutputSize;
+use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::manager::ReConnectionManager;
 use buck2_futures::cancellation::CancellationContext;
 use buck2_http::HttpClient;
@@ -47,21 +59,22 @@ use gazebo::prelude::VecExt;
 use once_cell::sync::Lazy;
 use remote_execution::NamedDigest;
 use remote_execution::NamedDigestWithPermissions;
-use remote_execution::REClientError;
 use remote_execution::TCode;
 use remote_execution::TDigest;
 use tracing::instrument;
 
+use crate::materializers::deferred::artifact_tree::MaterializationMethodToProto;
+use crate::materializers::deferred::clean_stale::CleanInvalidatedPathRequest;
 use crate::materializers::deferred::ArtifactMaterializationMethod;
 use crate::materializers::deferred::ArtifactMaterializationStage;
 use crate::materializers::deferred::ArtifactTree;
 use crate::materializers::deferred::LowPriorityMaterializerCommand;
-use crate::materializers::deferred::MaterializationMethodToProto;
 use crate::materializers::deferred::MaterializeEntryError;
 use crate::materializers::deferred::MaterializerSender;
 use crate::materializers::deferred::SharedMaterializingError;
 use crate::materializers::deferred::Version;
 use crate::materializers::deferred::WriteFile;
+use crate::materializers::immediate;
 use crate::materializers::io::materialize_files;
 use crate::materializers::io::MaterializeTreeStructure;
 
@@ -88,17 +101,28 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         path: ProjectRelativePathBuf,
         write: Arc<WriteFile>,
         version: Version,
-        command_sender: MaterializerSender<Self>,
-        cancellations: &'a CancellationContext<'a>,
+        command_sender: Arc<MaterializerSender<Self>>,
+        cancellations: &'a CancellationContext,
     ) -> BoxFuture<'a, Result<(), SharedMaterializingError>>;
+
+    async fn immediate_write<'a>(
+        self: &Arc<Self>,
+        gen: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
+    ) -> buck2_error::Result<Vec<ArtifactValue>>;
 
     fn clean_path<'a>(
         self: &Arc<Self>,
         path: ProjectRelativePathBuf,
         version: Version,
-        command_sender: MaterializerSender<Self>,
+        command_sender: Arc<MaterializerSender<Self>>,
         cancellations: &'a CancellationContext,
     ) -> BoxFuture<'a, Result<(), buck2_error::Error>>;
+
+    async fn clean_invalidated_path<'a>(
+        self: &Arc<Self>,
+        request: CleanInvalidatedPathRequest,
+        cancellations: &'a CancellationContext,
+    ) -> buck2_error::Result<()>;
 
     async fn materialize_entry(
         self: &Arc<Self>,
@@ -113,10 +137,10 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         self: &Arc<Self>,
         tree: &ArtifactTree,
         min_ttl: Duration,
-    ) -> Option<BoxFuture<'static, anyhow::Result<()>>>;
+    ) -> Option<BoxFuture<'static, buck2_error::Result<()>>>;
 
+    fn read_dir(&self, path: &AbsNormPathBuf) -> Result<ReadDir, IoError>;
     fn buck_out_path(&self) -> &ProjectRelativePathBuf;
-    fn io_executor(&self) -> &dyn BlockingExecutor;
     fn re_client_manager(&self) -> &Arc<ReConnectionManager>;
     fn fs(&self) -> &ProjectRoot;
     fn digest_config(&self) -> DigestConfig;
@@ -148,7 +172,7 @@ impl DefaultIoHandler {
         method: Arc<ArtifactMaterializationMethod>,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
         stat: &mut MaterializationStat,
-        cancellations: &CancellationContext<'_>,
+        cancellations: &CancellationContext,
     ) -> Result<(), MaterializeEntryError> {
         // Materialize the dir structure, and symlinks
         self.io_executor
@@ -167,11 +191,11 @@ impl DefaultIoHandler {
                 let mut files = Vec::new();
 
                 {
-                    let mut walk = unordered_entry_walk(entry.as_ref());
+                    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
 
                     while let Some((entry_path, entry)) = walk.next() {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) = entry {
-                            let name = path.join_normalized(entry_path.get())?;
+                            let name = path.join(entry_path.get());
                             let digest = maybe_tombstone_digest(f.digest.data())?.to_re();
 
                             tracing::trace!(name = %name, digest = %digest, "push download");
@@ -205,17 +229,25 @@ impl DefaultIoHandler {
                 re_client
                     .materialize_files(files, info.re_use_case)
                     .await
-                    .map_err(|e| match e.downcast_ref::<REClientError>() {
-                        Some(e) if e.code == TCode::NOT_FOUND => MaterializeEntryError::NotFound {
-                            info: info.dupe(),
-                            debug: Arc::from(e.message.as_str()),
-                        },
-                        _ => MaterializeEntryError::Error(e.context({
-                            format!(
-                                "Error materializing files declared by action: {}",
-                                info.origin
-                            )
-                        })),
+                    .map_err(|e| {
+                        let e: buck2_error::Error = e.into();
+                        match e.find_typed_context::<RemoteExecutionError>() {
+                            Some(re_error) if re_error.code == TCode::NOT_FOUND => {
+                                let e: buck2_error::Error = e.into();
+                                MaterializeEntryError::NotFound(CasNotFoundError {
+                                    path: Arc::from(path),
+                                    info: info.dupe(),
+                                    directory: entry,
+                                    error: Arc::from(e),
+                                })
+                            }
+                            _ => MaterializeEntryError::Error(e.context({
+                                format!(
+                                    "Error materializing files declared by action: {}",
+                                    info.origin
+                                )
+                            })),
+                        }
                     })?;
             }
             ArtifactMaterializationMethod::HttpDownload { info } => {
@@ -236,7 +268,8 @@ impl DefaultIoHandler {
                     // running on RE, it's a good idea to catch it here when materializing so that
                     // our test suite can surface bugs when downloading things locally.
                     if downloaded.size() != info.metadata.digest.size() {
-                        return Err(anyhow::anyhow!(
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Tier0,
                             "Downloaded size ({}) does not match expected size ({})",
                             downloaded.size(),
                             info.metadata.digest.size(),
@@ -248,7 +281,7 @@ impl DefaultIoHandler {
                 }
                 .boxed()
                 .await
-                .with_context(|| {
+                .with_buck_error_context(|| {
                     format!(
                         "Error materializing HTTP resource declared by target `{}`",
                         info.owner
@@ -279,7 +312,7 @@ impl DefaultIoHandler {
                     .execute_io_inline(|| {
                         let data =
                             zstd::bulk::decompress(&write.compressed_data, write.decompressed_size)
-                                .context("Error decompressing data")?;
+                                .buck_error_context("Error decompressing data")?;
                         stat.total_bytes = write.decompressed_size as u64;
                         self.fs.write_file(&path, data, write.is_executable)
                     })
@@ -299,7 +332,7 @@ impl IoHandler for DefaultIoHandler {
         path: ProjectRelativePathBuf,
         write: Arc<WriteFile>,
         version: Version,
-        command_sender: MaterializerSender<Self>,
+        command_sender: Arc<MaterializerSender<Self>>,
         cancellations: &'a CancellationContext,
     ) -> BoxFuture<'a, Result<(), SharedMaterializingError>> {
         self.io_executor
@@ -316,11 +349,24 @@ impl IoHandler for DefaultIoHandler {
             .boxed()
     }
 
+    async fn immediate_write<'a>(
+        self: &Arc<Self>,
+        gen: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
+    ) -> buck2_error::Result<Vec<ArtifactValue>> {
+        immediate::write_to_disk(
+            self.fs(),
+            self.io_executor.as_ref(),
+            self.digest_config(),
+            gen,
+        )
+        .await
+    }
+
     fn clean_path<'a>(
         self: &Arc<Self>,
         path: ProjectRelativePathBuf,
         version: Version,
-        command_sender: MaterializerSender<Self>,
+        command_sender: Arc<MaterializerSender<Self>>,
         cancellations: &'a CancellationContext,
     ) -> BoxFuture<'a, Result<(), buck2_error::Error>> {
         self.io_executor
@@ -336,6 +382,17 @@ impl IoHandler for DefaultIoHandler {
             .boxed()
     }
 
+    /// Used to clean paths that are already invalidated and don't need to notify the materializer
+    async fn clean_invalidated_path<'a>(
+        self: &Arc<Self>,
+        request: CleanInvalidatedPathRequest,
+        cancellations: &'a CancellationContext,
+    ) -> buck2_error::Result<()> {
+        self.io_executor
+            .execute_io(Box::new(request), cancellations)
+            .await
+    }
+
     /// Materializes an `entry` at `path`, using the materialization `method`
     #[instrument(level = "debug", skip(self, cancellations), fields(path = %path, method = %method, entry = %entry))]
     async fn materialize_entry(
@@ -346,13 +403,14 @@ impl IoHandler for DefaultIoHandler {
         event_dispatcher: EventDispatcher,
         cancellations: &CancellationContext,
     ) -> Result<(), MaterializeEntryError> {
+        let action_digest = match method.as_ref() {
+            ArtifactMaterializationMethod::CasDownload { info } => {
+                info.action_digest().map(|digest| digest.to_string())
+            }
+            _ => None,
+        };
         let materialization_start = buck2_data::MaterializationStart {
-            action_digest: match method.as_ref() {
-                ArtifactMaterializationMethod::CasDownload { info } => {
-                    info.action_digest().map(|digest| digest.to_string())
-                }
-                _ => None,
-            },
+            action_digest: action_digest.clone(),
         };
         event_dispatcher
             .span_async(materialization_start, async move {
@@ -369,7 +427,7 @@ impl IoHandler for DefaultIoHandler {
                 (
                     res,
                     buck2_data::MaterializationEnd {
-                        action_digest: None,
+                        action_digest,
                         file_count: stat.file_count,
                         total_bytes: stat.total_bytes,
                         path: path_string,
@@ -387,17 +445,17 @@ impl IoHandler for DefaultIoHandler {
         self: &Arc<Self>,
         tree: &ArtifactTree,
         min_ttl: Duration,
-    ) -> Option<BoxFuture<'static, anyhow::Result<()>>> {
+    ) -> Option<BoxFuture<'static, buck2_error::Result<()>>> {
         create_ttl_refresh(tree, &self.re_client_manager, min_ttl, self.digest_config)
             .map(|f| f.boxed())
     }
 
-    fn buck_out_path(&self) -> &ProjectRelativePathBuf {
-        &self.buck_out_path
+    fn read_dir(&self, path: &AbsNormPathBuf) -> Result<ReadDir, IoError> {
+        fs_util::read_dir(path)
     }
 
-    fn io_executor(&self) -> &dyn BlockingExecutor {
-        self.io_executor.as_ref()
+    fn buck_out_path(&self) -> &ProjectRelativePathBuf {
+        &self.buck_out_path
     }
 
     fn re_client_manager(&self) -> &Arc<ReConnectionManager> {
@@ -414,25 +472,31 @@ impl IoHandler for DefaultIoHandler {
 }
 
 /// This is used for testing to ingest digests (via BUCK2_TEST_TOMBSTONED_DIGESTS).
-fn maybe_tombstone_digest(digest: &FileDigest) -> anyhow::Result<&FileDigest> {
+fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDigest> {
     // This has to be of size 1 since size 0 will result in the RE client just producing an empty
     // instead of a not-found error.
     static TOMBSTONE_DIGEST: Lazy<FileDigest> = Lazy::new(|| FileDigest::new_sha1([0; 20], 1));
 
-    fn convert_digests(val: &str) -> anyhow::Result<HashSet<FileDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<HashSet<FileDigest>> {
         val.split(' ')
             .map(|digest| {
                 let digest = TDigest::from_str(digest)
-                    .with_context(|| format!("Invalid digest: `{}`", digest))?;
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                    .with_buck_error_context(|| format!("Invalid digest: `{}`", digest))?;
                 // This code is only used by E2E tests, so while it's not *a test*, testing_default
                 // is an OK choice here.
                 let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
-                anyhow::Ok(digest)
+                buck2_error::Ok(digest)
             })
             .collect()
     }
 
-    let tombstoned_digests = buck2_env!("BUCK2_TEST_TOMBSTONED_DIGESTS", type=HashSet<FileDigest>, converter=convert_digests)?;
+    let tombstoned_digests = buck2_env!(
+        "BUCK2_TEST_TOMBSTONED_DIGESTS",
+        type=HashSet<FileDigest>,
+        converter=convert_digests,
+        applicability=testing,
+    )?;
     if let Some(digests) = tombstoned_digests {
         if digests.contains(digest) {
             return Ok(&*TOMBSTONE_DIGEST);
@@ -448,7 +512,7 @@ pub(super) fn create_ttl_refresh(
     re_manager: &Arc<ReConnectionManager>,
     min_ttl: Duration,
     digest_config: DigestConfig,
-) -> Option<impl Future<Output = anyhow::Result<()>>> {
+) -> Option<impl Future<Output = buck2_error::Result<()>>> {
     let mut digests_to_refresh = HashMap::<_, HashSet<_>>::new();
 
     let ttl_deadline = Utc::now() + min_ttl;
@@ -457,7 +521,7 @@ pub(super) fn create_ttl_refresh(
         match &data.stage {
             ArtifactMaterializationStage::Declared { entry, method } => match method.as_ref() {
                 ArtifactMaterializationMethod::CasDownload { info } => {
-                    let mut walk = unordered_entry_walk(entry.as_ref());
+                    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
                     while let Some((_entry_path, entry)) = walk.next() {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
                             let needs_refresh = file.digest.expires() < ttl_deadline;
@@ -503,12 +567,13 @@ pub(super) fn create_ttl_refresh(
                     .await?;
 
                 let mut digests_expires = digests_expires.into_try_map(|(digest, expires)| {
-                    anyhow::Ok((FileDigest::from_re(&digest, digest_config)?, expires))
+                    buck2_error::Ok((FileDigest::from_re(&digest, digest_config)?, expires))
                 })?;
                 digests_expires.sort();
 
                 if chunk.len() != digests_expires.len() {
-                    return Err(anyhow::anyhow!(
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Tier0,
                         "Invalid response from get_digests_ttl: expected {}, got {} digests",
                         chunk.len(),
                         digests_expires.len()
@@ -517,7 +582,10 @@ pub(super) fn create_ttl_refresh(
 
                 for (digest, (matching_digest, expires)) in chunk.iter().zip(&digests_expires) {
                     if digest.data() != matching_digest {
-                        return Err(anyhow::anyhow!("Invalid response from get_digests_ttl"));
+                        return Err(buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Tier0,
+                            "Invalid response from get_digests_ttl"
+                        ));
                     }
 
                     digest.update_expires(*expires);
@@ -525,7 +593,7 @@ pub(super) fn create_ttl_refresh(
             }
         }
 
-        anyhow::Ok(())
+        buck2_error::Ok(())
     }
     .map(|res| {
         if let Err(e) = &res {
@@ -542,22 +610,22 @@ struct WriteIoRequest {
     path: ProjectRelativePathBuf,
     write: Arc<WriteFile>,
     version: Version,
-    command_sender: MaterializerSender<DefaultIoHandler>,
+    command_sender: Arc<MaterializerSender<DefaultIoHandler>>,
 }
 
 impl WriteIoRequest {
-    fn execute_inner(&self, project_fs: &ProjectRoot) -> anyhow::Result<()> {
+    fn execute_inner(&self, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         cleanup_path(project_fs, &self.path)?;
         let data =
             zstd::bulk::decompress(&self.write.compressed_data, self.write.decompressed_size)
-                .context("Error decompressing data")?;
+                .buck_error_context("Error decompressing data")?;
         project_fs.write_file(&self.path, data, self.write.is_executable)?;
         Ok(())
     }
 }
 
 impl IoRequest for WriteIoRequest {
-    fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> anyhow::Result<()> {
+    fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         // NOTE: No spans here! We should perhaps add one, but this needs to be considered
         // carefully as it's a lot of spans, and we haven't historically emitted those for writes.
         let res = self
@@ -574,18 +642,18 @@ impl IoRequest for WriteIoRequest {
             },
         );
 
-        Ok(res?)
+        res
     }
 }
 
 struct CleanIoRequest {
     path: ProjectRelativePathBuf,
     version: Version,
-    command_sender: MaterializerSender<DefaultIoHandler>,
+    command_sender: Arc<MaterializerSender<DefaultIoHandler>>,
 }
 
 impl IoRequest for CleanIoRequest {
-    fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> anyhow::Result<()> {
+    fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         // NOTE: No spans here! We should perhaps add one, but this needs to be considered
         // carefully as it's a lot of spans, and we haven't historically emitted those for writes.
         let res = cleanup_path(project_fs, &self.path).map_err(buck2_error::Error::from);
@@ -599,6 +667,6 @@ impl IoRequest for CleanIoRequest {
             },
         );
 
-        Ok(res?)
+        res
     }
 }

@@ -1,5 +1,5 @@
 load("@fbcode//buck2:proto_defs.bzl", "rust_protobuf_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load(":export_file_with.bzl", "export_file_with")
 
 oncall("build_infra")
@@ -29,4 +29,12 @@ export_file_with(
     src = "data.proto",
     attach = ["error.proto"],
     visibility = ["PUBLIC"],
+)
+
+export_file(
+    name = "error.proto",
+)
+
+export_file(
+    name = "data.proto",
 )

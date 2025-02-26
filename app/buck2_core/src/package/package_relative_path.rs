@@ -110,6 +110,20 @@ impl AsRef<ForwardRelativePathBuf> for PackageRelativePathBuf {
     }
 }
 
+impl AsRef<str> for PackageRelativePath {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for PackageRelativePathBuf {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 impl Clone for Box<PackageRelativePath> {
     #[inline]
     fn clone(&self) -> Self {
@@ -157,7 +171,7 @@ impl PackageRelativePath {
     /// assert!(PackageRelativePath::new(Path::new("normalize/../bar")).is_err());
     /// ```
     #[inline]
-    pub fn new<P: ?Sized + AsRef<Path>>(p: &P) -> anyhow::Result<&PackageRelativePath> {
+    pub fn new<P: ?Sized + AsRef<Path>>(p: &P) -> buck2_error::Result<&PackageRelativePath> {
         Ok(PackageRelativePath::ref_cast(ForwardRelativePath::new(
             p.as_ref(),
         )?))
@@ -194,7 +208,7 @@ impl PackageRelativePath {
     ///     path.join(other)
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn join<P: AsRef<ForwardRelativePath>>(&self, path: P) -> PackageRelativePathBuf {
@@ -211,7 +225,7 @@ impl PackageRelativePath {
     ///     PackageRelativePath::new("foo/bar")?.parent()
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn parent(&self) -> Option<&PackageRelativePath> {
@@ -233,7 +247,7 @@ impl PackageRelativePath {
     ///     PackageRelativePath::new("usr/bin")?.file_name()
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn file_name(&self) -> Option<&FileName> {
@@ -260,13 +274,13 @@ impl PackageRelativePath {
     ///     true
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn strip_prefix<'a, P: ?Sized>(
         &'a self,
         base: &'a P,
-    ) -> anyhow::Result<&'a ForwardRelativePath>
+    ) -> buck2_error::Result<&'a ForwardRelativePath>
     where
         P: AsRef<PackageRelativePath>,
     {
@@ -282,7 +296,7 @@ impl PackageRelativePath {
     ///
     /// assert!(path.starts_with(PackageRelativePath::new("some")?));
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn starts_with<P: AsRef<PackageRelativePath>>(&self, base: P) -> bool {
@@ -302,7 +316,7 @@ impl PackageRelativePath {
     ///
     /// assert!(path.ends_with(ForwardRelativePath::new("foo").unwrap()));
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn ends_with<P: AsRef<ForwardRelativePath>>(&self, child: P) -> bool {
@@ -326,7 +340,7 @@ impl PackageRelativePath {
     ///
     /// assert_eq!(Some("foo"), path.file_stem());
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn file_stem(&self) -> Option<&str> {
@@ -343,7 +357,7 @@ impl PackageRelativePath {
     ///     PackageRelativePath::new("hi/foo.rs")?.extension()
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn extension(&self) -> Option<&str> {
@@ -364,7 +378,7 @@ impl PackageRelativePath {
     /// assert_eq!(it.next(), Some(FileName::unchecked_new("baz")));
     /// assert_eq!(it.next(), None);
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     pub fn iter(&self) -> ForwardRelativePathIter {
@@ -402,7 +416,7 @@ impl<'a> From<&'a ForwardRelativePath> for &'a PackageRelativePath {
     ///     PackageRelativePath::new("foo")?
     /// );
     ///
-    /// # anyhow::Ok(())
+    /// # buck2_error::Ok(())
     /// ```
     #[inline]
     fn from(p: &'a ForwardRelativePath) -> &'a PackageRelativePath {
@@ -460,7 +474,7 @@ impl PackageRelativePathBuf {
 
     /// Pushes a `RelativePath` to the existing buffer, normalizing it
     #[inline]
-    pub fn push_normalized<P: AsRef<RelativePath>>(&mut self, path: P) -> anyhow::Result<()> {
+    pub fn push_normalized<P: AsRef<RelativePath>>(&mut self, path: P) -> buck2_error::Result<()> {
         self.0.push_normalized(path)
     }
 
@@ -494,7 +508,7 @@ impl From<PackageRelativePathBuf> for ForwardRelativePathBuf {
 }
 
 impl<'a> TryFrom<&'a str> for &'a PackageRelativePath {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -511,13 +525,13 @@ impl<'a> TryFrom<&'a str> for &'a PackageRelativePath {
     /// assert!(<&PackageRelativePath>::try_from("normalize/../bar").is_err());
     /// ```
     #[inline]
-    fn try_from(s: &'a str) -> anyhow::Result<&'a PackageRelativePath> {
+    fn try_from(s: &'a str) -> buck2_error::Result<&'a PackageRelativePath> {
         Ok(PackageRelativePath::ref_cast(ForwardRelativePath::new(s)?))
     }
 }
 
 impl<'a> TryFrom<&'a RelativePath> for &'a PackageRelativePath {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -533,7 +547,7 @@ impl<'a> TryFrom<&'a RelativePath> for &'a PackageRelativePath {
     /// assert!(<&PackageRelativePath>::try_from(RelativePath::new("normalize/../bar")).is_err());
     /// ```
     #[inline]
-    fn try_from(s: &'a RelativePath) -> anyhow::Result<&'a PackageRelativePath> {
+    fn try_from(s: &'a RelativePath) -> buck2_error::Result<&'a PackageRelativePath> {
         Ok(PackageRelativePath::ref_cast(ForwardRelativePath::new(
             s.as_str(),
         )?))
@@ -541,7 +555,7 @@ impl<'a> TryFrom<&'a RelativePath> for &'a PackageRelativePath {
 }
 
 impl TryFrom<String> for PackageRelativePathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -558,7 +572,7 @@ impl TryFrom<String> for PackageRelativePathBuf {
     /// assert!(PackageRelativePathBuf::try_from("normalize/../bar".to_owned()).is_err());
     /// ```
     #[inline]
-    fn try_from(s: String) -> anyhow::Result<PackageRelativePathBuf> {
+    fn try_from(s: String) -> buck2_error::Result<PackageRelativePathBuf> {
         Ok(PackageRelativePathBuf::from(
             ForwardRelativePathBuf::try_from(s)?,
         ))
@@ -566,7 +580,7 @@ impl TryFrom<String> for PackageRelativePathBuf {
 }
 
 impl TryFrom<RelativePathBuf> for PackageRelativePathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion (TODO make ForwardRelativePath a no allocation
     /// conversion)
@@ -584,7 +598,7 @@ impl TryFrom<RelativePathBuf> for PackageRelativePathBuf {
     /// assert!(PackageRelativePathBuf::try_from(RelativePathBuf::from("normalize/../bar")).is_err());
     /// ```
     #[inline]
-    fn try_from(p: RelativePathBuf) -> anyhow::Result<PackageRelativePathBuf> {
+    fn try_from(p: RelativePathBuf) -> buck2_error::Result<PackageRelativePathBuf> {
         Ok(PackageRelativePathBuf::from(
             ForwardRelativePathBuf::try_from(p)?,
         ))
@@ -592,7 +606,7 @@ impl TryFrom<RelativePathBuf> for PackageRelativePathBuf {
 }
 
 impl TryFrom<PathBuf> for PackageRelativePathBuf {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     /// no allocation conversion
     ///
@@ -610,7 +624,7 @@ impl TryFrom<PathBuf> for PackageRelativePathBuf {
     /// assert!(PackageRelativePathBuf::try_from(PathBuf::from("normalize/../bar")).is_err());
     /// ```
     #[inline]
-    fn try_from(p: PathBuf) -> anyhow::Result<PackageRelativePathBuf> {
+    fn try_from(p: PathBuf) -> buck2_error::Result<PackageRelativePathBuf> {
         Ok(PackageRelativePathBuf::from(
             ForwardRelativePathBuf::try_from(p)?,
         ))
@@ -664,7 +678,7 @@ mod tests {
     use crate::package::package_relative_path::PackageRelativePathBuf;
 
     #[test]
-    fn paths_work_in_maps() -> anyhow::Result<()> {
+    fn paths_work_in_maps() -> buck2_error::Result<()> {
         let mut map = HashMap::new();
 
         let p1 = PackageRelativePath::new("foo")?;
@@ -678,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn path_is_comparable() -> anyhow::Result<()> {
+    fn path_is_comparable() -> buck2_error::Result<()> {
         let path1_buf = PackageRelativePathBuf::unchecked_new("foo".into());
         let path2_buf = PackageRelativePathBuf::unchecked_new("foo".into());
         let path3_buf = PackageRelativePathBuf::unchecked_new("bar".into());

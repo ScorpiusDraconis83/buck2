@@ -8,14 +8,16 @@
  */
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
-use buck2_client_ctx::common::CommonConsoleOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
 use buck2_client_ctx::events_ctx::EventsCtx;
-use buck2_client_ctx::exit_result::ExitCode;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::replayer::Replayer;
 use buck2_client_ctx::signal_handler::with_simple_sigint_handler;
 use buck2_client_ctx::subscribers::get::get_console_with_root;
+use buck2_client_ctx::subscribers::subscribers::EventSubscribers;
+use buck2_error::buck2_error;
 
 use crate::commands::log::options::EventLogOptions;
 
@@ -23,9 +25,7 @@ use crate::commands::log::options::EventLogOptions;
 ///
 /// This command allows visualizing an existing event log in a Superconsole.
 #[derive(Debug, clap::Parser)]
-#[clap(
-    setting = clap::AppSettings::TrailingVarArg
-)]
+#[clap(trailing_var_arg = true)]
 pub struct ReplayCommand {
     #[clap(flatten)]
     event_log: EventLogOptions,
@@ -41,15 +41,15 @@ pub struct ReplayCommand {
     #[clap(long)]
     preload: bool,
 
-    #[clap(flatten)]
-    console_opts: CommonConsoleOptions,
-
     #[clap(help = "Override the arguments")]
     pub override_args: Vec<String>,
+
+    #[clap(flatten)]
+    console_opts: CommonConsoleOptions,
 }
 
 impl ReplayCommand {
-    pub fn exec(self, _matches: &clap::ArgMatches, ctx: ClientCommandContext<'_>) -> ExitResult {
+    pub fn exec(self, _matches: BuckArgMatches<'_>, ctx: ClientCommandContext<'_>) -> ExitResult {
         let Self {
             event_log,
             speed,
@@ -58,11 +58,14 @@ impl ReplayCommand {
             override_args: _,
         } = self;
 
-        ctx.with_runtime(async move |mut ctx| {
+        ctx.instant_command_no_log("log-replay", |mut ctx| async move {
             let work = async {
                 let (replayer, invocation) =
                     Replayer::new(event_log.get(&ctx).await?, speed, preload).await?;
-
+                let build_count_dir = match ctx.paths() {
+                    Ok(paths) => Some(paths.build_count_dir()),
+                    Err(_) => None,
+                };
                 let console = get_console_with_root(
                     invocation.trace_id,
                     console_opts.console_type,
@@ -71,14 +74,15 @@ impl ReplayCommand {
                     speed,
                     "(replay)", // Could be better
                     console_opts.superconsole_config(),
+                    build_count_dir,
                 )?;
 
-                let res = EventsCtx::new(vec![console])
+                let res = EventsCtx::new(EventSubscribers::new(vec![console]))
                     .unpack_stream::<_, ReplayResult, _>(
                         &mut NoPartialResultHandler,
                         Box::pin(replayer),
                         None,
-                        ctx.stdin().console_interaction_stream(&console_opts),
+                        ctx.console_interaction_stream(&console_opts),
                     )
                     .await;
 
@@ -97,13 +101,17 @@ impl ReplayCommand {
                 }
 
                 // FIXME(JakobDegen)(easy): This should probably return failures if there were errors
-                ExitResult::success()
+                buck2_error::Ok(())
             };
 
-            with_simple_sigint_handler(work)
-                .await
-                .unwrap_or_else(|| ExitResult::status(ExitCode::SignalInterrupt))
+            with_simple_sigint_handler(work).await.unwrap_or_else(|| {
+                Err(buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Signal Interrupted"
+                ))
+            })
         })
+        .into()
     }
 }
 

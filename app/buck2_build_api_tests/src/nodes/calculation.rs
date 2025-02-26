@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
-use buck2_configured::configuration::calculation::ExecutionPlatformsKey;
+use buck2_configured::execution::ExecutionPlatformsKey;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
 use buck2_core::configuration::data::ConfigurationData;
@@ -20,7 +20,7 @@ use buck2_core::package::PackageLabel;
 use buck2_core::plugins::PluginKindSet;
 use buck2_core::provider::label::ProvidersLabel;
 use buck2_core::provider::label::ProvidersName;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::name::TargetName;
 use buck2_interpreter_for_build::interpreter::calculation::InterpreterResultsKey;
 use buck2_interpreter_for_build::super_package::package_value::SuperPackageValuesImpl;
@@ -37,6 +37,7 @@ use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::attrs::internal::internal_attrs;
+use buck2_node::bzl_or_bxl_path::BzlOrBxlPath;
 use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 use buck2_node::nodes::eval_result::EvaluationResult;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
@@ -59,14 +60,14 @@ async fn test_get_node() -> anyhow::Result<()> {
     let cfg = ConfigurationData::testing_new();
     let pkg = PackageLabel::testing_parse("cell//foo/bar");
 
-    let name1 = TargetName::unchecked_new("t1");
+    let name1 = TargetName::testing_new("t1");
     let label1 = TargetLabel::new(pkg.dupe(), name1.as_ref());
 
-    let name2 = TargetName::unchecked_new("t2");
+    let name2 = TargetName::testing_new("t2");
     let label2 = TargetLabel::new(pkg.dupe(), name2.as_ref());
 
     let rule_type = RuleType::Starlark(Arc::new(StarlarkRuleType {
-        import_path: ImportPath::testing_new("cell//foo/bar:def.bzl"),
+        path: BzlOrBxlPath::Bzl(ImportPath::testing_new("cell//foo/bar:def.bzl")),
         name: "some_rule".to_owned(),
     }));
     let attrs1 = vec![
@@ -93,7 +94,7 @@ async fn test_get_node() -> anyhow::Result<()> {
         ),
     ];
 
-    let node1 = TargetNode::testing_new(label1.dupe(), rule_type.dupe(), attrs1);
+    let node1 = TargetNode::testing_new(label1.dupe(), rule_type.dupe(), attrs1, vec![], None);
 
     let attrs2 = vec![
         (
@@ -117,7 +118,7 @@ async fn test_get_node() -> anyhow::Result<()> {
         ),
     ];
 
-    let node2 = TargetNode::testing_new(label2.dupe(), rule_type.dupe(), attrs2);
+    let node2 = TargetNode::testing_new(label2.dupe(), rule_type.dupe(), attrs2, vec![], None);
 
     let eval_result = EvaluationResult::new(
         Arc::new(BuildFilePath::new(
@@ -125,7 +126,7 @@ async fn test_get_node() -> anyhow::Result<()> {
             FileNameBuf::unchecked_new("BUCK"),
         )),
         Vec::new(),
-        SuperPackage::empty::<SuperPackageValuesImpl>(),
+        SuperPackage::empty::<SuperPackageValuesImpl>()?,
         TargetsMap::from_iter([node1.dupe(), node2.dupe()]),
     );
 
@@ -135,7 +136,7 @@ async fn test_get_node() -> anyhow::Result<()> {
         .mock_and_return(InterpreterResultsKey(pkg), Ok(Arc::new(eval_result)))
         .mock_and_return(ExecutionPlatformsKey, Ok(None))
         .build(data)?;
-    let computations = computations.commit().await;
+    let mut computations = computations.commit().await;
 
     let node = computations.get_target_node(&label1).await?;
     assert_eq!(node, node1);

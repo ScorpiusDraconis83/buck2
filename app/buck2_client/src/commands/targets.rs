@@ -12,19 +12,24 @@ use buck2_cli_proto::targets_request;
 use buck2_cli_proto::targets_request::OutputFormat;
 use buck2_cli_proto::TargetsRequest;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::build::CommonOutputOptions;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
-use buck2_client_ctx::common::CommonOutputOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::common::PrintOutputsFormat;
+use buck2_client_ctx::console_interaction_stream::ConsoleInteractionStream;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
 use buck2_client_ctx::daemon::client::StdoutPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
+use buck2_client_ctx::exit_result::ClientIoError;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::path_arg::PathArg;
 use buck2_client_ctx::query_args::CommonAttributeArgs;
-use buck2_client_ctx::stdin::Stdin;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use dupe::Dupe;
@@ -32,7 +37,8 @@ use gazebo::prelude::*;
 
 use crate::print::PrintOutputs;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum TargetsError {
     /// Clap should report it, but if we missed something, this is a fallback.
     #[error("Flags are mutually exclusive")]
@@ -41,7 +47,7 @@ enum TargetsError {
 
 // Use non-camel case so the possible values match buck1's
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Dupe, clap::ArgEnum)]
+#[derive(Debug, Clone, Dupe, clap::ValueEnum)]
 #[clap(rename_all = "snake_case")]
 enum TargetHashFileMode {
     PathsOnly,
@@ -49,7 +55,19 @@ enum TargetHashFileMode {
     None,
 }
 
-#[derive(Debug, clap::ArgEnum, Clone, Dupe)]
+impl TargetHashFileMode {
+    fn to_proto(&self) -> targets_request::TargetHashFileMode {
+        match self {
+            TargetHashFileMode::PathsOnly => targets_request::TargetHashFileMode::PathsOnly,
+            TargetHashFileMode::PathsAndContents => {
+                targets_request::TargetHashFileMode::PathsAndContents
+            }
+            TargetHashFileMode::None => targets_request::TargetHashFileMode::NoFiles,
+        }
+    }
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Dupe)]
 enum TargetHashGraphType {
     None,
     Unconfigured,
@@ -60,13 +78,30 @@ enum TargetHashGraphType {
 /// Possible values for the --target-hash-function arg. We don't actually
 /// honor the specific algorithms, we use them as a hint to pick "fast" or "strong".
 #[allow(non_camel_case_types)]
-#[derive(Debug, clap::ArgEnum, Clone, Dupe)]
+#[derive(Debug, clap::ValueEnum, Clone, Dupe)]
 enum TargetHashFunction {
     Sha1,
     Sha256,
     Murmur_Hash3,
     Fast,
     Strong,
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Dupe)]
+enum Compression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+impl Compression {
+    fn to_proto(&self) -> buck2_cli_proto::targets_request::Compression {
+        match self {
+            Compression::None => buck2_cli_proto::targets_request::Compression::Uncompressed,
+            Compression::Gzip => buck2_cli_proto::targets_request::Compression::Gzip,
+            Compression::Zstd => buck2_cli_proto::targets_request::Compression::Zstd,
+        }
+    }
 }
 
 /// Show details about the specified targets.
@@ -76,9 +111,6 @@ enum TargetHashFunction {
 #[derive(Debug, clap::Parser)]
 #[clap(name = "utargets")]
 pub struct TargetsCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     /// Print targets as JSON
     #[clap(long)]
     json: bool,
@@ -100,7 +132,7 @@ pub struct TargetsCommand {
     show_target_hash: bool,
 
     /// Print a stable unconfigured hash of each target after the target name.
-    #[clap(long, conflicts_with = "show-target-hash")]
+    #[clap(long, conflicts_with = "show_target_hash")]
     show_unconfigured_target_hash: bool,
 
     /// Modifies computation of target hashes. If set to `PATHS_AND_CONTENTS` (the default), the contents
@@ -109,7 +141,7 @@ pub struct TargetsCommand {
     /// See also --target-hash-modified-paths.
     #[clap(
         long,
-        arg_enum,
+        value_enum,
         ignore_case = true,
         default_value = "paths_and_contents",
         conflicts_with = "streaming"
@@ -120,14 +152,14 @@ pub struct TargetsCommand {
     /// `PATHS_ONLY`. If a target or its dependencies reference a file from this set, the target's hash
     /// will be different than if this option was omitted. Otherwise, the target's hash will be the same
     /// as if this option was omitted.
-    #[clap(long, multiple_values = true, conflicts_with = "streaming")]
+    #[clap(long, num_args=1.., conflicts_with = "streaming")]
     target_hash_modified_paths: Vec<PathArg>,
 
     /// Selects either the "fast" or the "strong" target hash function to be used for computing target hashes.
     /// While we don't specify the exact algorithm, the "strong" algorithm should be a reasonable cryptographic
     /// hash (ex. blake3) while the "fast" function will likely be a non-crypto hash. Both functions are
     /// guaranteed to be deterministic and to have the same value across different platforms/architectures.
-    #[clap(long, ignore_case = true, default_value = "fast", arg_enum)]
+    #[clap(long, ignore_case = true, default_value = "fast", value_enum)]
     target_hash_function: TargetHashFunction,
 
     /// When true, emit the hash or target node and all dependencies recursively.
@@ -168,13 +200,13 @@ pub struct TargetsCommand {
 
     /// Show the package values. Produces an additional attribute representing all the package values
     /// for the package containing the target.
-    #[clap(long, conflicts_with = "package-values-regex")]
+    #[clap(long, conflicts_with = "package_values_regex")]
     package_values: bool,
 
     /// Regular expressions to match package values. Produces an additional attribute representing package values
     /// for the package containing the target. Regular expressions are used in "search" mode so,
     /// for example, empty string matches all package values.
-    #[clap(long, value_name = "VALUES", conflicts_with = "package-values")]
+    #[clap(long, value_name = "VALUES", conflicts_with = "package_values")]
     package_values_regex: Vec<String>,
 
     /// File to put the output in, rather than sending to stdout.
@@ -183,18 +215,33 @@ pub struct TargetsCommand {
     #[clap(long, short = 'o', value_name = "PATH")]
     output: Option<PathArg>,
 
+    /// Compress the output.
+    #[clap(
+        long,
+        default_value = "none",
+        value_name = "SCHEME",
+        requires = "output"
+    )]
+    compression: Compression,
+
     /// Patterns to interpret
-    #[clap(name = "TARGET_PATTERNS")]
+    #[clap(name = "TARGET_PATTERNS", value_hint = clap::ValueHint::Other)]
     patterns: Vec<String>,
 
     /// Number of threads to use during execution (default is # cores)
     #[clap(short = 'j', long = "num-threads", value_name = "THREADS")]
     pub num_threads: Option<u32>,
+
+    #[clap(flatten)]
+    target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
 }
 
 impl TargetsCommand {
     #[allow(clippy::if_same_then_else)]
-    fn output_format(&self) -> anyhow::Result<OutputFormat> {
+    fn output_format(&self) -> buck2_error::Result<OutputFormat> {
         if self.json {
             if self.json_lines || self.stats {
                 return Err(TargetsError::IncompatibleArguments.into());
@@ -221,7 +268,7 @@ impl TargetsCommand {
 
     /// Return each of the strings that were supplied as arguments to `--package-values-regex` or,
     /// if `--package-values` is used, return an empty string that effectively matches all package values.
-    fn package_values_as_regexes(&self) -> anyhow::Result<Vec<String>> {
+    fn package_values_as_regexes(&self) -> buck2_error::Result<Vec<String>> {
         if self.package_values {
             if self.package_values_regex.is_empty() {
                 Ok(vec![String::new()])
@@ -241,8 +288,9 @@ impl StreamingCommand for TargetsCommand {
     async fn exec_impl(
         mut self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let target_hash_use_fast_hash = match self.target_hash_function {
             TargetHashFunction::Sha1 | TargetHashFunction::Sha256 => {
@@ -266,9 +314,7 @@ impl StreamingCommand for TargetsCommand {
         let target_hash_graph_type =
             match (self.show_target_hash, self.show_unconfigured_target_hash) {
                 (true, true) => {
-                    return ExitResult::err(anyhow::Error::new(
-                        TargetsError::IncompatibleArguments,
-                    ));
+                    return ExitResult::err(TargetsError::IncompatibleArguments.into());
                 }
                 (true, false) => targets_request::TargetHashGraphType::Configured as i32,
                 (false, true) => targets_request::TargetHashGraphType::Unconfigured as i32,
@@ -285,26 +331,14 @@ impl StreamingCommand for TargetsCommand {
 
         let target_request = TargetsRequest {
             context,
-            target_patterns: self.patterns.map(|pat| buck2_data::TargetPattern {
-                value: pat.to_owned(),
-            }),
+            target_patterns: self.patterns,
             output_format: output_format as i32,
             targets: Some(if self.resolve_alias {
                 targets_request::Targets::ResolveAlias(targets_request::ResolveAlias {})
             } else {
                 targets_request::Targets::Other(targets_request::Other {
                     output_attributes,
-                    target_hash_file_mode: match self.target_hash_file_mode {
-                        TargetHashFileMode::PathsOnly => {
-                            targets_request::TargetHashFileMode::PathsOnly as i32
-                        }
-                        TargetHashFileMode::PathsAndContents => {
-                            targets_request::TargetHashFileMode::PathsAndContents as i32
-                        }
-                        TargetHashFileMode::None => {
-                            targets_request::TargetHashFileMode::NoFiles as i32
-                        }
-                    },
+                    target_hash_file_mode: self.target_hash_file_mode.to_proto() as i32,
                     target_hash_modified_paths,
                     target_hash_use_fast_hash,
                     target_hash_graph_type,
@@ -317,31 +351,33 @@ impl StreamingCommand for TargetsCommand {
                     package_values,
                 })
             }),
+            target_cfg: Some(self.target_cfg.target_cfg()),
             output: self
                 .output
                 .try_map(|x| x.resolve(&ctx.working_dir).into_string())?,
             concurrency: self
                 .num_threads
                 .map(|num| buck2_cli_proto::Concurrency { concurrency: num }),
+            compression: self.compression.to_proto() as i32,
         };
 
         if let Some(format) = self.show_output.format() {
             let project_root = ctx.paths()?.roots.project_root.clone();
             targets_show_outputs(
-                ctx.stdin(),
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 buckd,
+                events_ctx,
                 target_request,
                 self.show_output.is_full().then(|| project_root.root()),
                 format,
-                &self.common_opts.console_opts,
             )
             .await
         } else {
             targets(
-                ctx.stdin(),
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 buckd,
+                events_ctx,
                 target_request,
-                &self.common_opts.console_opts,
             )
             .await
         }
@@ -351,33 +387,38 @@ impl StreamingCommand for TargetsCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }
 
 async fn targets_show_outputs(
-    stdin: &mut Stdin,
-    buckd: &mut BuckdClientConnector<'_>,
+    console_interaction: Option<ConsoleInteractionStream<'_>>,
+    buckd: &mut BuckdClientConnector,
+    events_ctx: &mut EventsCtx,
     target_request: TargetsRequest,
     root_path: Option<&AbsNormPath>,
     format: PrintOutputsFormat,
-    console_opts: &CommonConsoleOptions,
 ) -> ExitResult {
     let response = buckd
         .with_flushing()
         .targets_show_outputs(
             target_request,
-            stdin.console_interaction_stream(console_opts),
+            events_ctx,
+            console_interaction,
             &mut NoPartialResultHandler,
         )
         .await??;
 
-    buck2_client_ctx::stdio::print_with_writer(|out| {
+    buck2_client_ctx::stdio::print_with_writer::<ClientIoError, _>(|out| {
         let root_path = root_path.map(|root| root.to_path_buf());
         let mut print = PrintOutputs::new(out, root_path, format)?;
         for target_paths in response.targets_paths {
@@ -392,16 +433,17 @@ async fn targets_show_outputs(
 }
 
 async fn targets(
-    stdin: &mut Stdin,
-    buckd: &mut BuckdClientConnector<'_>,
+    console_interaction: Option<ConsoleInteractionStream<'_>>,
+    buckd: &mut BuckdClientConnector,
+    events_ctx: &mut EventsCtx,
     target_request: TargetsRequest,
-    console_opts: &CommonConsoleOptions,
 ) -> ExitResult {
     let response = buckd
         .with_flushing()
         .targets(
             target_request,
-            stdin.console_interaction_stream(console_opts),
+            events_ctx,
+            console_interaction,
             &mut StdoutPartialResultHandler,
         )
         .await??;

@@ -20,6 +20,7 @@ use crate::interpreter::rule_defs::cmd_args::traits::CommandLineContext;
 use crate::interpreter::rule_defs::cmd_args::traits::CommandLineLocation;
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 pub enum CommandLineBuilderErrors {
     #[error(
         "write-to-file macro is only supported as a part of command line argument which is written to a file"
@@ -70,7 +71,7 @@ impl CommandLineContext for DefaultCommandLineContext<'_> {
     fn resolve_project_path(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<CommandLineLocation> {
+    ) -> buck2_error::Result<CommandLineLocation> {
         Ok(CommandLineLocation::from_relative_path(
             path.into(),
             self.fs.path_separator(),
@@ -81,21 +82,17 @@ impl CommandLineContext for DefaultCommandLineContext<'_> {
         self.fs
     }
 
-    fn next_macro_file_path(&mut self) -> anyhow::Result<RelativePathBuf> {
+    fn next_macro_file_path(&mut self) -> buck2_error::Result<RelativePathBuf> {
         if let Some((files, pos)) = self.maybe_macros_state {
             if pos >= files.len() {
-                return Err(anyhow::anyhow!(
-                    CommandLineBuilderErrors::InconsistentNumberOfMacroArtifacts
-                ));
+                return Err(CommandLineBuilderErrors::InconsistentNumberOfMacroArtifacts.into());
             }
             self.maybe_macros_state = Some((files, pos + 1));
             Ok(self
                 .resolve_project_path(files[pos].resolve_path(self.fs.fs())?)?
                 .into_relative())
         } else {
-            Err(anyhow::anyhow!(
-                CommandLineBuilderErrors::WriteToFileMacroNotSupported
-            ))
+            Err(CommandLineBuilderErrors::WriteToFileMacroNotSupported.into())
         }
     }
 }
@@ -116,7 +113,7 @@ impl CommandLineContext for AbsCommandLineContext<'_> {
     fn resolve_project_path(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<CommandLineLocation> {
+    ) -> buck2_error::Result<CommandLineLocation> {
         Ok(CommandLineLocation::from_root(
             self.0.fs().fs().fs(),
             path.into(),
@@ -128,11 +125,13 @@ impl CommandLineContext for AbsCommandLineContext<'_> {
         self.0.fs()
     }
 
-    fn next_macro_file_path(&mut self) -> anyhow::Result<RelativePathBuf> {
+    fn next_macro_file_path(&mut self) -> buck2_error::Result<RelativePathBuf> {
         let executor_fs = self.0.fs();
         let mut path = executor_fs.fs().fs().root().to_path_buf();
         path.extend(self.0.next_macro_file_path()?.iter());
-        RelativePathBuf::from_path(path).map_err(|e| anyhow::anyhow!(e))
+        RelativePathBuf::from_path(path).map_err(|e| {
+            buck2_error::buck2_error!(buck2_error::ErrorTag::Tier0, "{}", e.to_string())
+        })
     }
 }
 
@@ -148,14 +147,13 @@ mod tests {
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_core::fs::project::ProjectRoot;
-    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
 
     use super::*;
-    use crate::interpreter::rule_defs::cmd_args::builder::DefaultCommandLineContext;
     use crate::interpreter::rule_defs::cmd_args::traits::CommandLineArgLike;
 
     #[test]
-    fn adds_args_and_builds() -> anyhow::Result<()> {
+    fn adds_args_and_builds() -> buck2_error::Result<()> {
         let project_fs =
             ProjectRoot::new(AbsNormPathBuf::try_from(std::env::current_dir().unwrap()).unwrap())
                 .unwrap();
@@ -173,9 +171,8 @@ mod tests {
         let mut ctx = DefaultCommandLineContext::new(&executor_fs);
 
         "foo".add_to_command_line(&mut cli, &mut ctx)?;
-        "bar".to_owned().add_to_command_line(&mut cli, &mut ctx)?;
 
-        assert_eq!(&["foo".to_owned(), "bar".to_owned()], cli.as_slice());
+        assert_eq!(&["foo".to_owned()], cli.as_slice());
         Ok(())
     }
 
@@ -215,9 +212,12 @@ mod tests {
         );
     }
 
-    #[cfg(not(unix))]
     #[test]
     fn test_abs_command_line_location_windows() {
+        if !cfg!(windows) {
+            return;
+        }
+
         let root = ProjectRoot::new_unchecked(AbsNormPathBuf::unchecked_new(PathBuf::from(
             "C:\\foo\\bar",
         )));
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(
             CommandLineLocation::from_root(
                 &root,
-                RelativePathBuf::new(),
+                ProjectRelativePath::empty().to_buf(),
                 PathSeparatorKind::Windows
             )
             .into_string(),
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(
             CommandLineLocation::from_root(
                 &root,
-                RelativePathBuf::from("baz"),
+                ProjectRelativePathBuf::testing_new("baz"),
                 PathSeparatorKind::Windows
             )
             .into_string(),
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(
             CommandLineLocation::from_root(
                 &root,
-                RelativePathBuf::from("baz/qux"),
+                ProjectRelativePathBuf::testing_new("baz/qux"),
                 PathSeparatorKind::Windows
             )
             .into_string(),
@@ -253,22 +253,29 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_abs_command_line_location_unix() {
+        if !cfg!(unix) {
+            return;
+        }
+
         let root =
             ProjectRoot::new_unchecked(AbsNormPathBuf::unchecked_new(PathBuf::from("/foo/bar")));
 
         assert_eq!(
-            CommandLineLocation::from_root(&root, RelativePathBuf::new(), PathSeparatorKind::Unix)
-                .into_string(),
+            CommandLineLocation::from_root(
+                &root,
+                ProjectRelativePath::empty().to_buf(),
+                PathSeparatorKind::Unix
+            )
+            .into_string(),
             "/foo/bar",
         );
 
         assert_eq!(
             CommandLineLocation::from_root(
                 &root,
-                RelativePathBuf::from("baz"),
+                ProjectRelativePathBuf::testing_new("baz"),
                 PathSeparatorKind::Unix
             )
             .into_string(),
@@ -278,7 +285,7 @@ mod tests {
         assert_eq!(
             CommandLineLocation::from_root(
                 &root,
-                RelativePathBuf::from("baz/qux"),
+                ProjectRelativePathBuf::testing_new("baz/qux"),
                 PathSeparatorKind::Unix
             )
             .into_string(),

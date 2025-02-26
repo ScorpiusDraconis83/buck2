@@ -22,6 +22,9 @@ use buck2_core::cells::name::CellName;
 use buck2_core::cells::CellResolver;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPath;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_data::FileWatcherEventType;
+use buck2_data::FileWatcherKind;
+use buck2_error::conversion::from_any_with_tag;
 use buck2_events::dispatch::span_async;
 use dice::DiceTransactionUpdater;
 use dupe::Dupe;
@@ -39,41 +42,13 @@ use crate::file_watcher::FileWatcher;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
 
-#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Hash, Allocative)]
-enum ChangeType {
-    None,
-    FileContents,
-    FileExistence,
-    DirExistence,
-    SomeExistence,
-    Unknown,
-}
-
-impl ChangeType {
-    fn new(x: EventKind) -> Self {
-        match x {
-            EventKind::Access(_) => Self::None,
-            EventKind::Create(x) => match x {
-                CreateKind::File => Self::FileExistence,
-                CreateKind::Folder => Self::DirExistence,
-                CreateKind::Any | CreateKind::Other => Self::SomeExistence,
-            },
-            EventKind::Modify(x) => match x {
-                ModifyKind::Data(_) => Self::FileContents,
-                ModifyKind::Metadata(x) => match x {
-                    MetadataKind::Ownership | MetadataKind::Permissions => Self::FileContents,
-                    _ => Self::None,
-                },
-                ModifyKind::Name(_) => Self::SomeExistence,
-                ModifyKind::Any | ModifyKind::Other => Self::Unknown,
-            },
-            EventKind::Remove(x) => match x {
-                RemoveKind::File => Self::FileExistence,
-                RemoveKind::Folder => Self::DirExistence,
-                RemoveKind::Any | RemoveKind::Other => Self::SomeExistence,
-            },
-            EventKind::Any | EventKind::Other => Self::Unknown,
-        }
+fn ignore_event_kind(event_kind: &EventKind) -> bool {
+    match event_kind {
+        EventKind::Access(_) => true,
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership))
+        | EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)) => false,
+        EventKind::Modify(ModifyKind::Metadata(_)) => true,
+        _ => false,
     }
 }
 
@@ -82,7 +57,8 @@ impl ChangeType {
 #[derive(Allocative)]
 struct NotifyFileData {
     ignored: u64,
-    events: OrderedSet<(CellPath, ChangeType)>,
+    #[allocative(skip)]
+    events: OrderedSet<(CellPath, EventKind)>,
 }
 
 impl NotifyFileData {
@@ -99,9 +75,9 @@ impl NotifyFileData {
         root: &ProjectRoot,
         cells: &CellResolver,
         ignore_specs: &HashMap<CellName, IgnoreSet>,
-    ) -> anyhow::Result<()> {
-        let event = event?;
-        let change_type = ChangeType::new(event.kind);
+    ) -> buck2_error::Result<()> {
+        let event = event.map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
+
         for path in event.paths {
             // Testing shows that we get absolute paths back from the `notify` library.
             // It's not documented though.
@@ -120,18 +96,18 @@ impl NotifyFileData {
             let cell_path = cells.get_cell_path(&path)?;
             let ignore = ignore_specs
                 .get(&cell_path.cell())
-                .expect("unexpected cell name mismatch")
-                .is_match(cell_path.path());
+                // See the comment on the analogous code in `watchman/interface.rs`
+                .map_or(false, |ignore| ignore.is_match(cell_path.path()));
 
             info!(
                 "FileWatcher: {:?} {:?} (ignore = {})",
-                path, change_type, ignore
+                path, &event.kind, ignore
             );
 
-            if ignore || change_type == ChangeType::None {
+            if ignore || ignore_event_kind(&event.kind) {
                 self.ignored += 1;
             } else {
-                self.events.insert((cell_path, change_type));
+                self.events.insert((cell_path, event.kind.clone()));
             }
         }
         Ok(())
@@ -140,36 +116,112 @@ impl NotifyFileData {
     fn sync(self) -> (buck2_data::FileWatcherStats, FileChangeTracker) {
         // The changes that go into the DICE transaction
         let mut changed = FileChangeTracker::new();
-        // The files that were changed for accumulating the stats
-        let mut changed_paths = OrderedSet::new();
-
-        for (cell_path, change_type) in self.events {
-            let cell_path_str = cell_path.to_string();
-            match change_type {
-                ChangeType::None => {}
-                ChangeType::FileContents => changed.file_changed(cell_path),
-                ChangeType::FileExistence => changed.file_added_or_removed(cell_path),
-                ChangeType::DirExistence => changed.dir_added_or_removed(cell_path),
-                ChangeType::SomeExistence | ChangeType::Unknown => {
-                    changed.dir_added_or_removed(cell_path.clone());
-                    changed.file_added_or_removed(cell_path)
-                }
-            }
-            // We use changed_paths to deduplicate
-            changed_paths.insert(cell_path_str);
-        }
-
-        let mut stats = FileWatcherStats::new(changed_paths.len(), None, None, None);
+        let mut stats = FileWatcherStats::new(Default::default(), self.events.len());
         stats.add_ignored(self.ignored);
-        for path in changed_paths {
-            // The event type and watcher kind are just made up, but that's not a big deal
-            // since we only use this path open source, where we don't log the information to Scuba anyway.
-            // The path is right, which is probably what matters most
-            stats.add(
-                path,
-                buck2_data::FileWatcherEventType::Modify,
-                buck2_data::FileWatcherKind::File,
-            );
+
+        for (cell_path, event_kind) in self.events {
+            let cell_path_str = cell_path.to_string();
+            match event_kind {
+                EventKind::Create(create_kind) => match create_kind {
+                    CreateKind::File => {
+                        changed.file_added(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::File,
+                        );
+                    }
+                    CreateKind::Folder => {
+                        changed.dir_added(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::Directory,
+                        );
+                    }
+                    CreateKind::Any | CreateKind::Other => {
+                        changed.file_added(cell_path.clone());
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::File,
+                        );
+                        changed.dir_added(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::Directory,
+                        );
+                    }
+                },
+                EventKind::Modify(modify_kind) => match modify_kind {
+                    ModifyKind::Data(_) | ModifyKind::Metadata(_) => {
+                        changed.file_changed(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Modify,
+                            FileWatcherKind::File,
+                        );
+                    }
+                    ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other => {
+                        changed.file_added_or_removed(cell_path.clone());
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::File,
+                        );
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::File,
+                        );
+                        changed.dir_added_or_removed(cell_path);
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Create,
+                            FileWatcherKind::Directory,
+                        );
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::Directory,
+                        );
+                    }
+                },
+                EventKind::Remove(remove_kind) => match remove_kind {
+                    RemoveKind::File => {
+                        changed.file_removed(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::File,
+                        );
+                    }
+                    RemoveKind::Folder => {
+                        changed.dir_removed(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::Directory,
+                        );
+                    }
+                    RemoveKind::Any | RemoveKind::Other => {
+                        changed.file_removed(cell_path.clone());
+                        stats.add(
+                            cell_path_str.clone(),
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::File,
+                        );
+                        changed.dir_removed(cell_path);
+                        stats.add(
+                            cell_path_str,
+                            FileWatcherEventType::Delete,
+                            FileWatcherKind::Directory,
+                        );
+                    }
+                },
+                _ => {}
+            }
         }
 
         (stats.finish(), changed)
@@ -180,7 +232,7 @@ impl NotifyFileData {
 pub struct NotifyFileWatcher {
     #[allocative(skip)]
     watcher: RecommendedWatcher,
-    data: Arc<Mutex<anyhow::Result<NotifyFileData>>>,
+    data: Arc<Mutex<buck2_error::Result<NotifyFileData>>>,
 }
 
 impl NotifyFileWatcher {
@@ -188,7 +240,7 @@ impl NotifyFileWatcher {
         root: &ProjectRoot,
         cells: CellResolver,
         ignore_specs: HashMap<CellName, IgnoreSet>,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let data = Arc::new(Mutex::new(Ok(NotifyFileData::new())));
         let data2 = data.dupe();
         let root2 = root.dupe();
@@ -199,15 +251,18 @@ impl NotifyFileWatcher {
                     *guard = Err(e);
                 }
             }
-        })?;
-        watcher.watch(root.root().as_path(), notify::RecursiveMode::Recursive)?;
+        })
+        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
+        watcher
+            .watch(root.root().as_path(), notify::RecursiveMode::Recursive)
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
         Ok(Self { watcher, data })
     }
 
     fn sync2(
         &self,
         mut dice: DiceTransactionUpdater,
-    ) -> anyhow::Result<(buck2_data::FileWatcherStats, DiceTransactionUpdater)> {
+    ) -> buck2_error::Result<(buck2_data::FileWatcherStats, DiceTransactionUpdater)> {
         let mut guard = self.data.lock().unwrap();
         let old = mem::replace(&mut *guard, Ok(NotifyFileData::new()));
         let (stats, changes) = old?.sync();
@@ -221,7 +276,7 @@ impl FileWatcher for NotifyFileWatcher {
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,
-    ) -> anyhow::Result<(DiceTransactionUpdater, Mergebase)> {
+    ) -> buck2_error::Result<(DiceTransactionUpdater, Mergebase)> {
         span_async(
             buck2_data::FileWatcherStart {
                 provider: buck2_data::FileWatcherProvider::RustNotify as i32,

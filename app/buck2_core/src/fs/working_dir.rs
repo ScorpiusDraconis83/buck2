@@ -9,7 +9,6 @@
 
 use std::env;
 use std::path::Path;
-use std::path::PathBuf;
 
 use crate::fs::fs_util;
 use crate::fs::paths::abs_norm_path::AbsNormPath;
@@ -21,23 +20,24 @@ use crate::fs::paths::abs_path::AbsPathBuf;
 /// Can be different from process working directory if process changes the directory.
 /// So relative paths should be resolved against this.
 #[derive(Clone, Debug, derive_more::Display)]
-#[display(fmt = "{}", path)]
-pub struct WorkingDir {
+#[display("{}", path)]
+pub struct AbsWorkingDir {
     path: AbsNormPathBuf,
 }
 
-impl WorkingDir {
-    pub fn unchecked_new(path: AbsNormPathBuf) -> WorkingDir {
-        WorkingDir { path }
+impl AbsWorkingDir {
+    pub fn unchecked_new(path: AbsNormPathBuf) -> AbsWorkingDir {
+        AbsWorkingDir { path }
     }
 
-    pub fn current_dir() -> anyhow::Result<WorkingDir> {
-        let current_dir = env::current_dir()?;
+    pub fn current_dir() -> buck2_error::Result<AbsWorkingDir> {
+        let current_dir = AbsPathBuf::new(env::current_dir()?)?;
 
         #[derive(Debug, buck2_error::Error)]
+        #[buck2(tier0)]
         enum CurrentDirError {
             #[error("std::env::current_dir returns non-canonical path: `{}` -> `{}`", _0.display(), _1.display())]
-            NotCanonical(PathBuf, PathBuf),
+            NotCanonical(AbsPathBuf, AbsNormPathBuf),
         }
 
         // `current_dir` seems to return canonical path everywhere except Windows,
@@ -45,17 +45,15 @@ impl WorkingDir {
         // https://fb.workplace.com/groups/buck2windows/posts/754618429743405
         let current_dir_canonical = fs_util::canonicalize(&current_dir)?;
 
-        if current_dir != current_dir_canonical.as_path() {
+        if current_dir.as_path() != current_dir_canonical.as_path() {
             if !cfg!(windows) {
-                return Err(CurrentDirError::NotCanonical(
-                    current_dir,
-                    current_dir_canonical.into_path_buf(),
-                )
-                .into());
+                return Err(
+                    CurrentDirError::NotCanonical(current_dir, current_dir_canonical).into(),
+                );
             }
         }
 
-        Ok(WorkingDir::unchecked_new(current_dir_canonical))
+        Ok(AbsWorkingDir::unchecked_new(current_dir_canonical))
     }
 
     pub fn resolve(&self, path: &Path) -> AbsPathBuf {

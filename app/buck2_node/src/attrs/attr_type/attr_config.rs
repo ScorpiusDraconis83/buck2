@@ -9,7 +9,7 @@
 
 use std::fmt::Display;
 
-use buck2_core::buck_path::path::BuckPathRef;
+use buck2_core::package::source_path::SourcePathRef;
 use dupe::Dupe;
 use either::Either;
 use serde_json::to_value;
@@ -24,7 +24,7 @@ use crate::attrs::fmt_context::AttrFmtContext;
 use crate::attrs::json::ToJsonWithContext;
 
 impl ToJsonWithContext for ConfiguredAttr {
-    fn to_json(&self, ctx: &AttrFmtContext) -> anyhow::Result<serde_json::Value> {
+    fn to_json(&self, ctx: &AttrFmtContext) -> buck2_error::Result<serde_json::Value> {
         match self {
             ConfiguredAttr::Bool(v) => Ok(to_value(v)?),
             ConfiguredAttr::Int(v) => Ok(to_value(v)?),
@@ -39,7 +39,7 @@ impl ToJsonWithContext for ConfiguredAttr {
             ConfiguredAttr::ExplicitConfiguredDep(e) => e.to_json(),
             ConfiguredAttr::SplitTransitionDep(e) => e.to_json(),
             ConfiguredAttr::ConfigurationDep(e) => Ok(to_value(e.to_string())?),
-            ConfiguredAttr::PluginDep(e) => Ok(to_value(e.0.to_string())?),
+            ConfiguredAttr::PluginDep(e, _) => Ok(to_value(e.to_string())?),
             ConfiguredAttr::Dep(e) => Ok(to_value(e.to_string())?),
             ConfiguredAttr::SourceLabel(e) => Ok(to_value(e.to_string())?),
             ConfiguredAttr::Label(e) => Ok(to_value(e.to_string())?),
@@ -47,12 +47,16 @@ impl ToJsonWithContext for ConfiguredAttr {
             ConfiguredAttr::Query(e) => Ok(to_value(&e.query.query)?),
             ConfiguredAttr::SourceFile(e) => Ok(to_value(source_file_display(ctx, e).to_string())?),
             ConfiguredAttr::Metadata(m) => Ok(m.to_value()),
+            ConfiguredAttr::TargetModifiers(m) => Ok(m.to_value()),
         }
     }
 }
 
 impl AnyMatches for ConfiguredAttr {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         match self {
             ConfiguredAttr::String(v) | ConfiguredAttr::EnumVariant(v) => filter(v),
             ConfiguredAttr::List(vals) => vals.any_matches(filter),
@@ -67,7 +71,7 @@ impl AnyMatches for ConfiguredAttr {
             ConfiguredAttr::ExplicitConfiguredDep(e) => e.any_matches(filter),
             ConfiguredAttr::SplitTransitionDep(e) => e.any_matches(filter),
             ConfiguredAttr::ConfigurationDep(e) => filter(&e.to_string()),
-            ConfiguredAttr::PluginDep(e) => filter(&e.0.to_string()),
+            ConfiguredAttr::PluginDep(e, _) => filter(&e.to_string()),
             ConfiguredAttr::Dep(e) => filter(&e.to_string()),
             ConfiguredAttr::SourceLabel(e) => filter(&e.to_string()),
             ConfiguredAttr::Label(e) => filter(&e.to_string()),
@@ -75,18 +79,22 @@ impl AnyMatches for ConfiguredAttr {
             ConfiguredAttr::Query(e) => filter(&e.query.query),
             ConfiguredAttr::SourceFile(e) => filter(&e.path().to_string()),
             ConfiguredAttr::Metadata(e) => e.any_matches(filter),
+            ConfiguredAttr::TargetModifiers(e) => e.any_matches(filter),
         }
     }
 }
 
 impl ToJsonWithContext for CoercedAttr {
-    fn to_json(&self, ctx: &AttrFmtContext) -> anyhow::Result<serde_json::Value> {
+    fn to_json(&self, ctx: &AttrFmtContext) -> buck2_error::Result<serde_json::Value> {
         CoercedAttr::to_json(self, ctx)
     }
 }
 
 impl AnyMatches for CoercedAttr {
-    fn any_matches(&self, filter: &dyn Fn(&str) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    fn any_matches(
+        &self,
+        filter: &dyn Fn(&str) -> buck2_error::Result<bool>,
+    ) -> buck2_error::Result<bool> {
         CoercedAttr::any_matches(self, filter)
     }
 }
@@ -96,7 +104,7 @@ pub(crate) fn source_file_display<'a>(
     source_file: &'a CoercedPath,
 ) -> impl Display + 'a {
     match &ctx.package {
-        Some(pkg) => Either::Left(BuckPathRef::new(pkg.dupe(), source_file.path())),
+        Some(pkg) => Either::Left(SourcePathRef::new(pkg.dupe(), source_file.path())),
         None => {
             // This code is unreachable, but better this than panic.
             Either::Right(format!("<no package>/{}", source_file.path()))

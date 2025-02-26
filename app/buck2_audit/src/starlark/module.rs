@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 #[derive(Debug, clap::Parser, serde::Serialize, serde::Deserialize)]
@@ -17,6 +18,10 @@ use buck2_client_ctx::common::CommonCommandOptions;
 pub struct StarlarkModuleCommand {
     #[clap(name = "IMPORT_PATH", help = "Module import path")]
     pub import_path: String,
+
+    /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
+    #[clap(flatten)]
+    _target_cfg: TargetCfgUnusedOptions,
 
     #[clap(flatten)]
     pub(crate) common_opts: CommonCommandOptions,

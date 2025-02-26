@@ -17,17 +17,76 @@
 
 //! Parameter conversion utilities for `starlark_module` macros.
 
-use std::ops::Deref;
+use std::convert::Infallible;
+use std::fmt::Debug;
 
-use dupe::Dupe;
+use anyhow::Context;
 use either::Either;
+use starlark_syntax::StarlarkResultExt;
 
 use crate::typing::Ty;
 use crate::values::type_repr::StarlarkTypeRepr;
-use crate::values::AllocValue;
-use crate::values::Heap;
 use crate::values::Value;
-use crate::values::ValueError;
+
+/// Error that can be returned by [`UnpackValue`].
+pub trait UnpackValueError: Debug + Send + Sync + 'static {
+    /// Convert into a crate error.
+    fn into_error(this: Self) -> crate::Error;
+}
+
+impl UnpackValueError for crate::Error {
+    #[cold]
+    fn into_error(this: Self) -> crate::Error {
+        this
+    }
+}
+
+impl UnpackValueError for anyhow::Error {
+    #[cold]
+    fn into_error(this: Self) -> crate::Error {
+        crate::Error::new_value(this)
+    }
+}
+
+impl UnpackValueError for Infallible {
+    #[cold]
+    fn into_error(this: Self) -> crate::Error {
+        match this {}
+    }
+}
+
+impl<A: UnpackValueError, B: UnpackValueError> UnpackValueError for Either<A, B> {
+    #[cold]
+    fn into_error(this: Self) -> crate::Error {
+        match this {
+            Either::Left(a) => UnpackValueError::into_error(a),
+            Either::Right(b) => UnpackValueError::into_error(b),
+        }
+    }
+}
+
+/// Never error.
+pub trait UnpackValueErrorInfallible: UnpackValueError {
+    /// Convert into a never type.
+    fn into_infallible(this: Self) -> !;
+}
+
+impl UnpackValueErrorInfallible for Infallible {
+    fn into_infallible(this: Self) -> ! {
+        match this {}
+    }
+}
+
+impl<A: UnpackValueErrorInfallible, B: UnpackValueErrorInfallible> UnpackValueErrorInfallible
+    for Either<A, B>
+{
+    fn into_infallible(this: Self) -> ! {
+        match this {
+            Either::Left(a) => UnpackValueErrorInfallible::into_infallible(a),
+            Either::Right(b) => UnpackValueErrorInfallible::into_infallible(b),
+        }
+    }
+}
 
 /// How to convert a [`Value`] to a Rust type. Required for all arguments in
 /// a [`#[starlark_module]`](macro@crate::starlark_module) definition.
@@ -64,143 +123,153 @@ use crate::values::ValueError;
 /// struct BoolOrInt(i32);
 ///
 /// impl StarlarkTypeRepr for BoolOrInt {
+///     type Canonical = <Either<bool, i32> as StarlarkTypeRepr>::Canonical;
+///
 ///     fn starlark_type_repr() -> Ty {
 ///         Either::<bool, i32>::starlark_type_repr()
 ///     }
 /// }
 ///
 /// impl<'v> UnpackValue<'v> for BoolOrInt {
-///     fn unpack_value(value: Value<'v>) -> Option<Self> {
+///     type Error = starlark::Error;
+///
+///     fn unpack_value_impl(value: Value<'v>) -> starlark::Result<Option<Self>> {
 ///         if let Some(x) = value.unpack_bool() {
-///             Some(BoolOrInt(x as i32))
+///             Ok(Some(BoolOrInt(x as i32)))
 ///         } else {
-///             value.unpack_i32().map(BoolOrInt)
+///             let Some(x) = i32::unpack_value(value)? else {
+///                 return Ok(None);
+///             };
+///             Ok(Some(BoolOrInt(x)))
 ///         }
 ///     }
 /// }
 /// ```
 pub trait UnpackValue<'v>: Sized + StarlarkTypeRepr {
-    /// Description of values acceptable by `unpack_value`, e. g. `list or str`.
-    fn expected() -> String {
-        Self::starlark_type_repr().to_string()
+    /// Error returned when type matches, but conversion fails.
+    ///
+    /// Typically [`starlark::Error`](crate::Error), [`anyhow::Error`], or [`Infallible`].
+    type Error: UnpackValueError;
+
+    /// Given a [`Value`], try and unpack it into the given type,
+    /// which may involve some element of conversion.
+    ///
+    /// Return `None` if the value is not of expected type (as described by [`StarlarkTypeRepr`],
+    /// and return `Err` if the value is of expected type, but conversion cannot be performed.
+    /// For example, when unpacking an integer to `String`, return `None`,
+    /// and when unpacking a large integer to `i32`, return `Err`.
+    ///
+    /// This function is needs to be implemented, but usually not meant to be called directly.
+    /// Consider using [`unpack_value`](UnpackValue::unpack_value),
+    /// [`unpack_value_err`](UnpackValue::unpack_value_err),
+    /// [`unpack_value_opt`](UnpackValue::unpack_value_opt) instead.
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error>;
+
+    /// Given a [`Value`], try and unpack it into the given type,
+    /// which may involve some element of conversion.
+    ///
+    /// Return `None` if the value is not of expected type (as described by [`StarlarkTypeRepr`],
+    /// and return `Err` if the value is of expected type, but conversion cannot be performed.
+    /// For example, when unpacking an integer to `String`, return `None`,
+    /// and when unpacking a large integer to `i32`, return `Err`.
+    fn unpack_value(value: Value<'v>) -> Result<Option<Self>, crate::Error> {
+        Self::unpack_value_impl(value).map_err(Self::Error::into_error)
     }
 
-    /// Given a [`Value`], try and unpack it into the given type, which may involve some element of conversion.
-    fn unpack_value(value: Value<'v>) -> Option<Self>;
+    /// Unpack a value if unpacking is infallible.
+    fn unpack_value_opt(value: Value<'v>) -> Option<Self>
+    where
+        Self::Error: UnpackValueErrorInfallible,
+    {
+        match Self::unpack_value_impl(value) {
+            Ok(x) => x,
+            Err(e) => Self::Error::into_infallible(e),
+        }
+    }
 
     /// Unpack a value, but return error instead of `None` if unpacking fails.
-    fn unpack_value_err(value: Value<'v>) -> anyhow::Result<Self> {
-        #[derive(thiserror::Error, Debug)]
-        #[error("Expected `{0}`, but got `{1}`")]
-        struct Error(String, &'static str);
+    #[inline]
+    fn unpack_value_err(value: Value<'v>) -> crate::Result<Self> {
+        #[cold]
+        fn error<'v>(value: Value<'v>, ty: fn() -> Ty) -> crate::Error {
+            #[derive(thiserror::Error, Debug)]
+            #[error("Expected `{0}`, but got `{1}`")]
+            struct IncorrectType(Ty, String);
 
-        Self::unpack_value(value).ok_or_else(|| Error(Self::expected(), value.get_type()).into())
+            crate::Error::new_value(IncorrectType(ty(), value.to_string_for_type_error()))
+        }
+
+        Self::unpack_value(value)?.ok_or_else(|| error(value, Self::starlark_type_repr))
     }
 
     /// Unpack value, but instead of `None` return error about incorrect argument type.
     #[inline]
-    fn unpack_param(value: Value<'v>) -> anyhow::Result<Self> {
+    fn unpack_param(value: Value<'v>) -> crate::Result<Self> {
         #[cold]
-        fn error<'v, U: UnpackValue<'v>>(value: Value<'v>) -> anyhow::Error {
-            ValueError::IncorrectParameterTypeWithExpected(
-                U::expected(),
-                value.get_type().to_owned(),
-            )
-            .into()
+        fn error<'v>(value: Value<'v>, ty: fn() -> Ty) -> crate::Error {
+            #[derive(thiserror::Error, Debug)]
+            #[error("Type of parameters mismatch, expected `{0}`, actual `{1}`")]
+            struct IncorrectParameterTypeWithExpected(Ty, String);
+
+            crate::Error::new_value(IncorrectParameterTypeWithExpected(
+                ty(),
+                value.to_string_for_type_error(),
+            ))
         }
 
-        Self::unpack_value(value).ok_or_else(|| error::<Self>(value))
+        Self::unpack_value(value)?.ok_or_else(|| error(value, Self::starlark_type_repr))
     }
 
     /// Unpack value, but instead of `None` return error about incorrect named argument type.
     #[inline]
-    fn unpack_named_param(value: Value<'v>, param_name: &str) -> anyhow::Result<Self> {
+    fn unpack_named_param(value: Value<'v>, param_name: &str) -> crate::Result<Self> {
         #[cold]
-        fn error<'v, U: UnpackValue<'v>>(value: Value<'v>, param_name: &str) -> anyhow::Error {
-            ValueError::IncorrectParameterTypeNamedWithExpected(
+        fn error<'v>(value: Value<'v>, param_name: &str, ty: fn() -> Ty) -> crate::Error {
+            #[derive(thiserror::Error, Debug)]
+            #[error("Type of parameter `{0}` doesn't match, expected `{1}`, actual `{2}`")]
+            struct IncorrectParameterTypeNamedWithExpected(String, Ty, String);
+
+            crate::Error::new_value(IncorrectParameterTypeNamedWithExpected(
                 param_name.to_owned(),
-                U::expected(),
-                value.get_type().to_owned(),
-            )
-            .into()
+                ty(),
+                value.to_string_for_type_error(),
+            ))
         }
 
-        Self::unpack_value(value).ok_or_else(|| error::<Self>(value, param_name))
+        Self::unpack_value(value)
+            .into_anyhow_result()
+            .with_context(|| {
+                format!(
+                    "Error unpacking value for parameter `{}` of type `{}",
+                    param_name,
+                    Self::starlark_type_repr()
+                )
+            })?
+            .ok_or_else(|| error(value, param_name, Self::starlark_type_repr))
     }
 }
 
 impl<'v> UnpackValue<'v> for Value<'v> {
-    fn expected() -> String {
-        "Value".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        Some(value)
-    }
-}
-
-/// A wrapper that keeps the original value on the heap for use elsewhere,
-/// and also, when unpacked, unpacks the value to validate it is of
-/// the correct type. Has an [`UnpackValue`] instance, so often used as
-/// an argument to [`#[starlark_module]`](macro@crate::starlark_module) defined
-/// functions.
-///
-/// Two container specializations of this are [`ListOf`](crate::values::list::ListOf)
-/// and [`DictOf`](crate::values::dict::DictOf), which
-/// validate the types of their containers on unpack, but do not store the
-/// resulting Vec/Map
-#[derive(Debug, Copy, Clone, Dupe)]
-pub struct ValueOf<'v, T: UnpackValue<'v>> {
-    /// The original [`Value`] on the same heap.
-    pub value: Value<'v>,
-    /// The value that was unpacked.
-    pub typed: T,
-}
-
-impl<'v, T: UnpackValue<'v>> Deref for ValueOf<'v, T> {
-    type Target = Value<'v>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<'v, T: UnpackValue<'v>> StarlarkTypeRepr for ValueOf<'v, T> {
-    fn starlark_type_repr() -> Ty {
-        T::starlark_type_repr()
-    }
-}
-
-impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for ValueOf<'v, T> {
-    fn expected() -> String {
-        T::expected()
-    }
-
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        let typed = T::unpack_value(value)?;
-        Some(Self { value, typed })
-    }
-}
-
-impl<'v, T: UnpackValue<'v>> AllocValue<'v> for ValueOf<'v, T> {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
-        self.value
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(Some(value))
     }
 }
 
 impl<'v, TLeft: UnpackValue<'v>, TRight: UnpackValue<'v>> UnpackValue<'v>
     for Either<TLeft, TRight>
 {
-    fn expected() -> String {
-        format!("either {} or {}", TLeft::expected(), TRight::expected())
-    }
+    type Error = Either<TLeft::Error, TRight::Error>;
 
     // Only implemented for types that implement [`UnpackValue`]. Nonsensical for other types.
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        if let Some(left) = TLeft::unpack_value(value) {
-            Some(Self::Left(left))
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        if let Some(left) = TLeft::unpack_value_impl(value).map_err(Either::Left)? {
+            Ok(Some(Self::Left(left)))
         } else {
-            TRight::unpack_value(value).map(Self::Right)
+            Ok(TRight::unpack_value_impl(value)
+                .map_err(Either::Right)?
+                .map(Self::Right))
         }
     }
 }

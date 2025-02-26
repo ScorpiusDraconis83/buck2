@@ -7,26 +7,30 @@
  * of this source tree.
  */
 
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_cli_proto::CleanStaleRequest;
 use buck2_cli_proto::CleanStaleResponse;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::NoPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::TimeZone;
 use chrono::Utc;
-use humantime;
 
 /// Clean only old artifacts from a running buck daemon without killing the daemon.
+/// This can be interrupted by other commands that run in parallel and request materialization.
 ///
 /// This is a separate command from CleanCommand even though it is invoked with
 /// a flag (--stale) on the clean subcommand, which is a bit weird.
@@ -47,10 +51,11 @@ pub enum KeepSinceArg {
 pub fn parse_clean_stale_args(
     stale: Option<Option<humantime::Duration>>,
     keep_since_time: Option<i64>,
-) -> anyhow::Result<Option<KeepSinceArg>> {
+) -> buck2_error::Result<Option<KeepSinceArg>> {
     let arg = match (stale, keep_since_time) {
         (Some(Some(human_duration)), None) => {
-            let duration = chrono::Duration::from_std(human_duration.into())?;
+            let duration = chrono::Duration::from_std(human_duration.into())
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
             Some(KeepSinceArg::Duration(duration))
         }
         (Some(None), None) => Some(KeepSinceArg::Duration(chrono::Duration::weeks(1))),
@@ -78,11 +83,8 @@ fn format_result_stats(stats: buck2_data::CleanStaleStats) -> String {
         stats.untracked_artifact_count,
         bytesize::to_string(stats.untracked_bytes, true),
     );
-    if stats.cleaned_path_count > 0 || stats.cleaned_bytes > 0 {
-        output += &format!(
-            "Cleaned {} paths ({} artifacts)\n",
-            stats.cleaned_path_count, stats.cleaned_artifact_count,
-        );
+    if stats.cleaned_artifact_count > 0 || stats.cleaned_bytes > 0 {
+        output += &format!("Cleaned {} paths\n", stats.cleaned_artifact_count,);
         output += &format!(
             "{} bytes cleaned ({})\n",
             stats.cleaned_bytes,
@@ -99,18 +101,22 @@ impl StreamingCommand for CleanStaleCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let keep_since_time = match self.keep_since_arg {
             KeepSinceArg::Duration(duration) => {
                 let keep_since_time: DateTime<Utc> = Utc::now()
                     .checked_sub_signed(duration)
-                    .context("Duration underflow")?;
+                    .buck_error_context("Duration underflow")?;
                 buck2_client_ctx::eprintln!(
                     "Cleaning artifacts more than {} old",
                     humantime::format_duration(
-                        duration.to_std().context("Error converting duration")?
+                        duration
+                            .to_std()
+                            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                            .buck_error_context("Error converting duration")?
                     ),
                 )?;
                 // Round up to next second since timestamp below is rounded down
@@ -120,7 +126,7 @@ impl StreamingCommand for CleanStaleCommand {
             KeepSinceArg::Time(timestamp) => Utc
                 .timestamp_opt(timestamp, 0)
                 .single()
-                .context("Invalid timestamp")?,
+                .buck_error_context("Invalid timestamp")?,
         };
 
         let context = ctx.client_context(matches, &self)?;
@@ -133,8 +139,8 @@ impl StreamingCommand for CleanStaleCommand {
                     dry_run: self.dry_run,
                     tracked_only: self.tracked_only,
                 },
-                ctx.stdin()
-                    .console_interaction_stream(&self.common_opts.console_opts),
+                events_ctx,
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 &mut NoPartialResultHandler,
             )
             .await??;
@@ -152,11 +158,15 @@ impl StreamingCommand for CleanStaleCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }

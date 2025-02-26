@@ -25,7 +25,7 @@ pub(crate) async fn declare_copy_to_offline_output_cache(
     ctx: &mut dyn ActionExecutionCtx,
     output: &BuildArtifact,
     value: ArtifactValue,
-) -> anyhow::Result<ProjectRelativePathBuf> {
+) -> buck2_error::Result<ProjectRelativePathBuf> {
     let build_path = ctx.fs().resolve_build(output.get_path());
     let offline_cache_path = ctx
         .fs()
@@ -42,7 +42,7 @@ pub(crate) async fn declare_copy_to_offline_output_cache(
 pub(crate) async fn declare_copy_from_offline_cache(
     ctx: &mut dyn ActionExecutionCtx,
     output: &BuildArtifact,
-) -> anyhow::Result<ActionOutputs> {
+) -> buck2_error::Result<ActionOutputs> {
     let offline_cache_path = ctx
         .fs()
         .resolve_offline_output_cache_path(output.get_path());
@@ -51,11 +51,18 @@ pub(crate) async fn declare_copy_from_offline_cache(
         ctx.fs().fs().resolve(&offline_cache_path),
         FileDigestConfig::build(ctx.digest_config().cas_digest_config()),
         ctx.blocking_executor(),
+        ctx.fs().fs().root(),
     )
     .await?;
 
     let entry = value
-        .ok_or_else(|| anyhow::anyhow!("Missing offline cache entry: `{}`", offline_cache_path))?
+        .ok_or_else(|| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "Missing offline cache entry: `{}`",
+                offline_cache_path
+            )
+        })?
         .map_dir(|dir| {
             dir.fingerprint(ctx.digest_config().as_directory_serializer())
                 .shared(&*INTERNER)
@@ -74,7 +81,7 @@ async fn declare_copy_materialization(
     src: ProjectRelativePathBuf,
     dest: ProjectRelativePathBuf,
     value: ArtifactValue,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let immutable_entry = value.entry().dupe().map_dir(|d| d.as_immutable());
     ctx.materializer()
         .declare_copy(

@@ -9,15 +9,16 @@
 
 use std::io::Write;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_build_api::actions::query::ActionQueryNode;
 use buck2_build_api::query::oneshot::QUERY_FRONTEND;
 use buck2_common::dice::cells::HasCellResolver;
+use buck2_error::BuckErrorContext;
+use buck2_query::query::environment::AttrFmtOptions;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationResult;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
+use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
-use buck2_server_ctx::pattern::global_cfg_options_from_client_context;
 use buck2_server_ctx::template::run_server_command;
 use buck2_server_ctx::template::ServerCommandTemplate;
 use dice::DiceTransaction;
@@ -31,7 +32,7 @@ impl QueryCommandTarget for ActionQueryNode {
         None
     }
 
-    fn attr_to_string_alternate(&self, attr: &Self::Attr<'_>) -> String {
+    fn attr_to_string_alternate(&self, _options: AttrFmtOptions, attr: &Self::Attr<'_>) -> String {
         format!("{:#}", attr)
     }
 
@@ -42,13 +43,22 @@ impl QueryCommandTarget for ActionQueryNode {
     ) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(attr, serializer)
     }
+
+    fn attr_fmt(
+        &self,
+        fmt: &mut std::fmt::Formatter<'_>,
+        _options: AttrFmtOptions,
+        attr: &Self::Attr<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Display::fmt(attr, fmt)
+    }
 }
 
 pub(crate) async fn aquery_command(
     ctx: &dyn ServerCommandContextTrait,
     partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
     req: buck2_cli_proto::AqueryRequest,
-) -> anyhow::Result<buck2_cli_proto::AqueryResponse> {
+) -> buck2_error::Result<buck2_cli_proto::AqueryResponse> {
     run_server_command(AqueryServerCommand { req }, ctx, partial_result_dispatcher).await
 }
 
@@ -68,7 +78,7 @@ impl ServerCommandTemplate for AqueryServerCommand {
         server_ctx: &dyn ServerCommandContextTrait,
         mut partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
         ctx: DiceTransaction,
-    ) -> anyhow::Result<Self::Response> {
+    ) -> buck2_error::Result<Self::Response> {
         aquery(
             server_ctx,
             partial_result_dispatcher.as_writer(),
@@ -88,7 +98,7 @@ async fn aquery(
     mut stdout: impl Write,
     mut ctx: DiceTransaction,
     request: &buck2_cli_proto::AqueryRequest,
-) -> anyhow::Result<buck2_cli_proto::AqueryResponse> {
+) -> buck2_error::Result<buck2_cli_proto::AqueryResponse> {
     let cell_resolver = ctx.get_cell_resolver().await?;
 
     let output_configuration = QueryResultPrinter::from_request_options(
@@ -98,22 +108,23 @@ async fn aquery(
     )?;
 
     let buck2_cli_proto::AqueryRequest {
-        query,
-        query_args,
-        context,
-        ..
+        query, query_args, ..
     } = request;
 
-    let client_ctx = context
-        .as_ref()
-        .context("No client context (internal error)")?;
-    let global_cfg_options =
-        global_cfg_options_from_client_context(client_ctx, server_ctx, &mut ctx).await?;
+    let global_cfg_options = global_cfg_options_from_client_context(
+        request
+            .target_cfg
+            .as_ref()
+            .internal_error("target_cfg must be set")?,
+        server_ctx,
+        &mut ctx,
+    )
+    .await?;
 
     let query_result = QUERY_FRONTEND
         .get()?
         .eval_aquery(
-            &ctx,
+            &mut ctx,
             server_ctx.working_dir(),
             query,
             query_args,

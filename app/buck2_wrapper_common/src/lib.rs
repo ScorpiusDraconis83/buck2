@@ -22,28 +22,66 @@ use std::time::Duration;
 use std::time::Instant;
 
 use is_buck2::WhoIsAsking;
-use sysinfo::Pid;
-use sysinfo::PidExt;
-use sysinfo::ProcessExt;
 use sysinfo::System;
-use sysinfo::SystemExt;
 
 use crate::is_buck2::is_buck2_exe;
+use crate::pid::Pid;
 
 pub mod invocation_id;
 pub mod is_buck2;
 pub mod kill;
-pub mod winapi_handle;
-pub(crate) mod winapi_process;
+pub mod pid;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+pub mod win;
 
 pub const BUCK2_WRAPPER_ENV_VAR: &str = "BUCK2_WRAPPER";
 pub const BUCK_WRAPPER_UUID_ENV_VAR: &str = "BUCK_WRAPPER_UUID";
+pub const EXPERIMENTS_FILENAME: &str = "experiments_from_buck_start";
+pub const DOT_BUCKCONFIG_D: &str = ".buckconfig.d";
 
 /// Because `sysinfo::Process` is not `Clone`.
 struct ProcessInfo {
-    pid: u32,
+    pid: Pid,
     name: String,
     cmd: Vec<String>,
+}
+
+/// Get the list of all PIDs on Linux
+///
+/// As of sysinfo 0.30, the `processes` function returns all posix TIDs (what the kernel calls
+/// PIDs), and not just all posix PIDs (what the kernel calls TGIDs). In order to make sure that we
+/// don't kill any of the TIDs in our PID, we need to filter the list of TIDs down. This function
+/// returns the list of all PIDs on the system.
+fn get_all_tgids_linux() -> Option<HashSet<sysinfo::Pid>> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Some(HashSet::new());
+    };
+
+    let mut all_tgids = HashSet::new();
+
+    for e in entries {
+        let Ok(e) = e else {
+            continue;
+        };
+        let Ok(file_type) = e.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        all_tgids.insert(sysinfo::Pid::from_u32(pid));
+    }
+
+    Some(all_tgids)
 }
 
 /// Find all buck2 processes in the system.
@@ -52,7 +90,7 @@ fn find_buck2_processes(who_is_asking: WhoIsAsking) -> Vec<ProcessInfo> {
     system.refresh_processes();
 
     let mut current_parents = HashSet::new();
-    let mut parent = Some(Pid::from_u32(std::process::id()));
+    let mut parent = Some(sysinfo::Pid::from_u32(std::process::id()));
     while let Some(pid) = parent {
         // There is a small chance on Windows that the PID of a dead parent
         // was reused by some of its descendants, and this can create a loop.
@@ -62,11 +100,25 @@ fn find_buck2_processes(who_is_asking: WhoIsAsking) -> Vec<ProcessInfo> {
         parent = system.process(pid).and_then(|p| p.parent());
     }
 
+    let filtered_proc_list = get_all_tgids_linux();
+
     let mut buck2_processes = Vec::new();
     for (pid, process) in system.processes() {
-        if is_buck2_exe(process.exe(), who_is_asking) && !current_parents.contains(pid) {
+        // See comment on `get_all_tgids_linux`
+        if let Some(filtered_proc_list) = filtered_proc_list.as_ref() {
+            if !filtered_proc_list.contains(&pid) {
+                continue;
+            }
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if is_buck2_exe(exe, who_is_asking) && !current_parents.contains(pid) {
+            let Ok(pid) = Pid::from_u32(pid.as_u32()) else {
+                continue;
+            };
             buck2_processes.push(ProcessInfo {
-                pid: pid.as_u32(),
+                pid,
                 name: process.name().to_owned(),
                 cmd: process.cmd().to_vec(),
             });
@@ -99,7 +151,7 @@ pub fn killall(who_is_asking: WhoIsAsking, write: impl Fn(String)) -> bool {
             format!("{} {} ({}). {}", status, process.name, process.pid, cmd,)
         }
 
-        fn failed_to_kill(&mut self, process: &ProcessInfo, error: anyhow::Error) {
+        fn failed_to_kill(&mut self, process: &ProcessInfo, error: buck2_error::Error) {
             let mut message = self.fmt_status(process, "Failed to kill");
             for line in format!("{:?}", error).lines() {
                 message.push_str("\n  ");
@@ -123,7 +175,8 @@ pub fn killall(who_is_asking: WhoIsAsking, write: impl Fn(String)) -> bool {
     let mut processes_still_alive: Vec<(ProcessInfo, _)> = Vec::new();
     for process in buck2_processes {
         match kill::kill(process.pid) {
-            Ok(handle) => processes_still_alive.push((process, handle)),
+            Ok(Some(handle)) => processes_still_alive.push((process, handle)),
+            Ok(None) => {}
             Err(e) => printer.failed_to_kill(&process, e),
         };
     }
@@ -150,7 +203,10 @@ pub fn killall(who_is_asking: WhoIsAsking, write: impl Fn(String)) -> bool {
             for process in processes_still_alive {
                 printer.failed_to_kill(
                     &process.0,
-                    anyhow::anyhow!("Process still alive after {timeout_secs}s after kill sent"),
+                    buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Tier0,
+                        "Process still alive after {timeout_secs}s after kill sent"
+                    ),
                 );
             }
             break;

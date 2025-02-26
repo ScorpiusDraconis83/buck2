@@ -7,8 +7,6 @@
  * of this source tree.
  */
 
-use std::fmt::Display;
-
 use allocative::Allocative;
 use buck2_data::ActionErrorLocation;
 use buck2_data::ActionErrorLocations;
@@ -37,13 +35,13 @@ use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueError;
-use starlark::StarlarkDocs;
 
 use crate::starlark::values::ValueLike;
 
 pub(crate) type ActionSubErrorResult<'a> = UnpackList<&'a StarlarkActionSubError<'a>>;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 pub(crate) enum ActionErrorHandlerError {
     #[error("Error handler failed. Expected return type `{0}`, got value with type `{1}`")]
     TypeError(Ty, String),
@@ -53,16 +51,15 @@ pub(crate) enum ActionErrorHandlerError {
     ProvidesStaticType,
     Trace,
     Allocative,
-    StarlarkDocs,
     Debug,
     Display,
     NoSerialize,
     Clone
 )]
 #[display(
-    fmt = "ActionErrorCtx(stderr: {}, stdout: {})",
-    "self.stderr",
-    "self.stdout"
+    "ActionErrorCtx(stderr: {}, stdout: {})",
+    self.stderr,
+    self.stdout
 )]
 pub struct StarlarkActionErrorContext {
     stderr: String,
@@ -102,13 +99,13 @@ impl<'v> StarlarkValue<'v> for StarlarkActionErrorContext {
 fn action_error_context_methods(builder: &mut MethodsBuilder) {
     /// The stderr of the failed action.
     #[starlark(attribute)]
-    fn stderr<'v>(this: &'v StarlarkActionErrorContext) -> anyhow::Result<&'v str> {
+    fn stderr<'v>(this: &'v StarlarkActionErrorContext) -> starlark::Result<&'v str> {
         Ok(&this.stderr)
     }
 
     /// The stdout of the failed action.
     #[starlark(attribute)]
-    fn stdout<'v>(this: &'v StarlarkActionErrorContext) -> anyhow::Result<&'v str> {
+    fn stdout<'v>(this: &'v StarlarkActionErrorContext) -> starlark::Result<&'v str> {
         Ok(&this.stdout)
     }
 
@@ -119,7 +116,7 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(this)] _this: &'v StarlarkActionErrorContext,
         #[starlark(require = named)] file: String,
         #[starlark(require = named, default = NoneOr::None)] line: NoneOr<u64>,
-    ) -> anyhow::Result<StarlarkActionErrorLocation> {
+    ) -> starlark::Result<StarlarkActionErrorLocation> {
         // @TODO(wendyy) - actually enforce/validate the path types.
         Ok(StarlarkActionErrorLocation {
             file,
@@ -145,7 +142,7 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] locations: NoneOr<
             UnpackListOrTuple<&'v StarlarkActionErrorLocation>,
         >,
-    ) -> anyhow::Result<StarlarkActionSubError<'v>> {
+    ) -> starlark::Result<StarlarkActionSubError<'v>> {
         Ok(StarlarkActionSubError {
             category,
             message: message.into_option(),
@@ -158,7 +155,6 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
     ProvidesStaticType,
     Trace,
     Allocative,
-    StarlarkDocs,
     Debug,
     Display,
     NoSerialize,
@@ -170,9 +166,9 @@ fn action_error_context_methods(builder: &mut MethodsBuilder) {
     PartialEq
 )]
 #[display(
-    fmt = "ActionErrorLocation(file={}, line={})",
-    "self.file",
-    "self.line.map_or(\"None\".to_owned(), |l| l.to_string())"
+    "ActionErrorLocation(file={}, line={})",
+    self.file,
+    self.line.map_or("None".to_owned(), |l| l.to_string())
 )]
 pub struct StarlarkActionErrorLocation {
     file: String,
@@ -216,15 +212,15 @@ fn action_error_location_methods(builder: &mut MethodsBuilder) {
     /// The file of the error location. This is only needed for action error handler
     /// unit testing.
     #[starlark(attribute)]
-    fn file<'v>(this: &'v StarlarkActionErrorLocation) -> anyhow::Result<&'v str> {
+    fn file<'v>(this: &'v StarlarkActionErrorLocation) -> starlark::Result<&'v str> {
         Ok(&this.file)
     }
 
     /// The line of the error location. This is only needed for action error handler
     /// unit testing.
     #[starlark(attribute)]
-    fn line<'v>(this: &'v StarlarkActionErrorLocation) -> anyhow::Result<Option<u64>> {
-        Ok(this.line)
+    fn line<'v>(this: &'v StarlarkActionErrorLocation) -> starlark::Result<NoneOr<u64>> {
+        Ok(NoneOr::from_option(this.line))
     }
 }
 
@@ -232,7 +228,6 @@ fn action_error_location_methods(builder: &mut MethodsBuilder) {
     ProvidesStaticType,
     Trace,
     Allocative,
-    StarlarkDocs,
     Debug,
     NoSerialize,
     Clone,
@@ -304,15 +299,18 @@ fn action_sub_error_methods(builder: &mut MethodsBuilder) {
     /// The category name of this sub error. This function is only needed for action
     /// error handler unit testing.
     #[starlark(attribute)]
-    fn category<'v>(this: &'v StarlarkActionSubError) -> anyhow::Result<&'v str> {
+    fn category<'v>(this: &'v StarlarkActionSubError) -> starlark::Result<&'v str> {
         Ok(&this.category)
     }
 
     /// The optional message associated with this sub error.  This function is only
     /// needed for action error handler unit testing.
     #[starlark(attribute)]
-    fn message<'v>(this: &'v StarlarkActionSubError) -> anyhow::Result<Option<&'v str>> {
-        Ok(this.message.as_deref())
+    fn message<'v>(this: &'v StarlarkActionSubError) -> starlark::Result<NoneOr<&'v str>> {
+        Ok(match &this.message {
+            Some(message) => NoneOr::Other(message.as_str()),
+            None => NoneOr::None,
+        })
     }
 
     /// Any locations associated with this sub error.  This function is only needed
@@ -320,11 +318,11 @@ fn action_sub_error_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
     fn locations<'v>(
         this: &'v StarlarkActionSubError,
-    ) -> anyhow::Result<Option<Vec<StarlarkActionErrorLocation>>> {
-        Ok(this
-            .locations
-            .as_ref()
-            .map(|locations| locations.items.cloned()))
+    ) -> starlark::Result<NoneOr<Vec<StarlarkActionErrorLocation>>> {
+        match &this.locations {
+            None => Ok(NoneOr::None),
+            Some(locations) => Ok(NoneOr::Other(locations.items.cloned())),
+        }
     }
 }
 
@@ -367,7 +365,7 @@ pub(crate) fn register_action_error_handler_for_testing(builder: &mut GlobalsBui
     fn new_test_action_error_ctx(
         #[starlark(require=named, default = "")] stderr: &str,
         #[starlark(require=named, default = "")] stdout: &str,
-    ) -> anyhow::Result<StarlarkActionErrorContext> {
+    ) -> starlark::Result<StarlarkActionErrorContext> {
         Ok(StarlarkActionErrorContext {
             stderr: stderr.to_owned(),
             stdout: stdout.to_owned(),

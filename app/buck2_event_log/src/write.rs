@@ -7,122 +7,40 @@
  * of this source tree.
  */
 
-use std::io;
 use std::mem;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
 
-use anyhow::Context as _;
-use async_compression::tokio::write::GzipEncoder;
-use async_compression::tokio::write::ZstdEncoder;
 use buck2_cli_proto::*;
+use buck2_common::argv::SanitizedArgv;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::paths::abs_path::AbsPathBuf;
-use buck2_core::fs::working_dir::WorkingDir;
+use buck2_core::fs::working_dir::AbsWorkingDir;
+use buck2_error::BuckErrorContext;
 use buck2_events::BuckEvent;
-use buck2_util::cleanup_ctx::AsyncCleanupContext;
 use buck2_wrapper_common::invocation_id::TraceId;
 use futures::future::Future;
-use futures::FutureExt;
-use pin_project::pin_project;
 use prost::Message;
 use serde::Serialize;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWrite;
-use tokio::io::AsyncWriteExt;
 
 use crate::file_names::get_logfile_name;
 use crate::file_names::remove_old_logs;
 use crate::read::EventLogPathBuf;
 use crate::should_block_on_log_upload;
 use crate::should_upload_log;
-use crate::utils::Compression;
+use crate::user_event_types::try_get_user_event;
 use crate::utils::Encoding;
 use crate::utils::EventLogErrors;
 use crate::utils::Invocation;
-use crate::utils::LogMode;
-use crate::utils::NoInference;
 use crate::wait_for_child_and_log;
+use crate::writer::EventLogType;
+use crate::writer::NamedEventLogWriter;
+use crate::writer::SerializeForLog;
 use crate::FutureChildOutput;
 
-type EventLogWriter = Box<dyn AsyncWrite + Send + Sync + Unpin + 'static>;
-
-mod counting_reader {
-    use super::*;
-
-    #[pin_project]
-    pub struct CountingReader<T> {
-        #[pin]
-        pub(super) inner: T,
-        pub(super) stats: Option<Arc<AtomicU64>>,
-    }
-}
-
-use buck2_common::argv::SanitizedArgv;
-use counting_reader::CountingReader;
-
-use super::user_event_types::try_get_user_event;
-
-impl<T> CountingReader<T> {
-    fn new(inner: T, stats: Option<Arc<AtomicU64>>) -> Self {
-        Self { inner, stats }
-    }
-}
-
-impl<T> AsyncWrite for CountingReader<T>
-where
-    T: AsyncWrite,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.project();
-        let bytes = futures::ready!(this.inner.poll_write(cx, buf))?;
-        if let Some(stats) = this.stats {
-            stats.fetch_add(bytes as u64, Ordering::Relaxed);
-        }
-
-        Poll::Ready(Ok(bytes))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        self.project().inner.poll_shutdown(cx)
-    }
-}
-
-#[derive(Eq, PartialEq, Copy, Clone)]
-pub(crate) enum EventLogType {
-    System,
-    User,
-}
-
-pub(crate) struct NamedEventLogWriter {
-    path: EventLogPathBuf,
-    file: EventLogWriter,
-    event_log_type: EventLogType,
-    /// If this writing is done by a subprocess, that process's output, assuming we intend to wait
-    /// for it to exit.
-    process_to_wait_for: Option<FutureChildOutput>,
-}
-
-pub(crate) enum LogWriterState {
+enum LogWriterState {
     Unopened {
         logdir: AbsNormPathBuf,
         extra_path: Option<AbsPathBuf>,
@@ -134,50 +52,49 @@ pub(crate) enum LogWriterState {
     Closed,
 }
 
-pub struct WriteEventLog<'a> {
+pub struct WriteEventLog {
     state: LogWriterState,
-    async_cleanup_context: Option<AsyncCleanupContext<'a>>,
     sanitized_argv: SanitizedArgv,
     command_name: String,
-    working_dir: WorkingDir,
+    working_dir: AbsWorkingDir,
     /// Allocation cache. Must be cleaned before use.
     buf: Vec<u8>,
     log_size_counter_bytes: Option<Arc<AtomicU64>>,
-    allow_vpnless: bool,
 }
 
-impl<'a> WriteEventLog<'a> {
+impl WriteEventLog {
     pub fn new(
         logdir: AbsNormPathBuf,
-        working_dir: WorkingDir,
+        working_dir: AbsWorkingDir,
         extra_path: Option<AbsPathBuf>,
         extra_user_event_log_path: Option<AbsPathBuf>,
         sanitized_argv: SanitizedArgv,
-        async_cleanup_context: AsyncCleanupContext<'a>,
         command_name: String,
         log_size_counter_bytes: Option<Arc<AtomicU64>>,
-        allow_vpnless: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         Ok(Self {
             state: LogWriterState::Unopened {
                 logdir,
                 extra_path,
                 extra_user_event_log_path,
             },
-            async_cleanup_context: Some(async_cleanup_context),
             sanitized_argv,
             command_name,
             working_dir,
             buf: Vec::new(),
             log_size_counter_bytes,
-            allow_vpnless,
         })
     }
 
     /// Get the command line arguments and cwd and serialize them for replaying later.
-    async fn log_invocation(&mut self, trace_id: TraceId) -> anyhow::Result<()> {
+    async fn log_invocation(&mut self, trace_id: TraceId) -> buck2_error::Result<()> {
         let command_line_args = self.sanitized_argv.argv.clone();
-        let expanded_command_line_args = self.sanitized_argv.expanded_argv.clone();
+        let expanded_command_line_args = self
+            .sanitized_argv
+            .expanded_argv
+            .args()
+            .map(|v| v.to_owned())
+            .collect();
         let invocation = Invocation {
             command_line_args,
             expanded_command_line_args,
@@ -187,7 +104,7 @@ impl<'a> WriteEventLog<'a> {
         self.write_ln(&[invocation]).await
     }
 
-    async fn write_ln<'b, T, I>(&'b mut self, events: I) -> anyhow::Result<()>
+    async fn write_ln<'b, T, I>(&'b mut self, events: I) -> buck2_error::Result<()>
     where
         T: SerializeForLog + 'b,
         I: IntoIterator<Item = &'b T> + Clone + 'b,
@@ -197,31 +114,7 @@ impl<'a> WriteEventLog<'a> {
                 for writer in writers {
                     self.buf.clear();
 
-                    for event in events.clone() {
-                        match writer.event_log_type {
-                            EventLogType::System => {
-                                match writer.path.encoding.mode {
-                                    LogMode::Json => {
-                                        event.serialize_to_json(&mut self.buf)?;
-                                        self.buf.push(b'\n');
-                                    }
-                                    LogMode::Protobuf => event
-                                        .serialize_to_protobuf_length_delimited(&mut self.buf)?,
-                                };
-                            }
-                            EventLogType::User => {
-                                if event.maybe_serialize_user_event(&mut self.buf)? {
-                                    self.buf.push(b'\n');
-                                }
-                            }
-                        }
-                    }
-
-                    writer
-                        .file
-                        .write_all(&self.buf)
-                        .await
-                        .context("Failed to write event")?;
+                    writer.write_events(&mut self.buf, &events).await?;
 
                     if self.buf.len() > 1_000_000 {
                         // Make sure we don't keep too much memory if encountered one large event.
@@ -239,14 +132,14 @@ impl<'a> WriteEventLog<'a> {
                 }
                 Err(EventLogErrors::LogNotOpen {
                     serialized_event: String::from_utf8(mem::take(&mut self.buf))
-                        .context("Failed to serialize event for debug")?,
+                        .buck_error_context("Failed to serialize event for debug")?,
                 }
                 .into())
             }
         }
     }
 
-    async fn ensure_log_writers_opened(&mut self, event: &BuckEvent) -> anyhow::Result<()> {
+    async fn ensure_log_writers_opened(&mut self, event: &BuckEvent) -> buck2_error::Result<()> {
         let (logdir, maybe_extra_path, maybe_extra_user_event_log_path) = match &self.state {
             LogWriterState::Unopened {
                 logdir,
@@ -255,28 +148,29 @@ impl<'a> WriteEventLog<'a> {
             } => (logdir, extra_path, extra_user_event_log_path),
             LogWriterState::Opened { .. } => return Ok(()),
             LogWriterState::Closed => {
-                return Err(anyhow::anyhow!("Received events after logs were closed"));
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Received events after logs were closed"
+                ));
             }
         };
         tokio::fs::create_dir_all(logdir)
             .await
-            .with_context(|| format!("Error creating event log directory: `{}`", logdir))?;
+            .with_buck_error_context(|| {
+                format!("Error creating event log directory: `{}`", logdir)
+            })?;
         remove_old_logs(logdir).await;
 
-        // The event-log is going to be written to file containing the build uuid.
-        // But we don't know the build uuid until we've gotten the CommandStart event.
-        // So we'll just create it when we know where to put it.
         let encoding = Encoding::PROTO_ZSTD;
         let file_name = &get_logfile_name(event, encoding, &self.command_name)?;
         let path = EventLogPathBuf {
             path: logdir.as_abs_path().join(file_name),
             encoding,
         };
-        let writer = start_persist_subprocess(
+        let writer = start_persist_event_log_subprocess(
             path,
             event.trace_id()?.clone(),
             self.log_size_counter_bytes.clone(),
-            self.allow_vpnless,
         )
         .await?;
         let mut writers = vec![writer];
@@ -285,12 +179,10 @@ impl<'a> WriteEventLog<'a> {
         if let Some(extra_path) = maybe_extra_path {
             writers.push(
                 open_event_log_for_writing(
-                    EventLogPathBuf::infer_opt(extra_path.clone())?.unwrap_or_else(
-                        |NoInference(path)| EventLogPathBuf {
-                            path,
-                            encoding: Encoding::JSON_GZIP,
-                        },
-                    ),
+                    EventLogPathBuf::infer_opt(&extra_path)?.unwrap_or_else(|| EventLogPathBuf {
+                        path: extra_path.clone(),
+                        encoding: Encoding::JSON_GZIP,
+                    }),
                     self.log_size_counter_bytes.clone(),
                     EventLogType::System,
                 )
@@ -302,12 +194,12 @@ impl<'a> WriteEventLog<'a> {
         if let Some(extra_user_event_log_path) = maybe_extra_user_event_log_path {
             writers.push(
                 open_event_log_for_writing(
-                    EventLogPathBuf::infer_opt(extra_user_event_log_path.clone())?.unwrap_or_else(
-                        |NoInference(path)| EventLogPathBuf {
-                            path,
+                    EventLogPathBuf::infer_opt(&extra_user_event_log_path)?.unwrap_or_else(|| {
+                        EventLogPathBuf {
+                            path: extra_user_event_log_path.clone(),
                             encoding: Encoding::JSON,
-                        },
-                    ),
+                        }
+                    }),
                     self.log_size_counter_bytes.clone(),
                     EventLogType::User,
                 )
@@ -334,13 +226,7 @@ impl<'a> WriteEventLog<'a> {
             };
 
             for writer in writers.iter_mut() {
-                if let Err(e) = writer.file.shutdown().await {
-                    tracing::warn!(
-                        "Failed to flush log file at `{}`: {:#}",
-                        writer.path.path,
-                        e
-                    );
-                }
+                writer.shutdown().await
             }
 
             // NOTE: We call `into_iter()` here and that implicitly drops the `writer.file`, which
@@ -348,7 +234,7 @@ impl<'a> WriteEventLog<'a> {
             // an odd behavior in Tokio that `shutdown` doesn't do that).
             let futs = writers
                 .into_iter()
-                .filter_map(|mut w| w.process_to_wait_for.take())
+                .filter_map(|w| w.child())
                 .map(|proc| wait_for_child_and_log(proc, "Event Log"));
 
             futures::future::join_all(futs).await;
@@ -356,25 +242,12 @@ impl<'a> WriteEventLog<'a> {
     }
 }
 
-impl<'a> Drop for WriteEventLog<'a> {
-    fn drop(&mut self) {
-        let exit = self.exit();
-        match self.async_cleanup_context.as_ref() {
-            Some(async_cleanup_context) => {
-                async_cleanup_context.register("event log upload", exit.boxed());
-            }
-            None => (),
-        }
-    }
-}
-
-async fn start_persist_subprocess(
+async fn start_persist_event_log_subprocess(
     path: EventLogPathBuf,
     trace_id: TraceId,
     bytes_written: Option<Arc<AtomicU64>>,
-    allow_vpnless: bool,
-) -> anyhow::Result<NamedEventLogWriter> {
-    let current_exe = std::env::current_exe().context("No current_exe")?;
+) -> buck2_error::Result<NamedEventLogWriter> {
+    let current_exe = std::env::current_exe().buck_error_context("No current_exe")?;
     let mut command = buck2_util::process::async_background_command(current_exe);
     // @oss-disable: #[cfg(unix)]
     #[cfg(all(tokio_unstable, unix))] // @oss-enable
@@ -383,16 +256,15 @@ async fn start_persist_subprocess(
         command.process_group(0);
     }
     let manifold_name = &format!("{}{}", trace_id, path.extension());
+    // TODO T184566736: detach subprocess
     command
         .args(["debug", "persist-event-logs"])
         .args(["--manifold-name", manifold_name])
-        .args(["--local-path".as_ref(), path.path.as_os_str()]);
+        .args(["--local-path".as_ref(), path.path.as_os_str()])
+        .args(["--trace-id", &trace_id.to_string()]);
     if !should_upload_log()? {
         command.arg("--no-upload");
     };
-    if allow_vpnless {
-        command.arg("--allow-vpnless");
-    }
     command.stdout(Stdio::null()).stdin(Stdio::piped());
 
     let block = should_block_on_log_upload()?;
@@ -402,70 +274,58 @@ async fn start_persist_subprocess(
         command.stderr(Stdio::null());
     }
 
-    let mut child = command.spawn().with_context(|| {
+    let mut child = command.spawn().with_buck_error_context(|| {
         format!(
             "Failed to open event log subprocess for writing at `{}`",
             path.path.display()
         )
     })?;
     let pipe = child.stdin.take().expect("stdin was piped");
-    let mut writer = get_writer(path, pipe, bytes_written, EventLogType::System)?;
 
     // Only spawn this if we are going to wait.
-    if block {
-        writer.process_to_wait_for = Some(FutureChildOutput::new(child));
-    }
+    let process_to_wait_for = if block {
+        Some(FutureChildOutput::new(child))
+    } else {
+        None
+    };
 
-    Ok(writer)
+    Ok(NamedEventLogWriter::new(
+        path,
+        pipe,
+        bytes_written,
+        EventLogType::System,
+        process_to_wait_for,
+    ))
 }
 
 async fn open_event_log_for_writing(
     path: EventLogPathBuf,
     bytes_written: Option<Arc<AtomicU64>>,
     event_log_type: EventLogType,
-) -> anyhow::Result<NamedEventLogWriter> {
+) -> buck2_error::Result<NamedEventLogWriter> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path.path)
         .await
-        .with_context(|| {
+        .with_buck_error_context(|| {
             format!(
                 "Failed to open event log for writing at `{}`",
                 path.path.display()
             )
         })?;
 
-    get_writer(path, file, bytes_written, event_log_type)
-}
-
-fn get_writer(
-    path: EventLogPathBuf,
-    file: impl AsyncWrite + std::marker::Send + std::marker::Unpin + std::marker::Sync + 'static,
-    bytes_written: Option<Arc<AtomicU64>>,
-    event_log_type: EventLogType,
-) -> Result<NamedEventLogWriter, anyhow::Error> {
-    let file = match path.encoding.compression {
-        Compression::None => Box::new(CountingReader::new(file, bytes_written)) as EventLogWriter,
-        Compression::Gzip => Box::new(GzipEncoder::with_quality(
-            CountingReader::new(file, bytes_written),
-            async_compression::Level::Fastest,
-        )) as EventLogWriter,
-        Compression::Zstd => Box::new(ZstdEncoder::with_quality(
-            CountingReader::new(file, bytes_written),
-            async_compression::Level::Default,
-        )) as EventLogWriter,
-    };
-    Ok(NamedEventLogWriter {
+    Ok(NamedEventLogWriter::new(
         path,
         file,
+        bytes_written,
         event_log_type,
-        process_to_wait_for: None,
-    })
+        None,
+    ))
 }
 
-impl<'a> WriteEventLog<'a> {
-    pub async fn write_events(&mut self, events: &[Arc<BuckEvent>]) -> anyhow::Result<()> {
+impl WriteEventLog {
+    pub async fn write_events(&mut self, events: &[Arc<BuckEvent>]) -> buck2_error::Result<()> {
         let mut event_refs = Vec::new();
         let mut first = true;
         for event in events {
@@ -487,7 +347,7 @@ impl<'a> WriteEventLog<'a> {
     pub async fn write_result(
         &mut self,
         result: &buck2_cli_proto::CommandResult,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         match &self.state {
             LogWriterState::Opened { .. } | LogWriterState::Closed => {}
             LogWriterState::Unopened { .. } => {
@@ -505,34 +365,26 @@ impl<'a> WriteEventLog<'a> {
         self.write_ln(&[event]).await
     }
 
-    pub async fn flush_files(&mut self) -> anyhow::Result<()> {
+    pub async fn flush_files(&mut self) -> buck2_error::Result<()> {
         let writers = match &mut self.state {
             LogWriterState::Opened { writers } => writers,
             LogWriterState::Unopened { .. } | LogWriterState::Closed => return Ok(()),
         };
 
         for writer in writers {
-            writer.file.flush().await.with_context(|| {
-                format!("Error flushing log file at {}", writer.path.path.display())
-            })?;
+            writer.flush().await?;
         }
 
         Ok(())
     }
 }
 
-pub(crate) trait SerializeForLog {
-    fn serialize_to_json(&self, buf: &mut Vec<u8>) -> anyhow::Result<()>;
-    fn serialize_to_protobuf_length_delimited(&self, buf: &mut Vec<u8>) -> anyhow::Result<()>;
-    fn maybe_serialize_user_event(&self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
-}
-
 impl SerializeForLog for Invocation {
-    fn serialize_to_json(&self, buf: &mut Vec<u8>) -> anyhow::Result<()> {
-        serde_json::to_writer(buf, &self).context("Failed to serialize event")
+    fn serialize_to_json(&self, buf: &mut Vec<u8>) -> buck2_error::Result<()> {
+        serde_json::to_writer(buf, &self).buck_error_context("Failed to serialize event")
     }
 
-    fn serialize_to_protobuf_length_delimited(&self, buf: &mut Vec<u8>) -> anyhow::Result<()> {
+    fn serialize_to_protobuf_length_delimited(&self, buf: &mut Vec<u8>) -> buck2_error::Result<()> {
         let invocation = buck2_data::Invocation {
             command_line_args: self.command_line_args.clone(),
             expanded_command_line_args: self.expanded_command_line_args.clone(),
@@ -544,8 +396,8 @@ impl SerializeForLog for Invocation {
     }
 
     // Always log invocation record to user event log for `buck2 log show` compatibility
-    fn maybe_serialize_user_event(&self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
-        serde_json::to_writer(buf, &self).context("Failed to serialize event")?;
+    fn maybe_serialize_user_event(&self, buf: &mut Vec<u8>) -> buck2_error::Result<bool> {
+        serde_json::to_writer(buf, &self).buck_error_context("Failed to serialize event")?;
         Ok(true)
     }
 }
@@ -557,11 +409,11 @@ pub enum StreamValueForWrite<'a> {
 }
 
 impl<'a> SerializeForLog for StreamValueForWrite<'a> {
-    fn serialize_to_json(&self, buf: &mut Vec<u8>) -> anyhow::Result<()> {
-        serde_json::to_writer(buf, &self).context("Failed to serialize event")
+    fn serialize_to_json(&self, buf: &mut Vec<u8>) -> buck2_error::Result<()> {
+        serde_json::to_writer(buf, &self).buck_error_context("Failed to serialize event")
     }
 
-    fn serialize_to_protobuf_length_delimited(&self, buf: &mut Vec<u8>) -> anyhow::Result<()> {
+    fn serialize_to_protobuf_length_delimited(&self, buf: &mut Vec<u8>) -> buck2_error::Result<()> {
         // We use `CommandProgressForWrite` here to avoid cloning `BuckEvent`.
         // `CommandProgressForWrite` serialization is bitwise identical to `CommandProgress`.
         // See the protobuf spec
@@ -578,10 +430,11 @@ impl<'a> SerializeForLog for StreamValueForWrite<'a> {
         Ok(())
     }
 
-    fn maybe_serialize_user_event(&self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+    fn maybe_serialize_user_event(&self, buf: &mut Vec<u8>) -> buck2_error::Result<bool> {
         if let StreamValueForWrite::Event(event) = self {
             if let Some(user_event) = try_get_user_event(event)? {
-                serde_json::to_writer(buf, &user_event).context("Failed to serialize event")?;
+                serde_json::to_writer(buf, &user_event)
+                    .buck_error_context("Failed to serialize event")?;
                 return Ok(true);
             }
         }
@@ -594,36 +447,35 @@ impl<'a> SerializeForLog for StreamValueForWrite<'a> {
 mod tests {
     use std::time::SystemTime;
 
-    use buck2_core::fs::paths::abs_path::AbsPathBuf;
+    use buck2_common::argv::Argv;
+    use buck2_common::argv::ExpandedArgv;
     use buck2_data::LoadBuildFileStart;
     use buck2_data::SpanStartEvent;
     use buck2_events::span::SpanId;
-    use buck2_events::BuckEvent;
-    use buck2_wrapper_common::invocation_id::TraceId;
     use futures::TryStreamExt;
     use tempfile::TempDir;
 
     use super::*;
     use crate::stream_value::StreamValue;
+    use crate::utils::Compression;
 
-    impl WriteEventLog<'static> {
-        async fn new_test(log: EventLogPathBuf) -> anyhow::Result<Self> {
+    impl WriteEventLog {
+        async fn new_test(log: EventLogPathBuf) -> buck2_error::Result<Self> {
             Ok(Self {
                 state: LogWriterState::Opened {
                     writers: vec![
                         open_event_log_for_writing(log, None, EventLogType::System).await?,
                     ],
                 },
-                sanitized_argv: SanitizedArgv {
+                sanitized_argv: Argv {
                     argv: vec!["buck2".to_owned()],
-                    expanded_argv: vec!["buck2".to_owned()],
-                },
-                async_cleanup_context: None,
+                    expanded_argv: ExpandedArgv::from_literals(vec!["buck2".to_owned()]),
+                }
+                .no_need_to_sanitize(),
                 command_name: "testtest".to_owned(),
-                working_dir: WorkingDir::current_dir()?,
+                working_dir: AbsWorkingDir::current_dir()?,
                 buf: Vec::new(),
                 log_size_counter_bytes: None,
-                allow_vpnless: false,
             })
         }
     }
@@ -646,16 +498,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_protobuf_decoding_gzip() -> anyhow::Result<()> {
+    async fn test_protobuf_decoding_gzip() -> buck2_error::Result<()> {
         test_protobuf_decoding(Encoding::PROTO_GZIP).await
     }
 
     #[tokio::test]
-    async fn test_protobuf_decoding_zstd() -> anyhow::Result<()> {
+    async fn test_protobuf_decoding_zstd() -> buck2_error::Result<()> {
         test_protobuf_decoding(Encoding::PROTO_ZSTD).await
     }
 
-    async fn test_protobuf_decoding(encoding: Encoding) -> anyhow::Result<()> {
+    async fn test_protobuf_decoding(encoding: Encoding) -> buck2_error::Result<()> {
         //Create log dir
         let tmp_dir = TempDir::new()?;
 
@@ -703,11 +555,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tick_makes_valid_log_zstd() -> anyhow::Result<()> {
+    async fn test_tick_makes_valid_log_zstd() -> buck2_error::Result<()> {
         test_tick_makes_valid_log(Encoding::PROTO_ZSTD).await
     }
 
-    async fn test_tick_makes_valid_log(encoding: Encoding) -> anyhow::Result<()> {
+    async fn test_tick_makes_valid_log(encoding: Encoding) -> buck2_error::Result<()> {
         if cfg!(windows) {
             // Do not want to deal with exclusivity issues on Windows.
             return Ok(());

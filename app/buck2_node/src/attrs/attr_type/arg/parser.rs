@@ -49,11 +49,12 @@
 //! unquoted arg has seen more `(` than `)`, it will not be terminated by whitespace or `)`.
 //!
 //! We diverge from buckv1 in a handful of known ways.
-//! 1. buck1 allows pretty much any characters to appear in a macro type. We restrict it to alphanumeric and `_`.
-//! 2. buck1 disallows spaces entirely within unquoted args. This can be surprising. Unquoted args are generally used for
-//! the query part of query macros, and in other contexts where buck accepts queries it allows whitespace.
-//! Example, the string "$(query_outputs deps(//some:target, 3))" would be rejected by buck1 due to the space before the 3.
 //!
+//! 1. buck1 allows pretty much any characters to appear in a macro type. We restrict it to alphanumeric and `_`.
+//!
+//! 2. buck1 disallows spaces entirely within unquoted args. This can be surprising. Unquoted args are generally used for
+//!    the query part of query macros, and in other contexts where buck accepts queries it allows whitespace.
+//!    Example, the string "$(query_outputs deps(//some:target, 3))" would be rejected by buck1 due to the space before the 3.
 //!
 //! Some examples:
 //!
@@ -97,9 +98,9 @@ impl ParsedArg {
 }
 
 /// Parsed a string into a structure with macros and their types and args identified.
-pub fn parse_macros(input: &str) -> anyhow::Result<ParsedArg> {
+pub fn parse_macros(input: &str) -> buck2_error::Result<ParsedArg> {
     match read(input) {
-        Ok((remaining, value)) => {
+        Ok((value, remaining)) => {
             assert!(
                 remaining.is_empty(),
                 "somehow had remaining stuff after a successful macro parse. Had `{}` remaining.",
@@ -120,7 +121,8 @@ pub fn parse_macros(input: &str) -> anyhow::Result<ParsedArg> {
             // We'll print a line of `^` to indicate where the processing failed.
             let pointer = error_start - message_start;
 
-            Err(anyhow::anyhow!(
+            Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
                 "E:{}\n    V:{}\n    M:{}{}\n",
                 err,
                 &input[message_start..message_end],
@@ -132,7 +134,7 @@ pub fn parse_macros(input: &str) -> anyhow::Result<ParsedArg> {
 }
 
 #[derive(Debug, buck2_error::Error)]
-#[buck2(user)]
+#[buck2(input)]
 enum ArgParseError {
     #[error("Unfinished quoted arg, expected a `{0}`")]
     UnfinishedQuotedArg(char),
@@ -153,7 +155,7 @@ enum ArgParseError {
 type Error<'a> = (&'a str, ArgParseError);
 
 /// A Result includes both some parsed type and a slice of what remains to be parsed.
-type Result<'a, T> = result::Result<(&'a str, T), Error<'a>>;
+type Result<'a, T> = result::Result<(T, &'a str), Error<'a>>;
 
 // We diverge slightly from buckv1 here.
 //
@@ -227,9 +229,9 @@ fn read_unquoted_arg(input: &str) -> Result<String> {
             let (arg, rest) = (&input[0..pos], &input[pos..]);
             // The common case, by far, is that nothing is escaped.
             if !has_escapes {
-                Ok((rest, arg.to_owned()))
+                Ok((arg.to_owned(), rest))
             } else {
-                Ok((rest, unescape(arg)))
+                Ok((unescape(arg), rest))
             }
         }
     }
@@ -260,9 +262,9 @@ fn read_quoted_arg(input: &str, quote: char) -> Result<String> {
             let (arg, rest) = (&input[0..pos], &input[(pos + 1)..]);
             // The common case, by far, is that nothing is escaped.
             if !has_escapes {
-                Ok((rest, arg.to_owned()))
+                Ok((arg.to_owned(), rest))
             } else {
-                Ok((rest, unescape(arg)))
+                Ok((unescape(arg), rest))
             }
         }
     }
@@ -290,7 +292,7 @@ fn read_macro_type(input: &str) -> Result<String> {
             {
                 Err((&input[pos..], ArgParseError::MacroTypeInvalidChar))
             } else {
-                Ok((&input[pos..], macro_type.to_owned()))
+                Ok((macro_type.to_owned(), &input[pos..]))
             }
         }
     }
@@ -309,23 +311,23 @@ fn read_macro(input: &str) -> Result<ParsedMacro> {
         Some(working) => (true, working),
         None => (false, working),
     };
-    let (working, macro_type) = read_macro_type(working)?;
+    let (macro_type, working) = read_macro_type(working)?;
     let mut working = consume_whitespace(working);
 
     let mut args = Vec::new();
     while let Some(c) = working.chars().next() {
         if c == ')' {
             return Ok((
-                &working[1..],
                 ParsedMacro {
                     write_to_file,
                     macro_type,
                     args,
                 },
+                &working[1..],
             ));
         }
 
-        let (remaining, arg) = read_macro_arg(working)?;
+        let (arg, remaining) = read_macro_arg(working)?;
         working = consume_whitespace(remaining);
         args.push(arg);
     }
@@ -338,7 +340,17 @@ fn read_literal_opt(input: &str) -> Result<Option<Box<str>>> {
     // even number of preceding `\` (as the first of each pair escapes the second). If there's
     // an odd number of preceding `\`, one of them should be removed.
 
-    let mut char_indices = input.char_indices();
+    // Fast check that there are no macro refs in the string, which is the common case.
+    // We can do better than `memchr` (given our strings are short), but not much.
+    match memchr::memchr2(b'$', b'\\', input.as_bytes()) {
+        None => Ok((Some(input.into()), "")),
+        Some(pos) => read_literal_opt_slow(input, pos),
+    }
+}
+
+fn read_literal_opt_slow(input: &str, pos: usize) -> Result<Option<Box<str>>> {
+    let mut char_indices = input.bytes().enumerate().skip(pos);
+
     let mut indices_to_drop = Vec::new();
     enum State {
         Searching,
@@ -356,28 +368,28 @@ fn read_literal_opt(input: &str) -> Result<Option<Box<str>>> {
     let mut pos = char_indices.next();
     while let Some((idx, c)) = pos {
         state = match (state, c) {
-            (Searching, '\\') => Escaped,
-            (Dollar, '\\') => Escaped,
-            (EscapedDollar, '\\') => Escaped,
+            (Searching, b'\\') => Escaped,
+            (Dollar, b'\\') => Escaped,
+            (EscapedDollar, b'\\') => Escaped,
 
-            (Escaped, '$') => EscapedDollar,
+            (Escaped, b'$') => EscapedDollar,
             (Escaped, _) => Searching,
 
-            (Searching, '$') => Dollar,
+            (Searching, b'$') => Dollar,
             (Searching, _) => Searching,
 
-            (Dollar, '(') => {
+            (Dollar, b'(') => {
                 // found a macro
                 break;
             }
-            (EscapedDollar, '(') => {
+            (EscapedDollar, b'(') => {
                 // Indicates we hit the sequence `\$(` and we need to drop the `\`
                 indices_to_drop.push(idx - 2);
                 EscapedMacro(1)
             }
-            (EscapedMacro(1), ')') => Searching,
-            (EscapedMacro(n), ')') => EscapedMacro(n - 1),
-            (EscapedMacro(n), '(') => EscapedMacro(n + 1),
+            (EscapedMacro(1), b')') => Searching,
+            (EscapedMacro(n), b')') => EscapedMacro(n - 1),
+            (EscapedMacro(n), b'(') => EscapedMacro(n + 1),
             (EscapedMacro(n), _) => EscapedMacro(n),
             // Note that '(' and '\' is handled for both of thes above.
             (Dollar, _) => Searching,
@@ -401,20 +413,20 @@ fn read_literal_opt(input: &str) -> Result<Option<Box<str>>> {
             literal.push_str(&input[(indices_to_drop.last().unwrap() + 1)..literal_end]);
             literal
         };
-        Ok((&input[literal_end..], Some(literal.into_boxed_str())))
+        Ok((Some(literal.into_boxed_str()), &input[literal_end..]))
     } else {
-        Ok((input, None))
+        Ok((None, input))
     }
 }
 
 fn read(input: &str) -> Result<ParsedArg> {
-    let (remaining, literal) = read_literal_opt(input)?;
+    let (literal, remaining) = read_literal_opt(input)?;
     let mut working = remaining;
 
     if working.is_empty() {
         return Ok((
-            "",
             ParsedArg(vec![ArgItem::String(literal.unwrap_or_else(|| "".into()))]),
+            "",
         ));
     }
 
@@ -424,7 +436,7 @@ fn read(input: &str) -> Result<ParsedArg> {
     }
 
     while !working.is_empty() {
-        let (remaining, literal) = read_literal_opt(working)?;
+        let (literal, remaining) = read_literal_opt(working)?;
         working = remaining;
         if let Some(literal) = literal {
             complex.push(ArgItem::String(literal));
@@ -432,13 +444,13 @@ fn read(input: &str) -> Result<ParsedArg> {
 
         if !working.is_empty() {
             // we must be at the beginning of a macro.
-            let (remaining, parsed_macro) = read_macro(working)?;
+            let (parsed_macro, remaining) = read_macro(working)?;
             working = remaining;
             complex.push(ArgItem::Macro(parsed_macro));
         }
     }
 
-    Ok(("", ParsedArg(complex)))
+    Ok((ParsedArg(complex), ""))
 }
 
 #[cfg(test)]
@@ -463,15 +475,15 @@ mod tests {
 
     #[test]
     fn test_unquoted() -> result::Result<(), OwnedError> {
-        assert_eq!(read_macro_arg("abcd ")?, (" ", "abcd".to_owned()));
-        assert_eq!(read_macro_arg("abcd)")?, (")", "abcd".to_owned()));
+        assert_eq!(read_macro_arg("abcd ")?, ("abcd".to_owned(), " "));
+        assert_eq!(read_macro_arg("abcd)")?, ("abcd".to_owned(), ")"));
         assert_eq!(
             read_macro_arg("deps(//some:target))")?,
-            (")", "deps(//some:target)".to_owned())
+            ("deps(//some:target)".to_owned(), ")")
         );
         assert_eq!(
             read_macro_arg("deps(//some:target, 3, first_order_deps()) ")?,
-            (" ", "deps(//some:target, 3, first_order_deps())".to_owned())
+            ("deps(//some:target, 3, first_order_deps())".to_owned(), " ")
         );
 
         Ok(())
@@ -479,11 +491,11 @@ mod tests {
 
     #[test]
     fn test_quoted() -> result::Result<(), OwnedError> {
-        assert_eq!(read_macro_arg("' abcd )'")?, ("", " abcd )".to_owned()));
-        assert_eq!(read_macro_arg("' ab%cd )'")?, ("", " ab%cd )".to_owned()));
+        assert_eq!(read_macro_arg("' abcd )'")?, (" abcd )".to_owned(), ""));
+        assert_eq!(read_macro_arg("' ab%cd )'")?, (" ab%cd )".to_owned(), ""));
         assert_eq!(
             read_macro_arg(r#"" \"\$\\ ")"#)?,
-            (")", r#" "$\ "#.to_owned())
+            (r#" "$\ "#.to_owned(), ")")
         );
 
         Ok(())
@@ -491,11 +503,11 @@ mod tests {
 
     #[test]
     fn test_macro_type() -> result::Result<(), OwnedError> {
-        assert_eq!(read_macro_type("name ")?, (" ", "name".to_owned()));
-        assert_eq!(read_macro_type("name)")?, (")", "name".to_owned()));
+        assert_eq!(read_macro_type("name ")?, ("name".to_owned(), " "));
+        assert_eq!(read_macro_type("name)")?, ("name".to_owned(), ")"));
         assert_eq!(
             read_macro_type("platform-name ")?,
-            (" ", "platform-name".to_owned())
+            ("platform-name".to_owned(), " ")
         );
         assert!(read_macro_type("platform%name ").is_err());
         assert!(read_macro_type("platform$name ").is_err());
@@ -503,7 +515,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_macros() -> anyhow::Result<()> {
+    fn test_parse_macros() -> buck2_error::Result<()> {
+        assert_eq!(
+            ParsedArg(vec![ArgItem::String("contains no macros".into())]),
+            parse_macros(r#"contains no macros"#)?
+        );
+
         assert_eq!(
             ParsedArg(vec![ArgItem::String("contains no $(macros)".into())]),
             parse_macros(r#"contains no \$(macros)"#)?

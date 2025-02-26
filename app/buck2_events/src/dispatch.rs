@@ -23,6 +23,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use buck2_core::event::EventDispatch;
 use buck2_data::buck_event;
 use buck2_data::span_end_event;
 use buck2_data::span_start_event;
@@ -161,6 +162,14 @@ impl EventDispatcher {
     /// Returns the traceid for this event dispatcher.
     pub fn trace_id(&self) -> &TraceId {
         &self.trace_id
+    }
+}
+
+pub struct EventDispatcherLateBinding;
+
+impl EventDispatch for EventDispatcherLateBinding {
+    fn emit_instant_event_for_data(&self, data: buck2_data::instant_event::Data) {
+        get_dispatcher().instant_event(data);
     }
 }
 
@@ -351,7 +360,7 @@ impl Drop for Span {
 }
 
 thread_local! {
-    static CURRENT_SPAN: Cell<Option<SpanId>> = Cell::new(None);
+    static CURRENT_SPAN: Cell<Option<SpanId>> = const { Cell::new(None) };
 }
 
 use allocative::Allocative;
@@ -398,7 +407,7 @@ pub fn get_dispatcher() -> EventDispatcher {
                 panic!("dispatcher is not set")
             } else {
                 // TODO: This is firing millions of times, needs to fix this up before it's made a soft error.
-                // let _ignored = soft_error!(anyhow::anyhow!("Task local event dispatcher not set."));
+                // let _ignored = soft_error!(buck2_error::buck2_error!([], "Task local event dispatcher not set."));
                 EventDispatcher::null()
             }
         }
@@ -418,6 +427,17 @@ where
     F: FnOnce() -> (R, End),
 {
     get_dispatcher().span(start, func)
+}
+
+/// Simpler version of `span` where the end event
+/// can be constructed without requiring the result of the function.
+pub fn span_simple<Start, End, F, R>(start: Start, func: F, end: End) -> R
+where
+    Start: Into<span_start_event::Data>,
+    End: Into<span_end_event::Data>,
+    F: FnOnce() -> R,
+{
+    span(start, || (func(), end))
 }
 
 /// Emits an InstantEvent annotated with the current trace ID
@@ -447,6 +467,21 @@ where
     Fut: Future<Output = (R, End)>,
 {
     get_dispatcher().span_async(start, fut)
+}
+
+/// Simpler version of `span_async` where the end event
+/// can be constructed without requiring the result of the future.
+pub fn span_async_simple<Start, End, Fut, R>(
+    start: Start,
+    fut: Fut,
+    end: End,
+) -> impl Future<Output = R>
+where
+    Start: Into<span_start_event::Data>,
+    End: Into<span_end_event::Data>,
+    Fut: Future<Output = R>,
+{
+    span_async(start, async { (fut.await, end) })
 }
 
 /// To use when wrapping via span() and span_async is not convenient. This produces a Span guard
@@ -515,7 +550,7 @@ where
     for<'a> F: FnOnce(&'a mut Option<RootSpansRecorder>) -> O,
 {
     thread_local! {
-        static ROOT_SPAN_RECORDER: UnsafeCell<Option<RootSpansRecorder>> = UnsafeCell::new(None);
+        static ROOT_SPAN_RECORDER: UnsafeCell<Option<RootSpansRecorder>> = const { UnsafeCell::new(None) };
     }
 
     // SAFETY: Nobody can possibly hold a reference to the contents of this cell, since the thread
@@ -567,7 +602,6 @@ pub fn async_record_root_spans<Fut>(fut: Fut) -> RootSpansRecordingFuture<Fut> {
 mod tests {
     use buck2_data::CommandEnd;
     use buck2_data::CommandStart;
-    use buck2_data::SpanStartEvent;
     use tokio::task::JoinHandle;
 
     use super::*;

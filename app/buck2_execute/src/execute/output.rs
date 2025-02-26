@@ -10,14 +10,16 @@
 use std::fmt;
 use std::fmt::Debug;
 
-use anyhow::Context;
 use buck2_common::file_ops::FileDigest;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+use buck2_error::BuckErrorContext;
 use futures::future;
+use remote_execution::InlinedBlobWithDigest;
 use remote_execution::TDigest;
 
 use crate::digest::CasDigestConversionResultExt;
 use crate::digest::CasDigestFromReExt;
+use crate::digest::CasDigestToReExt;
 use crate::digest_config::DigestConfig;
 use crate::re::manager::ManagedRemoteExecutionClient;
 use crate::re::streams::RemoteCommandStdStreams;
@@ -63,6 +65,17 @@ impl ReStdStream {
         }
     }
 
+    fn download_blob_help(digest: &TDigest, digest_config: DigestConfig) -> String {
+        if buck2_core::is_open_source() {
+            String::new()
+        } else {
+            format!(
+                " - to view type `frecli cas download-blob {}`",
+                FileDigest::from_re(digest, digest_config).as_display()
+            )
+        }
+    }
+
     pub(crate) async fn to_lossy(
         &self,
         client: &ManagedRemoteExecutionClient,
@@ -81,8 +94,8 @@ impl ReStdStream {
                     Err(e) => {
                         tracing::warn!("Failed to download action stderr: {:#}", e);
                         format!(
-                            "Result could not be downloaded - to view type `frecli cas download-blob {}`",
-                            FileDigest::from_re(digest, digest_config).as_display(),
+                            "Result could not be downloaded{}",
+                            Self::download_blob_help(digest, digest_config),
                         )
                     }
                 }
@@ -90,8 +103,8 @@ impl ReStdStream {
             Self::PrefetchedLossy { data, .. } => data.clone(),
             Self::Digest(digest) => {
                 format!(
-                    "Result too large to display - to view type `frecli cas download-blob {}`",
-                    FileDigest::from_re(digest, digest_config).as_display(),
+                    "Result too large to display{}",
+                    Self::download_blob_help(digest, digest_config),
                 )
             }
             Self::None => String::new(),
@@ -103,14 +116,14 @@ impl ReStdStream {
         client: &ManagedRemoteExecutionClient,
         use_case: RemoteExecutorUseCase,
         digest_config: DigestConfig,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> buck2_error::Result<Vec<u8>> {
         match self {
             Self::Raw(raw) => Ok(raw),
             Self::Digest(digest) | Self::PrefetchedLossy { digest, .. } => {
                 let bytes = client
                     .download_blob(&digest, use_case)
                     .await
-                    .with_context(|| {
+                    .with_buck_error_context(|| {
                         format!(
                             "Error downloading from {}",
                             FileDigest::from_re(&digest, digest_config).as_display()
@@ -209,7 +222,7 @@ impl CommandStdStreams {
 
     /// Access the raw data. This is suitable for machine consumption. This will fail if we can't
     /// fetch it.
-    pub async fn into_bytes(self) -> anyhow::Result<StdStreamPair<Vec<u8>>> {
+    pub async fn into_bytes(self) -> buck2_error::Result<StdStreamPair<Vec<u8>>> {
         match self {
             Self::Local { stdout, stderr } => Ok(StdStreamPair { stdout, stderr }),
             Self::Remote(remote) => {
@@ -227,12 +240,13 @@ impl CommandStdStreams {
         self,
         client: &ManagedRemoteExecutionClient,
         use_case: RemoteExecutorUseCase,
-    ) -> anyhow::Result<StdStreamPair<ReStdStream>> {
+        digest_config: DigestConfig,
+    ) -> buck2_error::Result<StdStreamPair<ReStdStream>> {
         match self {
             Self::Local { stdout, stderr } => {
                 let (stdout, stderr) = future::try_join(
-                    maybe_upload_to_re(client, use_case, stdout),
-                    maybe_upload_to_re(client, use_case, stderr),
+                    maybe_upload_to_re(client, use_case, stdout, digest_config),
+                    maybe_upload_to_re(client, use_case, stderr, digest_config),
                 )
                 .await?;
 
@@ -243,7 +257,8 @@ impl CommandStdStreams {
                 // same re use case as what we passed in. Lots of things make this assumption, but
                 // for the sake of being safe, check it.
                 if remote.use_case() != use_case {
-                    return Err(anyhow::anyhow!(
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
                         "Copying log outputs across RE use cases (from `{}` to `{}`) is not supported",
                         remote.use_case(),
                         use_case
@@ -265,11 +280,17 @@ async fn maybe_upload_to_re(
     client: &ManagedRemoteExecutionClient,
     use_case: RemoteExecutorUseCase,
     bytes: Vec<u8>,
-) -> anyhow::Result<ReStdStream> {
+    digest_config: DigestConfig,
+) -> buck2_error::Result<ReStdStream> {
     const MIN_STREAM_UPLOAD_SIZE: usize = 50 * 1024; // Same as RE
     if bytes.len() < MIN_STREAM_UPLOAD_SIZE {
         return Ok(ReStdStream::Raw(bytes));
     }
-    let digest = client.upload_blob(bytes, use_case).await?;
+    let inline_blob = InlinedBlobWithDigest {
+        digest: FileDigest::from_content(&bytes, digest_config.cas_digest_config()).to_re(),
+        blob: bytes,
+        ..Default::default()
+    };
+    let digest = client.upload_blob(inline_blob, use_case).await?;
     Ok(ReStdStream::Digest(digest))
 }

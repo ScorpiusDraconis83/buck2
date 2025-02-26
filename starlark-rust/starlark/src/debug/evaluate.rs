@@ -23,7 +23,7 @@ use crate::syntax::AstModule;
 use crate::values::FrozenStringValue;
 use crate::values::Value;
 
-impl<'v, 'a> Evaluator<'v, 'a> {
+impl<'v> Evaluator<'v, '_, '_> {
     /// Evaluate statements in the existing context. This function is designed for debugging,
     /// not production use.
     ///
@@ -52,7 +52,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             .collect();
 
         // Push all the frozen variables into the module
-        if let Some(frozen) = &self.module_variables {
+        if let Some(frozen) = self.top_frame_def_frozen_module(true)? {
             for (name, slot) in frozen.names.symbols() {
                 if let Some(value) = frozen.get_slot(slot) {
                     self.module_env.set(&name, value.to_value())
@@ -78,10 +78,8 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             }
         }
 
-        let orig_module_variables = self.module_variables.take();
         let globals = self.top_frame_def_info_for_debugger()?.globals;
         let res = self.eval_module(statements, &globals);
-        self.module_variables = orig_module_variables;
 
         // Now put the Module back how it was before we started, as best we can
         // and move things into locals if that makes sense
@@ -109,6 +107,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
 mod tests {
     use itertools::Itertools;
     use starlark_derive::starlark_module;
+    use starlark_syntax::error::StarlarkResultExt;
 
     use super::*;
     use crate as starlark;
@@ -121,11 +120,11 @@ mod tests {
     fn debugger(builder: &mut GlobalsBuilder) {
         fn debug_evaluate<'v>(
             code: String,
-            eval: &mut Evaluator<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<Value<'v>> {
-            let ast = AstModule::parse("interactive", code, &Dialect::Extended)
-                .map_err(crate::Error::into_anyhow)?;
-            eval.eval_statements(ast).map_err(crate::Error::into_anyhow)
+            let ast = AstModule::parse("interactive", code, &Dialect::AllOptionsInternal)
+                .into_anyhow_result()?;
+            eval.eval_statements(ast).into_anyhow_result()
         }
     }
 

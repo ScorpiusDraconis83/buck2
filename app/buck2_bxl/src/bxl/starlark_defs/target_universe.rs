@@ -30,7 +30,6 @@ use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueTyped;
-use starlark::StarlarkDocs;
 
 use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::target_list_expr::TargetListExpr;
@@ -43,12 +42,10 @@ use crate::bxl::starlark_defs::targetset::StarlarkTargetSet;
     Display,
     Trace,
     NoSerialize,
-    StarlarkDocs,
     Allocative
 )]
-#[starlark_docs(directory = "bxl")]
 #[derivative(Debug)]
-#[display(fmt = "<universe of {} nodes>", "self.target_universe.len()")]
+#[display("<universe of {} nodes>", self.target_universe.len())]
 pub(crate) struct StarlarkTargetUniverse<'v> {
     // Cquery universe for performing
     target_universe: CqueryUniverse,
@@ -56,13 +53,12 @@ pub(crate) struct StarlarkTargetUniverse<'v> {
     target_set: TargetSet<ConfiguredTargetNode>,
     // Trace/Allocative are implemented for BxlContext, but we take a reference here.
     // This is used in unpacking target expressions for lookups.
-    #[trace(unsafe_ignore)]
     #[derivative(Debug = "ignore")]
     #[allocative(skip)]
-    ctx: &'v BxlContext<'v>,
+    ctx: ValueTyped<'v, BxlContext<'v>>,
 }
 
-#[starlark_value(type = "target_universe", StarlarkTypeRepr, UnpackValue)]
+#[starlark_value(type = "bxl.TargetUniverse", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for StarlarkTargetUniverse<'v> {
     fn get_methods() -> Option<&'static Methods> {
         static RES: MethodsStatic = MethodsStatic::new();
@@ -78,9 +74,9 @@ impl<'v> AllocValue<'v> for StarlarkTargetUniverse<'v> {
 
 impl<'v> StarlarkTargetUniverse<'v> {
     pub(crate) async fn new(
-        ctx: &'v BxlContext<'v>,
+        ctx: ValueTyped<'v, BxlContext<'v>>,
         target_set: TargetSet<ConfiguredTargetNode>,
-    ) -> anyhow::Result<StarlarkTargetUniverse<'v>> {
+    ) -> buck2_error::Result<Self> {
         let target_universe = CqueryUniverse::build(&target_set)?;
         let target_set = target_universe
             .get_from_targets(target_set.iter().map(|i| i.label().unconfigured().dupe()));
@@ -95,22 +91,34 @@ impl<'v> StarlarkTargetUniverse<'v> {
 /// Target universe in BXL. Used for looking up valid configured targets to use in cquery. This is not needed for uquery.
 #[starlark_module]
 fn target_universe_methods(builder: &mut MethodsBuilder) {
-    // The target set of the target universe.
+    /// The target set of the nodes used to construct the target universe.
     fn target_set<'v>(
         this: &'v StarlarkTargetUniverse<'v>,
         heap: &'v Heap,
-    ) -> anyhow::Result<ValueTyped<'v, StarlarkTargetSet<ConfiguredTargetNode>>> {
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ConfiguredTargetNode>>> {
         Ok(heap.alloc_typed(StarlarkTargetSet::from(this.target_set.clone())))
     }
 
-    // Looks up valid configured target nodes within the universe. The targets passed in are either string literals,
-    // unconfigured target nodes, or unconfigured target labels.
+    /// The target set of the entire target universe.
+    fn universe_target_set<'v>(
+        this: &'v StarlarkTargetUniverse<'v>,
+    ) -> starlark::Result<StarlarkTargetSet<ConfiguredTargetNode>> {
+        Ok(StarlarkTargetSet::from(
+            this.target_universe
+                .iter()
+                .map(|node| node.to_owned())
+                .collect::<TargetSet<_>>(),
+        ))
+    }
+
+    /// Looks up valid configured target nodes within the universe. The targets passed in are either string literals,
+    /// unconfigured target nodes, or unconfigured target labels.
     fn lookup<'v>(
         this: &'v StarlarkTargetUniverse<'v>,
         targets: TargetListExprArg<'v>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<ValueTyped<'v, StarlarkTargetSet<ConfiguredTargetNode>>> {
-        this.ctx.via_dice(|mut dice, ctx| {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ConfiguredTargetNode>>> {
+        Ok(this.ctx.via_dice(|dice, ctx| {
             dice.via(|dice| {
                 async move {
                     let inputs = &*TargetListExpr::<'v, TargetNode>::unpack(targets, ctx, dice)
@@ -126,6 +134,6 @@ fn target_universe_methods(builder: &mut MethodsBuilder) {
                 }
                 .boxed_local()
             })
-        })
+        })?)
     }
 }

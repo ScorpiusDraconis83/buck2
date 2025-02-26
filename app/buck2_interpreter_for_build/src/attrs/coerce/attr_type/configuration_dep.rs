@@ -25,12 +25,12 @@ impl AttrTypeCoerce for ConfigurationDepAttrType {
         _configurable: AttrIsConfigurable,
         ctx: &dyn AttrCoercionContext,
         value: Value,
-    ) -> anyhow::Result<CoercedAttr> {
+    ) -> buck2_error::Result<CoercedAttr> {
         let label = value
             .unpack_str()
-            .ok_or_else(|| anyhow::anyhow!(CoercionError::type_error(STRING_TYPE, value)))?;
+            .ok_or_else(|| CoercionError::type_error(STRING_TYPE, value))?;
 
-        ctx.coerce_target_label(label)
+        ctx.coerce_providers_label(label)
             .map(CoercedAttr::ConfigurationDep)
     }
 

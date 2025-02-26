@@ -13,15 +13,30 @@
 %%% @end
 
 -module(buck_ct_parser).
--compile(warn_missing_spec).
+-compile(warn_missing_spec_all).
+
+-eqwalizer(ignore).
 
 %% Public API
 -export([parse_str/1]).
 
--spec parse_str(string()) -> term().
-parse_str("") ->
+-spec parse_str(binary()) -> term().
+parse_str(<<"">>) ->
     [];
 parse_str(StrArgs) ->
-    {ok, Tokens, _} = erl_scan:string(StrArgs ++ "."),
-    {ok, Term} = erl_parse:parse_term(Tokens),
-    Term.
+    try
+        {ok, Tokens, _} = erl_scan:string(unicode:characters_to_list([StrArgs, "."])),
+        erl_parse:parse_term(Tokens)
+    of
+        {ok, Term} ->
+            Term;
+        {error, Reason} ->
+            error(lists:flatten(io_lib:format("Error parsing StrArgs ~p, Reason: ~p", [StrArgs, Reason])))
+    catch
+        E:R:S ->
+            error(
+                lists:flatten(
+                    io_lib:format("Error parsing StrArgs ~p, error ~ts", [StrArgs, erl_error:format_exception(E, R, S)])
+                )
+            )
+    end.

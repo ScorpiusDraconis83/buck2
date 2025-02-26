@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use std::convert::Infallible;
 use std::hash::Hasher;
 
 use allocative::Allocative;
@@ -23,7 +24,6 @@ use dupe::Dupe;
 use serde::Serialize;
 use serde::Serializer;
 use starlark_derive::starlark_value;
-use starlark_derive::StarlarkDocs;
 
 use crate as starlark;
 use crate::any::ProvidesStaticType;
@@ -32,8 +32,8 @@ use crate::collections::StarlarkHasher;
 use crate::private::Private;
 use crate::typing::Ty;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueBasic;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Basic;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
@@ -45,17 +45,8 @@ use crate::values::UnpackValue;
 use crate::values::Value;
 
 /// Define the None type, use [`NoneType`] in Rust.
-#[derive(
-    Debug,
-    Clone,
-    Dupe,
-    ProvidesStaticType,
-    Display,
-    StarlarkDocs,
-    Allocative
-)]
-#[starlark_docs(builtin = "standard")]
-#[display(fmt = "None")]
+#[derive(Debug, Clone, Dupe, ProvidesStaticType, Display, Allocative)]
+#[display("None")]
 pub struct NoneType;
 
 impl NoneType {
@@ -71,13 +62,6 @@ impl<'v> StarlarkValue<'v> for NoneType {
         Self: Sized,
     {
         true
-    }
-
-    fn equals(&self, other: Value) -> crate::Result<bool> {
-        // We always compare pointers before calling `equals`,
-        // so if we are here, the other is definitely not `None`.
-        debug_assert!(!other.is_none());
-        Ok(false)
     }
 
     fn to_bool(&self) -> bool {
@@ -122,8 +106,8 @@ impl Serialize for NoneType {
     }
 }
 
-pub(crate) static VALUE_NONE: AValueRepr<AValueImpl<Basic, NoneType>> =
-    alloc_static(Basic, NoneType);
+pub(crate) static VALUE_NONE: AValueRepr<AValueImpl<'static, AValueBasic<NoneType>>> =
+    alloc_static(NoneType);
 
 impl AllocFrozenValue for NoneType {
     fn alloc_frozen_value(self, _heap: &FrozenHeap) -> FrozenValue {
@@ -132,11 +116,13 @@ impl AllocFrozenValue for NoneType {
 }
 
 impl<'v> UnpackValue<'v> for NoneType {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
+    type Error = Infallible;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
         if value.is_none() {
-            Some(NoneType)
+            Ok(Some(NoneType))
         } else {
-            None
+            Ok(None)
         }
     }
 }

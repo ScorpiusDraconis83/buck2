@@ -19,6 +19,7 @@ use std::any::TypeId;
 use std::cell::Cell;
 use std::cmp;
 use std::cmp::Ordering;
+use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -29,7 +30,6 @@ use allocative::Allocative;
 use display_container::fmt_container;
 use serde::Serialize;
 use starlark_derive::starlark_value;
-use starlark_derive::StarlarkDocs;
 use starlark_derive::Trace;
 use starlark_syntax::slice_vec_ext::SliceExt;
 use starlark_syntax::slice_vec_ext::VecExt;
@@ -50,8 +50,8 @@ use crate::values::error::ValueError;
 use crate::values::index::apply_slice;
 use crate::values::index::convert_index;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueFrozenList;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Direct;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::list::ListRef;
 use crate::values::type_repr::StarlarkTypeRepr;
@@ -67,16 +67,7 @@ use crate::values::Value;
 use crate::values::ValueLike;
 use crate::values::ValueTyped;
 
-#[derive(
-    Clone,
-    Default,
-    Trace,
-    Debug,
-    ProvidesStaticType,
-    StarlarkDocs,
-    Allocative
-)]
-#[starlark_docs(builtin = "standard")]
+#[derive(Clone, Default, Trace, Debug, ProvidesStaticType, Allocative)]
 #[repr(transparent)]
 pub(crate) struct ListGen<T>(pub(crate) T);
 
@@ -110,8 +101,8 @@ pub(crate) type FrozenList = ListGen<FrozenListData>;
 
 pub(crate) type List<'v> = ListGen<ListData<'v>>;
 
-pub(crate) static VALUE_EMPTY_FROZEN_LIST: AValueRepr<AValueImpl<Direct, ListGen<FrozenListData>>> =
-    alloc_static(Direct, unsafe { ListGen(FrozenListData::new(0)) });
+pub(crate) static VALUE_EMPTY_FROZEN_LIST: AValueRepr<AValueImpl<'static, AValueFrozenList>> =
+    alloc_static(unsafe { ListGen(FrozenListData::new(0)) });
 
 impl ListGen<FrozenListData> {
     pub(crate) fn offset_of_content() -> usize {
@@ -193,6 +184,17 @@ impl<'v> ListData<'v> {
 
     #[inline]
     pub(crate) fn extend<I: IntoIterator<Item = Value<'v>>>(&self, iter: I, heap: &'v Heap) {
+        match self.try_extend(iter.into_iter().map(Ok::<_, Infallible>), heap) {
+            Ok(()) => {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_extend<E, I: IntoIterator<Item = Result<Value<'v>, E>>>(
+        &self,
+        iter: I,
+        heap: &'v Heap,
+    ) -> Result<(), E> {
         let iter = iter.into_iter();
         let (lo, hi) = iter.size_hint();
         match hi {
@@ -200,21 +202,22 @@ impl<'v> ListData<'v> {
                 // Exact size iterator.
                 self.reserve_additional(lo, heap);
                 // Extend will panic if upper bound is provided incorrectly.
-                self.content.get().extend(iter);
+                self.content.get().try_extend(iter)?;
             }
             Some(hi) if self.content.get().remaining_capacity() >= hi => {
                 // Enough capacity for upper bound.
                 // Extend will panic if upper bound is provided incorrectly.
-                self.content.get().extend(iter);
+                self.content.get().try_extend(iter)?;
             }
             _ => {
                 // Default slow version.
                 self.reserve_additional(iter.size_hint().0, heap);
                 for item in iter {
-                    self.push(item, heap);
+                    self.push(item?, heap);
                 }
             }
         }
+        Ok(())
     }
 
     pub(crate) fn push(&self, value: Value<'v>, heap: &'v Heap) {
@@ -252,6 +255,8 @@ impl<'a, V: 'a> StarlarkTypeRepr for &'a [V]
 where
     &'a V: StarlarkTypeRepr,
 {
+    type Canonical = <Vec<&'a V> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Vec::<&'a V>::starlark_type_repr()
     }
@@ -419,7 +424,7 @@ pub(crate) fn display_list(xs: &[Value], f: &mut fmt::Formatter<'_>) -> fmt::Res
 
 pub(crate) fn list_methods() -> Option<&'static Methods> {
     static RES: MethodsStatic = MethodsStatic::new();
-    RES.methods(crate::stdlib::list::list_methods)
+    RES.methods(crate::values::types::list::methods::list_methods)
 }
 
 #[starlark_value(type = ListData::TYPE)]
@@ -526,7 +531,11 @@ where
     }
 
     fn mul(&self, other: Value, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
-        let l = i32::unpack_value(other)?;
+        let l = match i32::unpack_value(other) {
+            Ok(Some(l)) => l,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
         let mut result = Vec::with_capacity(self.0.content().len() * cmp::max(0, l) as usize);
         for _ in 0..l {
             result.extend(self.0.content().iter());

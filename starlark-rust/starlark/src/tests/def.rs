@@ -187,8 +187,15 @@ fn test_context_captured() {
 
 #[test]
 fn test_lambda_errors() {
-    // Test from https://github.com/facebookexperimental/starlark-rust/issues/36
+    // Test from https://github.com/facebook/starlark-rust/issues/36
     assert::fail("lambda a,a:a", "duplicated parameter name");
+}
+
+#[test]
+fn test_lambda_errors_nested() {
+    // Test from https://issues.oss-fuzz.com/issues/369003809
+    assert::fail("lambda: lambda a,a:a", "duplicated parameter name");
+    assert::fail("[lambda a,a:a]", "duplicated parameter name");
 }
 
 #[test]

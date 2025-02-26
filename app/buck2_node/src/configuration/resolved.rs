@@ -8,88 +8,92 @@
  */
 
 use std::hash::Hash;
-use std::hash::Hasher;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_core::configuration::config_setting::ConfigSettingData;
-use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::pair::ConfigurationNoExec;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::provider::label::ProvidersLabel;
+use buck2_core::target::label::label::TargetLabel;
 use dupe::Dupe;
 use starlark_map::unordered_map::UnorderedMap;
-use starlark_map::Equivalent;
 
-#[derive(Debug, Eq, Allocative)]
-pub struct ConfigurationSettingKey(pub TargetLabel);
-
-#[derive(Debug, Hash, Eq, PartialEq)]
-pub struct ConfigurationSettingKeyRef<'a>(pub &'a TargetLabel);
-
-impl Equivalent<ConfigurationSettingKey> for ConfigurationSettingKeyRef<'_> {
-    fn equivalent(&self, key: &ConfigurationSettingKey) -> bool {
-        self == &key.as_ref()
-    }
-}
+/// Key in `select` or an item in `target_compatible_with`.
+/// Should point to `config_setting` target, or `constraint_value`.
+#[derive(
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Allocative,
+    derive_more::Display,
+    Clone,
+    Dupe,
+    Ord,
+    PartialOrd,
+    ref_cast::RefCast
+)]
+#[repr(transparent)]
+pub struct ConfigurationSettingKey(pub ProvidersLabel);
 
 impl ConfigurationSettingKey {
-    fn as_ref(&self) -> ConfigurationSettingKeyRef {
-        ConfigurationSettingKeyRef(&self.0)
+    pub fn testing_parse(label: &str) -> ConfigurationSettingKey {
+        ConfigurationSettingKey(ProvidersLabel::default_for(TargetLabel::testing_parse(
+            label,
+        )))
     }
 }
 
-impl PartialEq for ConfigurationSettingKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Hash for ConfigurationSettingKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_ref().hash(state);
-    }
-}
-
-/// For a target, some of the configuration comes down the graph from its dependents, other
-/// parts of the configuration (those not specified by the target platform or transitions)
-/// comes from the global configuration state.
-///
-/// The ResolvedConfiguration represents the full configuration state that is available to
-/// a target for analysis.
+/// See [`MatchedConfigurationSettingKeys`].
 #[derive(Clone, Dupe, Debug, Eq, PartialEq, Hash, Allocative)]
-pub struct ResolvedConfiguration(Arc<ResolvedConfigurationData>);
+pub struct MatchedConfigurationSettingKeysWithCfg(Arc<MatchedConfigurationSettingKeysWithCfgData>);
 
 #[derive(Debug, Eq, PartialEq, Hash, Allocative)]
-struct ResolvedConfigurationData {
+pub(crate) struct MatchedConfigurationSettingKeysWithCfgData {
     cfg: ConfigurationNoExec,
+    pub(crate) settings: MatchedConfigurationSettingKeys,
+}
+
+/// For a given target, this stores the result of matching all of the select keys and compatibility
+/// attributes against that target's configuration.
+#[derive(Debug, Eq, PartialEq, Hash, Allocative)]
+pub struct MatchedConfigurationSettingKeys {
     settings: UnorderedMap<ConfigurationSettingKey, ConfigurationNode>,
 }
 
-impl ResolvedConfiguration {
-    pub fn new(
-        cfg: ConfigurationNoExec,
-        settings: UnorderedMap<ConfigurationSettingKey, ConfigurationNode>,
-    ) -> Self {
-        Self(Arc::new(ResolvedConfigurationData { cfg, settings }))
+impl MatchedConfigurationSettingKeysWithCfg {
+    pub fn new(cfg: ConfigurationNoExec, settings: MatchedConfigurationSettingKeys) -> Self {
+        Self(Arc::new(MatchedConfigurationSettingKeysWithCfgData {
+            cfg,
+            settings,
+        }))
     }
 
     pub fn cfg(&self) -> &ConfigurationNoExec {
         &self.0.cfg
     }
 
-    pub fn setting_matches(&self, key: ConfigurationSettingKeyRef) -> Option<&ConfigSettingData> {
-        let configuration_node = self.0.settings.get(&key).expect(
-            "framework should've ensured all necessary configuration setting keys are present",
-        );
-        if configuration_node.matches() {
-            Some(configuration_node.configuration_data())
-        } else {
-            None
-        }
+    pub fn settings(&self) -> &MatchedConfigurationSettingKeys {
+        &self.0.settings
+    }
+}
+
+impl MatchedConfigurationSettingKeys {
+    pub fn new(
+        settings: UnorderedMap<ConfigurationSettingKey, ConfigurationNode>,
+    ) -> MatchedConfigurationSettingKeys {
+        MatchedConfigurationSettingKeys { settings }
     }
 
-    pub fn matches(&self, label: &TargetLabel) -> Option<&ConfigSettingData> {
-        self.setting_matches(ConfigurationSettingKeyRef(label))
+    pub fn empty() -> MatchedConfigurationSettingKeys {
+        MatchedConfigurationSettingKeys::new(UnorderedMap::new())
+    }
+
+    pub fn setting_matches(&self, key: &ConfigurationSettingKey) -> Option<&ConfigSettingData> {
+        let Some(configuration_node) = self.settings.get(key) else {
+            panic!("unresolved configuration setting: `{key}`");
+        };
+        configuration_node.configuration_data()
     }
 }
 
@@ -99,46 +103,16 @@ pub struct ConfigurationNode(Arc<ConfigurationNodeData>);
 
 #[derive(Debug, Eq, PartialEq, Hash, Allocative)]
 struct ConfigurationNodeData {
-    // This is stored as a split Configuration/TargetLabel (rather than a ConfiguredTargetLabel) because it's not
-    // quite the same as what you would think of a ConfiguredTargetLabel. Importantly, we don't do analysis of the
-    // target with this configuration, instead we interpret the results of the analysis of the target in the "unbound"
-    // configuration within the context of this configuration.
-    cfg: ConfigurationData,
-
-    label: TargetLabel,
-
-    config_setting: ConfigSettingData,
-
-    /// Indicates whether this node "matches" the configuration.
-    ///
-    /// For example, a configuration node that requires a list of constraints "matches" a configuration where all of those constraints are satisfied.
-    matches: bool,
+    /// `None` when config settings does not match the configuration.
+    config_setting: Option<ConfigSettingData>,
 }
 
 impl ConfigurationNode {
-    pub fn new(
-        cfg: ConfigurationData,
-        label: TargetLabel,
-        config_setting: ConfigSettingData,
-        matches: bool,
-    ) -> Self {
-        Self(Arc::new(ConfigurationNodeData {
-            cfg,
-            label,
-            config_setting,
-            matches,
-        }))
+    pub fn new(config_setting: Option<ConfigSettingData>) -> Self {
+        Self(Arc::new(ConfigurationNodeData { config_setting }))
     }
 
-    pub fn matches(&self) -> bool {
-        self.0.matches
-    }
-
-    pub fn label(&self) -> &TargetLabel {
-        &self.0.label
-    }
-
-    pub fn configuration_data(&self) -> &ConfigSettingData {
-        &self.0.config_setting
+    pub fn configuration_data(&self) -> Option<&ConfigSettingData> {
+        self.0.config_setting.as_ref()
     }
 }

@@ -10,14 +10,15 @@
 use std::borrow::Cow;
 use std::io::Write;
 
-use anyhow::Context;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::audit_dep_files::AUDIT_DEP_FILES;
-use buck2_core::base_deferred_key::BaseDeferredKey;
 use buck2_core::category::Category;
-use buck2_core::directory::Directory;
-use buck2_core::directory::DirectoryIterator;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_error::buck2_error;
+use buck2_error::BuckErrorContext;
 use buck2_execute::digest_config::HasDigestConfig;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use dice::DiceTransaction;
@@ -39,20 +40,21 @@ async fn audit_dep_files(
     category: Category,
     identifier: Option<String>,
     stdout: &mut (dyn Write + Send),
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     let key = DepFilesKey::new(BaseDeferredKey::TargetLabel(label), category, identifier);
 
-    let state = get_dep_files(&key).context("Failed to find dep files")?;
+    let state = get_dep_files(&key)
+        .with_buck_error_context(|| format!("Failed to find dep files for key `{}`", key))?;
 
     let dep_files = read_dep_files(
         state.has_signatures(),
         state.declared_dep_files(),
-        &ctx.get_artifact_fs().await?,
+        &ctx.clone().get_artifact_fs().await?,
         ctx.per_transaction_data().get_materializer().as_ref(),
     )
     .await
-    .context("Failed to read dep files")?
-    .context("Dep fils have expired")?;
+    .buck_error_context("Failed to read dep files")?
+    .buck_error_context("Dep fils have expired")?;
 
     let fingerprints = state.locked_compute_fingerprints(
         Cow::Owned(dep_files),
@@ -63,26 +65,20 @@ async fn audit_dep_files(
     let dirs = match &*fingerprints {
         StoredFingerprints::Digests(..) => {
             // This is bit awkward but this only for testing right now so that's OK
-            return Err(anyhow::anyhow!("Fingerprints were stored as digests!"));
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Fingerprints were stored as digests! You probably need to use BUCK2_KEEP_DEP_FILE_DIRECTORIES=true"
+            ));
         }
         StoredFingerprints::Dirs(dirs) => dirs,
     };
 
-    for (path, ..) in dirs
-        .untagged
-        .ordered_walk()
-        .with_paths()
-        .filter_map(|(p, e)| Some((p, e.into_leaf()?)))
-    {
+    for path in dirs.untagged.ordered_walk_leaves().paths() {
         writeln!(stdout, "untagged\t{}", path)?;
     }
 
     for (tag, dir) in dirs.tagged.iter() {
-        for (path, ..) in dir
-            .ordered_walk()
-            .with_paths()
-            .filter_map(|(p, e)| Some((p, e.into_leaf()?)))
-        {
+        for path in dir.ordered_walk_leaves().paths() {
             writeln!(stdout, "{}\t{}", tag, path)?;
         }
     }

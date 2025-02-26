@@ -11,7 +11,6 @@
 #![allow(clippy::useless_vec)]
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::file_ops::FileDigest;
@@ -24,29 +23,25 @@ use buck2_common::io::fs::FsIoProvider;
 use buck2_common::io::fs::ReadUncheckedOptions;
 use buck2_common::io::IoProvider;
 use buck2_core;
-use buck2_core::buck2_env;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::io_counters::IoCounterKey;
-use buck2_core::soft_error;
+use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use compact_str::CompactString;
 use dupe::Dupe;
-use edenfs::types::FileAttributes;
-use edenfs::types::GetAttributesFromFilesParams;
-use edenfs::types::ReaddirParams;
-use edenfs::types::SourceControlType;
-use edenfs::types::SyncBehavior;
-use edenfs::types::SynchronizeWorkingCopyParams;
+use edenfs::FileAttributes;
+use edenfs::GetAttributesFromFilesParams;
+use edenfs::ReaddirParams;
+use edenfs::SourceControlType;
+use edenfs::SyncBehavior;
+use edenfs::SynchronizeWorkingCopyParams;
 use fbinit::FacebookInit;
-use libc::EINVAL;
-use libc::EISDIR;
-use libc::ENOENT;
-use libc::ENOTDIR;
-use tokio::sync::Semaphore;
 
 use crate::connection::EdenConnectionManager;
-use crate::connection::EdenDataIntoResult;
-use crate::connection::EdenError;
+use crate::error::EdenDataIntoResult;
+use crate::error::EdenError;
+use crate::semaphore::buck2_default;
 
 #[derive(Allocative)]
 pub struct EdenIoProvider {
@@ -61,17 +56,17 @@ enum Digest {
     Blake3Keyed,
 }
 
+enum PathMetadataResult {
+    Result(Option<RawPathMetadata<ProjectRelativePathBuf>>),
+    Error(EdenError),
+}
+
 impl EdenIoProvider {
     pub async fn new(
         fb: FacebookInit,
         fs: &ProjectRoot,
         cas_digest_config: CasDigestConfig,
-    ) -> anyhow::Result<Option<Self>> {
-        if cfg!(not(fbcode_build)) {
-            tracing::warn!("Disabling Eden I/O: Cargo build detected");
-            return Ok(None);
-        }
-
+    ) -> buck2_error::Result<Option<Self>> {
         let (digest, min_eden_version) = if cas_digest_config.source_files_config().allows_sha1() {
             (Digest::Sha1, "20220905-214046")
         } else if cas_digest_config
@@ -84,18 +79,17 @@ impl EdenIoProvider {
             return Ok(None);
         };
 
-        let eden_semaphore = buck2_env!("BUCK2_EDEN_SEMAPHORE", type=usize, default=2048)?;
+        let eden_semaphore = buck2_default();
 
-        let manager =
-            match EdenConnectionManager::new(fb, fs.root(), Semaphore::new(eden_semaphore))? {
-                Some(manager) => manager,
-                None => return Ok(None),
-            };
+        let manager = match EdenConnectionManager::new(fb, fs, Some(eden_semaphore))? {
+            Some(manager) => manager,
+            None => return Ok(None),
+        };
 
         let eden_version = manager
             .get_eden_version()
             .await
-            .context("Error querying Eden version")?;
+            .buck_error_context("Error querying Eden version")?;
 
         if let Some(eden_version) = &eden_version {
             if eden_version.as_str() < min_eden_version {
@@ -118,14 +112,11 @@ impl EdenIoProvider {
             digest,
         }))
     }
-}
 
-#[async_trait]
-impl IoProvider for EdenIoProvider {
-    async fn read_path_metadata_if_exists(
+    async fn read_path_metadata_if_exists_impl(
         &self,
-        path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
+        path: &ProjectRelativePathBuf,
+    ) -> buck2_error::Result<PathMetadataResult> {
         let _guard = IoCounterKey::StatEden.guard();
 
         let hash_attribute = match self.digest {
@@ -142,7 +133,7 @@ impl IoProvider for EdenIoProvider {
 
         let params = GetAttributesFromFilesParams {
             mountPoint: self.manager.get_mount_point(),
-            paths: vec![path.to_string().into_bytes()],
+            paths: self.manager.project_paths_as_eden_paths([path.as_ref()]),
             requestedAttributes: requested_attributes,
             sync: no_sync(),
             ..Default::default()
@@ -160,18 +151,18 @@ impl IoProvider for EdenIoProvider {
             .res
             .into_iter()
             .next()
-            .context("Eden did not return file info")?
+            .buck_error_context("Eden did not return file info")?
             .into_result()
         {
             Ok(data) => {
                 let source_control_type = data
                     .sourceControlType
-                    .context("Eden did not return a type")?
+                    .buck_error_context("Eden did not return a type")?
                     .into_result()
-                    .context("Eden returned an error for sourceControlType")?;
+                    .buck_error_context("Eden returned an error for sourceControlType")?;
 
                 if source_control_type == SourceControlType::TREE {
-                    return Ok(Some(RawPathMetadata::Directory));
+                    return Ok(PathMetadataResult::Result(Some(RawPathMetadata::Directory)));
                 };
 
                 if source_control_type == SourceControlType::SYMLINK {
@@ -187,7 +178,7 @@ impl IoProvider for EdenIoProvider {
                         .fs
                         .read_unchecked(path.clone(), options)
                         .await
-                        .with_context(|| {
+                        .with_buck_error_context(|| {
                             format!(
                                 "Eden returned that `{}` was a symlink, but it was not.  \
                                 This path may have changed during the build",
@@ -195,39 +186,39 @@ impl IoProvider for EdenIoProvider {
                             )
                         })?;
 
-                    return Ok(Some(meta));
+                    return Ok(PathMetadataResult::Result(Some(meta)));
                 };
 
                 let size = data
                     .size
-                    .context("Eden did not return a size")?
+                    .buck_error_context("Eden did not return a size")?
                     .into_result()
-                    .context("Eden returned an error for size")?
+                    .buck_error_context("Eden returned an error for size")?
                     .try_into()
-                    .context("Eden returned an invalid size")?;
+                    .buck_error_context("Eden returned an invalid size")?;
 
                 tracing::debug!("getAttributesFromFilesV2({}): ok", path);
                 let digest = match self.digest {
                     Digest::Sha1 => {
                         let sha1 = data
                             .sha1
-                            .context("Eden did not return a sha1")?
+                            .buck_error_context("Eden did not return a sha1")?
                             .into_result()
-                            .context("Eden returned an error for sha1")?
+                            .buck_error_context("Eden returned an error for sha1")?
                             .try_into()
                             .ok()
-                            .context("Eden returned an invalid sha1")?;
+                            .buck_error_context("Eden returned an invalid sha1")?;
                         FileDigest::new_sha1(sha1, size)
                     }
                     Digest::Blake3Keyed => {
                         let blake3 = data
                             .blake3
-                            .context("Eden did not return a blake3")?
+                            .buck_error_context("Eden did not return a blake3")?
                             .into_result()
-                            .context("Eden returned an error for blake3")?
+                            .buck_error_context("Eden returned an error for blake3")?
                             .try_into()
                             .ok()
-                            .context("Eden returned an invalid blake3")?;
+                            .buck_error_context("Eden returned an invalid blake3")?;
                         FileDigest::new_blake3_keyed(blake3, size)
                     }
                 };
@@ -244,50 +235,25 @@ impl IoProvider for EdenIoProvider {
                     is_executable,
                 };
 
-                Ok(Some(RawPathMetadata::File(meta)))
+                Ok(PathMetadataResult::Result(Some(RawPathMetadata::File(
+                    meta,
+                ))))
             }
-            Err(EdenError::PosixError { code, .. }) if code == EISDIR => {
-                tracing::debug!("getAttributesFromFilesV2({}): EISDIR", path);
-                soft_error!(
-                    "eden_io_eisdir",
-                    anyhow::anyhow!("Eden returned EISDIR for {}", path)
-                )?;
-                Ok(Some(RawPathMetadata::Directory))
-            }
-            Err(EdenError::PosixError { code, .. }) if code == ENOENT => {
-                tracing::debug!("getAttributesFromFilesV2({}): ENOENT", path);
-                Ok(None)
-            }
-            Err(EdenError::PosixError { code, .. }) if code == EINVAL || code == ENOTDIR => {
-                // If we get EINVAL it means the target wasn't a file, and since we know it
-                // existed and it wasn't a dir, then that means it must be a symlink. If we get
-                // ENOTDIR, that means we tried to traverse a path component that was a
-                // symlink. In both cases, we need to both a) handle ExternalSymlink and b)
-                // look through to the target, so we do that.
-                tracing::debug!("getAttributesFromFilesV2({}): fallthrough", path);
-                self.fs.read_path_metadata_if_exists(path).await
-            }
-            Err(err) => Err(err.into()),
+            Err(err) => Ok(PathMetadataResult::Error(err)),
         }
     }
 
-    async fn read_file_if_exists(
+    async fn read_dir_impl(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<String>> {
-        self.fs.read_file_if_exists(path).await
-    }
-
-    async fn read_dir(&self, path: ProjectRelativePathBuf) -> anyhow::Result<Vec<RawDirEntry>> {
+    ) -> buck2_error::Result<Vec<RawDirEntry>> {
         let _guard = IoCounterKey::ReadDirEden.guard();
 
         let requested_attributes = i64::from(i32::from(FileAttributes::SOURCE_CONTROL_TYPE));
 
         let params = ReaddirParams {
             mountPoint: self.manager.get_mount_point(),
-            // TODO(nga): this assumes eden mount point is the project root.
-            //   Which is not the case for isolated test data directories for example.
-            directoryPaths: vec![path.to_string().into_bytes()],
+            directoryPaths: self.manager.project_paths_as_eden_paths([path.as_ref()]),
             requestedAttributes: requested_attributes,
             sync: no_sync(),
             ..Default::default()
@@ -305,7 +271,7 @@ impl IoProvider for EdenIoProvider {
         let data = res
             .into_iter()
             .next()
-            .context("Eden did not return a directory result")?
+            .buck_error_context("Eden did not return a directory result")?
             .into_result()?;
 
         tracing::debug!("readdir({}): {} entries", path, data.len());
@@ -313,13 +279,13 @@ impl IoProvider for EdenIoProvider {
         let entries = data
             .into_iter()
             .map(|(file_name, attrs)| {
-                let file_name =
-                    CompactString::from_utf8(file_name).context("Filename is not UTF-8")?;
+                let file_name = CompactString::from_utf8(file_name)
+                    .buck_error_context("Filename is not UTF-8")?;
 
                 let source_control_type = attrs
                     .into_result()?
                     .sourceControlType
-                    .context("Missing sourceControlType")?
+                    .buck_error_context("Missing sourceControlType")?
                     .into_result()?;
 
                 let file_type = match source_control_type {
@@ -331,7 +297,7 @@ impl IoProvider for EdenIoProvider {
                     _ => FileType::Unknown,
                 };
 
-                anyhow::Ok(RawDirEntry {
+                buck2_error::Ok(RawDirEntry {
                     file_name,
                     file_type,
                 })
@@ -340,8 +306,56 @@ impl IoProvider for EdenIoProvider {
 
         Ok(entries)
     }
+}
 
-    async fn settle(&self) -> anyhow::Result<()> {
+#[async_trait]
+impl IoProvider for EdenIoProvider {
+    async fn read_path_metadata_if_exists_impl(
+        &self,
+        path: ProjectRelativePathBuf,
+    ) -> buck2_error::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
+        match self.read_path_metadata_if_exists_impl(&path).await {
+            Ok(PathMetadataResult::Result(res)) => Ok(res),
+            Ok(PathMetadataResult::Error(err)) => {
+                match err {
+                    EdenError::PosixError { code, .. } if code == libc::ENOENT => {
+                        tracing::debug!("getAttributesFromFilesV2({}): ENOENT", path);
+                        Ok(None)
+                    }
+                    EdenError::PosixError { code, .. }
+                        if code == libc::EINVAL || code == libc::ENOTDIR =>
+                    {
+                        // If we get EINVAL it means the target wasn't a file, and since we know it
+                        // existed and it wasn't a dir, then that means it must be a symlink. If we get
+                        // ENOTDIR, that means we tried to traverse a path component that was a
+                        // symlink. In both cases, we need to both a) handle ExternalSymlink and b)
+                        // look through to the target, so we do that.
+                        tracing::debug!("getAttributesFromFilesV2({}): fallthrough", path);
+                        self.fs.read_path_metadata_if_exists_impl(path).await
+                    }
+                    _ => Err(err.into()),
+                }
+            }
+            Err(err) => Err(err).tag(ErrorTag::IoEden),
+        }
+    }
+
+    async fn read_file_if_exists_impl(
+        &self,
+        path: ProjectRelativePathBuf,
+    ) -> buck2_error::Result<Option<String>> {
+        // Don't tag as IoEden because it uses regular file I/O.
+        self.fs.read_file_if_exists_impl(path).await
+    }
+
+    async fn read_dir_impl(
+        &self,
+        path: ProjectRelativePathBuf,
+    ) -> buck2_error::Result<Vec<RawDirEntry>> {
+        self.read_dir_impl(path).await.tag(ErrorTag::IoEden)
+    }
+
+    async fn settle(&self) -> buck2_error::Result<()> {
         let _guard = IoCounterKey::EdenSettle.guard();
 
         let root = self.manager.get_mount_point();
@@ -360,15 +374,16 @@ impl IoProvider for EdenIoProvider {
                 )
             })
             .await
-            .context("Error synchronizing Eden working copy")
+            .buck_error_context("Error synchronizing Eden working copy")
+            .tag(ErrorTag::IoEden)
     }
 
     fn name(&self) -> &'static str {
         "eden"
     }
 
-    async fn eden_version(&self) -> anyhow::Result<Option<String>> {
-        self.manager.get_eden_version().await
+    async fn eden_version(&self) -> buck2_error::Result<Option<String>> {
+        Ok(self.manager.get_eden_version().await?)
     }
 
     fn project_root(&self) -> &ProjectRoot {

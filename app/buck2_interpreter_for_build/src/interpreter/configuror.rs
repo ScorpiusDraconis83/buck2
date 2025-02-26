@@ -8,12 +8,12 @@
  */
 
 use std::fmt::Debug;
-use std::ptr;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
+use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
 use buck2_interpreter::extra::xcode::XcodeVersionInfo;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
@@ -27,26 +27,11 @@ use starlark::environment::Globals;
 use starlark::environment::GlobalsBuilder;
 
 use crate::attrs::coerce::ctx::BuildAttrCoercionContext;
-use crate::interpreter::build_defs::configure_base_globals;
 use crate::interpreter::cell_info::InterpreterCellInfo;
 use crate::interpreter::functions::host_info::HostInfo;
+use crate::interpreter::globals::base_globals;
 use crate::interpreter::module_internals::ModuleInternals;
 use crate::interpreter::module_internals::PackageImplicits;
-
-#[derive(Clone, Allocative)]
-struct ConfigureGlobalsFn(#[allocative(skip)] fn(&mut GlobalsBuilder));
-
-impl Debug for ConfigureGlobalsFn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ConfiguredGlobalsFn")
-    }
-}
-
-impl PartialEq for ConfigureGlobalsFn {
-    fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.0 as *const (), other.0 as *const ())
-    }
-}
 
 #[derive(Clone, Dupe, Allocative)]
 pub struct AdditionalGlobalsFn(
@@ -66,7 +51,7 @@ impl PartialEq for AdditionalGlobalsFn {
         // And if compiler merges or splits vtables, we don't care,
         // because we behavior will be correct either way.
         // Anyway, this code is used only in tests.
-        #[allow(clippy::vtable_address_comparisons)]
+        #[allow(ambiguous_wide_pointer_comparisons)]
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -84,10 +69,7 @@ pub struct BuildInterpreterConfiguror {
     host_info: HostInfo,
     record_target_call_stack: bool,
     skip_targets_with_duplicate_names: bool,
-    configure_build_file_globals: ConfigureGlobalsFn,
-    configure_package_file_globals: ConfigureGlobalsFn,
-    configure_extension_file_globals: ConfigureGlobalsFn,
-    configure_bxl_file_globals: ConfigureGlobalsFn,
+    global_target_interner: Arc<ConcurrentTargetLabelInterner>,
     /// For test.
     additional_globals: Option<AdditionalGlobalsFn>,
 }
@@ -100,30 +82,22 @@ impl BuildInterpreterConfiguror {
         host_xcode_version: Option<XcodeVersionInfo>,
         record_target_call_stack: bool,
         skip_targets_with_duplicate_names: bool,
-        configure_build_file_globals: fn(&mut GlobalsBuilder),
-        configure_package_file_globals: fn(&mut GlobalsBuilder),
-        configure_extension_file_globals: fn(&mut GlobalsBuilder),
-        configure_bxl_file_globals: fn(&mut GlobalsBuilder),
         additional_globals: Option<AdditionalGlobalsFn>,
-    ) -> anyhow::Result<Arc<Self>> {
+        global_target_interner: Arc<ConcurrentTargetLabelInterner>,
+    ) -> buck2_error::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             prelude_import,
             host_info: HostInfo::new(host_platform, host_architecture, host_xcode_version),
             record_target_call_stack,
             skip_targets_with_duplicate_names,
-            configure_build_file_globals: ConfigureGlobalsFn(configure_build_file_globals),
-            configure_package_file_globals: ConfigureGlobalsFn(configure_package_file_globals),
-            configure_extension_file_globals: ConfigureGlobalsFn(configure_extension_file_globals),
-            configure_bxl_file_globals: ConfigureGlobalsFn(configure_bxl_file_globals),
             additional_globals,
+            global_target_interner,
         }))
     }
 
-    pub(crate) fn build_file_globals(&self) -> Globals {
-        // We want the `native` module to contain most things, so match what is in extension files
-        configure_base_globals(self.configure_extension_file_globals.0)
+    pub(crate) fn globals(&self) -> Globals {
+        base_globals()
             .with(|g| {
-                (self.configure_build_file_globals.0)(g);
                 if let Some(additional_globals) = &self.additional_globals {
                     (additional_globals.0)(g);
                 }
@@ -131,40 +105,7 @@ impl BuildInterpreterConfiguror {
             .build()
     }
 
-    pub(crate) fn package_file_globals(&self) -> Globals {
-        configure_base_globals(self.configure_extension_file_globals.0)
-            .with(|g| {
-                (self.configure_package_file_globals.0)(g);
-                if let Some(additional_globals) = &self.additional_globals {
-                    (additional_globals.0)(g);
-                }
-            })
-            .build()
-    }
-
-    pub(crate) fn extension_file_globals(&self) -> Globals {
-        configure_base_globals(self.configure_extension_file_globals.0)
-            .with(|g| {
-                (self.configure_extension_file_globals.0)(g);
-                if let Some(additional_globals) = &self.additional_globals {
-                    (additional_globals.0)(g);
-                }
-            })
-            .build()
-    }
-
-    pub(crate) fn bxl_file_globals(&self) -> Globals {
-        configure_base_globals(self.configure_extension_file_globals.0)
-            .with(|g| {
-                (self.configure_bxl_file_globals.0)(g);
-                if let Some(additional_globals) = &self.additional_globals {
-                    (additional_globals.0)(g);
-                }
-            })
-            .build()
-    }
-
-    pub(crate) fn host_info(&self) -> &HostInfo {
+    pub fn host_info(&self) -> &HostInfo {
         &self.host_info
     }
 
@@ -177,7 +118,7 @@ impl BuildInterpreterConfiguror {
         package_boundary_exception: bool,
         loaded_modules: &LoadedModules,
         implicit_import: Option<&Arc<ImplicitImport>>,
-    ) -> anyhow::Result<ModuleInternals> {
+    ) -> buck2_error::Result<ModuleInternals> {
         let record_target_call_stack = self.record_target_call_stack;
         let skip_targets_with_duplicate_names = self.skip_targets_with_duplicate_names;
         let package_implicits = implicit_import.map(|spec| {
@@ -198,8 +139,10 @@ impl BuildInterpreterConfiguror {
         });
         let attr_coercer = BuildAttrCoercionContext::new_with_package(
             cell_info.cell_resolver().dupe(),
+            cell_info.cell_alias_resolver().dupe(),
             (buildfile_path.package().dupe(), package_listing.dupe()),
             package_boundary_exception,
+            self.global_target_interner.dupe(),
         );
 
         let imports = loaded_modules.imports().cloned().collect();

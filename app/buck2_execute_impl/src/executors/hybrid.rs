@@ -7,15 +7,17 @@
  * of this source tree.
  */
 
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_common::liveliness_observer::CancelledLivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessObserver;
 use buck2_common::liveliness_observer::LivelinessObserverExt;
 use buck2_core::execution_types::executor_config::HybridExecutionLevel;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::execute::claim::Claim;
 use buck2_execute::execute::claim::ClaimManager;
@@ -26,6 +28,7 @@ use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
 use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::ExecutorPreference;
+use buck2_execute::execute::result::CommandExecutionErrorType;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_futures::cancellation::CancellationContext;
@@ -36,8 +39,10 @@ use futures::future::Either;
 use futures::future::Future;
 use futures::FutureExt;
 use host_sharing::HostSharingRequirements;
+use tokio::sync::MutexGuard;
 
 use crate::executors::local::LocalExecutor;
+use crate::executors::local_actions_throttle::LocalActionsThrottle;
 use crate::low_pass_filter::LowPassFilter;
 
 /// The [HybridExecutor] will accept requests and dispatch them to both a local and remote delegate
@@ -53,6 +58,8 @@ pub struct HybridExecutor<R> {
     pub executor_preference: ExecutorPreference,
     pub low_pass_filter: Arc<LowPassFilter>,
     pub re_max_input_files_bytes: u64,
+    pub fallback_tracker: Arc<FallbackTracker>,
+    pub local_actions_throttle: Option<Arc<LocalActionsThrottle>>,
 }
 
 impl<R> HybridExecutor<R>
@@ -65,7 +72,7 @@ where
         claim_manager: Box<dyn ClaimManager>,
         events: EventDispatcher,
         liveliness_observer: Arc<dyn LivelinessObserver>,
-        cancellations: &CancellationContext<'_>,
+        cancellations: &CancellationContext,
     ) -> CommandExecutionResult {
         let local_manager =
             CommandExecutionManager::new(claim_manager, events, liveliness_observer);
@@ -80,7 +87,7 @@ where
         claim_manager: Box<dyn ClaimManager>,
         events: EventDispatcher,
         liveliness_observer: Arc<dyn LivelinessObserver>,
-        cancellations: &CancellationContext<'_>,
+        cancellations: &CancellationContext,
         intend_to_fallback_on_failure: bool,
     ) -> CommandExecutionResult {
         let remote_manager =
@@ -94,7 +101,7 @@ where
     fn command_executor_preference(
         &self,
         command: &PreparedCommand<'_, '_>,
-    ) -> anyhow::Result<ExecutorPreference> {
+    ) -> buck2_error::Result<ExecutorPreference> {
         self.executor_preference
             .and(command.request.executor_preference())
     }
@@ -102,6 +109,20 @@ where
     /// Indicate whether an action is too big to run on RE.
     fn is_action_too_large_for_remote(&self, paths: &CommandExecutionPaths) -> bool {
         paths.input_files_bytes() > self.re_max_input_files_bytes
+    }
+
+    async fn ensure_low_memory_pressure(&self) {
+        if let Some(ref t) = self.local_actions_throttle {
+            t.ensure_low_memory_pressure().await
+        }
+    }
+
+    async fn throttle_when_memory_pressure(&self) -> Option<MutexGuard<()>> {
+        if let Some(ref t) = self.local_actions_throttle {
+            t.throttle().await
+        } else {
+            None
+        }
     }
 }
 
@@ -162,9 +183,10 @@ where
         let local_result = self.local_exec_cmd(
             command,
             Box::new(claim_manager.dupe()),
-            manager.events.dupe(),
+            manager.inner.events.dupe(),
             Arc::new(
                 manager
+                    .inner
                     .liveliness_observer
                     .dupe()
                     .and(local_execution_liveliness_observer.dupe()),
@@ -179,8 +201,8 @@ where
                 Box::new(claim_manager),
                 remote_execution_liveliness_guard,
             )),
-            manager.events.dupe(),
-            manager.liveliness_observer.dupe(),
+            manager.inner.events.dupe(),
+            manager.inner.liveliness_observer.dupe(),
             cancellations,
             fallback_on_failure,
         );
@@ -188,7 +210,11 @@ where
         if executor_preference.requires_local()
             || self.is_action_too_large_for_remote(command.request.paths())
         {
-            return local_result.await;
+            return async move {
+                let _guard = self.throttle_when_memory_pressure().await;
+                local_result.await
+            }
+            .await;
         };
 
         if executor_preference.requires_remote() {
@@ -202,42 +228,54 @@ where
         };
 
         if is_limited {
+            let jobs = jobs.map_local(|local| {
+                async move {
+                    let _guard = self.throttle_when_memory_pressure().await;
+                    local.await
+                }
+                .boxed()
+            });
             return jobs.into_primary().await.0;
         }
 
         let weight = match command.request.host_sharing_requirements() {
             HostSharingRequirements::ExclusiveAccess => self.low_pass_filter.capacity(),
-            HostSharingRequirements::OnePerToken(.., class) => self
-                .local
-                .host_sharing_broker
-                .requested_permits(class)
-                .into_count_uncapped(),
-            HostSharingRequirements::Shared(class) => self
+            HostSharingRequirements::OnePerToken(.., class)
+            | HostSharingRequirements::Shared(class) => self
                 .local
                 .host_sharing_broker
                 .requested_permits(class)
                 .into_count_uncapped(),
         };
 
-        let is_retryable_status = move |r: &CommandExecutionResult| {
-            match &r.report.status {
-                // This does need be retried since if we get a cancelled result that would
-                // typically mean the other result asked for cancellation and we're about to
-                // receive the result here, or it could mean we're being asked to cancel by our
-                // caller.
-                CommandExecutionStatus::Cancelled => true,
-                // If the execution is successful, use the result.
-                CommandExecutionStatus::Success { .. } => false,
-                // Retry commands that failed (i.e. exit 1) only if we're instructed to do so.
-                CommandExecutionStatus::Failure { .. } => fallback_on_failure,
-                // Don't retry timeouts. They are used for tests and falling back on a timeout is
-                // sort of the opposite of what's been requested.
-                CommandExecutionStatus::TimedOut { .. } => false,
-                // Errors are infra errors and are always retried because that is the point of
-                // falling back.
-                CommandExecutionStatus::Error { .. } => true,
-            }
-        };
+        let is_retryable_status =
+            move |r: &CommandExecutionResult, ignore_fallback_tracker: bool| {
+                match &r.report.status {
+                    // This does need be retried since if we get a cancelled result that would
+                    // typically mean the other result asked for cancellation and we're about to
+                    // receive the result here, or it could mean we're being asked to cancel by our
+                    // caller.
+                    CommandExecutionStatus::Cancelled => true,
+                    // If the execution is successful, use the result.
+                    CommandExecutionStatus::Success { .. } => false,
+                    // Retry commands that failed (i.e. exit 1) only if we're instructed to do so.
+                    CommandExecutionStatus::Failure { .. }
+                    | CommandExecutionStatus::WorkerFailure { .. } => fallback_on_failure,
+                    // Don't retry timeouts. They are used for tests and falling back on a timeout is
+                    // sort of the opposite of what's been requested.
+                    CommandExecutionStatus::TimedOut { .. } => false,
+                    // Don't retry storage resource exhaustion errors as retries might only increase the traffic to storage.
+                    CommandExecutionStatus::Error {
+                        typ: CommandExecutionErrorType::StorageResourceExhausted,
+                        ..
+                    } => ignore_fallback_tracker,
+                    // Errors are infra errors and are always retried because that is the point of
+                    // falling back.
+                    CommandExecutionStatus::Error { .. } => {
+                        ignore_fallback_tracker || self.fallback_tracker.can_fallback()
+                    }
+                }
+            };
 
         let fallback_only = fallback_only && !command.request.force_full_hybrid_if_capable();
 
@@ -245,6 +283,13 @@ where
             if executor_preference.prefers_local() || executor_preference.prefers_remote() {
                 // Don't race in this scenario, since this is typically used for
                 // actions that are too expensive to run on RE.
+                let jobs = jobs.map_local(|local| {
+                    async move {
+                        let _guard = self.throttle_when_memory_pressure().await;
+                        local.await
+                    }
+                    .boxed()
+                });
                 jobs.execute_sequential().await
             } else {
                 // In the full-hybrid case, we do race both executors. If the low-pass filter is in
@@ -256,6 +301,7 @@ where
                             // The claim actually comes back to us via the execution report so there's no race condition
                             // where local unblocks just when RE finishes
                             remote_execution_liveliness_observer.while_alive().await;
+                            let _guard = self.throttle_when_memory_pressure().await;
                             local.await
                         }
                         .boxed()
@@ -266,7 +312,13 @@ where
                             // Block local until either condition is met:
                             // - we only have a few actions (that's low_pass_filter)
                             // - the remote executor aborts (that's remote_execution_liveliness_guard)
-                            let access = self.low_pass_filter.access(weight);
+                            let access = async move {
+                                let guard = self.low_pass_filter.access(weight).await;
+                                // we can keep the low pass filter guard since other actions
+                                // are blocked by same memory issue
+                                self.ensure_low_memory_pressure().await;
+                                guard
+                            };
                             let alive = remote_execution_liveliness_observer.while_alive();
                             futures::pin_mut!(access);
                             futures::pin_mut!(alive);
@@ -276,12 +328,18 @@ where
                         .boxed()
                     })
                 } else {
-                    jobs.map_local(|local| local.boxed())
+                    jobs.map_local(|local| {
+                        async move {
+                            self.ensure_low_memory_pressure().await;
+                            local.await
+                        }
+                        .boxed()
+                    })
                 };
                 jobs.execute_concurrent().await
             };
 
-        let mut res = if is_retryable_status(&first_res) {
+        let mut res = if is_retryable_status(&first_res, false) {
             // If the first result had made a claim, then cancel it now to let the other result
             // proceed.
             if let Some(claim) = first_res.report.claim.take() {
@@ -298,7 +356,7 @@ where
             // For the purposes of giving users a good UX, if both things failed, give them the
             // local executor's error, which is likely to not have failed because of e.g.
             // sandboxing.
-            let (mut primary_res, mut secondary_res) = if is_retryable_status(&second_res) {
+            let (mut primary_res, mut secondary_res) = if is_retryable_status(&second_res, true) {
                 if first_priority > second_priority {
                     (first_res, second_res)
                 } else {
@@ -433,11 +491,11 @@ impl Claim for ReClaim {
     ///
     /// In that case, RE will have failed. To fix this, we need local to release its claim instead
     /// of returning ClaimCancelled.
-    fn release(self: Box<Self>) -> anyhow::Result<()> {
+    fn release(self: Box<Self>) -> buck2_error::Result<()> {
         // An error here should only occur if local execution had started without the claim.
         self.released_liveliness_guard
             .restore()
-            .context("Unable to restore CancelledLivelinessGuard!")?
+            .buck_error_context("Unable to restore CancelledLivelinessGuard!")?
             .forget();
 
         self.claim.release()?;
@@ -519,3 +577,41 @@ where
 
 #[derive(PartialOrd, Ord, PartialEq, Eq)]
 struct JobPriority(u8);
+
+pub struct FallbackTracker {
+    count_fallbacks: AtomicI64,
+}
+
+impl FallbackTracker {
+    pub fn new() -> Self {
+        FallbackTracker {
+            count_fallbacks: AtomicI64::new(0),
+        }
+    }
+
+    pub fn can_fallback(&self) -> bool {
+        let retried = self.count_fallbacks.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(all(fbcode_build, target_os = "linux"))]
+        let max = if hostcaps::is_prod() {
+            justknobs::get("buck2/buck2:max_fallback", None).ok()
+        } else {
+            None
+        };
+
+        #[cfg(not(all(fbcode_build, target_os = "linux")))]
+        let max = None;
+
+        if let Some(max) = max {
+            if retried >= max {
+                tracing::warn!(
+                    "Not falling back to local because too many actions have fallen back already.  \
+                    If you would like to proceed anyway, pass `--prefer-local`."
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+}

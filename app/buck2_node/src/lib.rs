@@ -9,15 +9,20 @@
 
 #![feature(error_generic_member_access)]
 #![feature(box_patterns)]
+#![allow(clippy::len_without_is_empty)]
 
 pub mod attrs;
+pub mod bzl_or_bxl_path;
 pub mod call_stack;
 pub mod cfg_constructor;
 pub mod configuration;
 pub mod configured_universe;
+pub mod execution;
 pub mod load_patterns;
 pub mod metadata;
+pub mod modifiers;
 pub mod nodes;
+pub mod oncall;
 pub mod package;
 pub mod package_values_calculation;
 pub mod provider_id_set;

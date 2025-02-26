@@ -40,16 +40,15 @@ use lsp_types::CompletionItemKind;
 use lsp_types::Url;
 use starlark::analysis::find_call_name::AstModuleFindCallName;
 use starlark::analysis::AstModuleLint;
-use starlark::docs::get_registered_starlark_docs;
-use starlark::docs::render_docs_as_code;
-use starlark::docs::Doc;
-use starlark::docs::DocItem;
 use starlark::docs::DocModule;
 use starlark::environment::FrozenModule;
+use starlark::environment::Globals;
 use starlark::environment::Module;
 use starlark::errors::EvalMessage;
 use starlark::eval::Evaluator;
 use starlark::syntax::AstModule;
+use starlark::syntax::Dialect;
+use starlark::StarlarkResultExt;
 use starlark_lsp::completion::StringCompletionResult;
 use starlark_lsp::completion::StringCompletionType;
 use starlark_lsp::error::eval_message_to_lsp_diagnostic;
@@ -59,8 +58,6 @@ use starlark_lsp::server::LspUrl;
 use starlark_lsp::server::StringLiteralResult;
 
 use self::label::Label;
-use crate::eval::dialect;
-use crate::eval::globals;
 use crate::eval::ContextMode;
 use crate::eval::EvalResult;
 
@@ -139,13 +136,22 @@ pub(crate) fn main(
     print_non_none: bool,
     is_interactive: bool,
     prelude: &[PathBuf],
+    dialect: Dialect,
+    globals: Globals,
 ) -> anyhow::Result<()> {
     if !lsp {
         return Err(anyhow::anyhow!("Bazel mode only supports `--lsp`"));
     }
 
     // NOTE: Copied from `main.rs`
-    let mut ctx = BazelContext::new(ContextMode::Check, print_non_none, prelude, is_interactive)?;
+    let mut ctx = BazelContext::new(
+        ContextMode::Check,
+        print_non_none,
+        prelude,
+        is_interactive,
+        dialect,
+        globals,
+    )?;
 
     ctx.mode = ContextMode::Check;
     starlark_lsp::server::stdio_server(ctx)?;
@@ -160,6 +166,8 @@ pub(crate) struct BazelContext {
     pub(crate) print_non_none: bool,
     pub(crate) prelude: Vec<FrozenModule>,
     pub(crate) module: Option<Module>,
+    pub(crate) dialect: Dialect,
+    pub(crate) globals: Globals,
     pub(crate) builtin_docs: HashMap<LspUrl, String>,
     pub(crate) builtin_symbols: HashMap<String, LspUrl>,
 }
@@ -174,20 +182,19 @@ impl BazelContext {
         print_non_none: bool,
         prelude: &[PathBuf],
         module: bool,
+        dialect: Dialect,
+        globals: Globals,
     ) -> anyhow::Result<Self> {
-        let globals = globals();
         let prelude: Vec<_> = prelude
             .iter()
             .map(|x| {
                 let env = Module::new();
                 {
                     let mut eval = Evaluator::new(&env);
-                    let module = AstModule::parse_file(x, &dialect())
-                        .map_err(starlark::Error::into_anyhow)?;
-                    eval.eval_module(module, &globals)
-                        .map_err(starlark::Error::into_anyhow)?;
+                    let module = AstModule::parse_file(x, &dialect).into_anyhow_result()?;
+                    eval.eval_module(module, &globals).into_anyhow_result()?;
                 }
-                env.freeze()
+                Ok(env.freeze()?)
             })
             .collect::<anyhow::Result<_>>()?;
 
@@ -196,17 +203,14 @@ impl BazelContext {
         } else {
             None
         };
-        let mut builtins: HashMap<LspUrl, Vec<Doc>> = HashMap::new();
+        let mut builtin_docs: HashMap<LspUrl, String> = HashMap::new();
         let mut builtin_symbols: HashMap<String, LspUrl> = HashMap::new();
-        for doc in get_registered_starlark_docs() {
-            let uri = Self::url_for_doc(&doc);
-            builtin_symbols.insert(doc.id.name.clone(), uri.clone());
-            builtins.entry(uri).or_default().push(doc);
+        for (name, item) in globals.documentation().members {
+            let uri = Url::parse(&format!("starlark:{name}.bzl"))?;
+            let uri = LspUrl::try_from(uri)?;
+            builtin_docs.insert(uri.clone(), item.render_as_code(&name));
+            builtin_symbols.insert(name, uri);
         }
-        let builtin_docs = builtins
-            .into_iter()
-            .map(|(u, ds)| (u, render_docs_as_code(&ds)))
-            .collect();
 
         let mut raw_command = Command::new("bazel");
         let mut command = raw_command.arg("info");
@@ -235,6 +239,8 @@ impl BazelContext {
             print_non_none,
             prelude,
             module,
+            dialect,
+            globals,
             builtin_docs,
             builtin_symbols,
             workspace_name: execroot.and_then(|execroot| {
@@ -267,19 +273,6 @@ impl BazelContext {
                 ast: res.ast,
             },
         }
-    }
-
-    fn url_for_doc(doc: &Doc) -> LspUrl {
-        let url = match &doc.item {
-            DocItem::Module(_) => Url::parse("starlark:/native/builtins.bzl").unwrap(),
-            DocItem::Object(_) => {
-                Url::parse(&format!("starlark:/native/builtins/{}.bzl", doc.id.name)).unwrap()
-            }
-            DocItem::Function(_) | DocItem::Property(_) => {
-                Url::parse("starlark:/native/builtins.bzl").unwrap()
-            }
-        };
-        LspUrl::try_from(url).unwrap()
     }
 
     fn new_module(prelude: &[FrozenModule]) -> Module {
@@ -320,10 +313,9 @@ impl BazelContext {
         };
         let mut eval = Evaluator::new(module);
         eval.enable_terminal_breakpoint_console();
-        let globals = globals();
         Self::err(
             file,
-            eval.eval_module(ast, &globals)
+            eval.eval_module(ast, &self.globals)
                 .map(|v| {
                     if self.print_non_none && !v.is_none() {
                         println!("{}", v);
@@ -367,7 +359,7 @@ impl BazelContext {
     ) -> EvalResult<impl Iterator<Item = EvalMessage>> {
         Self::err(
             filename,
-            AstModule::parse(filename, content, &dialect())
+            AstModule::parse(filename, content, &self.dialect)
                 .map(|module| self.go(filename, module))
                 .map_err(Into::into),
         )

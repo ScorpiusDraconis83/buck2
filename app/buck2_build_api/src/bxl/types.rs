@@ -10,8 +10,8 @@
 use std::hash::Hash;
 
 use allocative::Allocative;
+use buck2_core::bxl::BxlFilePath;
 use buck2_data::ToProtoMessage;
-use buck2_interpreter::paths::bxl::BxlFilePath;
 use derive_more::Display;
 use serde::Serialize;
 use serde::Serializer;
@@ -20,7 +20,7 @@ use serde::Serializer;
 #[derive(
     Debug, Clone, Display, Eq, PartialEq, Hash, Ord, PartialOrd, Allocative
 )]
-#[display(fmt = "{}:{}", bxl_path, name)]
+#[display("{}:{}", bxl_path, name)]
 pub struct BxlFunctionLabel {
     /// The cell, package, and file that contains the output of `bxl()`
     pub bxl_path: BxlFilePath,

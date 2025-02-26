@@ -1,15 +1,18 @@
-[repositories]
+[cells]
 root = .
 prelude = prelude
 toolchains = toolchains
 bootstrap = bootstrap
 none = none
 
-[repository_aliases]
+[cell_aliases]
 config = prelude
 buck = none
 fbcode = none
 fbsource = none
+
+[external_cells]
+  prelude = bundled
 
 [parser]
 target_platform_detector_spec = target:root//...->bootstrap//platform:default

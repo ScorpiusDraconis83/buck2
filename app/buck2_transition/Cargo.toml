@@ -7,10 +7,11 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 derive_more = { workspace = true }
+either = { workspace = true }
 itertools = { workspace = true }
+ref-cast = { workspace = true }
 
 allocative = { workspace = true }
 dice = { workspace = true }
@@ -19,6 +20,7 @@ gazebo = { workspace = true }
 starlark = { workspace = true }
 starlark_map = { workspace = true }
 
+buck2_analysis = { workspace = true }
 buck2_build_api = { workspace = true }
 buck2_core = { workspace = true }
 buck2_error = { workspace = true }

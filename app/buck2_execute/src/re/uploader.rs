@@ -7,23 +7,30 @@
  * of this source tree.
  */
 
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::Context;
 use buck2_common::cas_digest::TrackedCasDigest;
 use buck2_common::file_ops::FileDigest;
 use buck2_common::file_ops::FileDigestKind;
 use buck2_common::file_ops::TrackedFileDigest;
 use buck2_core::buck2_env;
-use buck2_core::directory::DirectoryEntry;
-use buck2_core::directory::DirectoryIterator;
-use buck2_core::directory::FingerprintedDirectory;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
+use buck2_data::ReUploadMetrics;
+use buck2_directory::directory::directory::Directory;
+use buck2_directory::directory::directory_iterator::DirectoryIterator;
+use buck2_directory::directory::directory_iterator::DirectoryIteratorPathStack;
+use buck2_directory::directory::directory_ref::FingerprintedDirectoryRef;
+use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
+use buck2_error::conversion::from_any_with_tag;
+use buck2_error::BuckErrorContext;
 use chrono::Duration;
 use chrono::Utc;
 use futures::FutureExt;
@@ -41,19 +48,20 @@ use crate::digest::CasDigestFromReExt;
 use crate::digest::CasDigestToReExt;
 use crate::digest_config::DigestConfig;
 use crate::directory::ActionDirectoryMember;
-use crate::directory::ActionFingerprintedDirectory;
+use crate::directory::ActionFingerprintedDirectoryRef;
 use crate::directory::ActionImmutableDirectory;
 use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::Materializer;
+use crate::re::action_identity::ReActionIdentity;
 use crate::re::metadata::RemoteExecutionMetadataExt;
 
 #[derive(Clone, Debug, Default)]
 pub struct UploadStats {
-    pub bytes_uploaded: u64,
-    pub digests_uploaded: u64,
+    pub total: ReUploadMetrics,
+    pub by_extension: HashMap<String, ReUploadMetrics>,
 }
 
 pub struct Uploader {}
@@ -64,6 +72,7 @@ impl Uploader {
         input_dir: &'a ActionImmutableDirectory,
         blobs: &'a ActionBlobs,
         use_case: &RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
     ) -> anyhow::Result<(
         Vec<InlinedBlobWithDigest>,
@@ -82,9 +91,9 @@ impl Uploader {
         let mut input_digests = blobs.keys().collect::<HashSet<_>>();
         let digest_ttls = {
             // Collect the digests we need to upload
-            for entry in input_dir.fingerprinted_unordered_walk().without_paths() {
+            for entry in input_dir.unordered_walk().without_paths() {
                 let digest = match entry {
-                    DirectoryEntry::Dir(d) => d.fingerprint(),
+                    DirectoryEntry::Dir(d) => d.as_fingerprinted_dyn().fingerprint(),
                     DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => &f.digest,
                     DirectoryEntry::Leaf(..) => continue,
                 };
@@ -105,7 +114,7 @@ impl Uploader {
                 ..Default::default()
             };
             client
-                .get_digests_ttl(use_case.metadata(), request)
+                .get_digests_ttl(use_case.metadata(identity), request)
                 .boxed()
                 .await?
                 .digests_with_ttl
@@ -119,7 +128,10 @@ impl Uploader {
         input_digests.sort();
 
         let mut digest_ttls = digest_ttls.into_try_map(|d| {
-            anyhow::Ok((FileDigest::from_re(&d.digest, digest_config)?, d.ttl))
+            anyhow::Ok((
+                FileDigest::from_re(&d.digest, digest_config).map_err(buck2_error::Error::from)?,
+                d.ttl,
+            ))
         })?;
         digest_ttls.sort();
 
@@ -171,10 +183,12 @@ impl Uploader {
         input_dir: &ActionImmutableDirectory,
         blobs: &ActionBlobs,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         digest_config: DigestConfig,
     ) -> anyhow::Result<UploadStats> {
         let (mut upload_blobs, mut missing_digests) =
-            Self::find_missing(client, input_dir, blobs, &use_case, digest_config).await?;
+            Self::find_missing(client, input_dir, blobs, &use_case, identity, digest_config)
+                .await?;
 
         if upload_blobs.is_empty() && missing_digests.is_empty() {
             return Ok(UploadStats::default());
@@ -191,10 +205,10 @@ impl Uploader {
             let mut upload_file_digests = Vec::new();
 
             {
-                let mut walk = input_dir.fingerprinted_unordered_walk();
+                let mut walk = input_dir.unordered_walk();
                 while let Some((path, entry)) = walk.next() {
                     let digest = match entry {
-                        DirectoryEntry::Dir(d) => d.fingerprint(),
+                        DirectoryEntry::Dir(d) => d.as_fingerprinted_dyn().fingerprint(),
                         DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => &f.digest,
                         DirectoryEntry::Leaf(..) => continue,
                     };
@@ -217,7 +231,7 @@ impl Uploader {
             }
 
             if missing_digests.remove(input_dir.fingerprint()) {
-                upload_blobs.push(directory_to_blob(input_dir));
+                upload_blobs.push(directory_to_blob(input_dir.as_fingerprinted_ref()));
             }
 
             assert!(
@@ -262,7 +276,8 @@ impl Uploader {
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(
                                         "cas_missing_fatal",
-                                        anyhow::anyhow!(
+                                        buck2_error::buck2_error!(
+                                            buck2_error::ErrorTag::Input,
                                             "{} missing (origin: {})",
                                             file.digest,
                                             info.origin.as_display_for_not_found(),
@@ -283,7 +298,8 @@ impl Uploader {
 
                                 soft_error!(
                                     "cas_missing",
-                                    anyhow::anyhow!(
+                                    buck2_error::buck2_error!(
+                                        buck2_error::ErrorTag::Input,
                                         "{} (expires = {}) is missing in the CAS but expected to exist as per: {:#}",
                                         file.digest,
                                         file.digest.expires(),
@@ -321,19 +337,24 @@ impl Uploader {
             materializer
                 .ensure_materialized(paths_to_materialize)
                 .await
-                .context("Error materializing paths for upload")?;
+                .buck_error_context_anyhow("Error materializing paths for upload")?;
         }
 
         // Compute stats of digests we're about to upload so we can report them
         // to the span end event of this stage of execution.
         let stats = {
-            let named_digest_byte_count: u64 = upload_files
-                .iter()
-                .map(|nd| {
-                    let byte_count: u64 = nd.digest.size_in_bytes.try_into().unwrap_or_default();
-                    byte_count
-                })
-                .sum();
+            let mut stats_by_extension = HashMap::new();
+            let mut named_digest_byte_count: u64 = 0;
+            for nd in &upload_files {
+                // Aggregate metrics by file extension.
+                let byte_count: u64 = nd.digest.size_in_bytes.try_into().unwrap_or_default();
+                let extension = extract_file_extension(&nd.name);
+                let ext_stats: &mut ReUploadMetrics =
+                    stats_by_extension.entry(extension).or_default();
+                ext_stats.digests_uploaded += 1;
+                ext_stats.bytes_uploaded += byte_count;
+                named_digest_byte_count += byte_count;
+            }
             let blob_byte_count: u64 = upload_blobs
                 .iter()
                 .map(|blob| {
@@ -343,16 +364,19 @@ impl Uploader {
                 .sum();
 
             UploadStats {
-                digests_uploaded: (upload_files.len() + upload_blobs.len()) as u64,
-                bytes_uploaded: named_digest_byte_count + blob_byte_count,
+                total: ReUploadMetrics {
+                    digests_uploaded: (upload_files.len() + upload_blobs.len()) as u64,
+                    bytes_uploaded: named_digest_byte_count + blob_byte_count,
+                },
+                by_extension: stats_by_extension,
             }
         };
 
         // Upload
-        let upload_res = if !upload_files.is_empty() || !upload_blobs.is_empty() {
+        if !upload_files.is_empty() || !upload_blobs.is_empty() {
             client
                 .upload(
-                    use_case.metadata(),
+                    use_case.metadata(identity),
                     UploadRequest {
                         files_with_digest: Some(upload_files),
                         inlined_blobs_with_digest: Some(upload_blobs),
@@ -364,24 +388,16 @@ impl Uploader {
                 )
                 .boxed()
                 .await
-                .map(|_| ())
-        } else {
-            Ok(())
+                .map_err(|e| match e.downcast_ref::<REClientError>() {
+                    Some(re_client_error) if re_client_error.code == TCode::INVALID_ARGUMENT =>
+                         anyhow::anyhow!(
+                                "RE Upload failed. It looks like you might have modified files while the build \
+                                was in progress. Retry your build to proceed. Debug information: {:#}",
+                                e
+                        ),
+                    _ => e,
+                })?;
         };
-
-        if let Err(e) = upload_res.as_ref() {
-            if let Some(re_client_error) = e.downcast_ref::<REClientError>() {
-                if re_client_error.code == TCode::INVALID_ARGUMENT {
-                    return Err(anyhow::anyhow!(
-                        "RE Upload failed. It looks like you might have modified files while the build \
-                        was in progress. Retry your build to proceed. Debug information: {:#}",
-                        e
-                    ));
-                }
-            }
-        }
-
-        upload_res.context("RE: upload")?;
 
         Ok(stats)
     }
@@ -404,13 +420,13 @@ fn should_error_for_missing_digest(info: &CasDownloadInfo) -> bool {
     }
 }
 
-fn directory_to_blob<D>(d: &D) -> InlinedBlobWithDigest
+fn directory_to_blob<'a, D>(d: D) -> InlinedBlobWithDigest
 where
-    D: ActionFingerprintedDirectory + ?Sized,
+    D: ActionFingerprintedDirectoryRef<'a>,
 {
     InlinedBlobWithDigest {
-        digest: d.fingerprint().to_re(),
-        blob: ReDirectorySerializer::serialize_entries(d.fingerprinted_entries()),
+        digest: d.as_fingerprinted_dyn().fingerprint().to_re(),
+        blob: ReDirectorySerializer::serialize_entries(d.entries()),
         ..Default::default()
     }
 }
@@ -434,19 +450,25 @@ fn add_injected_missing_digests<'a>(
     input_digests: &HashSet<&'a TrackedFileDigest>,
     missing_digests: &mut HashSet<&'a TrackedFileDigest>,
 ) -> anyhow::Result<()> {
-    fn convert_digests(val: &str) -> anyhow::Result<Vec<FileDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
         val.split(' ')
             .map(|digest| {
                 let digest = TDigest::from_str(digest)
-                    .with_context(|| format!("Invalid digest: `{}`", digest))?;
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                    .with_buck_error_context(|| format!("Invalid digest: `{}`", digest))?;
                 // This code does not run in a test but it is only used for testing.
                 let digest = FileDigest::from_re(&digest, DigestConfig::testing_default())?;
-                anyhow::Ok(digest)
+                buck2_error::Ok(digest)
             })
             .collect()
     }
 
-    let ingested_digests = buck2_env!("BUCK2_TEST_INJECTED_MISSING_DIGESTS", type=Vec<FileDigest>, converter=convert_digests)?;
+    let ingested_digests = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS",
+        type=Vec<FileDigest>,
+        converter=convert_digests,
+        applicability=testing
+    )?;
     if let Some(digests) = ingested_digests {
         for d in digests {
             if let Some(i) = input_digests.get(d) {
@@ -456,4 +478,12 @@ fn add_injected_missing_digests<'a>(
     }
 
     Ok(())
+}
+
+fn extract_file_extension(path: &str) -> String {
+    let path = Path::new(path);
+    match path.extension() {
+        Some(ext) => ext.to_string_lossy().to_lowercase(),
+        None => "<empty>".to_owned(),
+    }
 }

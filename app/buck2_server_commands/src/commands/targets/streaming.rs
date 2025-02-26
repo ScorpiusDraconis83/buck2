@@ -15,17 +15,16 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use buck2_cli_proto::TargetsResponse;
 use buck2_common::pattern::package_roots::find_package_roots_stream;
 use buck2_common::pattern::resolve::ResolvedPattern;
 use buck2_core::bzl::ImportPath;
 use buck2_core::package::PackageLabel;
+use buck2_core::pattern::pattern::PackageSpec;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::PackageSpec;
-use buck2_core::pattern::ParsedPattern;
 use buck2_core::target::name::TargetName;
-use buck2_futures::spawn::spawn_cancellable;
+use buck2_futures::spawn::spawn_dropcancel;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::load_module::INTERPRETER_CALCULATION_IMPL;
 use buck2_interpreter::paths::package::PackageFilePath;
@@ -48,117 +47,63 @@ use tokio::sync::Semaphore;
 use crate::commands::targets::fmt::Stats;
 use crate::commands::targets::fmt::TargetFormatter;
 use crate::commands::targets::fmt::TargetInfo;
-use crate::commands::targets::mk_error;
-use crate::commands::targets::Outputter;
 use crate::target_hash::TargetHashes;
 
+fn write_str(outputter: &mut dyn Write, s: &mut String) -> buck2_error::Result<()> {
+    outputter.write_all(s.as_bytes())?;
+    s.clear();
+    Ok(())
+}
+
+/// Run the targets command in streaming mode.
+///
+/// # Arguments
+///
+/// `keep_going` - On loading errors, put buck.error in the output stream and continue
+///                Passing from cli args `--keep-going` from `app/buck2_client/src/commands/targets.rs`.
+/// * `imports` - Show the imports of each package/import. Shows an additional output per package/import (not per target), including implicit dependencies (e.g. the prelude) but only direct dependencies (not the transitive closure)
+///               Passing from cli args `--imports` from `app/buck2_client/src/commands/targets.rs`.
 pub(crate) async fn targets_streaming(
     server_ctx: &dyn ServerCommandContextTrait,
-    stdout: &mut impl Write,
-    dice: DiceTransaction,
+    mut dice: DiceTransaction,
     formatter: Arc<dyn TargetFormatter>,
-    outputter: &mut Outputter,
+    outputter: &mut (dyn Write + Send),
     parsed_patterns: Vec<ParsedPattern<TargetPatternExtra>>,
     keep_going: bool,
     cached: bool,
     imports: bool,
     fast_hash: Option<bool>, // None = no hashing
     threads: Option<usize>,
-) -> anyhow::Result<TargetsResponse> {
-    struct Res {
-        stats: Stats,           // Stats to merge in
-        package: PackageLabel,  // The package I was operating on
-        stderr: Option<String>, // Print to stderr (and break unless keep_going is set)
-        stdout: String,         // Print to stdout
-    }
-
+) -> buck2_error::Result<Stats> {
     let imported = Arc::new(Mutex::new(SmallSet::new()));
     let threads = Arc::new(Semaphore::new(threads.unwrap_or(Semaphore::MAX_PERMITS)));
 
-    let mut packages = stream_packages(&dice, parsed_patterns)
+    let cloned_dice = dice.clone();
+    let mut packages = stream_packages(&cloned_dice, parsed_patterns)
         .map(|x| {
             let formatter = formatter.dupe();
             let imported = imported.dupe();
             let threads = threads.dupe();
-            let ctx = dice.dupe();
+            let mut ctx = cloned_dice.dupe();
 
-            spawn_cancellable(
+            spawn_dropcancel(
                 |_cancellation| {
                     {
                         async move {
                             let (package, spec) = x?;
-                            let mut res = Res {
-                                stats: Stats::default(),
-                                package: package.dupe(),
-                                stderr: None,
-                                stdout: String::new(),
-                            };
-                            let targets = {
-                                // This bit of code is the heavy CPU stuff, so guard it with the threads
-                                let _permit = threads.acquire().await.unwrap();
-                                load_targets(&ctx, package.dupe(), spec, cached, keep_going).await
-                            };
-                            let mut show_err = |err| {
-                                res.stats.errors += 1;
-                                let mut stderr = String::new();
-                                formatter.package_error(
-                                    package.dupe(),
-                                    err,
-                                    &mut res.stdout,
-                                    &mut stderr,
-                                );
-                                res.stderr = Some(stderr);
-                            };
-                            match targets {
-                                Ok((eval_result, targets, err)) => {
-                                    if let Some(err) = err {
-                                        show_err(&err);
-                                        formatter.separator(&mut res.stdout);
-                                    }
-                                    res.stats.success += 1;
-                                    if imports {
-                                        let eval_imports = eval_result.imports();
-                                        formatter.imports(
-                                            &eval_result.buildfile_path().path(),
-                                            eval_imports,
-                                            Some(package.dupe()),
-                                            &mut res.stdout,
-                                        );
-                                        imported
-                                            .lock()
-                                            .unwrap()
-                                            .extend(eval_imports.iter().cloned());
-                                    }
-                                    for (i, node) in targets.iter().enumerate() {
-                                        res.stats.targets += 1;
-                                        if imports || i != 0 {
-                                            formatter.separator(&mut res.stdout);
-                                        }
-                                        formatter.target(
-                                            TargetInfo {
-                                                node: node.as_ref(),
-                                                target_hash: fast_hash.map(|fast| {
-                                                    TargetHashes::compute_immediate_one(node, fast)
-                                                }),
-                                                super_package: eval_result.super_package(),
-                                            },
-                                            &mut res.stdout,
-                                        )
-                                    }
-                                }
-                                Err(err) => {
-                                    show_err(&err);
-                                }
-                            }
-                            anyhow::Ok(res)
+                            let res = process_package(
+                                &mut ctx, formatter, package, spec, cached, keep_going, imports,
+                                fast_hash, threads, imported,
+                            )
+                            .await;
+                            buck2_error::Ok(res)
                         }
                     }
                     .boxed()
                 },
-                &*dice.per_transaction_data().spawner,
-                dice.per_transaction_data(),
+                &*cloned_dice.per_transaction_data().spawner,
+                cloned_dice.per_transaction_data(),
             )
-            .into_drop_cancel()
         })
         // Use unlimited parallelism - tokio will restrict us anyway
         .buffer_unordered(1000000);
@@ -168,50 +113,66 @@ pub(crate) async fn targets_streaming(
     let mut stats = Stats::default();
     let mut needs_separator = false;
     let mut package_files_seen = SmallSet::new();
+
+    // Process package results and finally output the result
     while let Some(res) = packages.next().await {
-        let res = res?;
+        let mut res = res?;
         stats.merge(&res.stats);
+
+        // Print the error to stderr if exists
         if let Some(stderr) = &res.stderr {
             server_ctx.stderr()?.write_all(stderr.as_bytes())?;
             if !keep_going {
-                return Err(mk_error(stats.errors));
+                return Err(stats
+                    .to_error()
+                    .expect("Result only has a stderr if there were errors"));
             }
         }
+
+        // Output `res.stdout` which has the targets and imports
         if !res.stdout.is_empty() {
             if needs_separator {
                 formatter.separator(&mut buffer);
             }
             needs_separator = true;
-            outputter.write2(stdout, &buffer, &res.stdout)?;
-            buffer.clear();
+            write_str(outputter, &mut buffer)?;
+            write_str(outputter, &mut res.stdout)?;
         }
+
+        // Output all parent packages's imports (including self), if requested
         if imports {
             // Need to also find imports from PACKAGE files
-            let mut path = Some(PackageFilePath::for_dir(res.package.as_cell_path()));
+            let mut path = Some(res.package);
+
             while let Some(x) = path {
                 if package_files_seen.contains(&x) {
                     break;
                 }
-                package_files_seen.insert(x.clone());
+                package_files_seen.insert(x);
                 // These aren't cached, but the cost is relatively low (Starlark parsing),
                 // and there aren't many, so we just do it on the main thread.
                 // We ignore errors as these will bubble up as BUCK file errors already.
-                if let Ok(Some(imports)) = package_imports(&dice, &x).await {
+                if let Ok(Some((package_file_path, imports))) =
+                    package_imports(&mut dice, x.dupe()).await
+                {
                     if needs_separator {
                         formatter.separator(&mut buffer);
                     }
                     needs_separator = true;
-                    formatter.imports(x.path(), &imports, None, &mut buffer);
-                    outputter.write1(stdout, &buffer)?;
-                    buffer.clear();
+                    formatter.imports(package_file_path.path(), &imports, None, &mut buffer);
+                    write_str(outputter, &mut buffer)?;
                     imported.lock().unwrap().extend(imports.into_iter());
                 }
-                path = x.parent_package_file();
+                // TODO(nga): we should cross cell boundary:
+                //   This is what we do when we evaluate `PACKAGE` files.
+                //   https://fburl.com/code/qxl59b64
+                path = x.parent();
             }
         }
     }
 
-    // Recursively chase down all imported paths
+    // Recursively chase down all `imported` paths, and output them.
+    // This will only be done if `imports` is set
     let mut todo = mem::take(&mut *imported.lock().unwrap());
     let mut seen_imported = HashSet::new();
     while let Some(path) = todo.pop() {
@@ -227,23 +188,137 @@ pub(crate) async fn targets_streaming(
             let imports = loaded.imports().cloned().collect::<Vec<_>>();
             formatter.imports(path.path(), &imports, None, &mut buffer);
             todo.extend(imports);
-            outputter.write1(stdout, &buffer)?;
-            buffer.clear();
+            write_str(outputter, &mut buffer)?;
         }
     }
 
     formatter.end(&stats, &mut buffer);
-    Ok(TargetsResponse {
-        error_count: stats.errors,
-        serialized_targets_output: buffer,
-    })
+    write_str(outputter, &mut buffer)?;
+    Ok(stats)
+}
+
+struct PreparePackageResult {
+    stats: Stats,           // Stats to merge in
+    package: PackageLabel,  // The package I was operating on
+    stderr: Option<String>, // Print to stderr (and break unless keep_going is set)
+    stdout: String,         // Print to stdout
+}
+
+impl PreparePackageResult {
+    fn from_package(package: PackageLabel) -> Self {
+        Self {
+            stats: Stats::default(),
+            package,
+            stderr: None,
+            stdout: String::new(),
+        }
+    }
+
+    fn append_successful_targets(
+        &mut self,
+        eval_result: Arc<EvaluationResult>,
+        targets: Vec<TargetNode>,
+        error: Option<buck2_error::Error>,
+        formatter: &dyn TargetFormatter,
+        imports_flag: bool,
+        fast_hash: Option<bool>,
+        imported: Arc<Mutex<SmallSet<ImportPath>>>,
+    ) {
+        if let Some(ref err) = error {
+            self.record_error(err, formatter);
+        }
+
+        self.stats.success += 1;
+
+        // if requested, save the imports in the result.output to be printed later
+        // and add them to the imported set to be recursively imported later
+        if imports_flag {
+            if error.is_some() {
+                formatter.separator(&mut self.stdout);
+            }
+            let eval_imports = eval_result.imports();
+            formatter.imports(
+                &eval_result.buildfile_path().path(),
+                eval_imports,
+                Some(self.package.dupe()),
+                &mut self.stdout,
+            );
+            imported
+                .lock()
+                .unwrap()
+                .extend(eval_imports.iter().cloned());
+        }
+
+        // save the target info in the result.output to be printed later
+        for (i, node) in targets.iter().enumerate() {
+            self.stats.targets += 1;
+            if error.is_some() || imports_flag || i != 0 {
+                formatter.separator(&mut self.stdout);
+            }
+            formatter.target(
+                TargetInfo {
+                    node: node.as_ref(),
+                    target_hash: fast_hash
+                        .map(|fast| TargetHashes::compute_immediate_one(node, fast)),
+                    super_package: eval_result.super_package(),
+                },
+                &mut self.stdout,
+            )
+        }
+    }
+
+    fn record_error(&mut self, error: &buck2_error::Error, formatter: &dyn TargetFormatter) {
+        self.stats.add_error(error);
+        let mut stderr = String::new();
+        formatter.package_error(self.package.dupe(), error, &mut self.stdout, &mut stderr);
+        self.stderr = Some(stderr);
+    }
+}
+
+async fn process_package(
+    ctx: &mut DiceTransaction,
+    formatter: Arc<dyn TargetFormatter>,
+    package: PackageLabel,
+    spec: PackageSpec<TargetPatternExtra>,
+    cached: bool,
+    keep_going: bool,
+    imports_flag: bool,
+    fast_hash: Option<bool>,
+    threads: Arc<Semaphore>,
+    imported: Arc<Mutex<SmallSet<ImportPath>>>,
+) -> PreparePackageResult {
+    let mut result = PreparePackageResult::from_package(package.dupe());
+    let targets = {
+        // This bit of code is the heavy CPU stuff, so guard it with the threads
+        let _permit = threads.acquire().await.unwrap();
+        load_targets(ctx, package.dupe(), spec, cached, keep_going).await
+    };
+
+    match targets {
+        Ok((eval_result, targets, err)) => {
+            result.append_successful_targets(
+                eval_result,
+                targets,
+                err,
+                formatter.as_ref(),
+                imports_flag,
+                fast_hash,
+                imported,
+            );
+        }
+        Err(err) => {
+            result.record_error(&err, formatter.as_ref());
+        }
+    }
+
+    result
 }
 
 /// Given the patterns, separate into those which have an explicit package, and those which are recursive
-fn stream_packages<T: PatternType>(
-    dice: &DiceTransaction,
+fn stream_packages<'a, T: PatternType>(
+    dice: &'a DiceTransaction,
     patterns: Vec<ParsedPattern<T>>,
-) -> impl Stream<Item = anyhow::Result<(PackageLabel, PackageSpec<T>)>> {
+) -> impl Stream<Item = buck2_error::Result<(PackageLabel, PackageSpec<T>)>> + 'a {
     let mut spec = ResolvedPattern::<T>::new();
     let mut recursive_paths = Vec::new();
 
@@ -266,6 +341,7 @@ fn stream_packages<T: PatternType>(
 }
 
 #[derive(buck2_error::Error, Debug)]
+#[buck2(tag = Input)]
 enum TargetsError {
     #[error(
         "Unknown targets {} from package `{0}`.",
@@ -276,21 +352,22 @@ enum TargetsError {
 
 /// Load the targets from a package. If `keep_going` is specified then it may return a `Some` error in the triple.
 async fn load_targets(
-    dice: &DiceComputations,
+    dice: &mut DiceComputations<'_>,
     package: PackageLabel,
     spec: PackageSpec<TargetPatternExtra>,
     cached: bool,
     keep_going: bool,
-) -> anyhow::Result<(
+) -> buck2_error::Result<(
     Arc<EvaluationResult>,
     Vec<TargetNode>,
-    Option<anyhow::Error>,
+    Option<buck2_error::Error>,
 )> {
     let result = if cached {
         dice.get_interpreter_results(package.dupe()).await?
     } else {
         dice.get_interpreter_results_uncached(package.dupe())
-            .await?
+            .await
+            .1?
     };
 
     match spec {
@@ -313,7 +390,7 @@ async fn load_targets(
                 Ok((result, targets, err))
             } else {
                 let targets = targets.into_try_map(|(target, TargetPatternExtra)| {
-                    anyhow::Ok(result.resolve_target(target.as_ref())?.to_owned())
+                    buck2_error::Ok(result.resolve_target(target.as_ref())?.to_owned())
                 })?;
                 Ok((result, targets, None))
             }
@@ -327,9 +404,9 @@ async fn load_targets(
 
 /// Return `None` if the PACKAGE file doesn't exist
 async fn package_imports(
-    dice: &DiceComputations,
-    path: &PackageFilePath,
-) -> anyhow::Result<Option<Vec<ImportPath>>> {
+    dice: &mut DiceComputations<'_>,
+    path: PackageLabel,
+) -> buck2_error::Result<Option<(PackageFilePath, Vec<ImportPath>)>> {
     INTERPRETER_CALCULATION_IMPL
         .get()?
         .get_package_file_deps(dice, path)

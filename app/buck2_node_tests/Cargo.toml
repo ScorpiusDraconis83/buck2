@@ -7,11 +7,9 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dev-dependencies]
-anyhow = { workspace = true }
-
+buck2_error = { workspace = true }
 dupe = { workspace = true }
-starlark = { workspace = true }
 
 buck2_core = { workspace = true }
-buck2_interpreter_for_build = { workspace = true }
 buck2_node = { workspace = true }
+buck2_util = { workspace = true }

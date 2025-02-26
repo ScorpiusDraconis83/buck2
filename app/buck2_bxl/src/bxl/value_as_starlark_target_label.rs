@@ -11,10 +11,11 @@ use buck2_common::target_aliases::BuckConfigTargetAliasResolver;
 use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePath;
+use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
+use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use dupe::Dupe;
 use starlark::values::none::NoneType;
@@ -35,9 +36,10 @@ impl<'v> ValueAsStarlarkTargetLabel<'v> {
         self,
         target_alias_resolver: &BuckConfigTargetAliasResolver,
         cell_resolver: &CellResolver,
+        cell_alias_resolver: &CellAliasResolver,
         cell_name: CellName,
         default_target_platform: &Option<TargetLabel>,
-    ) -> anyhow::Result<Option<TargetLabel>> {
+    ) -> buck2_error::Result<Option<TargetLabel>> {
         match self {
             ValueAsStarlarkTargetLabel::None(_) => Ok(default_target_platform.clone()),
             ValueAsStarlarkTargetLabel::Str(s) => {
@@ -48,6 +50,7 @@ impl<'v> ValueAsStarlarkTargetLabel<'v> {
                         CellPathRef::new(cell_name, CellRelativePath::empty()),
                         s,
                         cell_resolver,
+                        cell_alias_resolver,
                     )?
                     .as_target_label(s)?,
                 ))

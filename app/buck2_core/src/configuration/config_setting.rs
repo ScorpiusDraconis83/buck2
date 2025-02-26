@@ -41,6 +41,15 @@ impl ConfigSettingData {
             && Self::is_subset(&that.constraints, &self.constraints)
             && Self::is_subset(&that.buckconfigs, &self.buckconfigs)
     }
+
+    pub fn testing_new(
+        constraint_values: BTreeMap<ConstraintKey, ConstraintValue>,
+    ) -> ConfigSettingData {
+        ConfigSettingData {
+            constraints: constraint_values,
+            buckconfigs: BTreeMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -52,7 +61,7 @@ mod tests {
     use crate::configuration::config_setting::ConfigSettingData;
     use crate::configuration::constraints::ConstraintKey;
     use crate::configuration::constraints::ConstraintValue;
-    use crate::target::label::TargetLabel;
+    use crate::target::label::label::TargetLabel;
 
     #[test]
     fn is_subset() {

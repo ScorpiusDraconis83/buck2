@@ -11,17 +11,22 @@ use async_trait::async_trait;
 use buck2_cli_proto::CqueryRequest;
 use buck2_cli_proto::CqueryResponse;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::target_cfg::TargetCfgWithUniverseOptions;
+use buck2_client_ctx::common::ui::CommonConsoleOptions;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonBuildConfigurationOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
-use buck2_client_ctx::common::CommonConsoleOptions;
-use buck2_client_ctx::common::CommonDaemonCommandOptions;
+use buck2_client_ctx::common::CommonEventLogOptions;
+use buck2_client_ctx::common::CommonStarlarkOptions;
 use buck2_client_ctx::daemon::client::BuckdClientConnector;
 use buck2_client_ctx::daemon::client::StdoutPartialResultHandler;
+use buck2_client_ctx::events_ctx::EventsCtx;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_core::if_else_opensource;
 
 use crate::commands::query::common::CommonQueryOptions;
+use crate::commands::query::profile::QueryProfileOptions;
 
 fn help() -> &'static str {
     concat!(
@@ -73,22 +78,7 @@ require quotes):
 )]
 pub struct CqueryCommand {
     #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
-    #[clap(flatten)]
     query_common: CommonQueryOptions,
-
-    #[clap(
-        long,
-        short = 'u',
-        use_delimiter = true,
-        help = "Comma separated list of targets at which to root the queryable universe.
-                This is useful since targets can exist in multiple configurations. While
-                this argument isn't required, it's recommended for most non-trivial queries.
-                In the absence of this argument, buck2 will use the target literals
-                in your cquery expression as the argument to this."
-    )]
-    target_universe: Vec<String>,
 
     #[clap(
         long,
@@ -96,19 +86,14 @@ pub struct CqueryCommand {
     )]
     show_providers: bool,
 
-    #[allow(rustdoc::bare_urls)]
-    /// Enable deprecated `owner()` function behavior.
-    ///
-    /// See this post https://fburl.com/1mf2d2xj for details.
-    #[clap(long)]
-    deprecated_owner: bool,
+    #[clap(flatten)]
+    target_cfg: TargetCfgWithUniverseOptions,
 
-    #[allow(rustdoc::bare_urls)]
-    /// Enable correct `owner()` function behavior.
-    ///
-    /// See this post https://fburl.com/1mf2d2xj for details.
-    #[clap(long)]
-    correct_owner: bool,
+    #[clap(flatten)]
+    common_opts: CommonCommandOptions,
+
+    #[clap(flatten)]
+    profile_options: QueryProfileOptions,
 }
 
 #[async_trait]
@@ -118,24 +103,14 @@ impl StreamingCommand for CqueryCommand {
     async fn exec_impl(
         self,
         buckd: &mut BuckdClientConnector,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: &mut ClientCommandContext<'_>,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let (query, query_args) = self.query_common.get_query();
         let unstable_output_format = self.query_common.output_format() as i32;
         let output_attributes = self.query_common.attributes.get()?;
         let context = ctx.client_context(matches, &self)?;
-
-        let correct_owner = match (self.correct_owner, self.deprecated_owner) {
-            (true, false) => true,
-            (false, true) => false,
-            (false, false) => true,
-            (true, true) => {
-                return ExitResult::bail(
-                    "Cannot specify both --correct-owner and --deprecated-owner",
-                );
-            }
-        };
 
         let CqueryResponse {} = buckd
             .with_flushing()
@@ -145,13 +120,20 @@ impl StreamingCommand for CqueryCommand {
                     query_args,
                     context: Some(context),
                     output_attributes,
-                    target_universe: self.target_universe,
+                    target_universe: self.target_cfg.target_universe,
+                    target_cfg: Some(self.target_cfg.target_cfg.target_cfg()),
                     show_providers: self.show_providers,
                     unstable_output_format,
-                    correct_owner,
+                    profile_mode: self.profile_options.profile_mode_proto().map(|m| m as i32),
+                    profile_output: self
+                        .profile_options
+                        .profile_output
+                        .as_ref()
+                        .map(|p| buck2_error::Ok(p.resolve(&ctx.working_dir).to_str()?.to_owned()))
+                        .transpose()?,
                 },
-                ctx.stdin()
-                    .console_interaction_stream(&self.common_opts.console_opts),
+                events_ctx,
+                ctx.console_interaction_stream(&self.common_opts.console_opts),
                 &mut StdoutPartialResultHandler,
             )
             .await??;
@@ -163,11 +145,15 @@ impl StreamingCommand for CqueryCommand {
         &self.common_opts.console_opts
     }
 
-    fn event_log_opts(&self) -> &CommonDaemonCommandOptions {
+    fn event_log_opts(&self) -> &CommonEventLogOptions {
         &self.common_opts.event_log_opts
     }
 
-    fn common_opts(&self) -> &CommonBuildConfigurationOptions {
+    fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {
         &self.common_opts.config_opts
+    }
+
+    fn starlark_opts(&self) -> &CommonStarlarkOptions {
+        &self.common_opts.starlark_opts
     }
 }

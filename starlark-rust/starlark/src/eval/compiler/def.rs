@@ -20,10 +20,8 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::Display;
 use std::fmt::Write;
 use std::ptr;
-use std::time::Instant;
 
 use allocative::Allocative;
 use derivative::Derivative;
@@ -37,6 +35,7 @@ use starlark_map::StarlarkHasher;
 use starlark_syntax::eval_exception::EvalException;
 use starlark_syntax::slice_vec_ext::SliceExt;
 use starlark_syntax::syntax::def::DefParam;
+use starlark_syntax::syntax::def::DefParamIndices;
 use starlark_syntax::syntax::def::DefParamKind;
 use starlark_syntax::syntax::def::DefParams;
 
@@ -48,6 +47,7 @@ use crate::collections::Hashed;
 use crate::const_frozen_string;
 use crate::docs::DocFunction;
 use crate::docs::DocItem;
+use crate::docs::DocMember;
 use crate::docs::DocString;
 use crate::docs::DocStringKind;
 use crate::environment::FrozenModuleData;
@@ -56,6 +56,7 @@ use crate::eval::bc::bytecode::Bc;
 use crate::eval::bc::frame::alloca_frame;
 use crate::eval::compiler::def_inline::inline_def_body;
 use crate::eval::compiler::def_inline::InlineDefBody;
+use crate::eval::compiler::error::CompilerInternalError;
 use crate::eval::compiler::expr::ExprCompiled;
 use crate::eval::compiler::opt_ctx::OptCtx;
 use crate::eval::compiler::scope::payload::CstAssignIdent;
@@ -75,17 +76,21 @@ use crate::eval::runtime::arguments::ResolvedArgName;
 use crate::eval::runtime::evaluator::Evaluator;
 use crate::eval::runtime::frame_span::FrameSpan;
 use crate::eval::runtime::frozen_file_span::FrozenFileSpan;
-use crate::eval::runtime::params::ParametersSpec;
+use crate::eval::runtime::params::spec::ParametersSpec;
+use crate::eval::runtime::profile::instant::ProfilerInstant;
 use crate::eval::runtime::slots::LocalSlotId;
 use crate::eval::runtime::slots::LocalSlotIdCapturedOrNot;
 use crate::eval::Arguments;
 use crate::starlark_complex_values;
-use crate::typing::Param;
+use crate::typing::callable_param::ParamIsRequired;
+use crate::typing::ParamSpec;
 use crate::typing::Ty;
+use crate::util::arc_str::ArcStr;
 use crate::values::frozen_ref::AtomicFrozenRefOption;
 use crate::values::function::FUNCTION_TYPE;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenHeap;
 use crate::values::FrozenRef;
@@ -145,18 +150,23 @@ pub(crate) struct ParameterName {
 
 #[derive(Clone, Debug, VisitSpanMut)]
 pub(crate) enum ParameterCompiled<T> {
-    Normal(ParameterName, Option<TypeCompiled<FrozenValue>>),
-    WithDefaultValue(ParameterName, Option<TypeCompiled<FrozenValue>>, T),
+    Normal(
+        /// Name.
+        ParameterName,
+        /// Type.
+        Option<TypeCompiled<FrozenValue>>,
+        /// Default value.
+        Option<T>,
+    ),
     Args(ParameterName, Option<TypeCompiled<FrozenValue>>),
     KwArgs(ParameterName, Option<TypeCompiled<FrozenValue>>),
 }
 
 impl<T> ParameterCompiled<T> {
-    pub(crate) fn map_expr<U>(&self, mut f: impl FnMut(&T) -> U) -> ParameterCompiled<U> {
+    pub(crate) fn map_expr<U>(&self, f: impl FnMut(&T) -> U) -> ParameterCompiled<U> {
         match self {
-            ParameterCompiled::Normal(n, o) => ParameterCompiled::Normal(n.clone(), *o),
-            ParameterCompiled::WithDefaultValue(n, o, t) => {
-                ParameterCompiled::WithDefaultValue(n.clone(), *o, f(t))
+            ParameterCompiled::Normal(n, o, t) => {
+                ParameterCompiled::Normal(n.clone(), *o, t.as_ref().map(f))
             }
             ParameterCompiled::Args(n, o) => ParameterCompiled::Args(n.clone(), *o),
             ParameterCompiled::KwArgs(n, o) => ParameterCompiled::KwArgs(n.clone(), *o),
@@ -165,8 +175,7 @@ impl<T> ParameterCompiled<T> {
 
     pub(crate) fn accepts_positional(&self) -> bool {
         match self {
-            ParameterCompiled::Normal(_, _) => true,
-            ParameterCompiled::WithDefaultValue(_, _, _) => true,
+            ParameterCompiled::Normal(..) => true,
             _ => false,
         }
     }
@@ -177,8 +186,7 @@ impl<T> ParameterCompiled<T> {
 
     pub(crate) fn name_ty(&self) -> (&ParameterName, Option<TypeCompiled<FrozenValue>>) {
         match self {
-            Self::Normal(n, t) => (n, *t),
-            Self::WithDefaultValue(n, t, _) => (n, *t),
+            Self::Normal(n, t, _) => (n, *t),
             Self::Args(n, t) => (n, *t),
             Self::KwArgs(n, t) => (n, *t),
         }
@@ -198,6 +206,15 @@ impl<T> ParameterCompiled<T> {
         }
     }
 
+    pub(crate) fn required(&self) -> ParamIsRequired {
+        match self {
+            ParameterCompiled::Normal(_, _, None) => ParamIsRequired::Yes,
+            ParameterCompiled::Normal(_, _, Some(_)) => ParamIsRequired::No,
+            ParameterCompiled::Args(..) => ParamIsRequired::No,
+            ParameterCompiled::KwArgs(..) => ParamIsRequired::No,
+        }
+    }
+
     pub(crate) fn is_star_or_star_star(&self) -> bool {
         matches!(
             self,
@@ -209,9 +226,7 @@ impl<T> ParameterCompiled<T> {
 #[derive(Debug, Clone, VisitSpanMut)]
 pub(crate) struct ParametersCompiled<T> {
     pub(crate) params: Vec<IrSpanned<ParameterCompiled<T>>>,
-    /// Number of parameters which can be filled positionally.
-    /// That is, number of parameters before first `*`, `*args` or `**kwargs`.
-    pub(crate) num_positional: u32,
+    pub(crate) indices: DefParamIndices,
 }
 
 impl<T> ParametersCompiled<T> {
@@ -258,32 +273,39 @@ impl<T> ParametersCompiled<T> {
             .collect()
     }
 
-    pub(crate) fn to_ty_params(&self) -> Vec<Param> {
-        self.params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let ty = p.ty();
-                match &p.node {
-                    ParameterCompiled::Normal(name, ..) => {
-                        if i < self.num_positional as usize {
-                            Param::pos_or_name(&name.name, ty)
-                        } else {
-                            Param::name_only(&name.name, ty)
-                        }
-                    }
-                    ParameterCompiled::WithDefaultValue(name, ..) => {
-                        if i < self.num_positional as usize {
-                            Param::pos_or_name(&name.name, ty).optional()
-                        } else {
-                            Param::name_only(&name.name, ty).optional()
-                        }
-                    }
-                    ParameterCompiled::Args(..) => Param::args(ty),
-                    ParameterCompiled::KwArgs(..) => Param::kwargs(ty),
-                }
-            })
-            .collect()
+    pub(crate) fn to_ty_params(&self) -> ParamSpec {
+        ParamSpec::new_parts(
+            self.indices.pos_only().map(|i| {
+                let p = &self.params[i].node;
+                (p.required(), p.ty())
+            }),
+            self.indices.pos_or_named().map(|i| {
+                let p = &self.params[i].node;
+                (
+                    ArcStr::from(p.name_ty().0.name.as_str()),
+                    p.required(),
+                    p.ty(),
+                )
+            }),
+            self.indices.args.map(|i| {
+                let p = &self.params[i as usize].node;
+                p.ty()
+            }),
+            self.indices.named_only(self.params.len()).map(|i| {
+                let p = &self.params[i].node;
+                (
+                    ArcStr::from(p.name_ty().0.name.as_str()),
+                    p.required(),
+                    p.ty(),
+                )
+            }),
+            self.indices.kwargs.map(|i| {
+                let p = &self.params[i as usize].node;
+                p.ty()
+            }),
+        )
+        // TODO(nga): do not unwrap.
+        .unwrap()
     }
 }
 
@@ -299,7 +321,7 @@ pub(crate) struct CopySlotFromParent {
 /// Static info for `def`, `lambda` or module.
 #[derive(Derivative, Display)]
 #[derivative(Debug)]
-#[display(fmt = "DefInfo")]
+#[display("DefInfo")]
 pub(crate) struct DefInfo {
     pub(crate) name: FrozenStringValue,
     /// Span of function signature.
@@ -386,7 +408,7 @@ pub(crate) struct DefCompiled {
     pub(crate) info: FrozenRef<'static, DefInfo>,
 }
 
-impl Compiler<'_, '_, '_> {
+impl Compiler<'_, '_, '_, '_> {
     fn parameter_name(&mut self, ident: &CstAssignIdent) -> ParameterName {
         let binding_id = ident.payload.expect("no binding for parameter");
         let binding = self.scope_data.get_binding(binding_id);
@@ -396,24 +418,19 @@ impl Compiler<'_, '_, '_> {
         }
     }
 
-    /// Compile a parameter. Return `None` for `*` pseudo parameter.
     fn parameter(
         &mut self,
         x: &Spanned<DefParam<'_, CstPayload>>,
-    ) -> IrSpanned<ParameterCompiled<IrSpanned<ExprCompiled>>> {
+    ) -> Result<IrSpanned<ParameterCompiled<IrSpanned<ExprCompiled>>>, CompilerInternalError> {
         let span = FrameSpan::new(FrozenFileSpan::new(self.codemap, x.span));
         let parameter_name = self.parameter_name(x.ident);
-        IrSpanned {
+        Ok(IrSpanned {
             span,
             node: match &x.node.kind {
-                DefParamKind::Regular(None) => ParameterCompiled::Normal(
+                DefParamKind::Regular(_mode, default_value) => ParameterCompiled::Normal(
                     parameter_name,
                     self.expr_for_type(x.ty).map(|t| t.node),
-                ),
-                DefParamKind::Regular(Some(default_value)) => ParameterCompiled::WithDefaultValue(
-                    parameter_name,
-                    self.expr_for_type(x.ty).map(|t| t.node),
-                    self.expr(default_value),
+                    default_value.as_ref().map(|d| self.expr(d)).transpose()?,
                 ),
                 DefParamKind::Args => ParameterCompiled::Args(
                     parameter_name,
@@ -424,7 +441,7 @@ impl Compiler<'_, '_, '_> {
                     self.expr_for_type(x.ty).map(|t| t.node),
                 ),
             },
-        }
+        })
     }
 
     pub fn function(
@@ -435,20 +452,23 @@ impl Compiler<'_, '_, '_> {
         params: &[CstParameter],
         return_type: Option<&CstTypeExpr>,
         suite: &CstStmt,
-    ) -> ExprCompiled {
+    ) -> Result<ExprCompiled, CompilerInternalError> {
         let file = self.codemap.file_span(suite.span);
         let function_name = format!("{}.{}", file.file.filename(), name);
-        let name = self.eval.frozen_heap().alloc_str(name);
+        let name = self.eval.frozen_heap().alloc_str_intern(name);
 
-        let def_params = DefParams::unpack(params, &self.codemap).expect("verified at parse time");
+        let DefParams { params, indices } = match DefParams::unpack(params, &self.codemap) {
+            Ok(def_params) => def_params,
+            Err(e) => return Err(CompilerInternalError::from_eval_exception(e)),
+        };
 
         // The parameters run in the scope of the parent, so compile them with the outer
         // scope
-        let params = def_params.params.map(|x| self.parameter(x));
-        let params = ParametersCompiled {
-            params,
-            num_positional: def_params.num_positional,
-        };
+        let params: Vec<_> = params
+            .iter()
+            .map(|x| self.parameter(x))
+            .collect::<Result<_, CompilerInternalError>>()?;
+        let params = ParametersCompiled { params, indices };
         let return_type = self.expr_for_type(return_type).map(|t| t.node);
 
         let ty = Ty::function(
@@ -459,7 +479,7 @@ impl Compiler<'_, '_, '_> {
         self.enter_scope(scope_id);
 
         let docstring = DocString::extract_raw_starlark_docstring(suite);
-        let body = self.stmt(suite, false);
+        let body = self.stmt(suite, false)?;
         let scope_id = self.exit_scope();
         let scope_names = self.scope_data.get_scope(scope_id);
 
@@ -474,25 +494,19 @@ impl Compiler<'_, '_, '_> {
 
         let param_count = params.count_param_variables();
 
-        let used = self
-            .eval
-            .frozen_heap()
-            .alloc_any_slice_display_from_debug(&scope_names.used);
+        let used = self.eval.frozen_heap().alloc_any_slice(&scope_names.used);
         let info = self.eval.module_env.frozen_heap().alloc_any(DefInfo {
             name,
             signature_span,
             parameter_captures: self
                 .eval
                 .frozen_heap()
-                .alloc_any_slice_display_from_debug(&params.parameter_captures()),
+                .alloc_any_slice(&params.parameter_captures()),
             ty,
             codemap: self.codemap,
             docstring,
             used,
-            parent: self
-                .eval
-                .frozen_heap()
-                .alloc_any_slice_display_from_debug(&scope_names.parent),
+            parent: self.eval.frozen_heap().alloc_any_slice(&scope_names.parent),
             stmt_compiled: body.as_bc(
                 &self.compile_context(return_type.is_some()),
                 used,
@@ -505,12 +519,12 @@ impl Compiler<'_, '_, '_> {
             globals: self.globals,
         });
 
-        ExprCompiled::Def(DefCompiled {
+        Ok(ExprCompiled::Def(DefCompiled {
             function_name,
             params,
             return_type,
             info,
-        })
+        }))
     }
 }
 
@@ -541,7 +555,7 @@ pub(crate) struct DefGen<V> {
     /// When the module is not frozen yet, this field contains `None`, and function's module
     /// can be accessed from evaluator's module.
     #[allocative(skip)]
-    module: AtomicFrozenRefOption<FrozenModuleData>,
+    pub(crate) module: AtomicFrozenRefOption<FrozenModuleData>,
     /// This field is only used in `FrozenDef`. It is populated in `post_freeze`.
     #[derivative(Debug = "ignore")]
     #[allocative(skip)]
@@ -565,29 +579,29 @@ impl<'v> Def<'v> {
         parameter_types: Vec<(LocalSlotId, String, TypeCompiled<FrozenValue>)>,
         return_type: Option<TypeCompiled<FrozenValue>>,
         stmt: FrozenRef<'static, DefInfo>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> Value<'v> {
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<Value<'v>> {
         let captured = stmt
             .parent
             .as_ref()
             .map(|copy| eval.clone_slot_capture(copy, &stmt));
-        eval.heap().alloc(Self {
+        Ok(eval.heap().alloc(Self {
             parameters,
             parameter_captures: stmt.parameter_captures,
             parameter_types,
             return_type,
             captured,
-            module: AtomicFrozenRefOption::new(eval.module_variables),
+            module: AtomicFrozenRefOption::new(eval.top_frame_def_frozen_module(false)?),
             optimized_on_freeze_stmt: StmtCompiledCell::new(),
             def_info: stmt,
-        })
+        }))
     }
 }
 
 impl<'v> Freeze for Def<'v> {
     type Frozen = FrozenDef;
 
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         let parameters = self.parameters.freeze(freezer)?;
         let parameter_types = self.parameter_types.freeze(freezer)?;
         let return_type = self.return_type.freeze(freezer)?;
@@ -619,7 +633,7 @@ impl<'v> DefLike<'v> for DefGen<FrozenValue> {
 }
 
 #[starlark_value(type = FUNCTION_TYPE)]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for DefGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for DefGen<V>
 where
     Self: ProvidesStaticType<'v> + DefLike<'v>,
 {
@@ -631,12 +645,12 @@ where
         &self,
         me: Value<'v>,
         args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
         self.invoke_impl(me, &args.0, eval)
     }
 
-    fn documentation(&self) -> Option<DocItem> {
+    fn documentation(&self) -> DocItem {
         let mut parameter_types = vec![Ty::any(); self.parameters.len()];
         for (idx, _, ty) in &self.parameter_types {
             // Local slot number for parameter is the same as parameter index.
@@ -651,10 +665,9 @@ where
                 .documentation(parameter_types, HashMap::new()),
             return_type,
             self.def_info.docstring.as_ref().map(String::as_ref),
-            None,
         );
 
-        Some(DocItem::Function(function_docs))
+        DocItem::Member(DocMember::Function(function_docs))
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
@@ -679,9 +692,9 @@ where
         }
     }
 
-    fn check_parameter_types(&self, eval: &mut Evaluator<'v, '_>) -> anyhow::Result<()> {
+    fn check_parameter_types(&self, eval: &mut Evaluator<'v, '_, '_>) -> crate::Result<()> {
         let start = if eval.typecheck_profile.enabled {
-            Some(Instant::now())
+            Some(ProfilerInstant::now())
         } else {
             None
         };
@@ -703,12 +716,13 @@ where
     pub(crate) fn check_return_type(
         &self,
         ret: Value<'v>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<()> {
-        let return_type_ty: TypeCompiled<FrozenValue> =
-            self.return_type.ok_or(DefError::CheckReturnTypeNoType)?;
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> crate::Result<()> {
+        let return_type_ty: TypeCompiled<FrozenValue> = self
+            .return_type
+            .ok_or_else(|| crate::Error::new_other(DefError::CheckReturnTypeNoType))?;
         let start = if eval.typecheck_profile.enabled {
-            Some(Instant::now())
+            Some(ProfilerInstant::now())
         } else {
             None
         };
@@ -725,7 +739,7 @@ where
         &self,
         me: Value<'v>,
         args: &A,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>>
     where
         'v: 'a,
@@ -737,7 +751,11 @@ where
             bc.max_stack_size,
             bc.max_loop_depth,
             |eval| {
-                let slots = eval.current_frame.locals();
+                // SAFETY: `slots` is unique: `alloca_frame` just allocated the frame,
+                //   so there are no references to the frame except `eval.current_frame`.
+                //   We use `slots` only in `collect_inline`,
+                //   which does not have access to `eval` thus cannot access the frame indirectly.
+                let slots = unsafe { eval.current_frame.locals_mut() };
                 self.parameters.collect_inline(args, slots, eval.heap())?;
                 self.invoke_raw(me, eval)
             },
@@ -748,7 +766,7 @@ where
         &self,
         me: Value<'v>,
         args: &A,
-        eval: &mut Evaluator<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>>
     where
         'v: 'a,
@@ -763,7 +781,11 @@ where
     /// * the frame has been allocated and stored in `eval.current_frame`
     /// * the arguments have been collected into the frame
     #[inline(always)]
-    fn invoke_raw(&self, me: Value<'v>, eval: &mut Evaluator<'v, '_>) -> crate::Result<Value<'v>> {
+    fn invoke_raw(
+        &self,
+        me: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> crate::Result<Value<'v>> {
         // println!("invoking {}", self.def.stmt.name.node);
 
         if !self.parameter_types.is_empty() {
@@ -789,9 +811,9 @@ where
         if Self::FROZEN {
             debug_assert!(self.module.load_relaxed().is_some());
         }
-        let res = eval.with_function_context(me, self.module.load_relaxed(), self.bc());
 
-        res.map_err(EvalException::into_error)
+        eval.eval_bc(me, self.bc())
+            .map_err(EvalException::into_error)
     }
 
     pub(crate) fn resolve_arg_name(&self, name: Hashed<&str>) -> ResolvedArgName {

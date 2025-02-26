@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -11,7 +10,7 @@ rust_library(
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:clap-3",
+        "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:derivative",
         "fbsource//third-party/rust:derive_more",
         "fbsource//third-party/rust:linked-hash-map",
@@ -20,9 +19,11 @@ rust_library(
         "fbsource//third-party/rust:termwiz",
         "fbsource//third-party/rust:tracing",
         "//buck2/app/buck2_common:buck2_common",
+        "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_data:buck2_data",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_events:buck2_events",
+        "//buck2/app/buck2_health_check:buck2_health_check",
         "//buck2/app/buck2_test_api:buck2_test_api",
         "//buck2/app/buck2_util:buck2_util",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use buck2_common::liveliness_observer::LivelinessObserver;
 use buck2_events::dispatch::EventDispatcher;
+use futures::future::Future;
+use futures::future::FutureExt;
 use indexmap::IndexMap;
 
 use crate::artifact_value::ArtifactValue;
@@ -20,6 +22,7 @@ use crate::execute::claim::ClaimManager;
 use crate::execute::kind::CommandExecutionKind;
 use crate::execute::output::CommandStdStreams;
 use crate::execute::request::CommandExecutionOutput;
+use crate::execute::result::CommandExecutionErrorType;
 use crate::execute::result::CommandExecutionMetadata;
 use crate::execute::result::CommandExecutionReport;
 use crate::execute::result::CommandExecutionResult;
@@ -34,18 +37,23 @@ trait CommandExecutionManagerLike: Sized {
         std_streams: CommandStdStreams,
         exit_code: Option<i32>,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult;
 
     fn execution_kind(&self) -> Option<CommandExecutionKind>;
 }
 
-/// This tracker helps track the information that will go into the BuckCommandExecutionMetadata
-pub struct CommandExecutionManager {
+pub struct CommandExecutionManagerInner {
     pub claim_manager: Box<dyn ClaimManager>,
     pub events: EventDispatcher,
     pub liveliness_observer: Arc<dyn LivelinessObserver>,
     pub intend_to_fallback_on_failure: bool,
     pub execution_kind: Option<CommandExecutionKind>,
+}
+
+/// This tracker helps track the information that will go into the BuckCommandExecutionMetadata
+pub struct CommandExecutionManager {
+    pub inner: Box<CommandExecutionManagerInner>,
 }
 
 impl CommandExecutionManager {
@@ -55,28 +63,36 @@ impl CommandExecutionManager {
         liveliness_observer: Arc<dyn LivelinessObserver>,
     ) -> Self {
         Self {
-            claim_manager,
-            events,
-            liveliness_observer,
-            intend_to_fallback_on_failure: false,
-            execution_kind: None,
+            inner: Box::new(CommandExecutionManagerInner {
+                claim_manager,
+                events,
+                liveliness_observer,
+                intend_to_fallback_on_failure: false,
+                execution_kind: None,
+            }),
         }
     }
 
     /// Acquire a claim. This might never return if the claim has been taken.
-    pub async fn claim(self) -> CommandExecutionManagerWithClaim {
-        let claim = self.claim_manager.claim().await;
-
-        CommandExecutionManagerWithClaim {
-            claim,
-            events: self.events,
-            liveliness_observer: self.liveliness_observer,
-            execution_kind: self.execution_kind,
-        }
+    pub fn claim(self) -> impl Future<Output = CommandExecutionManagerWithClaim> {
+        let events = self.inner.events;
+        let liveliness_observer = self.inner.liveliness_observer;
+        let execution_kind = self.inner.execution_kind;
+        self.inner
+            .claim_manager
+            .claim()
+            .map(|claim| CommandExecutionManagerWithClaim {
+                inner: Box::new(CommandExecutionManagerWithClaimInner {
+                    claim,
+                    events,
+                    liveliness_observer,
+                    execution_kind,
+                }),
+            })
     }
 
     pub fn on_result_delayed(&mut self) {
-        self.claim_manager.on_result_delayed();
+        self.inner.claim_manager.on_result_delayed();
     }
 
     pub fn cancel(self) -> CommandExecutionResult {
@@ -86,6 +102,7 @@ impl CommandExecutionManager {
             Default::default(),
             None,
             CommandExecutionMetadata::default(),
+            None,
         )
     }
 
@@ -93,12 +110,12 @@ impl CommandExecutionManager {
         mut self,
         intend_to_fallback_on_failure: bool,
     ) -> Self {
-        self.intend_to_fallback_on_failure = intend_to_fallback_on_failure;
+        self.inner.intend_to_fallback_on_failure = intend_to_fallback_on_failure;
         self
     }
 
     pub fn with_execution_kind(mut self, execution_kind: CommandExecutionKind) -> Self {
-        self.execution_kind = Some(execution_kind);
+        self.inner.execution_kind = Some(execution_kind);
         self
     }
 }
@@ -111,6 +128,7 @@ impl CommandExecutionManagerLike for CommandExecutionManager {
         std_streams: CommandStdStreams,
         exit_code: Option<i32>,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult {
         CommandExecutionResult {
             outputs,
@@ -120,6 +138,7 @@ impl CommandExecutionManagerLike for CommandExecutionManager {
                 timing,
                 std_streams,
                 exit_code,
+                additional_message,
             },
             rejected_execution: None,
             did_cache_upload: false,
@@ -127,19 +146,24 @@ impl CommandExecutionManagerLike for CommandExecutionManager {
             dep_file_key: None,
             eligible_for_full_hybrid: false,
             dep_file_metadata: None,
+            action_result: None,
         }
     }
 
     fn execution_kind(&self) -> Option<CommandExecutionKind> {
-        self.execution_kind.clone()
+        self.inner.execution_kind.clone()
     }
 }
 
-pub struct CommandExecutionManagerWithClaim {
+pub struct CommandExecutionManagerWithClaimInner {
     pub events: EventDispatcher,
     pub liveliness_observer: Arc<dyn LivelinessObserver>,
     pub execution_kind: Option<CommandExecutionKind>,
     claim: Box<dyn Claim>,
+}
+
+pub struct CommandExecutionManagerWithClaim {
+    pub inner: Box<CommandExecutionManagerWithClaimInner>,
 }
 
 /// Like CommandExecutionManager but provides access to things that are only allowed with a Claim;
@@ -159,6 +183,7 @@ impl CommandExecutionManagerWithClaim {
             std_streams,
             Some(0),
             timing,
+            None,
         )
     }
 
@@ -169,11 +194,12 @@ impl CommandExecutionManagerWithClaim {
             Default::default(),
             None,
             CommandExecutionMetadata::default(),
+            None,
         )
     }
 
     pub fn with_execution_kind(mut self, execution_kind: CommandExecutionKind) -> Self {
-        self.execution_kind = Some(execution_kind);
+        self.inner.execution_kind = Some(execution_kind);
         self
     }
 }
@@ -186,15 +212,17 @@ impl CommandExecutionManagerLike for CommandExecutionManagerWithClaim {
         std_streams: CommandStdStreams,
         exit_code: Option<i32>,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult {
         CommandExecutionResult {
             outputs,
             report: CommandExecutionReport {
-                claim: Some(self.claim),
+                claim: Some(self.inner.claim),
                 status,
                 timing,
                 std_streams,
                 exit_code,
+                additional_message,
             },
             rejected_execution: None,
             did_cache_upload: false,
@@ -202,11 +230,12 @@ impl CommandExecutionManagerLike for CommandExecutionManagerWithClaim {
             dep_file_key: None,
             eligible_for_full_hybrid: false,
             dep_file_metadata: None,
+            action_result: None,
         }
     }
 
     fn execution_kind(&self) -> Option<CommandExecutionKind> {
-        self.execution_kind.clone()
+        self.inner.execution_kind.clone()
     }
 }
 
@@ -218,6 +247,14 @@ pub trait CommandExecutionManagerExt: Sized {
         std_streams: CommandStdStreams,
         exit_code: Option<i32>,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
+    ) -> CommandExecutionResult;
+
+    fn worker_failure(
+        self,
+        execution_kind: CommandExecutionKind,
+        stderr: String,
+        timing: CommandExecutionMetadata,
     ) -> CommandExecutionResult;
 
     fn timeout(
@@ -226,9 +263,23 @@ pub trait CommandExecutionManagerExt: Sized {
         duration: Duration,
         std_streams: CommandStdStreams,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult;
 
-    fn error(self, stage: &'static str, error: impl Into<anyhow::Error>) -> CommandExecutionResult;
+    fn error(
+        self,
+        stage: &'static str,
+        error: impl Into<buck2_error::Error>,
+    ) -> CommandExecutionResult {
+        self.error_classified(stage, error, CommandExecutionErrorType::Other)
+    }
+
+    fn error_classified(
+        self,
+        stage: &'static str,
+        error: impl Into<buck2_error::Error>,
+        error_type: CommandExecutionErrorType,
+    ) -> CommandExecutionResult;
 }
 
 impl<T> CommandExecutionManagerExt for T
@@ -242,6 +293,7 @@ where
         std_streams: CommandStdStreams,
         exit_code: Option<i32>,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult {
         self.result(
             CommandExecutionStatus::Failure { execution_kind },
@@ -249,6 +301,26 @@ where
             std_streams,
             exit_code,
             timing,
+            additional_message,
+        )
+    }
+
+    fn worker_failure(
+        self,
+        execution_kind: CommandExecutionKind,
+        stderr: String,
+        timing: CommandExecutionMetadata,
+    ) -> CommandExecutionResult {
+        self.result(
+            CommandExecutionStatus::WorkerFailure { execution_kind },
+            Default::default(),
+            CommandStdStreams::Local {
+                stdout: Default::default(),
+                stderr: stderr.into_bytes(),
+            },
+            None,
+            timing,
+            None,
         )
     }
 
@@ -258,6 +330,7 @@ where
         duration: Duration,
         std_streams: CommandStdStreams,
         timing: CommandExecutionMetadata,
+        additional_message: Option<String>,
     ) -> CommandExecutionResult {
         self.result(
             CommandExecutionStatus::TimedOut {
@@ -268,21 +341,29 @@ where
             std_streams,
             None,
             timing,
+            additional_message,
         )
     }
 
-    fn error(self, stage: &'static str, error: impl Into<anyhow::Error>) -> CommandExecutionResult {
+    fn error_classified(
+        self,
+        stage: &'static str,
+        error: impl Into<buck2_error::Error>,
+        error_type: CommandExecutionErrorType,
+    ) -> CommandExecutionResult {
         let execution_kind = self.execution_kind();
         self.result(
             CommandExecutionStatus::Error {
                 stage,
                 error: error.into(),
                 execution_kind,
+                typ: error_type,
             },
             IndexMap::new(),
             Default::default(),
             None,
             CommandExecutionMetadata::default(),
+            None,
         )
     }
 }

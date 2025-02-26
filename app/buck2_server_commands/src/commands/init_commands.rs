@@ -8,17 +8,26 @@
  */
 
 use async_trait::async_trait;
+use buck2_cli_proto::new_generic::CompleteRequest;
+use buck2_cli_proto::new_generic::CompleteResponse;
 use buck2_cli_proto::new_generic::DebugEvalRequest;
 use buck2_cli_proto::new_generic::DebugEvalResponse;
+use buck2_cli_proto::new_generic::ExpandExternalCellsRequest;
+use buck2_cli_proto::new_generic::ExpandExternalCellsResponse;
+use buck2_cli_proto::new_generic::ExplainRequest;
+use buck2_cli_proto::new_generic::ExplainResponse;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
-use buck2_server_ctx::other_server_commands::OtherServerCommands;
-use buck2_server_ctx::other_server_commands::OTHER_SERVER_COMMANDS;
+use buck2_server_ctx::late_bindings::OtherServerCommands;
+use buck2_server_ctx::late_bindings::OTHER_SERVER_COMMANDS;
 use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 
 use crate::commands::build::build_command;
+use crate::commands::complete::complete_command;
 use crate::commands::ctargets::configured_targets_command;
 use crate::commands::debug_eval::debug_eval_command;
+use crate::commands::expand_external_cells::expand_external_cells_command;
+use crate::commands::explain::explain_command;
 use crate::commands::install::install_command;
 use crate::commands::query::aquery::aquery_command;
 use crate::commands::query::cquery::cquery_command;
@@ -35,7 +44,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::BuildRequest,
-    ) -> anyhow::Result<buck2_cli_proto::BuildResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::BuildResponse> {
         build_command(ctx, partial_result_dispatcher, req).await
     }
     async fn install(
@@ -43,7 +52,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::InstallRequest,
-    ) -> anyhow::Result<buck2_cli_proto::InstallResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::InstallResponse> {
         install_command(ctx, partial_result_dispatcher, req).await
     }
     async fn uquery(
@@ -51,7 +60,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         req: buck2_cli_proto::UqueryRequest,
-    ) -> anyhow::Result<buck2_cli_proto::UqueryResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::UqueryResponse> {
         uquery_command(ctx, partial_result_dispatcher, req).await
     }
     async fn cquery(
@@ -59,7 +68,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         req: buck2_cli_proto::CqueryRequest,
-    ) -> anyhow::Result<buck2_cli_proto::CqueryResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::CqueryResponse> {
         cquery_command(ctx, partial_result_dispatcher, req).await
     }
     async fn aquery(
@@ -67,7 +76,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         req: buck2_cli_proto::AqueryRequest,
-    ) -> anyhow::Result<buck2_cli_proto::AqueryResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::AqueryResponse> {
         aquery_command(ctx, partial_result_dispatcher, req).await
     }
     async fn targets(
@@ -75,7 +84,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
         req: buck2_cli_proto::TargetsRequest,
-    ) -> anyhow::Result<buck2_cli_proto::TargetsResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::TargetsResponse> {
         targets_command(ctx, partial_result_dispatcher, req).await
     }
     async fn targets_show_outputs(
@@ -83,7 +92,7 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::TargetsRequest,
-    ) -> anyhow::Result<buck2_cli_proto::TargetsShowOutputsResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::TargetsShowOutputsResponse> {
         targets_show_outputs_command(ctx, partial_result_dispatcher, req).await
     }
     async fn ctargets(
@@ -91,15 +100,43 @@ impl OtherServerCommands for OtherServerCommandsInstance {
         ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
         req: buck2_cli_proto::ConfiguredTargetsRequest,
-    ) -> anyhow::Result<buck2_cli_proto::ConfiguredTargetsResponse> {
+    ) -> buck2_error::Result<buck2_cli_proto::ConfiguredTargetsResponse> {
         configured_targets_command(ctx, partial_result_dispatcher, req).await
     }
+
+    async fn complete(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        req: CompleteRequest,
+    ) -> buck2_error::Result<CompleteResponse> {
+        complete_command(ctx, partial_result_dispatcher, req).await
+    }
+
     async fn debug_eval(
         &self,
         ctx: &dyn ServerCommandContextTrait,
         req: DebugEvalRequest,
-    ) -> anyhow::Result<DebugEvalResponse> {
+    ) -> buck2_error::Result<DebugEvalResponse> {
         debug_eval_command(ctx, req).await
+    }
+
+    async fn explain(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        req: ExplainRequest,
+    ) -> buck2_error::Result<ExplainResponse> {
+        explain_command(ctx, partial_result_dispatcher, req).await
+    }
+
+    async fn expand_external_cells(
+        &self,
+        ctx: &dyn ServerCommandContextTrait,
+        partial_result_dispatcher: PartialResultDispatcher<NoPartialResult>,
+        req: ExpandExternalCellsRequest,
+    ) -> buck2_error::Result<ExpandExternalCellsResponse> {
+        expand_external_cells_command(ctx, partial_result_dispatcher, req).await
     }
 }
 

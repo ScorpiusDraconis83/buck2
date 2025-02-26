@@ -11,14 +11,15 @@ use itertools::Itertools;
 use starlark::docs::DocFunction;
 use starlark::docs::DocItem;
 use starlark::docs::DocMember;
-use starlark::docs::DocObject;
 use starlark::docs::DocProperty;
 use starlark::docs::DocString;
+use starlark::docs::DocType;
 use starlark::environment::GlobalsBuilder;
 use starlark::typing::Ty;
 
 pub fn provider_callable_documentation(
     creator: Option<for<'a> fn(&'a mut GlobalsBuilder)>,
+    self_ty: Ty,
     overall: &Option<DocString>,
     fields: &[&str],
     field_docs: &[Option<DocString>],
@@ -39,7 +40,7 @@ pub fn provider_callable_documentation(
             let docs = GlobalsBuilder::new().with(creator).build().documentation();
             if docs.members.len() == 1 {
                 match docs.members.into_iter().next() {
-                    Some((name, DocMember::Function(x))) => Some((name, x)),
+                    Some((name, DocItem::Member(DocMember::Function(x)))) => Some((name, x)),
                     _ => None,
                 }
             } else {
@@ -50,22 +51,16 @@ pub fn provider_callable_documentation(
     };
 
     match ctor {
-        None => DocItem::Object(DocObject {
+        None => DocItem::Type(DocType {
             docs: overall.clone(),
+            ty: self_ty,
             members: members
                 .into_iter()
                 .map(|(a, b)| (a.to_owned(), DocMember::Property(b)))
                 .collect(),
+            constructor: None,
         }),
-        Some((
-            _name,
-            DocFunction {
-                docs,
-                params,
-                ret,
-                as_type,
-            },
-        )) => {
+        Some((_name, DocFunction { docs, params, ret })) => {
             let summary = if let Some(x) = &docs {
                 x.summary.clone()
             } else if let Some(x) = &overall {
@@ -95,12 +90,7 @@ pub fn provider_callable_documentation(
                 summary,
                 details: Some(details.iter().flatten().join("\n\n")),
             });
-            DocItem::Function(DocFunction {
-                docs,
-                params,
-                ret,
-                as_type,
-            })
+            DocItem::Member(DocMember::Function(DocFunction { docs, params, ret }))
         }
     }
 }

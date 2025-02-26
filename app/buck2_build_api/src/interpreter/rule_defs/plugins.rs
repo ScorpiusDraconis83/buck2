@@ -17,16 +17,17 @@ use dupe::Dupe;
 use starlark::coerce::coerce;
 use starlark::coerce::CoerceKey;
 use starlark::starlark_complex_value;
-use starlark::typing::Ty;
 use starlark::values::starlark_value;
 use starlark::values::Coerce;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::ProvidesStaticType;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
 use starlark_map::small_map::SmallMap;
 
@@ -35,12 +36,7 @@ use starlark_map::small_map::SmallMap;
     Clone, Dupe, Debug, Display, Eq, PartialEq, Hash, Ord, PartialOrd, Allocative, Freeze, Trace
 )]
 #[repr(transparent)]
-struct PluginKindWrapper(
-    #[freeze(identity)]
-    // SAFETY: `PluginKind` does not contain any starlark values
-    #[trace(unsafe_ignore)]
-    PluginKind,
-);
+struct PluginKindWrapper(#[freeze(identity)] PluginKind);
 
 // SAFETY: Trivial coercion is always correct
 unsafe impl Coerce<PluginKindWrapper> for PluginKindWrapper {}
@@ -66,22 +62,23 @@ impl Borrow<PluginKind> for PluginKindWrapper {
     NoSerialize,
     Allocative
 )]
-#[display(fmt = "<ctx.plugins>")]
+#[display("<ctx.plugins>")]
 #[repr(transparent)]
-pub struct AnalysisPluginsGen<V> {
+pub struct AnalysisPluginsGen<V: ValueLifetimeless> {
     plugins: SmallMap<PluginKindWrapper, V>,
 }
 
 starlark_complex_value!(pub AnalysisPlugins);
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum AnalysisPluginsError {
     #[error("The rule did not declare that it uses plugins of kind {0}")]
     PluginKindNotUsed(PluginKind),
 }
 
 #[starlark_value(type = "AnalysisPlugins")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for AnalysisPluginsGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for AnalysisPluginsGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -89,19 +86,15 @@ where
         let kind = (PLUGIN_KIND_FROM_VALUE.get()?)(index)?;
         match self.plugins.get(&kind) {
             Some(v) => Ok(v.to_value()),
-            None => Err(starlark::Error::new_other(
+            None => Err(starlark::Error::new_other(buck2_error::Error::from(
                 AnalysisPluginsError::PluginKindNotUsed(kind),
-            )),
+            ))),
         }
     }
 
     fn is_in(&self, other: Value<'v>) -> starlark::Result<bool> {
         let kind = (PLUGIN_KIND_FROM_VALUE.get()?)(other)?;
         Ok(self.plugins.contains_key(&kind))
-    }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
     }
 }
 

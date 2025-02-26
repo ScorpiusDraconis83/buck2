@@ -92,7 +92,7 @@ fn run_info_stringifies() -> buck2_error::Result<()> {
 }
 
 #[test]
-fn run_info_validates_types() {
+fn run_info_validates_types_1() {
     let content_bad_args1 = indoc!(
         r#"
             def test():
@@ -102,9 +102,12 @@ fn run_info_validates_types() {
     let mut tester = run_info_tester();
     tester.run_starlark_bzl_test_expecting_error(
         content_bad_args1,
-        "a value implementing CommandLineArgLike",
+        "Expected type `CellPath | artifact",
     );
+}
 
+#[test]
+fn run_info_validates_types_2() {
     let content_bad_args2 = indoc!(
         r#"
             def test():
@@ -114,7 +117,7 @@ fn run_info_validates_types() {
     let mut tester = run_info_tester();
     tester.run_starlark_bzl_test_expecting_error(
         content_bad_args2,
-        "a value implementing CommandLineArgLike",
+        "Expected type `CellPath | artifact",
     );
 }
 

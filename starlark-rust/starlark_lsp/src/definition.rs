@@ -508,7 +508,7 @@ impl LspModule {
                         }
                     }
 
-                    for arg in args {
+                    for arg in &args.args {
                         if let ArgumentP::Named(arg_name, arg_expr) = &arg.node {
                             if arg_name.node != member {
                                 continue;
@@ -608,11 +608,6 @@ pub(crate) mod helpers {
     use std::collections::hash_map::Entry;
     use std::collections::HashMap;
 
-    use starlark::codemap::CodeMap;
-    use starlark::codemap::Pos;
-    use starlark::codemap::ResolvedSpan;
-    use starlark::codemap::Span;
-    use starlark::syntax::AstModule;
     use starlark::syntax::Dialect;
     use starlark_syntax::codemap::ResolvedPos;
     use textwrap::dedent;
@@ -736,11 +731,11 @@ pub(crate) mod helpers {
             Ok(LspModule::new(AstModule::parse(
                 &self.filename,
                 self.program.clone(),
-                &Dialect::Extended,
+                // TODO(nga): use dialect of current module.
+                &Dialect::AllOptionsInternal,
             )?))
         }
 
-        #[cfg(not(windows))]
         pub(crate) fn program(&self) -> String {
             self.program.clone()
         }
@@ -807,7 +802,7 @@ pub(crate) mod helpers {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use textwrap::dedent;
 
     use super::helpers::*;

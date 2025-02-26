@@ -17,12 +17,8 @@
 
 use dupe::Dupe;
 
-use crate::eval::runtime::frame_span::FrameSpan;
-use crate::eval::Arguments;
-use crate::eval::Evaluator;
 use crate::values::layout::vtable::AValueDyn;
 use crate::values::stack_guard;
-use crate::values::FrozenRef;
 use crate::values::FrozenValue;
 use crate::values::Value;
 
@@ -78,17 +74,5 @@ impl FrozenValueNotSpecial {
     fn equals_not_ptr_eq(self, other: Value) -> crate::Result<bool> {
         let _guard = stack_guard::stack_guard()?;
         self.get_ref().equals(other)
-    }
-
-    pub(crate) fn invoke_method<'v>(
-        self,
-        this: Value<'v>,
-        location: FrozenRef<'static, FrameSpan>,
-        args: &Arguments<'v, '_>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> crate::Result<Value<'v>> {
-        eval.with_call_stack(self.to_value(), Some(location), |eval| {
-            self.get_ref().invoke_method(this, args, eval)
-        })
     }
 }

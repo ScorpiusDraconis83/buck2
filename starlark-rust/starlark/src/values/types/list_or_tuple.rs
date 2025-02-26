@@ -30,23 +30,36 @@ use crate::values::UnpackValue;
 use crate::values::Value;
 
 /// Unpack a value of type `list[T]` or `tuple[T, ...]` into a vec.
-#[derive(Default, Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct UnpackListOrTuple<T> {
     /// Unpacked items of the list or tuple.
     pub items: Vec<T>,
 }
 
+impl<T> Default for UnpackListOrTuple<T> {
+    fn default() -> Self {
+        UnpackListOrTuple { items: Vec::new() }
+    }
+}
+
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for UnpackListOrTuple<T> {
+    type Canonical = <Either<UnpackList<T>, UnpackTuple<T>> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Either::<UnpackList<T>, UnpackTuple<T>>::starlark_type_repr()
     }
 }
 
 impl<'v, T: UnpackValue<'v>> UnpackValue<'v> for UnpackListOrTuple<T> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        match Either::<UnpackList<T>, UnpackTuple<T>>::unpack_value(value)? {
-            Either::Left(l) => Some(UnpackListOrTuple { items: l.items }),
-            Either::Right(r) => Some(UnpackListOrTuple { items: r.items }),
+    type Error = <T as UnpackValue<'v>>::Error;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        match Either::<UnpackList<T>, UnpackTuple<T>>::unpack_value_impl(value)
+            .map_err(|e| e.into_inner())?
+        {
+            Some(Either::Left(l)) => Ok(Some(UnpackListOrTuple { items: l.items })),
+            Some(Either::Right(r)) => Ok(Some(UnpackListOrTuple { items: r.items })),
+            None => Ok(None),
         }
     }
 }
@@ -93,16 +106,32 @@ mod tests {
         let tuple_of_ints = heap.alloc((1, 2));
         assert_eq!(
             vec!["a", "b"],
-            UnpackListOrTuple::<&str>::unpack_value(list).unwrap().items
+            UnpackListOrTuple::<&str>::unpack_value(list)
+                .unwrap()
+                .unwrap()
+                .items
         );
         assert_eq!(
             vec!["a", "b"],
             UnpackListOrTuple::<&str>::unpack_value(tuple)
                 .unwrap()
+                .unwrap()
                 .items
         );
-        assert!(UnpackListOrTuple::<&str>::unpack_value(list_of_ints).is_none());
-        assert!(UnpackListOrTuple::<&str>::unpack_value(tuple_of_ints).is_none());
-        assert!(UnpackListOrTuple::<&str>::unpack_value(heap.alloc(1)).is_none());
+        assert!(
+            UnpackListOrTuple::<&str>::unpack_value(list_of_ints)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            UnpackListOrTuple::<&str>::unpack_value(tuple_of_ints)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            UnpackListOrTuple::<&str>::unpack_value(heap.alloc(1))
+                .unwrap()
+                .is_none()
+        );
     }
 }

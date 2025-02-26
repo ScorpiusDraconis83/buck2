@@ -17,6 +17,8 @@
 
 //! Bindings to/from Rust tuple types.
 
+use either::Either;
+
 use crate::typing::Ty;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::tuple::value::Tuple;
@@ -80,12 +82,16 @@ impl<T1: AllocFrozenValue, T2: AllocFrozenValue, T3: AllocFrozenValue> AllocFroz
 }
 
 impl<T1: StarlarkTypeRepr, T2: StarlarkTypeRepr> StarlarkTypeRepr for (T1, T2) {
+    type Canonical = (T1::Canonical, T2::Canonical);
+
     fn starlark_type_repr() -> Ty {
         Ty::tuple2(T1::starlark_type_repr(), T2::starlark_type_repr())
     }
 }
 
 impl<T1: StarlarkTypeRepr> StarlarkTypeRepr for (T1,) {
+    type Canonical = (T1::Canonical,);
+
     fn starlark_type_repr() -> Ty {
         Ty::tuple(vec![T1::starlark_type_repr()])
     }
@@ -94,6 +100,8 @@ impl<T1: StarlarkTypeRepr> StarlarkTypeRepr for (T1,) {
 impl<T1: StarlarkTypeRepr, T2: StarlarkTypeRepr, T3: StarlarkTypeRepr> StarlarkTypeRepr
     for (T1, T2, T3)
 {
+    type Canonical = (T1::Canonical, T2::Canonical, T3::Canonical);
+
     fn starlark_type_repr() -> Ty {
         Ty::tuple(vec![
             T1::starlark_type_repr(),
@@ -104,18 +112,54 @@ impl<T1: StarlarkTypeRepr, T2: StarlarkTypeRepr, T3: StarlarkTypeRepr> StarlarkT
 }
 
 impl<'v, T1: UnpackValue<'v>, T2: UnpackValue<'v>> UnpackValue<'v> for (T1, T2) {
-    fn expected() -> String {
-        format!("tuple ({}, {})", T1::expected(), T2::expected())
-    }
+    type Error = Either<T1::Error, T2::Error>;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        let t = Tuple::from_value(value)?;
-        if t.len() != 2 {
-            return None;
-        }
-        Some((
-            T1::unpack_value(t.content()[0])?,
-            T2::unpack_value(t.content()[1])?,
-        ))
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        let Some(t) = Tuple::from_value(value) else {
+            return Ok(None);
+        };
+        let [a, b] = t.content() else {
+            return Ok(None);
+        };
+        let [a, b] = [*a, *b];
+        let Some(a) = T1::unpack_value_impl(a).map_err(Either::Left)? else {
+            return Ok(None);
+        };
+        let Some(b) = T2::unpack_value_impl(b).map_err(Either::Right)? else {
+            return Ok(None);
+        };
+        Ok(Some((a, b)))
+    }
+}
+
+impl<'v, T1: UnpackValue<'v>, T2: UnpackValue<'v>, T3: UnpackValue<'v>> UnpackValue<'v>
+    for (T1, T2, T3)
+{
+    type Error = Either<T1::Error, Either<T2::Error, T3::Error>>;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        let Some(t) = Tuple::from_value(value) else {
+            return Ok(None);
+        };
+        let [a, b, c] = t.content() else {
+            return Ok(None);
+        };
+        let [a, b, c] = [*a, *b, *c];
+        let Some(a) = T1::unpack_value_impl(a).map_err(Either::Left)? else {
+            return Ok(None);
+        };
+        let Some(b) = T2::unpack_value_impl(b)
+            .map_err(Either::Left)
+            .map_err(Either::Right)?
+        else {
+            return Ok(None);
+        };
+        let Some(c) = T3::unpack_value_impl(c)
+            .map_err(Either::Right)
+            .map_err(Either::Right)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((a, b, c)))
     }
 }

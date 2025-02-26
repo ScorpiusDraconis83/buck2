@@ -21,7 +21,6 @@ use starlark_syntax::syntax::ast::Argument;
 use starlark_syntax::syntax::ast::AstExpr;
 use starlark_syntax::syntax::ast::AstLiteral;
 use starlark_syntax::syntax::ast::Expr;
-use starlark_syntax::syntax::module::AstModuleFields;
 
 use crate::codemap::Span;
 use crate::codemap::Spanned;
@@ -53,16 +52,22 @@ impl AstModuleFindCallName for AstModule {
                     ..
                 } => {
                     if let Expr::Identifier(_) = &identifier.node {
-                        let found = arguments.iter().find_map(|argument| match &argument.node {
-                            Argument::Named(
-                                arg_name,
-                                Spanned {
-                                    node: Expr::Literal(AstLiteral::String(s)),
-                                    ..
-                                },
-                            ) if arg_name.node == "name" && s.node == name => Some(identifier.span),
-                            _ => None,
-                        });
+                        let found =
+                            arguments
+                                .args
+                                .iter()
+                                .find_map(|argument| match &argument.node {
+                                    Argument::Named(
+                                        arg_name,
+                                        Spanned {
+                                            node: Expr::Literal(AstLiteral::String(s)),
+                                            ..
+                                        },
+                                    ) if arg_name.node == "name" && s.node == name => {
+                                        Some(identifier.span)
+                                    }
+                                    _ => None,
+                                });
                         if found.is_some() {
                             *ret = found;
                         }
@@ -79,7 +84,7 @@ impl AstModuleFindCallName for AstModule {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use starlark_syntax::syntax::module::AstModuleFields;
 
     use crate::analysis::find_call_name::AstModuleFindCallName;
@@ -99,7 +104,12 @@ def x(name = "foo_name"):
     pass
 "#;
 
-        let module = AstModule::parse("foo.star", contents.to_owned(), &Dialect::Extended).unwrap();
+        let module = AstModule::parse(
+            "foo.star",
+            contents.to_owned(),
+            &Dialect::AllOptionsInternal,
+        )
+        .unwrap();
 
         assert_eq!(
             Some(ResolvedSpan {

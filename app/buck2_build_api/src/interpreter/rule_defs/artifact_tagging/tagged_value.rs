@@ -11,13 +11,14 @@ use allocative::Allocative;
 use derive_more::Display;
 use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
-use starlark::typing::Ty;
 use starlark::values::starlark_value;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
+use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
 
 use super::ArtifactTag;
@@ -39,8 +40,8 @@ use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 )]
 #[derive(NoSerialize)] // TODO make artifacts serializable
 #[repr(C)]
-#[display(fmt = "TaggedValue({}, tagged {})", inner, tag)]
-pub struct TaggedValueGen<V> {
+#[display("TaggedValue({}, tagged {})", inner, tag)]
+pub struct TaggedValueGen<V: ValueLifetimeless> {
     inner: V,
     tag: ArtifactTag,
     inputs_only: bool,
@@ -67,16 +68,10 @@ impl<'v> TaggedValue<'v> {
 starlark_complex_value!(pub TaggedValue);
 
 #[starlark_value(type = "tagged_value")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for TaggedValueGen<V>
-where
-    Self: ProvidesStaticType<'v>,
-{
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
-    }
-}
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TaggedValueGen<V> where Self: ProvidesStaticType<'v>
+{}
 
-impl<V> TaggedValueGen<V> {
+impl<V: ValueLifetimeless> TaggedValueGen<V> {
     pub fn value(&self) -> &V {
         &self.inner
     }

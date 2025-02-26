@@ -74,11 +74,10 @@ Once the top-level nodes have been configured via the target platform
 resolution, the configuration is propagated to dependencies (possibly altered by
 transitions).
 
-<!-- prettier-ignore -->
 :::note
+
 The target platform resolution is not applied to all nodes in the graph.
 
-<!-- prettier-ignore -->
 :::
 
 ## Transitions
@@ -217,6 +216,18 @@ If you have a binary that you want to run, but it isn't a build tool, then you
 should use `$(exe_target //:binary)` rather than `$(exe //:binary)`. That will
 run the same binary that you'd get from `buck2 build`, rather than one that is
 built for the execution platform.
+
+The path macros vary along two axes:
+
+- **Path Source**: either `DefaultInfo` or `RunInfo` providers
+- **Configuration**: inherits the configuration or transitions to an execution
+  platform configuration
+
+Specifically:
+
+- `$location`: `DefaultInfo` path source, inherits configuration
+- `$exe`: `RunInfo` path source, exec platform configuration
+- `$exe_target`: `RunInfo` path source, inherits configuration
 
 ## Execution platform resolution
 

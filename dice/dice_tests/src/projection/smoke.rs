@@ -56,7 +56,7 @@ struct GlobalConfig {
 
 /// "Evaluate" a file.
 #[derive(Debug, derive_more::Display, Clone, Hash, PartialEq, Eq, Allocative)]
-#[display(fmt = "{}", name)]
+#[display("{}", name)]
 struct FileKey {
     name: String,
 }
@@ -79,10 +79,13 @@ impl Key for FileKey {
         // which is the result of file evaluation.
         // We are testing that file evaluation is not invalidated
         // if unrelated configurations changed.
-        let value = config
-            .projection(&ConfigPropertyKey {
-                key: "x".to_owned(),
-            })
+        let value = ctx
+            .projection(
+                &config,
+                &ConfigPropertyKey {
+                    key: "x".to_owned(),
+                },
+            )
             .map_err(|e| Arc::new(anyhow::anyhow!(e)))?;
         // Record we executed this computation.
         ctx.global_data()
@@ -113,7 +116,7 @@ impl Key for FileKey {
     Eq,
     Allocative
 )]
-#[display(fmt = "{:?}", self)]
+#[display("{:?}", self)]
 struct ConfigKey;
 
 #[async_trait]
@@ -150,7 +153,7 @@ impl Key for ConfigKey {
 
 /// One "property" of the "configuration".
 #[derive(Debug, derive_more::Display, Clone, Hash, PartialEq, Eq, Allocative)]
-#[display(fmt = "{}", key)]
+#[display("{}", key)]
 struct ConfigPropertyKey {
     key: String,
 }
@@ -192,6 +195,7 @@ async fn smoke() -> anyhow::Result<()> {
     }));
 
     let mut dice = Dice::modern();
+
     dice.set(tracker.dupe());
     let dice = dice.build(DetectCycles::Enabled);
 
@@ -207,7 +211,7 @@ async fn smoke() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    let ctx = ctx.commit().await;
+    let mut ctx = ctx.commit().await;
 
     let file = ctx
         .compute(&FileKey {
@@ -240,7 +244,7 @@ async fn smoke() -> anyhow::Result<()> {
     data.data.set(GlobalConfig {
         config: HashMap::from_iter([("x".to_owned(), "X".to_owned())]),
     });
-    let ctx = dice.updater_with_data(data).commit().await;
+    let mut ctx = dice.updater_with_data(data).commit().await;
 
     let file = ctx
         .compute(&FileKey {
@@ -272,7 +276,7 @@ async fn smoke() -> anyhow::Result<()> {
             ("y".to_owned(), "Y".to_owned()),
         ]),
     });
-    let ctx = dice.updater_with_data(data).commit().await;
+    let mut ctx = dice.updater_with_data(data).commit().await;
 
     let file = ctx
         .compute(&FileKey {
@@ -347,7 +351,7 @@ async fn projection_sync_and_then_recompute_incremental_reuses_key() -> anyhow::
     }
 
     #[derive(Allocative, Clone, Debug, Display)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct DependsOnProjection(Arc<AtomicBool>);
 
     #[async_trait]
@@ -360,11 +364,11 @@ async fn projection_sync_and_then_recompute_incremental_reuses_key() -> anyhow::
             _cancellations: &CancellationContext,
         ) -> Self::Value {
             self.0.store(true, Ordering::SeqCst);
-            ctx.compute_opaque(&BaseKey)
-                .await
-                .unwrap()
-                .projection(&ProjectionEqualKey)
-                .unwrap()
+            ctx.projection(
+                &ctx.compute_opaque(&BaseKey).await.unwrap(),
+                &ProjectionEqualKey,
+            )
+            .unwrap()
         }
 
         fn equality(x: &Self::Value, y: &Self::Value) -> bool {
@@ -385,7 +389,7 @@ async fn projection_sync_and_then_recompute_incremental_reuses_key() -> anyhow::
 
     let mut updater = dice.updater();
     updater.changed_to([(BaseKey, 1)])?;
-    let ctx = updater.commit().await;
+    let mut ctx = updater.commit().await;
 
     assert_eq!(ctx.compute(&DependsOnProjection(is_ran.dupe())).await?, 1);
     assert!(is_ran.load(Ordering::SeqCst));
@@ -394,13 +398,11 @@ async fn projection_sync_and_then_recompute_incremental_reuses_key() -> anyhow::
     // introduce a change
     let mut updater = dice.updater();
     updater.changed_to([(BaseKey, 9999)])?;
-    let ctx = updater.commit().await;
+    let mut ctx = updater.commit().await;
 
     // if we run the sync first
-    let projected = ctx
-        .compute_opaque(&BaseKey)
-        .await?
-        .projection(&ProjectionEqualKey)?;
+    let derive_from = ctx.compute_opaque(&BaseKey).await?;
+    let projected = ctx.projection(&derive_from, &ProjectionEqualKey)?;
     assert_eq!(projected, 1);
 
     // should not be ran

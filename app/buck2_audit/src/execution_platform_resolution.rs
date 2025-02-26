@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgWithUniverseOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 
 use crate::AuditSubcommand;
@@ -18,11 +19,14 @@ use crate::AuditSubcommand;
     about = "prints out information about execution platform resolution"
 )]
 pub struct AuditExecutionPlatformResolutionCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     #[clap(name = "TARGET_PATTERNS", help = "Patterns to analyze")]
     pub patterns: Vec<String>,
+
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgWithUniverseOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

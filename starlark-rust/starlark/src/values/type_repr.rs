@@ -24,64 +24,106 @@ use either::Either;
 pub use starlark_derive::StarlarkTypeRepr;
 
 use crate::typing::Ty;
+use crate::values::list::ListType;
 use crate::values::none::NoneType;
-use crate::values::string::StarlarkStr;
+use crate::values::string::str_type::StarlarkStr;
 use crate::values::Heap;
 use crate::values::StarlarkValue;
-use crate::values::Value;
 
 /// Provides a starlark type representation, even if StarlarkValue is not implemented.
+///
+/// # Derive
+///
+/// There is `#[derive(StarlarkTypeRepr)]` for enums, for example:
+///
+/// ```
+/// use starlark::values::type_repr::StarlarkTypeRepr;
+///
+/// #[derive(StarlarkTypeRepr)]
+/// enum IntOrString {
+///     Int(i32),
+///     String(String),
+/// }
+/// ```
+///
+/// It emits type `int | str`.
+///
+/// This derive is useful in combination with derive of [`UnpackValue`](crate::values::UnpackValue).
 pub trait StarlarkTypeRepr {
+    /// Different Rust type representing the same Starlark Type.
+    ///
+    /// For example, `bool` and `StarlarkBool` Rust types represent the same Starlark type `bool`.
+    ///
+    /// Formal requirement: `Self::starlark_type_repr() == Self::Canonical::starlark_type_repr()`.
+    ///
+    /// If unsure, it is safe to put `= Self` here.
+    /// When [`associated_type_defaults`](https://github.com/rust-lang/rust/issues/29661)
+    /// is stabilized, this will be the default.
+    type Canonical: StarlarkTypeRepr;
+
     /// The representation of a type that a user would use verbatim in starlark type annotations
     fn starlark_type_repr() -> Ty;
 }
 
-/// A dict used just for display purposes.
+/// A set used just for display purposes.
 ///
-/// `DictOf` requires `Unpack` to be implemented, and `Dict` does not take type parameters so
+/// `SetOf` requires `Unpack` to be implemented, and `Set` does not take type parameters so
 /// we need something for documentation generation.
-pub struct DictType<K: StarlarkTypeRepr, V: StarlarkTypeRepr> {
-    k: PhantomData<K>,
-    v: PhantomData<V>,
+pub struct SetType<T: StarlarkTypeRepr> {
+    t: PhantomData<T>,
 }
 
-impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for DictType<K, V> {
+impl<T: StarlarkTypeRepr> StarlarkTypeRepr for SetType<T> {
+    type Canonical = SetType<T::Canonical>;
+
     fn starlark_type_repr() -> Ty {
-        Ty::dict(K::starlark_type_repr(), V::starlark_type_repr())
+        Ty::set(T::starlark_type_repr())
     }
 }
 
-impl<'v, T: StarlarkValue<'v> + ?Sized> StarlarkTypeRepr for T {
+impl<'v, T: StarlarkValue<'v>> StarlarkTypeRepr for T {
+    type Canonical = Self;
+
     fn starlark_type_repr() -> Ty {
         Self::get_type_starlark_repr()
     }
 }
 
 impl StarlarkTypeRepr for String {
+    type Canonical = StarlarkStr;
+
     fn starlark_type_repr() -> Ty {
         StarlarkStr::starlark_type_repr()
     }
 }
 
 impl StarlarkTypeRepr for &str {
+    type Canonical = StarlarkStr;
+
     fn starlark_type_repr() -> Ty {
         StarlarkStr::starlark_type_repr()
     }
 }
 
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for Option<T> {
+    type Canonical = <Either<NoneType, T> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Either::<NoneType, T>::starlark_type_repr()
     }
 }
 
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for Vec<T> {
+    type Canonical = <ListType<T> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
-        Ty::list(T::starlark_type_repr())
+        ListType::<T::Canonical>::starlark_type_repr()
     }
 }
 
 impl<TLeft: StarlarkTypeRepr, TRight: StarlarkTypeRepr> StarlarkTypeRepr for Either<TLeft, TRight> {
+    type Canonical = Either<TLeft::Canonical, TRight::Canonical>;
+
     fn starlark_type_repr() -> Ty {
         Ty::union2(TLeft::starlark_type_repr(), TRight::starlark_type_repr())
     }
@@ -90,8 +132,26 @@ impl<TLeft: StarlarkTypeRepr, TRight: StarlarkTypeRepr> StarlarkTypeRepr for Eit
 /// Derive macros generate a reference to this method to be able to get the `type_repr` of types
 /// they can't name
 #[doc(hidden)]
-pub fn type_repr_from_attr_impl<'v, T: StarlarkTypeRepr>(
-    _f: fn(Value<'v>, &'v Heap) -> anyhow::Result<T>,
+pub fn type_repr_from_attr_impl<'v, T: StarlarkTypeRepr, V, E>(
+    _f: fn(V, &'v Heap) -> Result<T, E>,
 ) -> Ty {
     T::starlark_type_repr()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::util::TestComplexValue;
+    use crate::util::non_static_type_id::non_static_type_id;
+    use crate::values::type_repr::StarlarkTypeRepr;
+    use crate::values::FrozenValue;
+    use crate::values::Value;
+
+    #[test]
+    fn test_canonical_for_complex_value() {
+        // TODO(nga): `StarlarkTypeRepr::Canonical` should be equal.
+        assert_ne!(
+            non_static_type_id::<<TestComplexValue<Value> as StarlarkTypeRepr>::Canonical>(),
+            non_static_type_id::<<TestComplexValue<FrozenValue> as StarlarkTypeRepr>::Canonical>(),
+        );
+    }
 }

@@ -15,10 +15,15 @@
  * limitations under the License.
  */
 
-use crate as starlark;
-use crate::coerce::coerce;
-use crate::coerce::Coerce;
+use std::convert::Infallible;
+use std::iter;
+use std::slice;
+
+use ref_cast::ref_cast_custom;
+use ref_cast::RefCastCustom;
+
 use crate::typing::Ty;
+use crate::values::tuple::UnpackTuple;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::tuple::value::FrozenTuple;
 use crate::values::types::tuple::value::Tuple;
@@ -28,7 +33,7 @@ use crate::values::Value;
 use crate::values::ValueLike;
 
 /// Reference to tuple data in Starlark heap.
-#[derive(Coerce, Debug)]
+#[derive(RefCastCustom, Debug)]
 #[repr(transparent)]
 pub struct TupleRef<'v> {
     contents: [Value<'v>],
@@ -36,7 +41,7 @@ pub struct TupleRef<'v> {
 
 /// Reference to tuple data in frozen Starlark heap.
 #[repr(transparent)]
-#[derive(Coerce, Debug)]
+#[derive(RefCastCustom, Debug)]
 pub struct FrozenTupleRef {
     contents: [FrozenValue],
 }
@@ -45,9 +50,12 @@ impl<'v> TupleRef<'v> {
     /// `type(())`, which is `"tuple"`.
     pub const TYPE: &'static str = FrozenTupleRef::TYPE;
 
+    #[ref_cast_custom]
+    fn new(slice: &'v [Value<'v>]) -> &'v TupleRef<'v>;
+
     /// Downcast a value to a tuple.
     pub fn from_value(value: Value<'v>) -> Option<&'v TupleRef<'v>> {
-        Some(coerce(Tuple::from_value(value)?.content()))
+        Some(Self::new(Tuple::from_value(value)?.content()))
     }
 
     /// Downcast a value to a tuple.
@@ -66,7 +74,7 @@ impl<'v> TupleRef<'v> {
     }
 
     /// Iterate over the contents.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = Value<'v>> + '_ {
+    pub fn iter<'a>(&'a self) -> iter::Copied<slice::Iter<'a, Value<'v>>> {
         self.content().iter().copied()
     }
 }
@@ -75,9 +83,12 @@ impl FrozenTupleRef {
     /// `type(())`, which is `"tuple"`.
     pub const TYPE: &'static str = FrozenTuple::TYPE;
 
+    #[ref_cast_custom]
+    fn new(slice: &'static [FrozenValue]) -> &'static FrozenTupleRef;
+
     /// Downcast a value to a tuple.
     pub fn from_frozen_value(value: FrozenValue) -> Option<&'static FrozenTupleRef> {
-        Some(coerce(value.downcast_ref::<FrozenTuple>()?.content()))
+        Some(Self::new(value.downcast_ref::<FrozenTuple>()?.content()))
     }
 
     /// Number of elements.
@@ -97,25 +108,37 @@ impl FrozenTupleRef {
 }
 
 impl<'v> StarlarkTypeRepr for &'v TupleRef<'v> {
+    type Canonical = <UnpackTuple<FrozenValue> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Ty::any_tuple()
     }
 }
 
 impl<'a> StarlarkTypeRepr for &'a FrozenTupleRef {
+    type Canonical = <UnpackTuple<FrozenValue> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         Ty::any_tuple()
     }
 }
 
 impl<'v> UnpackValue<'v> for &'v TupleRef<'v> {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        TupleRef::from_value(value)
+    type Error = Infallible;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(TupleRef::from_value(value))
     }
 }
 
 impl<'v> UnpackValue<'v> for &'v FrozenTupleRef {
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        FrozenTupleRef::from_frozen_value(value.unpack_frozen()?)
+    type Error = crate::Error;
+
+    fn unpack_value_impl(value: Value<'v>) -> crate::Result<Option<Self>> {
+        let Some(value) = value.unpack_frozen() else {
+            // TODO(nga): return error.
+            return Ok(None);
+        };
+        Ok(FrozenTupleRef::from_frozen_value(value))
     }
 }

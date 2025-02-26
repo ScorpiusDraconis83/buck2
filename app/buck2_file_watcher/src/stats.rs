@@ -14,7 +14,7 @@ use allocative::Allocative;
 ///
 /// 100 entries covers everything required for 96% of updates, which seems sufficient.
 /// Number needs to be < 850 or it is often bigger than a scribe message.
-const MAX_FILE_CHANGE_RECORDS: usize = 100;
+pub(crate) const MAX_FILE_CHANGE_RECORDS: usize = 100;
 
 #[derive(Allocative)]
 pub(crate) struct FileWatcherStats {
@@ -26,19 +26,7 @@ pub(crate) struct FileWatcherStats {
 }
 
 impl FileWatcherStats {
-    pub(crate) fn new(
-        min_count: usize,
-        mergebase: Option<&str>,
-        mergebase_global_rev: Option<u64>,
-        watchman_version: Option<String>,
-    ) -> Self {
-        let stats = buck2_data::FileWatcherStats {
-            branched_from_revision: mergebase.map(ToOwned::to_owned),
-            branched_from_global_rev: mergebase_global_rev,
-            watchman_version,
-            ..Default::default()
-        };
-
+    pub(crate) fn new(stats: buck2_data::FileWatcherStats, min_count: usize) -> Self {
         let changes = Vec::with_capacity(std::cmp::min(MAX_FILE_CHANGE_RECORDS, min_count));
 
         Self {

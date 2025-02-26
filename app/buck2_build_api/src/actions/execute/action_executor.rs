@@ -7,12 +7,12 @@
  * of this source tree.
  */
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context;
 use async_trait::async_trait;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_common::dice::data::HasIoProvider;
@@ -22,7 +22,8 @@ use buck2_common::io::IoProvider;
 use buck2_common::liveliness_observer::NoopLivelinessObserver;
 use buck2_core::execution_types::executor_config::CommandExecutorConfig;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
-use buck2_core::fs::buck_out_path::BuckOutPath;
+use buck2_core::fs::buck_out_path::BuildArtifactPath;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -33,7 +34,7 @@ use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::HasBlockingExecutor;
 use buck2_execute::execute::cache_uploader::CacheUploadInfo;
 use buck2_execute::execute::cache_uploader::CacheUploadResult;
-use buck2_execute::execute::cache_uploader::DepFileEntry;
+use buck2_execute::execute::cache_uploader::IntoRemoteDepFile;
 use buck2_execute::execute::claim::MutexClaimManager;
 use buck2_execute::execute::clean_output_paths::CleanOutputPaths;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
@@ -44,6 +45,7 @@ use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::prepared::PreparedAction;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::request::CommandExecutionRequest;
+use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::request::OutputType;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
@@ -64,16 +66,17 @@ use dupe::Dupe;
 use indexmap::indexmap;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use remote_execution::TActionResult2;
 
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
 use crate::actions::execute::action_execution_target::ActionExecutionTarget;
 use crate::actions::execute::dice_data::CommandExecutorResponse;
 use crate::actions::execute::dice_data::DiceHasCommandExecutor;
+use crate::actions::execute::dice_data::GetInvalidationTrackingConfig;
 use crate::actions::execute::dice_data::GetReClient;
 use crate::actions::execute::error::ExecuteError;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
 use crate::actions::impls::run_action_knobs::RunActionKnobs;
-use crate::actions::ActionExecutable;
 use crate::actions::ActionExecutionCtx;
 use crate::actions::RegisteredAction;
 use crate::artifact_groups::ArtifactGroup;
@@ -102,7 +105,7 @@ impl OutputSize for ActionOutputs {
 #[derive(Derivative, Debug, Allocative)]
 #[derivative(PartialEq, Eq)]
 struct ActionOutputsData {
-    outputs: IndexMap<BuckOutPath, ArtifactValue>,
+    outputs: IndexMap<BuildArtifactPath, ArtifactValue>,
 }
 
 /// Metadata associated with the execution of this action.
@@ -110,12 +113,13 @@ struct ActionOutputsData {
 pub struct ActionExecutionMetadata {
     pub execution_kind: ActionExecutionKind,
     pub timing: ActionExecutionTimingData,
+    pub input_files_bytes: Option<u64>,
 }
 
 /// The *way* that a particular action was executed.
 #[derive(Debug, Display, Clone)]
 pub enum ActionExecutionKind {
-    #[display(fmt = "command({})", kind)]
+    #[display("command({})", kind)]
     Command {
         kind: Box<CommandExecutionKind>,
         prefers_local: bool,
@@ -128,14 +132,18 @@ pub enum ActionExecutionKind {
         dep_file_key: Option<DepFileDigest>,
     },
     /// This action is simple and executed inline within buck2 (e.g. write, symlink_dir)
-    #[display(fmt = "simple")]
+    #[display("simple")]
     Simple,
     /// This action logically executed, but didn't do all the work.
-    #[display(fmt = "deferred")]
+    #[display("deferred")]
     Deferred,
     /// This action was served by the local dep file cache and not executed.
-    #[display(fmt = "local_dep_files")]
+    #[display("local_dep_files")]
     LocalDepFile,
+
+    /// This action was served by the local action cache and not executed.
+    #[display("local_action_cache")]
+    LocalActionCache,
 }
 
 pub struct CommandExecutionRef<'a> {
@@ -157,6 +165,9 @@ impl ActionExecutionKind {
             ActionExecutionKind::Simple => buck2_data::ActionExecutionKind::Simple,
             ActionExecutionKind::Deferred => buck2_data::ActionExecutionKind::Deferred,
             ActionExecutionKind::LocalDepFile => buck2_data::ActionExecutionKind::LocalDepFile,
+            ActionExecutionKind::LocalActionCache => {
+                buck2_data::ActionExecutionKind::LocalActionCache
+            }
         }
     }
 
@@ -183,25 +194,25 @@ impl ActionExecutionKind {
                 dep_file_key,
                 eligible_for_full_hybrid: *eligible_for_full_hybrid,
             }),
-            Self::Simple | Self::Deferred | Self::LocalDepFile => None,
+            Self::Simple | Self::Deferred | Self::LocalDepFile | Self::LocalActionCache => None,
         }
     }
 }
 
 impl ActionOutputs {
-    pub fn new(outputs: IndexMap<BuckOutPath, ArtifactValue>) -> Self {
+    pub fn new(outputs: IndexMap<BuildArtifactPath, ArtifactValue>) -> Self {
         Self(Arc::new(ActionOutputsData { outputs }))
     }
 
-    pub fn from_single(artifact: BuckOutPath, value: ArtifactValue) -> Self {
+    pub fn from_single(artifact: BuildArtifactPath, value: ArtifactValue) -> Self {
         Self::new(indexmap! {artifact => value})
     }
 
-    pub fn get(&self, artifact: &BuckOutPath) -> Option<&ArtifactValue> {
+    pub fn get(&self, artifact: &BuildArtifactPath) -> Option<&ArtifactValue> {
         self.0.outputs.get(artifact)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&BuckOutPath, &ArtifactValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&BuildArtifactPath, &ArtifactValue)> {
         self.0.outputs.iter()
     }
 
@@ -210,34 +221,20 @@ impl ActionOutputs {
     }
 }
 
-/// Executes 'Actions'
-#[async_trait]
-pub trait ActionExecutor: Send + Sync {
-    async fn execute(
-        &self,
-        inputs: IndexMap<ArtifactGroup, ArtifactGroupValues>,
-        action: &RegisteredAction,
-        cancellation: &CancellationContext,
-    ) -> (
-        Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>,
-        Vec<CommandExecutionReport>,
-    );
-}
-
 #[async_trait]
 pub trait HasActionExecutor {
     async fn get_action_executor(
-        &self,
+        &mut self,
         config: &CommandExecutorConfig,
-    ) -> anyhow::Result<Arc<dyn ActionExecutor>>;
+    ) -> buck2_error::Result<Arc<BuckActionExecutor>>;
 }
 
 #[async_trait]
-impl HasActionExecutor for DiceComputations {
+impl HasActionExecutor for DiceComputations<'_> {
     async fn get_action_executor(
-        &self,
+        &mut self,
         executor_config: &CommandExecutorConfig,
-    ) -> anyhow::Result<Arc<dyn ActionExecutor>> {
+    ) -> buck2_error::Result<Arc<BuckActionExecutor>> {
         let artifact_fs = self.get_artifact_fs().await?;
         let digest_config = self.global_data().get_digest_config();
 
@@ -255,6 +252,7 @@ impl HasActionExecutor for DiceComputations {
         let io_provider = self.global_data().get_io_provider();
         let http_client = self.per_transaction_data().get_http_client();
         let mergebase = self.per_transaction_data().get_mergebase();
+        let invalidation_tracking_enabled = self.get_invalidation_tracking_config().enabled;
 
         Ok(Arc::new(BuckActionExecutor::new(
             CommandExecutor::new(
@@ -274,6 +272,7 @@ impl HasActionExecutor for DiceComputations {
             io_provider,
             http_client,
             mergebase,
+            invalidation_tracking_enabled,
         )))
     }
 }
@@ -289,6 +288,7 @@ pub struct BuckActionExecutor {
     io_provider: Arc<dyn IoProvider>,
     http_client: HttpClient,
     mergebase: Mergebase,
+    invalidation_tracking_enabled: bool,
 }
 
 impl BuckActionExecutor {
@@ -303,8 +303,9 @@ impl BuckActionExecutor {
         io_provider: Arc<dyn IoProvider>,
         http_client: HttpClient,
         mergebase: Mergebase,
+        invalidation_tracking_enabled: bool,
     ) -> Self {
-        Self {
+        BuckActionExecutor {
             command_executor,
             blocking_executor,
             materializer,
@@ -315,6 +316,7 @@ impl BuckActionExecutor {
             io_provider,
             http_client,
             mergebase,
+            invalidation_tracking_enabled,
         }
     }
 }
@@ -325,7 +327,7 @@ struct BuckActionExecutionContext<'a> {
     inputs: IndexMap<ArtifactGroup, ArtifactGroupValues>,
     outputs: &'a [BuildArtifact],
     command_reports: &'a mut Vec<CommandExecutionReport>,
-    cancellations: &'a CancellationContext<'a>,
+    cancellations: &'a CancellationContext,
 }
 
 #[async_trait]
@@ -370,6 +372,10 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
         self.executor.re_client.dupe()
     }
 
+    fn re_platform(&self) -> &remote_execution::Platform {
+        self.executor.command_executor.re_platform()
+    }
+
     fn digest_config(&self) -> DigestConfig {
         self.executor.digest_config
     }
@@ -389,7 +395,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
     fn prepare_action(
         &mut self,
         request: &CommandExecutionRequest,
-    ) -> anyhow::Result<PreparedAction> {
+    ) -> buck2_error::Result<PreparedAction> {
         self.executor
             .command_executor
             .prepare_action(request, self.digest_config())
@@ -419,10 +425,11 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
 
     fn unpack_command_execution_result(
         &mut self,
-        request: &CommandExecutionRequest,
+        executor_preference: ExecutorPreference,
         result: CommandExecutionResult,
         allows_cache_upload: bool,
         allows_dep_file_cache_upload: bool,
+        input_files_bytes: Option<u64>,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         let CommandExecutionResult {
             outputs,
@@ -432,7 +439,7 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
             did_dep_file_cache_upload,
             dep_file_key,
             eligible_for_full_hybrid,
-            dep_file_metadata: _,
+            ..
         } = result;
         // TODO (@torozco): The execution kind should be made to come via the command reports too.
         let res = match &report.status {
@@ -450,8 +457,8 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
                     ActionExecutionMetadata {
                         execution_kind: ActionExecutionKind::Command {
                             kind: Box::new(execution_kind.clone()),
-                            prefers_local: request.executor_preference().prefers_local(),
-                            requires_local: request.executor_preference().requires_local(),
+                            prefers_local: executor_preference.prefers_local(),
+                            requires_local: executor_preference.requires_local(),
                             allows_cache_upload,
                             did_cache_upload,
                             allows_dep_file_cache_upload,
@@ -460,11 +467,17 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
                             eligible_for_full_hybrid,
                         },
                         timing: report.timing.into(),
+                        input_files_bytes,
                     },
                 );
                 Ok(result)
             }
-            _ => Err(ExecuteError::CommandExecutionError),
+            CommandExecutionStatus::Error { error, .. } => {
+                Err(ExecuteError::CommandExecutionError {
+                    error: Some(error.clone()),
+                })
+            }
+            _ => Err(ExecuteError::CommandExecutionError { error: None }),
         };
         self.command_reports.extend(rejected_execution);
         self.command_reports.push(report);
@@ -497,10 +510,12 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
         &mut self,
         action_digest_and_blobs: &ActionDigestAndBlobs,
         execution_result: &CommandExecutionResult,
-        dep_file_entry: Option<DepFileEntry>,
-    ) -> anyhow::Result<CacheUploadResult> {
+        re_result: Option<TActionResult2>,
+        dep_file_bundle: Option<&mut dyn IntoRemoteDepFile>,
+    ) -> buck2_error::Result<CacheUploadResult> {
         let action = self.target();
-        self.executor
+        Ok(self
+            .executor
             .command_executor
             .cache_upload(
                 &CacheUploadInfo {
@@ -508,13 +523,14 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
                     digest_config: self.digest_config(),
                 },
                 execution_result,
-                dep_file_entry,
+                re_result,
+                dep_file_bundle,
                 action_digest_and_blobs,
             )
-            .await
+            .await?)
     }
 
-    async fn cleanup_outputs(&mut self) -> anyhow::Result<()> {
+    async fn cleanup_outputs(&mut self) -> buck2_error::Result<()> {
         // Delete all outputs before we start, so things will be clean.
         let output_paths = self
             .outputs
@@ -531,26 +547,18 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
             .materializer
             .invalidate_many(output_paths.clone())
             .await
-            .context("Failed to invalidate output directory")?;
+            .buck_error_context("Failed to invalidate output directory")?;
 
-        // Use Eden's clean up API if possible, it is significantly faster on Eden compared with
-        // the native method as the API does not load and materialize files or folders
-        if let Some(eden_buck_out) = self.executor.materializer.eden_buck_out() {
-            eden_buck_out
-                .remove_paths_recursive(self.fs().fs(), output_paths, self.cancellations)
-                .await?;
-        } else {
-            self.executor
-                .blocking_executor
-                .execute_io(
-                    Box::new(CleanOutputPaths {
-                        paths: output_paths,
-                    }),
-                    self.cancellations,
-                )
-                .await
-                .context("Failed to cleanup output directory")?;
-        }
+        self.executor
+            .blocking_executor
+            .execute_io(
+                Box::new(CleanOutputPaths {
+                    paths: output_paths,
+                }),
+                self.cancellations,
+            )
+            .await
+            .buck_error_context("Failed to cleanup output directory")?;
 
         Ok(())
     }
@@ -564,9 +572,8 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_> {
     }
 }
 
-#[async_trait]
-impl ActionExecutor for BuckActionExecutor {
-    async fn execute(
+impl BuckActionExecutor {
+    pub(crate) async fn execute(
         &self,
         inputs: IndexMap<ArtifactGroup, ArtifactGroupValues>,
         action: &RegisteredAction,
@@ -578,7 +585,7 @@ impl ActionExecutor for BuckActionExecutor {
         let mut command_reports = Vec::new();
 
         let res = async {
-            let outputs = action.outputs()?;
+            let outputs = action.outputs();
 
             let mut ctx = BuckActionExecutionContext {
                 executor: self,
@@ -589,16 +596,7 @@ impl ActionExecutor for BuckActionExecutor {
                 cancellations,
             };
 
-            let (result, metadata) = match action.as_executable() {
-                ActionExecutable::Pristine(exe) => {
-                    ctx.cleanup_outputs().await?;
-                    exe.execute(&mut ctx).await?
-                }
-                ActionExecutable::Incremental(exe) => {
-                    // Let the action perform clean up in this case.
-                    exe.execute(&mut ctx).await?
-                }
-            };
+            let (result, metadata) = action.execute(&mut ctx).await?;
 
             // Check that all the outputs are the right output_type
             for x in outputs.iter() {
@@ -622,13 +620,30 @@ impl ActionExecutor for BuckActionExecutor {
                 }
             }
 
-            // Check all the outputs were returned, and no additional outputs
+            fn check_all_requested_outputs_returned_without_extra<'a>(
+                outputs: &[BuildArtifact],
+                result_outputs: impl IntoIterator<Item = &'a BuildArtifactPath>,
+            ) -> bool {
+                // Ignore ordering as outputs in original action might be ordered differently from
+                // output paths in action result (they are sorted there).
+                let result_output_paths: HashSet<&BuildArtifactPath> =
+                    result_outputs.into_iter().collect();
+                let mut outputs_count = 0;
+                for output in outputs.iter() {
+                    outputs_count += 1;
+                    let output_path = output.get_path();
+                    if !result_output_paths.contains(output_path) {
+                        return false;
+                    }
+                }
+                outputs_count == result_output_paths.len()
+            }
+
             // TODO (T122966509): Check projections here as well
-            if !outputs
-                .iter()
-                .map(|b| b.get_path())
-                .eq(result.0.outputs.keys())
-            {
+            if !check_all_requested_outputs_returned_without_extra(
+                &outputs,
+                result.0.outputs.keys(),
+            ) {
                 let declared = outputs
                     .iter()
                     .filter(|x| !result.0.outputs.contains_key(x.get_path()))
@@ -657,6 +672,10 @@ impl ActionExecutor for BuckActionExecutor {
 
         (res, command_reports)
     }
+
+    pub fn invalidation_tracking_enabled(&self) -> bool {
+        self.invalidation_tracking_enabled
+    }
 }
 
 #[cfg(test)]
@@ -669,38 +688,32 @@ mod tests {
 
     use allocative::Allocative;
     use async_trait::async_trait;
+    use buck2_artifact::actions::key::ActionIndex;
     use buck2_artifact::actions::key::ActionKey;
     use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
     use buck2_artifact::artifact::artifact_type::Artifact;
     use buck2_artifact::artifact::build_artifact::BuildArtifact;
     use buck2_artifact::artifact::source_artifact::SourceArtifact;
-    use buck2_artifact::deferred::data::DeferredData;
-    use buck2_artifact::deferred::id::DeferredId;
-    use buck2_artifact::deferred::key::DeferredKey;
     use buck2_common::cas_digest::CasDigestConfig;
     use buck2_common::io::fs::FsIoProvider;
-    use buck2_core::base_deferred_key::BaseDeferredKey;
-    use buck2_core::buck_path::path::BuckPath;
-    use buck2_core::category::Category;
+    use buck2_core::category::CategoryRef;
     use buck2_core::cells::cell_root_path::CellRootPathBuf;
     use buck2_core::cells::name::CellName;
-    use buck2_core::cells::paths::CellRelativePath;
     use buck2_core::cells::CellResolver;
     use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+    use buck2_core::deferred::key::DeferredHolderKey;
     use buck2_core::execution_types::executor_config::CommandExecutorConfig;
     use buck2_core::execution_types::executor_config::CommandGenerationOptions;
     use buck2_core::execution_types::executor_config::PathSeparatorKind;
     use buck2_core::fs::artifact_path_resolver::ArtifactFs;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::fs_util;
-    use buck2_core::fs::paths::forward_rel_path::ForwardRelativePathBuf;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
     use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-    use buck2_core::package::package_relative_path::PackageRelativePathBuf;
-    use buck2_core::package::PackageLabel;
-    use buck2_core::target::label::TargetLabel;
-    use buck2_core::target::name::TargetNameRef;
+    use buck2_core::package::source_path::SourcePath;
+    use buck2_core::target::label::label::TargetLabel;
     use buck2_events::dispatch::with_dispatcher_async;
     use buck2_events::dispatch::EventDispatcher;
     use buck2_execute::artifact_value::ArtifactValue;
@@ -723,21 +736,16 @@ mod tests {
     use buck2_http::HttpClientBuilder;
     use dupe::Dupe;
     use indexmap::indexset;
-    use once_cell::sync::Lazy;
     use sorted_vector_map::SortedVectorMap;
 
     use crate::actions::box_slice_set::BoxSliceSet;
     use crate::actions::execute::action_executor::ActionExecutionKind;
     use crate::actions::execute::action_executor::ActionExecutionMetadata;
-    use crate::actions::execute::action_executor::ActionExecutor;
     use crate::actions::execute::action_executor::ActionOutputs;
     use crate::actions::execute::action_executor::BuckActionExecutor;
-    use crate::actions::key::ActionKeyExt;
     use crate::actions::Action;
-    use crate::actions::ActionExecutable;
     use crate::actions::ActionExecutionCtx;
     use crate::actions::ExecuteError;
-    use crate::actions::PristineActionExecutable;
     use crate::actions::RegisteredAction;
     use crate::artifact_groups::ArtifactGroup;
     use crate::artifact_groups::ArtifactGroupValues;
@@ -771,6 +779,7 @@ mod tests {
                 CommandGenerationOptions {
                     path_separator: PathSeparatorKind::Unix,
                     output_paths_behavior: Default::default(),
+                    use_bazel_protocol_remote_persistent_workers: false,
                 },
                 Default::default(),
             ),
@@ -787,9 +796,11 @@ mod tests {
                 CasDigestConfig::testing_default(),
             )),
             HttpClientBuilder::https_with_system_roots()
+                .await
                 .unwrap()
                 .build(),
             Default::default(),
+            true,
         );
 
         #[derive(Debug, Allocative)]
@@ -805,32 +816,26 @@ mod tests {
                 buck2_data::ActionKind::NotSet
             }
 
-            fn inputs(&self) -> anyhow::Result<Cow<'_, [ArtifactGroup]>> {
+            fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
                 Ok(Cow::Borrowed(self.inputs.as_slice()))
             }
 
-            fn outputs(&self) -> anyhow::Result<Cow<'_, [BuildArtifact]>> {
-                Ok(Cow::Borrowed(self.outputs.as_slice()))
+            fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+                Cow::Borrowed(self.outputs.as_slice())
             }
 
-            fn as_executable(&self) -> ActionExecutable<'_> {
-                ActionExecutable::Pristine(self)
+            fn first_output(&self) -> &BuildArtifact {
+                &self.outputs.as_slice()[0]
             }
 
-            fn category(&self) -> &Category {
-                static TEST_CATEGORY: Lazy<Category> =
-                    Lazy::new(|| Category::try_from("testing").unwrap());
-
-                &TEST_CATEGORY
+            fn category(&self) -> CategoryRef {
+                CategoryRef::new("testing").unwrap()
             }
 
             fn identifier(&self) -> Option<&str> {
                 None
             }
-        }
 
-        #[async_trait]
-        impl PristineActionExecutable for TestingAction {
             async fn execute(
                 &self,
                 ctx: &mut dyn ActionExecutionCtx,
@@ -861,6 +866,8 @@ mod tests {
                             .collect(),
                         ctx.fs(),
                         ctx.digest_config(),
+                        ctx.run_action_knobs()
+                            .add_empty_dot_buckconfig_to_re_commands,
                     )?,
                     SortedVectorMap::new(),
                 );
@@ -877,7 +884,13 @@ mod tests {
                     ctx.fs().fs().write_file(&dest_path, "", false)?
                 }
 
-                ctx.unpack_command_execution_result(&req, res, false, false)?;
+                ctx.unpack_command_execution_result(
+                    req.executor_preference,
+                    res,
+                    false,
+                    false,
+                    None,
+                )?;
                 let outputs = self
                     .outputs
                     .iter()
@@ -893,35 +906,28 @@ mod tests {
                     ActionExecutionMetadata {
                         execution_kind: ActionExecutionKind::Simple,
                         timing: ActionExecutionTimingData::default(),
+                        input_files_bytes: None,
                     },
                 ))
             }
         }
 
-        let pkg = PackageLabel::new(
-            CellName::testing_new("cell"),
-            CellRelativePath::unchecked_new("pkg"),
-        );
-
         let inputs = indexset![ArtifactGroup::Artifact(Artifact::from(
-            SourceArtifact::new(BuckPath::testing_new(
-                pkg.dupe(),
-                PackageRelativePathBuf::unchecked_new("source".into()),
-            ))
+            SourceArtifact::new(SourcePath::testing_new("cell//pkg", "source"))
         ))];
-        let label = TargetLabel::new(pkg, TargetNameRef::unchecked_new("foo"))
-            .configure(ConfigurationData::testing_new());
+        let label =
+            TargetLabel::testing_parse("cell//pkg:foo").configure(ConfigurationData::testing_new());
         let outputs = indexset![BuildArtifact::testing_new(
             label.dupe(),
-            ForwardRelativePathBuf::unchecked_new("output".into()),
-            DeferredId::testing_new(0),
+            "output",
+            ActionIndex::new(0),
         )];
 
         let action = RegisteredAction::new(
-            ActionKey::new(DeferredData::unchecked_new(DeferredKey::Base(
-                BaseDeferredKey::TargetLabel(label.dupe()),
-                DeferredId::testing_new(0),
-            ))),
+            ActionKey::new(
+                DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(label.dupe())),
+                ActionIndex::new(0),
+            ),
             Box::new(TestingAction {
                 inputs: BoxSliceSet::from(inputs),
                 outputs: BoxSliceSet::from(outputs.clone()),
@@ -949,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_path_missing() -> anyhow::Result<()> {
+    fn test_cleanup_path_missing() -> buck2_error::Result<()> {
         let fs = ProjectRootTemp::new()?;
         let fs = fs.path();
         fs_util::create_dir_all(fs.resolve(ProjectRelativePath::unchecked_new("foo/bar/qux")))?;
@@ -962,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_path_present() -> anyhow::Result<()> {
+    fn test_cleanup_path_present() -> buck2_error::Result<()> {
         let fs = ProjectRootTemp::new()?;
         let fs = fs.path();
         fs_util::create_dir_all(fs.resolve(ProjectRelativePath::unchecked_new("foo/bar/qux")))?;
@@ -979,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_path_overlap() -> anyhow::Result<()> {
+    fn test_cleanup_path_overlap() -> buck2_error::Result<()> {
         let fs = ProjectRootTemp::new()?;
         let fs = fs.path();
         fs.write_file(ProjectRelativePath::unchecked_new("foo/bar"), "xx", false)?;
@@ -996,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_path_overlap_deep() -> anyhow::Result<()> {
+    fn test_cleanup_path_overlap_deep() -> buck2_error::Result<()> {
         let fs = ProjectRootTemp::new()?;
         let fs = fs.path();
         fs.write_file(ProjectRelativePath::unchecked_new("foo/bar"), "xx", false)?;

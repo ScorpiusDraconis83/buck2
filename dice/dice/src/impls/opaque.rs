@@ -10,64 +10,37 @@
 use std::marker::PhantomData;
 
 use derivative::Derivative;
-use dupe::Dupe;
 
-use crate::api::error::DiceResult;
 use crate::api::key::Key;
-use crate::api::projection::ProjectionKey;
-use crate::impls::ctx::ModernComputeCtx;
 use crate::impls::key::DiceKey;
 use crate::impls::value::MaybeValidDiceValue;
+use crate::impls::value::TrackedInvalidationPaths;
 
 #[derive(Derivative)]
 #[derivative(Debug)]
-pub(crate) struct OpaqueValueModern<'a, K: Key> {
-    derive_from_key: DiceKey,
+pub(crate) struct OpaqueValueModern<K: Key> {
+    pub(crate) derive_from_key: DiceKey,
     #[derivative(Debug = "ignore")]
-    derive_from: MaybeValidDiceValue,
-    #[derivative(Debug = "ignore")]
-    parent_computation: &'a ModernComputeCtx,
+    pub(crate) derive_from: MaybeValidDiceValue,
+    pub(crate) invalidation_paths: TrackedInvalidationPaths,
     ty: PhantomData<K>,
 }
 
-impl<'a, K> OpaqueValueModern<'a, K>
+impl<K> OpaqueValueModern<K>
 where
     K: Key,
 {
     pub(crate) fn new(
-        parent_computation: &'a ModernComputeCtx,
         derive_from_key: DiceKey,
         derive_from: MaybeValidDiceValue,
+        invalidation_paths: TrackedInvalidationPaths,
     ) -> Self {
         Self {
             derive_from_key,
             derive_from,
-            parent_computation,
+            invalidation_paths,
             ty: Default::default(),
         }
-    }
-
-    pub(crate) fn projection<P>(&self, projection_key: &P) -> DiceResult<P::Value>
-    where
-        P: ProjectionKey<DeriveFromKey = K>,
-    {
-        self.parent_computation.project(
-            projection_key,
-            self.derive_from_key,
-            self.derive_from.dupe(),
-        )
-    }
-
-    /// Get a value and record parent computation dependency on `K`.
-    pub(crate) fn into_value(self) -> K::Value {
-        self.parent_computation
-            .dep_trackers()
-            .record(self.derive_from_key, self.derive_from.validity());
-
-        self.derive_from
-            .downcast_maybe_transient::<K::Value>()
-            .expect("type mismatch")
-            .dupe()
     }
 }
 
@@ -82,13 +55,14 @@ mod tests {
 
     use crate::api::data::DiceData;
     use crate::api::key::Key;
-    use crate::impls::dep_trackers::testing::RecordingDepsTrackersExt;
+    use crate::impls::deps::testing::RecordingDepsTrackersExt;
     use crate::impls::dice::DiceModern;
     use crate::impls::key::DiceKey;
     use crate::impls::opaque::OpaqueValueModern;
     use crate::impls::value::DiceKeyValue;
     use crate::impls::value::DiceValidity;
     use crate::impls::value::MaybeValidDiceValue;
+    use crate::impls::value::TrackedInvalidationPaths;
     use crate::DiceComputations;
     use crate::HashSet;
 
@@ -116,21 +90,21 @@ mod tests {
     async fn opaque_records_deps_when_used() {
         let dice = DiceModern::new(DiceData::new());
 
-        let ctx = dice.updater().commit().await;
+        let mut ctx = dice.updater().commit().await;
 
         let opaque = OpaqueValueModern::<K>::new(
-            &ctx,
             DiceKey { index: 0 },
             MaybeValidDiceValue::new(Arc::new(DiceKeyValue::<K>::new(1)), DiceValidity::Valid),
+            TrackedInvalidationPaths::clean(),
         );
 
-        assert_eq!(ctx.dep_trackers().recorded_deps(), &HashSet::default());
+        assert_eq!(ctx.dep_trackers().recorded_deps(), HashSet::default());
 
-        assert_eq!(opaque.into_value(), 1);
+        assert_eq!(ctx.opaque_into_value(opaque), 1);
 
         assert_eq!(
             ctx.dep_trackers().recorded_deps(),
-            &[DiceKey { index: 0 }].into_iter().collect()
+            [DiceKey { index: 0 }].into_iter().collect()
         );
     }
 }

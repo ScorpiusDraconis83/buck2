@@ -18,11 +18,11 @@
 use std::collections::HashSet;
 use std::mem;
 use std::mem::MaybeUninit;
-use std::path::Path;
 
 use dupe::Dupe;
 use starlark_syntax::eval_exception::EvalException;
 use starlark_syntax::frame::Frame;
+use starlark_syntax::internal_error;
 use thiserror::Error;
 
 use crate::any::AnyLifetime;
@@ -52,19 +52,22 @@ use crate::eval::runtime::frame_span::FrameSpan;
 use crate::eval::runtime::inlined_frame::InlinedFrames;
 use crate::eval::runtime::profile::bc::BcProfile;
 use crate::eval::runtime::profile::data::ProfileData;
+use crate::eval::runtime::profile::data::ProfileDataImpl;
 use crate::eval::runtime::profile::heap::HeapProfile;
 use crate::eval::runtime::profile::heap::HeapProfileFormat;
 use crate::eval::runtime::profile::heap::RetainedHeapProfileMode;
+use crate::eval::runtime::profile::mode::ProfileMode;
 use crate::eval::runtime::profile::or_instrumentation::ProfileOrInstrumentationMode;
 use crate::eval::runtime::profile::stmt::StmtProfile;
 use crate::eval::runtime::profile::time_flame::TimeFlameProfile;
 use crate::eval::runtime::profile::typecheck::TypecheckProfile;
-use crate::eval::runtime::profile::ProfileMode;
 use crate::eval::runtime::rust_loc::rust_loc;
 use crate::eval::runtime::slots::LocalCapturedSlotId;
 use crate::eval::runtime::slots::LocalSlotId;
+use crate::eval::soft_error::HardErrorSoftErrorHandler;
 use crate::eval::CallStack;
 use crate::eval::FileLoader;
+use crate::eval::SoftErrorHandler;
 use crate::stdlib::breakpoint::BreakpointConsole;
 use crate::stdlib::breakpoint::RealBreakpointConsole;
 use crate::stdlib::extra::PrintHandler;
@@ -93,10 +96,6 @@ enum EvaluatorError {
     ProfileOrInstrumentationAlreadyEnabled,
     #[error("Top frame is not def (internal error)")]
     TopFrameNotDef,
-    #[error(
-        "Coverage profile generation not implemented (but can be obtained with `.coverage()` function)"
-    )]
-    CoverageNotImplemented,
     #[error("Coverage not enabled")]
     CoverageNotEnabled,
     #[error("Local variable `{0}` referenced before assignment")]
@@ -114,13 +113,9 @@ pub(crate) const GC_THRESHOLD: usize = 100000;
 pub(crate) const DEFAULT_STACK_SIZE: usize = 50;
 
 /// Holds everything about an ongoing evaluation (local variables, globals, module resolution etc).
-pub struct Evaluator<'v, 'a> {
+pub struct Evaluator<'v, 'a, 'e> {
     // The module that is being used for this evaluation
     pub(crate) module_env: &'v Module,
-    // The module-level variables in scope at the moment.
-    // If `None` then we're in the initial module, use variables from `module_env`.
-    // If `Some` we've called a `def` in a loaded frozen module.
-    pub(crate) module_variables: Option<FrozenRef<'static, FrozenModuleData>>,
     /// Current function (`def` or `lambda`) frame: locals and bytecode stack.
     pub(crate) current_frame: BcFramePtr<'v>,
     // How we deal with a `load` function.
@@ -146,7 +141,7 @@ pub struct Evaluator<'v, 'a> {
     // Used for line profiling
     stmt_profile: StmtProfile,
     // Holds things that require hooking into evaluation.
-    eval_instrumentation: EvaluationInstrumentation<'a>,
+    eval_instrumentation: EvaluationInstrumentation<'a, 'e>,
     // Total time spent in runtime typechecking.
     // Filled only if runtime typechecking profiling is enabled.
     pub(crate) typecheck_profile: TypecheckProfile,
@@ -156,12 +151,14 @@ pub struct Evaluator<'v, 'a> {
     pub(crate) string_pool: StringPool,
     /// Field that can be used for any purpose you want (can store types you define).
     /// Typically accessed via native functions you also define.
-    pub extra: Option<&'a dyn AnyLifetime<'a>>,
+    pub extra: Option<&'a dyn AnyLifetime<'e>>,
     /// Called to perform console IO each time `breakpoint` function is called.
     pub(crate) breakpoint_handler:
         Option<Box<dyn Fn() -> anyhow::Result<Box<dyn BreakpointConsole>>>>,
     /// Use in implementation of `print` function.
     pub(crate) print_handler: &'a (dyn PrintHandler + 'a),
+    /// Deprecation handler.
+    pub(crate) soft_error_handler: &'a (dyn SoftErrorHandler + 'a),
     /// Max size of starlark stack
     pub(crate) max_callstack_size: Option<usize>,
     // The Starlark-level call-stack of functions.
@@ -170,18 +167,18 @@ pub struct Evaluator<'v, 'a> {
 }
 
 /// Just holds things that require using EvaluationCallbacksEnabled so that we can cache whether that needs to be enabled or not.
-struct EvaluationInstrumentation<'a> {
+struct EvaluationInstrumentation<'a, 'e: 'a> {
     // Bytecode profile.
     bc_profile: BcProfile,
     // Extra functions to run on each statement, usually empty
-    before_stmt: BeforeStmt<'a>,
+    before_stmt: BeforeStmt<'a, 'e>,
     heap_or_flame_profile: bool,
     // Whether we need to instrument evaluation or not, should be set if before_stmt or bc_profile are enabled.
     enabled: bool,
 }
 
-impl<'a> EvaluationInstrumentation<'a> {
-    fn new() -> EvaluationInstrumentation<'a> {
+impl<'a, 'e: 'a> EvaluationInstrumentation<'a, 'e> {
+    fn new() -> EvaluationInstrumentation<'a, 'e> {
         Self {
             bc_profile: BcProfile::new(),
             before_stmt: BeforeStmt::default(),
@@ -194,20 +191,21 @@ impl<'a> EvaluationInstrumentation<'a> {
         self.heap_or_flame_profile = true;
     }
 
-    fn change<F: FnOnce(&mut EvaluationInstrumentation<'a>)>(&mut self, f: F) {
-        f(self);
+    fn change<F: FnOnce(&mut EvaluationInstrumentation<'a, 'e>) -> R, R>(&mut self, f: F) -> R {
+        let r = f(self);
         self.enabled =
             self.bc_profile.enabled() || self.before_stmt.enabled() || self.heap_or_flame_profile;
+        r
     }
 }
 
 // Implementing this forces users to be more careful about lifetimes that the Evaluator captures such that we could
 // add captures of types that implement Drop without needing changes to client code.
-impl Drop for Evaluator<'_, '_> {
+impl Drop for Evaluator<'_, '_, '_> {
     fn drop(&mut self) {}
 }
 
-impl<'v, 'a> Evaluator<'v, 'a> {
+impl<'v, 'a, 'e: 'a> Evaluator<'v, 'a, 'e> {
     /// Crate a new [`Evaluator`] specifying the [`Module`] used for module variables.
     ///
     /// If your program contains `load()` statements, you also need to call
@@ -216,7 +214,6 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         Evaluator {
             call_stack: CheapCallStack::default(),
             module_env: module,
-            module_variables: None,
             current_frame: BcFramePtr::null(),
             loader: None,
             extra: None,
@@ -233,6 +230,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             string_pool: StringPool::default(),
             breakpoint_handler: None,
             print_handler: &StderrPrintHandler,
+            soft_error_handler: &HardErrorSoftErrorHandler,
             verbose_gc: false,
             static_typechecking: false,
             max_callstack_size: None,
@@ -269,7 +267,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         self.loader = Some(loader);
     }
 
-    /// Enable profiling, allowing [`Evaluator::write_profile`] to be used.
+    /// Enable profiling, allowing [`Evaluator::gen_profile`] to be used.
     /// Profilers add overhead, and while some profilers can be used together,
     /// it's better to run at most one profiler at a time.
     pub fn enable_profile(&mut self, mode: &ProfileMode) -> anyhow::Result<()> {
@@ -280,7 +278,9 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         self.profile_or_instrumentation_mode = ProfileOrInstrumentationMode::Profile(mode.dupe());
 
         match mode {
-            ProfileMode::HeapSummaryAllocated
+            ProfileMode::HeapAllocated
+            | ProfileMode::HeapRetained
+            | ProfileMode::HeapSummaryAllocated
             | ProfileMode::HeapFlameAllocated
             | ProfileMode::HeapSummaryRetained
             | ProfileMode::HeapFlameRetained => {
@@ -289,10 +289,14 @@ impl<'v, 'a> Evaluator<'v, 'a> {
                 match mode {
                     ProfileMode::HeapFlameRetained => self
                         .module_env
-                        .enable_heap_profile(RetainedHeapProfileMode::Flame),
+                        .enable_retained_heap_profile(RetainedHeapProfileMode::Flame),
                     ProfileMode::HeapSummaryRetained => self
                         .module_env
-                        .enable_heap_profile(RetainedHeapProfileMode::Summary),
+                        .enable_retained_heap_profile(RetainedHeapProfileMode::Summary),
+                    ProfileMode::HeapRetained => {
+                        self.module_env
+                            .enable_retained_heap_profile(RetainedHeapProfileMode::FlameAndSummary);
+                    }
                     _ => {}
                 }
 
@@ -323,45 +327,50 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             ProfileMode::Typecheck => {
                 self.typecheck_profile.enabled = true;
             }
+            ProfileMode::None => {}
         }
         Ok(())
     }
 
-    /// Write a profile to a file.
-    /// Only valid if corresponding profiler was enabled.
-    pub fn write_profile<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<()> {
-        self.gen_profile()?.write(filename.as_ref())
-    }
-
     /// Generate profile for a given mode.
     /// Only valid if corresponding profiler was enabled.
-    pub fn gen_profile(&mut self) -> anyhow::Result<ProfileData> {
+    pub fn gen_profile(&mut self) -> crate::Result<ProfileData> {
         let mode = match &self.profile_or_instrumentation_mode {
             ProfileOrInstrumentationMode::None => {
-                return Err(EvaluatorError::ProfilingNotEnabled.into());
+                return Err(crate::Error::new_other(EvaluatorError::ProfilingNotEnabled));
             }
             ProfileOrInstrumentationMode::Collected => {
-                return Err(EvaluatorError::ProfileDataAlreadyCollected.into());
+                return Err(crate::Error::new_other(
+                    EvaluatorError::ProfileDataAlreadyCollected,
+                ));
             }
             ProfileOrInstrumentationMode::Profile(mode) => mode.dupe(),
         };
         self.profile_or_instrumentation_mode = ProfileOrInstrumentationMode::Collected;
         match mode {
+            ProfileMode::HeapAllocated => self
+                .heap_profile
+                .gen(self.heap(), HeapProfileFormat::FlameGraphAndSummary),
             ProfileMode::HeapSummaryAllocated => self
                 .heap_profile
                 .gen(self.heap(), HeapProfileFormat::Summary),
             ProfileMode::HeapFlameAllocated => self
                 .heap_profile
                 .gen(self.heap(), HeapProfileFormat::FlameGraph),
-            ProfileMode::HeapSummaryRetained | ProfileMode::HeapFlameRetained => {
-                Err(EvaluatorError::RetainedMemoryProfilingCannotBeObtainedFromEvaluator.into())
-            }
+            ProfileMode::HeapSummaryRetained
+            | ProfileMode::HeapFlameRetained
+            | ProfileMode::HeapRetained => Err(crate::Error::new_other(
+                EvaluatorError::RetainedMemoryProfilingCannotBeObtainedFromEvaluator,
+            )),
             ProfileMode::Statement => self.stmt_profile.gen(),
-            ProfileMode::Coverage => Err(EvaluatorError::CoverageNotImplemented.into()),
+            ProfileMode::Coverage => self.stmt_profile.gen_coverage(),
             ProfileMode::Bytecode => self.gen_bc_profile(),
             ProfileMode::BytecodePairs => self.gen_bc_pairs_profile(),
             ProfileMode::TimeFlame => self.time_flame_profile.gen(),
             ProfileMode::Typecheck => self.typecheck_profile.gen(),
+            ProfileMode::None => Ok(ProfileData {
+                profile: ProfileDataImpl::None,
+            }),
         }
     }
 
@@ -372,12 +381,12 @@ impl<'v, 'a> Evaluator<'v, 'a> {
     /// Note coverage is not precise, because
     /// * some optimizer transformations may create incorrect spans
     /// * some optimizer transformations may remove statements
-    pub fn coverage(&self) -> anyhow::Result<HashSet<ResolvedFileSpan>> {
+    pub fn coverage(&self) -> crate::Result<HashSet<ResolvedFileSpan>> {
         match self.profile_or_instrumentation_mode {
             ProfileOrInstrumentationMode::Profile(ProfileMode::Coverage) => {
                 self.stmt_profile.coverage()
             }
-            _ => Err(EvaluatorError::CoverageNotEnabled.into()),
+            _ => Err(crate::Error::new_other(EvaluatorError::CoverageNotEnabled)),
         }
     }
 
@@ -413,12 +422,12 @@ impl<'v, 'a> Evaluator<'v, 'a> {
 
     pub(crate) fn before_stmt_fn(
         &mut self,
-        f: &'a dyn for<'v1> Fn(FileSpanRef, &mut Evaluator<'v1, 'a>),
+        f: &'a dyn for<'v1> Fn(FileSpanRef, &mut Evaluator<'v1, 'a, 'e>),
     ) {
         self.before_stmt(f.into())
     }
 
-    pub(crate) fn before_stmt(&mut self, f: BeforeStmtFunc<'a>) {
+    pub(crate) fn before_stmt(&mut self, f: BeforeStmtFunc<'a, 'e>) {
         self.eval_instrumentation
             .change(|v| v.before_stmt.before_stmt.push(f))
     }
@@ -426,13 +435,18 @@ impl<'v, 'a> Evaluator<'v, 'a> {
     /// This function is used by DAP, and it is not public API.
     // TODO(nga): pull DAP into the crate, and hide this function.
     #[doc(hidden)]
-    pub fn before_stmt_for_dap(&mut self, f: BeforeStmtFunc<'a>) {
+    pub fn before_stmt_for_dap(&mut self, f: BeforeStmtFunc<'a, 'e>) {
         self.before_stmt(f)
     }
 
     /// Set the handler invoked when `print` function is used.
     pub fn set_print_handler(&mut self, handler: &'a (dyn PrintHandler + 'a)) {
         self.print_handler = handler;
+    }
+
+    /// Set deprecation handler. If not set, deprecations are treated as hard errors.
+    pub fn set_soft_error_handler(&mut self, handler: &'a (dyn SoftErrorHandler + 'a)) {
+        self.soft_error_handler = handler;
     }
 
     /// Called to add an entry to the call stack, by the function being invoked.
@@ -459,26 +473,6 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         res
     }
 
-    /// Called to change the local variables, from the callee.
-    /// Only called for user written functions.
-    #[inline(always)] // There is only one caller
-    pub(crate) fn with_function_context(
-        &mut self,
-        def: Value<'v>,
-        module: Option<FrozenRef<'static, FrozenModuleData>>, // None == use module_env
-        bc: &Bc,
-    ) -> Result<Value<'v>, EvalException> {
-        // Set up for the new function call
-        let old_module_variables = mem::replace(&mut self.module_variables, module);
-
-        // Run the computation
-        let res = self.eval_bc(def, bc);
-
-        // Restore them all back
-        self.module_variables = old_module_variables;
-        res
-    }
-
     /// The active heap where [`Value`]s are allocated.
     pub fn heap(&self) -> &'v Heap {
         self.module_env.heap()
@@ -498,24 +492,27 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         self.module_env.frozen_heap()
     }
 
-    pub(crate) fn get_slot_module(&self, slot: ModuleSlotId) -> anyhow::Result<Value<'v>> {
+    pub(crate) fn get_slot_module(&self, slot: ModuleSlotId) -> crate::Result<Value<'v>> {
         // Make sure the error-path doesn't get inlined into the normal-path execution
         #[cold]
         #[inline(never)]
-        fn error<'v>(eval: &Evaluator<'v, '_>, slot: ModuleSlotId) -> anyhow::Error {
-            let name = match &eval.module_variables {
-                None => eval
+        fn error<'v>(eval: &Evaluator<'v, '_, '_>, slot: ModuleSlotId) -> crate::Error {
+            let name = match eval.top_frame_def_frozen_module(false) {
+                Err(e) => Some(format!("<internal error: {e}>")),
+                Ok(None) => eval
                     .module_env
                     .mutable_names()
                     .get_slot(slot)
                     .map(|s| s.as_str().to_owned()),
-                Some(e) => e.get_slot_name(slot).map(|s| s.as_str().to_owned()),
+                Ok(Some(e)) => e.get_slot_name(slot).map(|s| s.as_str().to_owned()),
             }
             .unwrap_or_else(|| "<unknown>".to_owned());
-            EvaluatorError::LocalVariableReferencedBeforeAssignment(name).into()
+            crate::Error::new_other(EvaluatorError::LocalVariableReferencedBeforeAssignment(
+                name,
+            ))
         }
 
-        match &self.module_variables {
+        match self.top_frame_def_frozen_module(false)? {
             None => self.module_env.slots().get_slot(slot),
             Some(e) => e.get_slot(slot).map(Value::new_frozen),
         }
@@ -525,17 +522,16 @@ impl<'v, 'a> Evaluator<'v, 'a> {
     // Make sure the error-path doesn't get inlined into the normal-path execution
     #[cold]
     #[inline(never)]
-    pub(crate) fn local_var_referenced_before_assignment(
-        &self,
-        slot: LocalSlotId,
-    ) -> anyhow::Error {
+    pub(crate) fn local_var_referenced_before_assignment(&self, slot: LocalSlotId) -> crate::Error {
         let def_info = match self.top_frame_def_info() {
             Ok(def_info) => def_info,
             Err(e) => return e,
         };
         let names = &def_info.used;
         let name = names[slot.0 as usize].as_str().to_owned();
-        EvaluatorError::LocalVariableReferencedBeforeAssignment(name).into()
+        crate::Error::new_other(EvaluatorError::LocalVariableReferencedBeforeAssignment(
+            name,
+        ))
     }
 
     #[inline(always)]
@@ -543,7 +539,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         &self,
         frame: BcFramePtr<'v>,
         slot: LocalSlotId,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> crate::Result<Value<'v>> {
         // We access locals from explicitly passed frame because it is faster.
         debug_assert!(self.current_frame == frame);
 
@@ -555,7 +551,7 @@ impl<'v, 'a> Evaluator<'v, 'a> {
     pub(crate) fn get_slot_local_captured(
         &self,
         slot: LocalCapturedSlotId,
-    ) -> anyhow::Result<Value<'v>> {
+    ) -> crate::Result<Value<'v>> {
         let value_captured = self.get_slot_local(self.current_frame, LocalSlotId(slot.0))?;
         let value_captured = value_captured_get(value_captured);
         value_captured
@@ -648,18 +644,18 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             .set_slot(slot.to_captured_or_not(), value_captured);
     }
 
-    pub(crate) fn check_return_type(&mut self, ret: Value<'v>) -> anyhow::Result<()> {
+    pub(crate) fn check_return_type(&mut self, ret: Value<'v>) -> crate::Result<()> {
         let func = self.call_stack.top_nth_function(0)?;
         if let Some(func) = func.downcast_ref::<Def>() {
             func.check_return_type(ret, self)
         } else if let Some(func) = func.downcast_ref::<FrozenDef>() {
             func.check_return_type(ret, self)
         } else {
-            Err(EvaluatorError::TopFrameNotDef.into())
+            Err(crate::Error::new_other(EvaluatorError::TopFrameNotDef))
         }
     }
 
-    fn func_to_def_info(&self, func: Value<'_>) -> anyhow::Result<FrozenRef<DefInfo>> {
+    fn func_to_def_info(&self, func: Value<'_>) -> crate::Result<FrozenRef<DefInfo>> {
         if let Some(func) = func.downcast_ref::<Def>() {
             Ok(func.def_info)
         } else if let Some(func) = func.downcast_ref::<FrozenDef>() {
@@ -668,28 +664,43 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             // For module, it is `None`.
             Ok(self.module_def_info)
         } else {
-            Err(EvaluatorError::TopFrameNotDef.into())
+            Err(crate::Error::new_other(EvaluatorError::TopFrameNotDef))
         }
     }
 
-    pub(crate) fn top_frame_def_info(&self) -> anyhow::Result<FrozenRef<DefInfo>> {
+    pub(crate) fn top_frame_def_info(&self) -> crate::Result<FrozenRef<DefInfo>> {
         let func = self.call_stack.top_nth_function(0)?;
         self.func_to_def_info(func)
     }
 
+    pub(crate) fn top_frame_def_frozen_module(
+        &self,
+        for_debugger: bool,
+    ) -> anyhow::Result<Option<FrozenRef<'static, FrozenModuleData>>> {
+        let func = self.top_frame_maybe_for_debugger(for_debugger)?;
+        if let Some(func) = func.downcast_ref::<FrozenDef>() {
+            Ok(func.module.load_relaxed())
+        } else if let Some(func) = func.downcast_ref::<Def>() {
+            Ok(func.module.load_relaxed())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn top_frame_maybe_for_debugger(&self, for_debugger: bool) -> anyhow::Result<Value<'v>> {
+        let func = self.call_stack.top_nth_function(0)?;
+        if for_debugger && func.downcast_ref::<NativeFunction>().is_some() {
+            // If top frame is `breakpoint` or `debug_evaluate`, it will be skipped.
+            self.call_stack.top_nth_function(1)
+        } else {
+            Ok(func)
+        }
+    }
+
     /// Gets the "top frame" for debugging. If the real top frame is `breakpoint` or `debug_evaluate`
     /// it will be skipped. This should only be used for the starlark debugger.
-    pub(crate) fn top_frame_def_info_for_debugger(&self) -> anyhow::Result<FrozenRef<DefInfo>> {
-        let func = {
-            let top = self.call_stack.top_nth_function(0)?;
-            if top.downcast_ref::<NativeFunction>().is_some() {
-                // we are in `breakpoint` or `debug_evaluate` function, get the next frame.
-                self.call_stack.top_nth_function(1)?
-            } else {
-                top
-            }
-        };
-
+    pub(crate) fn top_frame_def_info_for_debugger(&self) -> crate::Result<FrozenRef<DefInfo>> {
+        let func = self.top_frame_maybe_for_debugger(true)?;
         self.func_to_def_info(func)
     }
 
@@ -769,11 +780,11 @@ impl<'v, 'a> Evaluator<'v, 'a> {
         alloca.alloca_concat(x, y, |xs| k(xs, self))
     }
 
-    pub(crate) fn gen_bc_profile(&mut self) -> anyhow::Result<ProfileData> {
+    pub(crate) fn gen_bc_profile(&mut self) -> crate::Result<ProfileData> {
         self.eval_instrumentation.bc_profile.gen_bc_profile()
     }
 
-    pub(crate) fn gen_bc_pairs_profile(&mut self) -> anyhow::Result<ProfileData> {
+    pub(crate) fn gen_bc_pairs_profile(&mut self) -> crate::Result<ProfileData> {
         self.eval_instrumentation.bc_profile.gen_bc_pairs_profile()
     }
 
@@ -796,8 +807,23 @@ impl<'v, 'a> Evaluator<'v, 'a> {
             bc.run(
                 self,
                 &mut EvalCallbacksEnabled {
-                    bc_profile: self.eval_instrumentation.bc_profile.enabled(),
-                    before_stmt: self.eval_instrumentation.before_stmt.enabled(),
+                    mode: match (
+                        self.eval_instrumentation.before_stmt.enabled(),
+                        self.eval_instrumentation.bc_profile.enabled(),
+                    ) {
+                        (true, false) => EvalCallbacksMode::BeforeStmt,
+                        (false, true) => EvalCallbacksMode::BcProfile,
+                        (true, true) => {
+                            return Err(EvalException::new_unknown_span(internal_error!(
+                                "both before_stmt and bc_profile are enabled"
+                            )));
+                        }
+                        (false, false) => {
+                            return Err(EvalException::new_unknown_span(internal_error!(
+                                "neither before_stmt nor bc_profile are enabled"
+                            )));
+                        }
+                    },
                     stmt_locs: &bc.instrs.stmt_locs,
                     bc_start_ptr: bc.instrs.start_ptr(),
                 },
@@ -829,40 +855,63 @@ impl<'v, 'a> Evaluator<'v, 'a> {
 }
 
 pub(crate) trait EvaluationCallbacks {
-    fn before_instr(&mut self, _eval: &mut Evaluator, _ip: BcPtrAddr, _opcode: BcOpcode);
+    fn before_instr(
+        &mut self,
+        _eval: &mut Evaluator,
+        _ip: BcPtrAddr,
+        _opcode: BcOpcode,
+    ) -> crate::Result<()>;
 }
 
 pub(crate) struct EvalCallbacksDisabled;
 
 impl EvaluationCallbacks for EvalCallbacksDisabled {
     #[inline(always)]
-    fn before_instr(&mut self, _eval: &mut Evaluator, _ip: BcPtrAddr, _opcode: BcOpcode) {}
+    fn before_instr(
+        &mut self,
+        _eval: &mut Evaluator,
+        _ip: BcPtrAddr,
+        _opcode: BcOpcode,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) enum EvalCallbacksMode {
+    BcProfile,
+    BeforeStmt,
 }
 
 pub(crate) struct EvalCallbacksEnabled<'a> {
-    pub(crate) bc_profile: bool,
-    pub(crate) before_stmt: bool,
+    pub(crate) mode: EvalCallbacksMode,
     pub(crate) stmt_locs: &'a BcStatementLocations,
     pub(crate) bc_start_ptr: BcPtrAddr<'a>,
 }
 
 impl<'a> EvalCallbacksEnabled<'a> {
-    fn before_stmt(&mut self, eval: &mut Evaluator, ip: BcPtrAddr) {
+    fn before_stmt(&mut self, eval: &mut Evaluator, ip: BcPtrAddr) -> crate::Result<()> {
         let offset = ip.offset_from(self.bc_start_ptr);
         if let Some(loc) = self.stmt_locs.stmt_at(offset) {
-            before_stmt(loc.span, eval);
+            before_stmt(loc.span, eval)?;
         }
+        Ok(())
     }
 }
 
 impl<'a> EvaluationCallbacks for EvalCallbacksEnabled<'a> {
     #[inline(always)]
-    fn before_instr(&mut self, eval: &mut Evaluator, ip: BcPtrAddr, opcode: BcOpcode) {
-        if self.bc_profile {
-            eval.eval_instrumentation.bc_profile.before_instr(opcode)
-        }
-        if self.before_stmt {
-            self.before_stmt(eval, ip);
+    fn before_instr(
+        &mut self,
+        eval: &mut Evaluator,
+        ip: BcPtrAddr,
+        opcode: BcOpcode,
+    ) -> crate::Result<()> {
+        match self.mode {
+            EvalCallbacksMode::BcProfile => {
+                eval.eval_instrumentation.bc_profile.before_instr(opcode);
+                Ok(())
+            }
+            EvalCallbacksMode::BeforeStmt => self.before_stmt(eval, ip),
         }
     }
 }
@@ -871,18 +920,26 @@ impl<'a> EvaluationCallbacks for EvalCallbacksEnabled<'a> {
 // The purposes are GC, profiling and debugging.
 //
 // This function is called only if `before_stmt` is set before compilation start.
-pub(crate) fn before_stmt(span: FrameSpan, eval: &mut Evaluator) {
+pub(crate) fn before_stmt(span: FrameSpan, eval: &mut Evaluator) -> crate::Result<()> {
     assert!(
         eval.eval_instrumentation.before_stmt.enabled(),
         "this code should only be called if `before_stmt` is set"
     );
-    let mut fs = mem::take(&mut eval.eval_instrumentation.before_stmt.before_stmt);
+    let mut fs = eval.eval_instrumentation.change(|eval_instrumentation| {
+        mem::take(&mut eval_instrumentation.before_stmt.before_stmt)
+    });
+    let mut result = Ok(());
     for f in &mut fs {
-        f.call(span.span.file_span_ref(), eval)
+        if result.is_ok() {
+            result = f.call(span.span.file_span_ref(), eval);
+        }
     }
-    let added = mem::replace(&mut eval.eval_instrumentation.before_stmt.before_stmt, fs);
+    let added = eval.eval_instrumentation.change(|eval_instrumentation| {
+        mem::replace(&mut eval_instrumentation.before_stmt.before_stmt, fs)
+    });
     assert!(
         added.is_empty(),
         "`before_stmt` cannot be modified during evaluation"
     );
+    result
 }

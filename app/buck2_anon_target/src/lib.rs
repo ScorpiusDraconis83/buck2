@@ -8,7 +8,6 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(async_closure)]
 #![feature(box_patterns)]
 
 use std::sync::Once;
@@ -19,6 +18,7 @@ pub(crate) mod anon_target_attr_coerce;
 pub(crate) mod anon_target_attr_resolve;
 pub(crate) mod anon_target_node;
 pub(crate) mod anon_targets;
+pub mod bxl;
 pub(crate) mod promise_artifacts;
 pub(crate) mod starlark_defs;
 

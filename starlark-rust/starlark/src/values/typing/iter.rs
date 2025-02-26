@@ -25,8 +25,8 @@ use starlark_derive::ProvidesStaticType;
 use crate as starlark;
 use crate::typing::Ty;
 use crate::values::layout::avalue::alloc_static;
+use crate::values::layout::avalue::AValueBasic;
 use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::Basic;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::AllocFrozenValue;
@@ -40,6 +40,8 @@ enum NonInstantiable {}
 pub struct StarlarkIter<T: StarlarkTypeRepr>(PhantomData<T>, NonInstantiable);
 
 impl<T: StarlarkTypeRepr> StarlarkTypeRepr for StarlarkIter<T> {
+    type Canonical = StarlarkIter<T::Canonical>;
+
     fn starlark_type_repr() -> Ty {
         Ty::iter(T::starlark_type_repr())
     }
@@ -52,7 +54,7 @@ impl<T: StarlarkTypeRepr> StarlarkTypeRepr for StarlarkIter<T> {
     ProvidesStaticType,
     NoSerialize
 )]
-#[display(fmt = "{}", Self::TYPE)]
+#[display("{}", Self::TYPE)]
 pub(crate) struct TypingIterable;
 
 #[starlark_value(type = "typing.Iterable")]
@@ -66,8 +68,8 @@ impl<'v> StarlarkValue<'v> for TypingIterable {
 
 impl AllocFrozenValue for TypingIterable {
     fn alloc_frozen_value(self, _heap: &FrozenHeap) -> FrozenValue {
-        static ANY: AValueRepr<AValueImpl<Basic, TypingIterable>> =
-            alloc_static(Basic, TypingIterable);
+        static ANY: AValueRepr<AValueImpl<'static, AValueBasic<TypingIterable>>> =
+            alloc_static(TypingIterable);
 
         FrozenValue::new_repr(&ANY)
     }

@@ -7,18 +7,17 @@
  * of this source tree.
  */
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context as _;
-use buck2_build_api::actions::RegisteredAction;
-use buck2_build_signals::CriticalPathBackendName;
-use buck2_build_signals::NodeDuration;
+use buck2_build_api::actions::calculation::ActionWithExtraData;
+use buck2_build_signals::env::CriticalPathBackendName;
+use buck2_build_signals::env::NodeDuration;
 use buck2_core::soft_error;
 use buck2_critical_path::compute_critical_path_potentials;
 use buck2_critical_path::GraphBuilder;
 use buck2_critical_path::OptionalVertexId;
 use buck2_critical_path::PushError;
+use buck2_error::BuckErrorContext;
 use buck2_events::span::SpanId;
 use dupe::Dupe;
 use smallvec::SmallVec;
@@ -31,7 +30,7 @@ use crate::NodeKey;
 /// An implementation of critical path that uses a longest-paths graph in order to produce
 /// potential savings in addition to the critical path.
 pub(crate) struct LongestPathGraphBackend {
-    builder: anyhow::Result<GraphBuilder<NodeKey, NodeData>>,
+    builder: buck2_error::Result<GraphBuilder<NodeKey, NodeData>>,
     top_level_analysis: Vec<VisibilityEdge>,
 }
 
@@ -54,7 +53,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
     fn process_node(
         &mut self,
         key: NodeKey,
-        action: Option<Arc<RegisteredAction>>,
+        action_with_extra_data: Option<ActionWithExtraData>,
         duration: NodeDuration,
         dep_keys: impl IntoIterator<Item = NodeKey>,
         span_ids: SmallVec<[SpanId; 1]>,
@@ -68,7 +67,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
             key,
             dep_keys,
             NodeData {
-                action,
+                action_with_extra_data,
                 duration,
                 span_ids,
             },
@@ -78,7 +77,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
             e @ PushError::Overflow => Err(e.into()),
             e @ PushError::DuplicateKey { .. } => {
                 soft_error!("critical_path_duplicate_key", e.into(), quiet: true)?;
-                anyhow::Ok(())
+                Ok(())
             }
         });
 
@@ -99,7 +98,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
         })
     }
 
-    fn finish(self) -> anyhow::Result<BuildInfo> {
+    fn finish(self) -> buck2_error::Result<BuildInfo> {
         let (graph, keys, mut data) = {
             let (graph, keys, data) = self.builder?.finish();
 
@@ -158,7 +157,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
 
             let graph = graph
                 .add_edges(&first_analysis, n)
-                .context("Error adding first_analysis edges to graph")?;
+                .buck_error_context("Error adding first_analysis edges to graph")?;
 
             (graph, keys, data)
         };
@@ -168,12 +167,12 @@ impl BuildListenerBackend for LongestPathGraphBackend {
                 .critical_path_duration()
                 .as_micros()
                 .try_into()
-                .context("Duration `as_micros()` exceeds u64")
+                .buck_error_context("Duration `as_micros()` exceeds u64")
         })?;
 
         let (critical_path, critical_path_cost, replacement_durations) =
             compute_critical_path_potentials(&graph, &durations)
-                .context("Error computing critical path potentials")?;
+                .buck_error_context("Error computing critical path potentials")?;
 
         drop(durations);
 
@@ -188,7 +187,7 @@ impl BuildListenerBackend for LongestPathGraphBackend {
                 let data = std::mem::replace(
                     &mut data[vertex_idx],
                     NodeData {
-                        action: None,
+                        action_with_extra_data: None,
                         duration: NodeDuration::zero(),
                         span_ids: Default::default(),
                     },

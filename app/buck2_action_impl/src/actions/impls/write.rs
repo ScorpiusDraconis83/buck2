@@ -12,7 +12,6 @@ use std::slice;
 use std::time::Instant;
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
@@ -21,15 +20,14 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::execute::error::ExecuteError;
 use buck2_build_api::actions::Action;
-use buck2_build_api::actions::ActionExecutable;
 use buck2_build_api::actions::ActionExecutionCtx;
-use buck2_build_api::actions::IncrementalActionExecutable;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::AbsCommandLineContext;
 use buck2_build_api::interpreter::rule_defs::cmd_args::DefaultCommandLineContext;
-use buck2_core::category::Category;
+use buck2_core::category::CategoryRef;
+use buck2_error::BuckErrorContext;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::WriteRequest;
@@ -37,11 +35,11 @@ use dupe::Dupe;
 use indexmap::indexmap;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
-use once_cell::sync::Lazy;
 use starlark::values::OwnedFrozenValue;
 use starlark::values::UnpackValue;
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 enum WriteActionValidationError {
     #[error("WriteAction received inputs")]
     TooManyInputs,
@@ -67,7 +65,7 @@ impl UnregisteredAction for UnregisteredWriteAction {
         outputs: IndexSet<BuildArtifact>,
         starlark_data: Option<OwnedFrozenValue>,
         _error_handler: Option<OwnedFrozenValue>,
-    ) -> anyhow::Result<Box<dyn Action>> {
+    ) -> buck2_error::Result<Box<dyn Action>> {
         let contents = starlark_data.expect("module data to be present");
 
         let write_action = WriteAction::new(contents, inputs, outputs, *self)?;
@@ -88,7 +86,7 @@ impl WriteAction {
         inputs: IndexSet<ArtifactGroup>,
         outputs: IndexSet<BuildArtifact>,
         inner: UnregisteredWriteAction,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let mut outputs = outputs.into_iter();
 
         let output = match (outputs.next(), outputs.next()) {
@@ -101,7 +99,7 @@ impl WriteAction {
             return Err(WriteActionValidationError::TooManyInputs.into());
         }
 
-        if ValueAsCommandLineLike::unpack_value(contents.value()).is_none() {
+        if ValueAsCommandLineLike::unpack_value(contents.value())?.is_none() {
             return Err(WriteActionValidationError::ContentsNotCommandLineValue(
                 contents.value().to_repr(),
             )
@@ -115,7 +113,7 @@ impl WriteAction {
         })
     }
 
-    fn get_contents(&self, fs: &ExecutorFs) -> anyhow::Result<String> {
+    fn get_contents(&self, fs: &ExecutorFs) -> buck2_error::Result<String> {
         let mut cli = Vec::<String>::new();
 
         let mut ctx = if let Some(macro_files) = &self.inner.macro_files {
@@ -148,22 +146,20 @@ impl Action for WriteAction {
         buck2_data::ActionKind::Write
     }
 
-    fn inputs(&self) -> anyhow::Result<Cow<'_, [ArtifactGroup]>> {
+    fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
         Ok(Cow::Borrowed(&[]))
     }
 
-    fn outputs(&self) -> anyhow::Result<Cow<'_, [BuildArtifact]>> {
-        Ok(Cow::Borrowed(slice::from_ref(&self.output)))
+    fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+        Cow::Borrowed(slice::from_ref(&self.output))
     }
 
-    fn as_executable(&self) -> ActionExecutable<'_> {
-        ActionExecutable::Incremental(self)
+    fn first_output(&self) -> &BuildArtifact {
+        &self.output
     }
 
-    fn category(&self) -> &Category {
-        static WRITE_CATEGORY: Lazy<Category> = Lazy::new(|| Category::try_from("write").unwrap());
-
-        &WRITE_CATEGORY
+    fn category(&self) -> CategoryRef {
+        CategoryRef::unchecked_new("write")
     }
 
     fn identifier(&self) -> Option<&str> {
@@ -180,10 +176,7 @@ impl Action for WriteAction {
             "absolute".to_owned() => self.inner.absolute.to_string(),
         }
     }
-}
 
-#[async_trait]
-impl IncrementalActionExecutable for WriteAction {
     async fn execute(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
@@ -206,10 +199,10 @@ impl IncrementalActionExecutable for WriteAction {
             .await?
             .into_iter()
             .next()
-            .context("Write did not execute")?;
+            .buck_error_context("Write did not execute")?;
 
         let wall_time = execution_start
-            .context("Action did not set execution_start")?
+            .buck_error_context("Action did not set execution_start")?
             .elapsed();
 
         Ok((
@@ -217,6 +210,7 @@ impl IncrementalActionExecutable for WriteAction {
             ActionExecutionMetadata {
                 execution_kind: ActionExecutionKind::Simple,
                 timing: ActionExecutionTimingData { wall_time },
+                input_files_bytes: None,
             },
         ))
     }

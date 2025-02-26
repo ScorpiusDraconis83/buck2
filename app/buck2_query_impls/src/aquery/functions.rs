@@ -11,7 +11,6 @@ use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use buck2_artifact::artifact::provide_outputs::ProvideActionKey;
 use buck2_build_api::actions::query::ActionQueryNode;
 use buck2_build_api::actions::query::ActionQueryNodeData;
 use buck2_query::query::syntax::simple::eval::error::QueryError;
@@ -23,6 +22,7 @@ use buck2_query::query::syntax::simple::functions::DefaultQueryFunctionsModule;
 use buck2_query::query::syntax::simple::functions::QueryFunctions;
 use buck2_query::query_module;
 use buck2_query_parser::BinaryOp;
+use dupe::Dupe;
 
 use crate::aquery::environment::AqueryEnvironment;
 
@@ -67,6 +67,7 @@ pub(crate) fn aquery_functions<'a>() -> impl QueryFunctions<Env = AqueryEnvironm
 #[derive(Debug)]
 pub(crate) struct AqueryFunctions<'a>(pub(crate) PhantomData<&'a ()>);
 
+/// Aquery-specific
 #[query_module(AqueryEnvironment<'a>)]
 impl<'a> AqueryFunctions<'a> {
     /// Obtain the actions for all the outputs provided by the `DefaultInfo` for the targets passed
@@ -86,11 +87,8 @@ impl<'a> AqueryFunctions<'a> {
                 analysis
                     .providers()?
                     .provider_collection()
-                    .default_info()
-                    .for_each_output(&mut |output| {
-                        outputs.push(output);
-                        Ok(())
-                    })?;
+                    .default_info()?
+                    .for_each_output(&mut |output| outputs.push(output))?;
             }
         }
 
@@ -117,17 +115,15 @@ impl<'a> AqueryFunctions<'a> {
                     res.insert(node);
                 }
                 ActionQueryNodeData::Analysis(analysis) => {
-                    for entry in analysis.analysis_result().iter_deferreds() {
-                        action_keys.extend(provider::request_value::<ProvideActionKey>(
-                            entry.as_complex(),
-                        ));
+                    for action in analysis.analysis_result().analysis_values().iter_actions() {
+                        action_keys.push(action.key().dupe());
                     }
                 }
             }
         }
 
-        let nodes = futures::future::try_join_all(
-            action_keys.iter().map(|key| env.delegate.get_node(&key.0)),
+        let nodes = buck2_util::future::try_join_all(
+            action_keys.iter().map(|key| env.delegate.get_node(&key)),
         )
         .await?;
         res.extend(nodes);

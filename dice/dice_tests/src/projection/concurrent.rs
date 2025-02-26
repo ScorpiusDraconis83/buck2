@@ -47,7 +47,7 @@ impl Key for BaseK {
 #[tokio::test]
 async fn concurrent_identical_requests_are_reused() -> anyhow::Result<()> {
     #[derive(Allocative, Clone, Debug, Display)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct ComputeOnce(#[allocative(skip)] Arc<AtomicU8>);
 
     impl PartialEq for ComputeOnce {
@@ -83,22 +83,22 @@ async fn concurrent_identical_requests_are_reused() -> anyhow::Result<()> {
 
     let count = Arc::new(AtomicU8::new(0));
 
-    let ctx = dice.updater().commit().await;
+    let mut ctx = dice.updater().commit().await;
 
     let k = ComputeOnce(count.dupe());
 
     let base = ctx.compute_opaque(&BaseK).await?;
 
-    base.projection(&k)?;
+    ctx.projection(&base, &k)?;
 
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    base.projection(&k)?;
+    ctx.projection(&base, &k)?;
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
     // call base again but technically same key
     let base = ctx.compute_opaque(&BaseK).await?;
 
-    base.projection(&k)?;
+    ctx.projection(&base, &k)?;
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
     Ok(())

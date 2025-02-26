@@ -32,11 +32,15 @@ LinkOptions = record(
     strip = bool,
     # A function/lambda which will generate the strip args using the ctx.
     strip_args_factory = [typing.Callable, None],
-    import_library = [Artifact, None],
+    import_library = Artifact | None,
     allow_cache_upload = bool,
     cxx_toolchain = [CxxToolchainInfo, None],
     # Force callers to use link_options() or merge_link_options() to create.
     __private_use_link_options_function_to_construct = None,
+    error_handler = [typing.Callable, None],
+    # Factory methods used to provide extra linker outputs and flags.
+    extra_linker_outputs_factory = field(typing.Callable | None, None),
+    extra_linker_outputs_flags_factory = field(typing.Callable | None, None),
 )
 
 def link_options(
@@ -49,9 +53,12 @@ def link_options(
         identifier: [str, None] = None,
         strip: bool = False,
         strip_args_factory = None,
-        import_library: [Artifact, None] = None,
+        import_library: Artifact | None = None,
         allow_cache_upload: bool = False,
-        cxx_toolchain: [CxxToolchainInfo, None] = None) -> LinkOptions:
+        cxx_toolchain: [CxxToolchainInfo, None] = None,
+        error_handler: [typing.Callable, None] = None,
+        extra_linker_outputs_factory: [typing.Callable, None] = None,
+        extra_linker_outputs_flags_factory: [typing.Callable, None] = None) -> LinkOptions:
     """
     A type-checked constructor for LinkOptions because by default record
     constructors aren't typed.
@@ -70,9 +77,12 @@ def link_options(
         allow_cache_upload = allow_cache_upload,
         cxx_toolchain = cxx_toolchain,
         __private_use_link_options_function_to_construct = None,
+        error_handler = error_handler,
+        extra_linker_outputs_factory = extra_linker_outputs_factory,
+        extra_linker_outputs_flags_factory = extra_linker_outputs_flags_factory,
     )
 
-# A marker instance to differentiate explicitly-passed None and a field tha
+# A marker instance to differentiate explicitly-passed None and a field that
 # isn't provided in merge_link_options.
 _NotProvided = record()
 _NOT_PROVIDED = _NotProvided()
@@ -110,4 +120,7 @@ def merge_link_options(
         allow_cache_upload = base.allow_cache_upload if allow_cache_upload == _NOT_PROVIDED else allow_cache_upload,
         cxx_toolchain = base.cxx_toolchain if cxx_toolchain == _NOT_PROVIDED else cxx_toolchain,
         __private_use_link_options_function_to_construct = None,
+        error_handler = base.error_handler,
+        extra_linker_outputs_factory = base.extra_linker_outputs_factory,
+        extra_linker_outputs_flags_factory = base.extra_linker_outputs_flags_factory,
     )

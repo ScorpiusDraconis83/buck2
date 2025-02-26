@@ -7,16 +7,14 @@
  * of this source tree.
  */
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
 
 use allocative::Allocative;
-use anyhow::Context as _;
 use async_trait::async_trait;
 use buck2_analysis::analysis::calculation::get_rule_spec;
-use buck2_analysis::analysis::env::RuleAnalysisAttrResolutionContext;
+use buck2_analysis::analysis::env::transitive_validations;
 use buck2_analysis::analysis::env::RuleSpec;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::analysis::anon_promises_dyn::AnonPromisesDyn;
@@ -24,86 +22,76 @@ use buck2_build_api::analysis::anon_targets_registry::AnonTargetsRegistryDyn;
 use buck2_build_api::analysis::anon_targets_registry::ANON_TARGET_REGISTRY_NEW;
 use buck2_build_api::analysis::registry::AnalysisRegistry;
 use buck2_build_api::analysis::AnalysisResult;
+use buck2_build_api::anon_target::AnonTargetDependentAnalysisResults;
+use buck2_build_api::anon_target::AnonTargetDyn;
 use buck2_build_api::artifact_groups::promise::PromiseArtifact;
 use buck2_build_api::artifact_groups::promise::PromiseArtifactId;
 use buck2_build_api::artifact_groups::promise::PromiseArtifactResolveError;
 use buck2_build_api::deferred::calculation::EVAL_ANON_TARGET;
 use buck2_build_api::deferred::calculation::GET_PROMISED_ARTIFACT;
-use buck2_build_api::deferred::types::DeferredTable;
-use buck2_build_api::interpreter::rule_defs::artifact::ValueAsArtifactLike;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisContext;
 use buck2_build_api::interpreter::rule_defs::plugins::AnalysisPlugins;
-use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::collection::ProviderCollection;
-use buck2_configured::nodes::calculation::find_execution_platform_by_configuration;
-use buck2_core::base_deferred_key::BaseDeferredKey;
-use buck2_core::base_deferred_key::BaseDeferredKeyDyn;
+use buck2_configured::execution::find_execution_platform_by_configuration;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePath;
-use buck2_core::configuration::config_setting::ConfigSettingData;
-use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::pair::ConfigurationNoExec;
-use buck2_core::configuration::pair::ConfigurationWithExec;
-use buck2_core::configuration::transition::applied::TransitionApplied;
-use buck2_core::configuration::transition::id::TransitionId;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKeyDyn;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::package::PackageLabel;
-use buck2_core::pattern::lex_target_pattern;
+use buck2_core::pattern::pattern::lex_target_pattern;
+use buck2_core::pattern::pattern::PatternData;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
-use buck2_core::pattern::ParsedPattern;
-use buck2_core::pattern::PatternData;
-use buck2_core::provider::label::ConfiguredProvidersLabel;
-use buck2_core::provider::label::ProvidersLabel;
-use buck2_core::provider::label::ProvidersName;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::name::TargetNameRef;
 use buck2_core::unsafe_send_future::UnsafeSendFuture;
+use buck2_error::internal_error;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_events::dispatch::span_async;
 use buck2_execute::digest_config::HasDigestConfig;
 use buck2_futures::cancellation::CancellationContext;
 use buck2_interpreter::dice::starlark_provider::with_starlark_eval_provider;
-use buck2_interpreter::error::BuckStarlarkError;
+use buck2_interpreter::from_freeze::from_freeze_error;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
-use buck2_interpreter::starlark_profiler::StarlarkProfilerOrInstrumentation;
+use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
+use buck2_interpreter::starlark_profiler::profiler::StarlarkProfilerOpt;
 use buck2_interpreter::starlark_promise::StarlarkPromise;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_interpreter_for_build::rule::FrozenRuleCallable;
 use buck2_node::attrs::attr_type::AttrType;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
-use buck2_node::attrs::coerced_path::CoercedPath;
-use buck2_node::attrs::coercion_context::AttrCoercionContext;
-use buck2_node::attrs::configuration_context::AttrConfigurationContext;
 use buck2_node::attrs::internal::internal_attrs;
-use buck2_util::arc_str::ArcSlice;
+use buck2_node::bzl_or_bxl_path::BzlOrBxlPath;
+use buck2_node::rule_type::StarlarkRuleType;
 use buck2_util::arc_str::ArcStr;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
 use dupe::Dupe;
-use futures::Future;
+use futures::future::BoxFuture;
 use futures::FutureExt;
 use starlark::any::AnyLifetime;
 use starlark::any::ProvidesStaticType;
 use starlark::codemap::FileSpan;
 use starlark::environment::Module;
-use starlark::eval::Evaluator;
-use starlark::values::dict::DictOf;
-use starlark::values::structs::AllocStruct;
+use starlark::values::dict::UnpackDictEntries;
 use starlark::values::Trace;
-use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueTyped;
+use starlark::values::ValueTypedComplex;
 use starlark_map::ordered_map::OrderedMap;
 use starlark_map::small_map::SmallMap;
+use starlark_map::sorted_map::SortedMap;
 
 use crate::anon_promises::AnonPromises;
 use crate::anon_target_attr::AnonTargetAttr;
 use crate::anon_target_attr_coerce::AnonTargetAttrTypeCoerce;
-use crate::anon_target_attr_resolve::AnonTargetAttrResolution;
-use crate::anon_target_attr_resolve::AnonTargetAttrResolutionContext;
 use crate::anon_target_attr_resolve::AnonTargetDependents;
 use crate::anon_target_node::AnonTarget;
+use crate::anon_target_node::AnonTargetVariant;
+use crate::bxl::eval_bxl_for_anon_target;
 use crate::promise_artifacts::PromiseArtifactRegistry;
 
 #[derive(Debug, Trace, Allocative, ProvidesStaticType)]
@@ -115,17 +103,14 @@ pub struct AnonTargetsRegistry<'v> {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 pub enum AnonTargetsError {
     #[error("Not allowed to call `anon_targets` in this context")]
     AssertNoPromisesFailed,
-    #[error(
-        "Invalid `name` attribute, must be a label or a string, got `{value}` of type `{typ}`"
-    )]
+    #[error("Invalid `name` attribute, must be a label or a string, got `{value}` of type `{typ}`")]
     InvalidNameType { typ: String, value: String },
     #[error("`name` attribute must be a valid target label, got `{0}`")]
     NotTargetLabel(String),
-    #[error("can't parse strings during `anon_targets` coercion, got `{0}`")]
-    CantParseDuringCoerce(String),
     #[error("Unknown attribute `{0}`")]
     UnknownAttribute(String),
     #[error("Internal attribute `{0}` not allowed as argument to `anon_targets`")]
@@ -139,25 +124,47 @@ pub enum AnonTargetsError {
 #[derive(Hash, Eq, PartialEq, Clone, Dupe, Debug, Display, Trace, Allocative)]
 pub(crate) struct AnonTargetKey(pub(crate) Arc<AnonTarget>);
 
+#[async_trait]
+impl Key for AnonTargetKey {
+    type Value = buck2_error::Result<AnalysisResult>;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        cancellation: &CancellationContext,
+    ) -> Self::Value {
+        Ok(self.run_analysis(ctx, cancellation).await?)
+    }
+
+    fn equality(_: &Self::Value, _: &Self::Value) -> bool {
+        false
+    }
+}
+
 impl AnonTargetKey {
-    fn downcast(key: Arc<dyn BaseDeferredKeyDyn>) -> anyhow::Result<Self> {
+    fn downcast(key: Arc<dyn BaseDeferredKeyDyn>) -> buck2_error::Result<Self> {
         Ok(AnonTargetKey(
             key.into_any()
                 .downcast()
                 .ok()
-                .context("Expecting AnonTarget (internal error)")?,
+                .internal_error("Expecting AnonTarget")?,
         ))
     }
 
-    pub(crate) fn new<'v>(
+    fn prepare_anon_target_data<'v>(
         execution_platform: &ExecutionPlatformResolution,
         rule: ValueTyped<'v, FrozenRuleCallable>,
-        attributes: DictOf<'v, &'v str, Value<'v>>,
-    ) -> anyhow::Result<Self> {
+        attributes: UnpackDictEntries<&'v str, Value<'v>>,
+    ) -> buck2_error::Result<(
+        Arc<StarlarkRuleType>,
+        TargetLabel,
+        SortedMap<String, AnonTargetAttr>,
+        ConfigurationNoExec,
+    )> {
         let mut name = None;
         let internal_attrs = internal_attrs();
 
-        let entries = attributes.collect_entries();
+        let entries = attributes.entries;
         let attrs_spec = rule.attributes();
         let mut attrs = OrderedMap::with_capacity(attrs_spec.len());
 
@@ -175,7 +182,7 @@ impl AnonTargetKey {
                 attrs.insert(
                     k.to_owned(),
                     Self::coerce_to_anon_target_attr(attr.coercer(), v, &anon_attr_ctx)
-                        .with_context(|| format!("Error coercing attribute `{}`", k))?,
+                        .with_buck_error_context(|| format!("Error coercing attribute `{}`", k))?,
                 );
             }
         }
@@ -198,21 +205,51 @@ impl AnonTargetKey {
             None => Self::create_name(&rule.rule_type().name)?,
             Some(name) => name,
         };
-
-        Ok(Self(Arc::new(AnonTarget::new(
+        Ok((
             rule.rule_type().dupe(),
             name,
             attrs.into(),
             execution_platform.cfg().dupe(),
-        ))))
+        ))
+    }
+
+    pub(crate) fn new<'v>(
+        execution_platform: &ExecutionPlatformResolution,
+        rule: ValueTyped<'v, FrozenRuleCallable>,
+        attributes: UnpackDictEntries<&'v str, Value<'v>>,
+        owner_key: &BaseDeferredKey,
+    ) -> buck2_error::Result<Self> {
+        let (rule_type, name, attrs, exec_cfg) =
+            Self::prepare_anon_target_data(execution_platform, rule, attributes)?;
+
+        let global_cfg_options = match owner_key {
+            BaseDeferredKey::TargetLabel(_) => None,
+            BaseDeferredKey::AnonTarget(anon) => anon.global_cfg_options(),
+            BaseDeferredKey::BxlLabel(bxl) => bxl.0.global_cfg_options(),
+        };
+        let anon_target = match (&rule_type.path, global_cfg_options) {
+            (BzlOrBxlPath::Bzl(_), _) => AnonTarget::new(rule_type, name, attrs, exec_cfg),
+            (BzlOrBxlPath::Bxl(_), Some(global_cfg_options)) => {
+                AnonTarget::new_bxl(rule_type, name, attrs, exec_cfg, global_cfg_options)
+            }
+            (BzlOrBxlPath::Bxl(bxl_file_path), None) => {
+                return Err(internal_error!(
+                    "Bxl anon target defined at {} must have global configuration options.",
+                    bxl_file_path
+                ));
+            }
+        };
+
+        Ok(Self(Arc::new(anon_target)))
     }
 
     /// We need to parse a TargetLabel from a String, but it doesn't matter if the pieces aren't
     /// valid targets in the context of this build (e.g. if the package really exists),
     /// just that it is syntactically valid.
-    fn parse_target_label(x: &str) -> anyhow::Result<TargetLabel> {
+    fn parse_target_label(x: &str) -> buck2_error::Result<TargetLabel> {
         let err = || AnonTargetsError::NotTargetLabel(x.to_owned());
-        let lex = lex_target_pattern::<TargetPatternExtra>(x, false).with_context(err)?;
+        let lex =
+            lex_target_pattern::<TargetPatternExtra>(x, false).with_buck_error_context(err)?;
         // TODO(nga): `CellName` contract requires it refers to declared cell name.
         //   This `unchecked_new` violates it.
         let cell =
@@ -230,14 +267,14 @@ impl AnonTargetKey {
         }
     }
 
-    fn create_name(rule_name: &str) -> anyhow::Result<TargetLabel> {
+    fn create_name(rule_name: &str) -> buck2_error::Result<TargetLabel> {
         // TODO(nga): this creates non-existing cell reference.
         let cell_name = CellName::unchecked_new("anon")?;
         let pkg = PackageLabel::new(cell_name, CellRelativePath::empty());
         Ok(TargetLabel::new(pkg, TargetNameRef::new(rule_name)?))
     }
 
-    fn coerce_name(x: Value) -> anyhow::Result<TargetLabel> {
+    fn coerce_name(x: Value) -> buck2_error::Result<TargetLabel> {
         if let Some(x) = StarlarkConfiguredProvidersLabel::from_value(x) {
             Ok(x.label().target().unconfigured().dupe())
         } else if let Some(x) = x.unpack_str() {
@@ -255,47 +292,38 @@ impl AnonTargetKey {
         attr: &AttrType,
         x: Value,
         ctx: &AnonAttrCtx,
-    ) -> anyhow::Result<AnonTargetAttr> {
+    ) -> buck2_error::Result<AnonTargetAttr> {
         attr.coerce_item(ctx, x)
     }
 
     fn coerced_to_anon_target_attr(
         x: &CoercedAttr,
         ty: &AttrType,
-    ) -> anyhow::Result<AnonTargetAttr> {
+    ) -> buck2_error::Result<AnonTargetAttr> {
         AnonTargetAttr::from_coerced_attr(x, ty)
     }
 
-    pub(crate) async fn resolve(&self, dice: &DiceComputations) -> anyhow::Result<AnalysisResult> {
-        #[async_trait]
-        impl Key for AnonTargetKey {
-            type Value = buck2_error::Result<AnalysisResult>;
-
-            async fn compute(
-                &self,
-                ctx: &mut DiceComputations,
-                _cancellation: &CancellationContext,
-            ) -> Self::Value {
-                Ok(self.run_analysis(ctx).await?)
-            }
-
-            fn equality(_: &Self::Value, _: &Self::Value) -> bool {
-                false
-            }
-        }
-
-        Ok(dice.compute(self).await??)
+    pub(crate) async fn resolve(
+        &self,
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<AnalysisResult> {
+        dice.compute(self).await?
     }
 
     fn run_analysis<'a>(
         &'a self,
-        dice: &'a DiceComputations,
-    ) -> impl Future<Output = anyhow::Result<AnalysisResult>> + Send + 'a {
-        let fut = async move { self.run_analysis_impl(dice).await };
-        unsafe { UnsafeSendFuture::new_encapsulates_starlark(fut) }
+        dice: &'a mut DiceComputations<'_>,
+        cancellation: &'a CancellationContext,
+    ) -> BoxFuture<'a, buck2_error::Result<AnalysisResult>> {
+        let fut = async move { self.run_analysis_impl(dice, cancellation).await };
+        Box::pin(unsafe { UnsafeSendFuture::new_encapsulates_starlark(fut) })
     }
 
-    async fn run_analysis_impl(&self, dice: &DiceComputations) -> anyhow::Result<AnalysisResult> {
+    async fn run_analysis_impl(
+        &self,
+        dice: &mut DiceComputations<'_>,
+        cancellation: &CancellationContext,
+    ) -> buck2_error::Result<AnalysisResult> {
         let dependents = AnonTargetDependents::get_dependents(self)?;
         let dependents_analyses = dependents.get_analysis_results(dice).await?;
 
@@ -311,250 +339,173 @@ impl AnonTargetKey {
             Vec::new(),
         );
 
-        let rule_impl = get_rule_spec(dice, self.0.rule_type()).await?;
-        let env = Module::new();
-        let print = EventDispatcherPrintHandler(get_dispatcher());
-
         span_async(
             buck2_data::AnalysisStart {
                 target: Some(self.0.as_proto().into()),
                 rule: self.0.rule_type().to_string(),
             },
             async move {
-                let (mut eval, ctx, list_res) = with_starlark_eval_provider(
-                    dice,
-                    &mut StarlarkProfilerOrInstrumentation::disabled(),
-                    format!("anon_analysis:{}", self),
-                    |provider, dice| {
-                        let mut eval = provider.make(&env)?;
-                        eval.set_print_handler(&print);
-
-                        // No attributes are allowed to contain macros or other stuff, so an empty resolution context works
-                        let rule_analysis_attr_resolution_ctx = RuleAnalysisAttrResolutionContext {
-                            module: &env,
-                            dep_analysis_results: dependents_analyses.dep_analysis_results,
-                            query_results: HashMap::new(),
-                            execution_platform_resolution: exec_resolution.clone(),
-                        };
-
-                        let resolution_ctx = AnonTargetAttrResolutionContext {
-                            promised_artifacts_map: dependents_analyses.promised_artifacts,
-                            rule_analysis_attr_resolution_ctx,
-                        };
-
-                        let mut resolved_attrs = Vec::with_capacity(self.0.attrs().len());
-                        for (name, attr) in self.0.attrs().iter() {
-                            resolved_attrs.push((
-                                name,
-                                attr.resolve_single(self.0.name().pkg(), &resolution_ctx)?,
-                            ));
-                        }
-                        let attributes = env.heap().alloc(AllocStruct(resolved_attrs));
-
-                        let registry = AnalysisRegistry::new_from_owner(
-                            BaseDeferredKey::AnonTarget(self.0.dupe()),
-                            exec_resolution,
-                        )?;
-
-                        let ctx = env.heap().alloc_typed(AnalysisContext::new(
-                            eval.heap(),
-                            attributes,
-                            Some(
-                                eval.heap()
-                                    .alloc_typed(StarlarkConfiguredProvidersLabel::new(
-                                        ConfiguredProvidersLabel::new(
-                                            self.0.configured_label(),
-                                            ProvidersName::Default,
-                                        ),
-                                    )),
-                            ),
-                            // FIXME(JakobDegen): There should probably be a way to pass plugins
-                            // into anon targets
-                            eval.heap()
-                                .alloc_typed(AnalysisPlugins::new(SmallMap::new()))
-                                .into(),
-                            registry,
-                            dice.global_data().get_digest_config(),
-                        ));
-
-                        let list_res = rule_impl.invoke(&mut eval, ctx)?;
-                        Ok((eval, ctx, list_res))
-                    },
-                )
-                .await?;
-
-                ctx.actions
-                    .run_promises(dice, &mut eval, format!("anon_analysis$promises:{}", self))
-                    .await?;
-                let res_typed = ProviderCollection::try_from_value(list_res)?;
-                let res = env.heap().alloc(res_typed);
-                env.set("", res);
-
-                let fulfilled_artifact_mappings = {
-                    let promise_artifact_mappings =
-                        rule_impl.promise_artifact_mappings(&mut eval)?;
-
-                    self.get_fulfilled_promise_artifacts(promise_artifact_mappings, res, &mut eval)?
-                };
-
-                // Pull the ctx object back out, and steal ctx.action's state back
-                let analysis_registry = ctx.take_state();
-                std::mem::drop(eval);
-
-                let (frozen_env, deferreds) = analysis_registry.finalize(&env)?(env)?;
-
-                let res = frozen_env.get("").unwrap();
-                let provider_collection = FrozenProviderCollectionValue::try_from_value(res)
-                    .expect("just created this, this shouldn't happen");
-
-                // this could look nicer if we had the entire analysis be a deferred
-                let deferred = DeferredTable::new(deferreds.take_result()?);
-                Ok(AnalysisResult::new(
-                    provider_collection,
-                    deferred,
-                    None,
-                    fulfilled_artifact_mappings,
-                ))
+                match (&self.0.rule_type().path, self.0.anon_target_type()) {
+                    (BzlOrBxlPath::Bxl(_), AnonTargetVariant::Bxl(global_cfg_options)) => {
+                        cancellation
+                            .with_structured_cancellation(|observer| {
+                                eval_bxl_for_anon_target(
+                                    dice,
+                                    self.0.dupe(),
+                                    global_cfg_options.dupe(),
+                                    dependents_analyses,
+                                    exec_resolution,
+                                    observer,
+                                )
+                                .boxed_local()
+                            })
+                            .await
+                    }
+                    (BzlOrBxlPath::Bzl(_), AnonTargetVariant::Bzl) => {
+                        self.eval_for_bzl(dice, dependents_analyses, exec_resolution)
+                            .await
+                    }
+                    (BzlOrBxlPath::Bxl(bxl_file_path), AnonTargetVariant::Bzl) => {
+                        Err(internal_error!(
+                            "Bxl anon target defined at {}, but AnonTarget key is bzl.",
+                            bxl_file_path
+                        ))
+                    }
+                    (BzlOrBxlPath::Bzl(import_path), AnonTargetVariant::Bxl(_)) => {
+                        Err(internal_error!(
+                            "Bzl anon target defined at {}, but AnonTarget key is bxl.",
+                            import_path
+                        ))
+                    }
+                }
             }
             .map(|res| {
-                (
-                    res,
-                    buck2_data::AnalysisEnd {
-                        target: Some(self.0.as_proto().into()),
-                        rule: self.0.rule_type().to_string(),
-                        profile: None, // Not implemented for anon targets
-                    },
-                )
+                let end = buck2_data::AnalysisEnd {
+                    target: Some(self.0.as_proto().into()),
+                    rule: self.0.rule_type().to_string(),
+                    profile: None, // Not implemented for anon targets
+                    declared_actions: res.as_ref().ok().map(|v| v.num_declared_actions),
+                    declared_artifacts: res.as_ref().ok().map(|v| v.num_declared_artifacts),
+                };
+                (res, end)
             }),
         )
         .await
     }
 
-    fn get_fulfilled_promise_artifacts<'v>(
+    async fn eval_for_bzl(
         &self,
-        promise_artifact_mappings: SmallMap<String, Value<'v>>,
-        anon_target_result: Value<'v>,
-        eval: &mut Evaluator<'v, '_>,
-    ) -> anyhow::Result<HashMap<PromiseArtifactId, Artifact>> {
-        let mut fulfilled_artifact_mappings = HashMap::new();
+        dice: &mut DiceComputations<'_>,
+        dependents_analyses: AnonTargetDependentAnalysisResults<'_>,
+        exec_resolution: ExecutionPlatformResolution,
+    ) -> buck2_error::Result<AnalysisResult> {
+        let validations_from_deps = dependents_analyses.validations();
+        let rule_impl = get_rule_spec(dice, self.0.rule_type()).await?;
+        let env = Module::new();
+        let print = EventDispatcherPrintHandler(get_dispatcher());
 
-        for (id, func) in promise_artifact_mappings.values().enumerate() {
-            let artifact = eval
-                .eval_function(*func, &[anon_target_result], &[])
-                .map_err(BuckStarlarkError::new)?;
+        let eval_kind = self.0.dupe().eval_kind();
+        let (dice, mut eval, ctx, list_res) = with_starlark_eval_provider(
+            dice,
+            &mut StarlarkProfilerOpt::disabled(),
+            &eval_kind,
+            |provider, dice| {
+                let (mut eval, _) = provider.make(&env)?;
+                eval.set_print_handler(&print);
+                eval.set_soft_error_handler(&Buck2StarlarkSoftErrorHandler);
 
-            let promise_id =
-                PromiseArtifactId::new(BaseDeferredKey::AnonTarget(self.0.clone()), id);
+                let attributes =
+                    self.0
+                        .resolve_attrs(&env, dependents_analyses, exec_resolution.clone())?;
 
-            match ValueAsArtifactLike::unpack_value(artifact) {
-                Some(artifact) => {
-                    fulfilled_artifact_mappings
-                        .insert(promise_id.clone(), artifact.0.get_bound_artifact()?);
-                }
-                None => {
-                    return Err(
-                        PromiseArtifactResolveError::NotAnArtifact(artifact.to_repr()).into(),
-                    );
-                }
-            }
-        }
+                let registry = AnalysisRegistry::new_from_owner(
+                    BaseDeferredKey::AnonTarget(self.0.dupe()),
+                    exec_resolution,
+                )?;
 
-        Ok(fulfilled_artifact_mappings)
+                let ctx = AnalysisContext::prepare(
+                    eval.heap(),
+                    Some(attributes),
+                    Some(self.0.configured_label()),
+                    // FIXME(JakobDegen): There should probably be a way to pass plugins
+                    // into anon targets
+                    Some(
+                        eval.heap()
+                            .alloc_typed(AnalysisPlugins::new(SmallMap::new()))
+                            .into(),
+                    ),
+                    registry,
+                    dice.global_data().get_digest_config(),
+                );
+
+                let list_res = rule_impl.invoke(&mut eval, ctx)?;
+                Ok((dice, eval, ctx, list_res))
+            },
+        )
+        .await?;
+
+        ctx.actions
+            .run_promises(dice, &mut eval, &eval_kind)
+            .await?;
+        let res_typed = ProviderCollection::try_from_value(list_res)?;
+        let res = env.heap().alloc(res_typed);
+
+        let fulfilled_artifact_mappings = {
+            let promise_artifact_mappings = rule_impl.promise_artifact_mappings(&mut eval)?;
+
+            self.0.dupe().get_fulfilled_promise_artifacts(
+                promise_artifact_mappings,
+                res,
+                &mut eval,
+            )?
+        };
+
+        let res =
+            ValueTypedComplex::new(res).internal_error("Just allocated the provider collection")?;
+
+        // Pull the ctx object back out, and steal ctx.action's state back
+        let analysis_registry = ctx.take_state();
+        analysis_registry
+            .analysis_value_storage
+            .set_result_value(res)?;
+        std::mem::drop(eval);
+        let num_declared_actions = analysis_registry.num_declared_actions();
+        let num_declared_artifacts = analysis_registry.num_declared_artifacts();
+        let registry_finalizer = analysis_registry.finalize(&env)?;
+        let frozen_env = env.freeze().map_err(from_freeze_error)?;
+        let recorded_values = registry_finalizer(&frozen_env)?;
+
+        let validations = transitive_validations(
+            validations_from_deps,
+            recorded_values.provider_collection()?,
+        );
+
+        Ok(AnalysisResult::new(
+            recorded_values,
+            None,
+            fulfilled_artifact_mappings,
+            num_declared_actions,
+            num_declared_artifacts,
+            validations,
+        ))
     }
 }
 
 /// Several attribute functions need a context, make one that is mostly useless.
-pub struct AnonAttrCtx {
-    cfg: ConfigurationData,
-    transitions: OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>>,
-    pub execution_platform_resolution: ExecutionPlatformResolution,
+pub(crate) struct AnonAttrCtx {
+    pub(crate) execution_platform_resolution: ExecutionPlatformResolution,
 }
 
 impl AnonAttrCtx {
     fn new(execution_platform_resolution: &ExecutionPlatformResolution) -> Self {
         Self {
-            cfg: ConfigurationData::unspecified(),
-            transitions: OrderedMap::new(),
             execution_platform_resolution: execution_platform_resolution.clone(),
         }
     }
-}
 
-impl AttrCoercionContext for AnonAttrCtx {
-    fn coerce_providers_label(&self, value: &str) -> anyhow::Result<ProvidersLabel> {
-        Err(AnonTargetsError::CantParseDuringCoerce(value.to_owned()).into())
-    }
-
-    fn intern_str(&self, value: &str) -> ArcStr {
+    pub(crate) fn intern_str(&self, value: &str) -> ArcStr {
         // TODO(scottcao): do intern.
         ArcStr::from(value)
-    }
-
-    fn intern_list(&self, value: Vec<CoercedAttr>) -> ArcSlice<CoercedAttr> {
-        // TODO(scottcao): do intern.
-        value.into()
-    }
-
-    fn intern_dict(
-        &self,
-        value: Vec<(CoercedAttr, CoercedAttr)>,
-    ) -> ArcSlice<(CoercedAttr, CoercedAttr)> {
-        // TODO(scottcao): do intern.
-        value.into()
-    }
-
-    fn intern_select(
-        &self,
-        value: Vec<(TargetLabel, CoercedAttr)>,
-    ) -> ArcSlice<(TargetLabel, CoercedAttr)> {
-        // TODO(scottcao): do intern.
-        value.into()
-    }
-
-    fn coerce_path(&self, value: &str, _allow_directory: bool) -> anyhow::Result<CoercedPath> {
-        Err(AnonTargetsError::CantParseDuringCoerce(value.to_owned()).into())
-    }
-
-    fn coerce_target_pattern(
-        &self,
-        pattern: &str,
-    ) -> anyhow::Result<ParsedPattern<TargetPatternExtra>> {
-        Err(AnonTargetsError::CantParseDuringCoerce(pattern.to_owned()).into())
-    }
-
-    fn visit_query_function_literals(
-        &self,
-        _visitor: &mut dyn buck2_query::query::syntax::simple::functions::QueryLiteralVisitor,
-        _expr: &buck2_query_parser::spanned::Spanned<buck2_query_parser::Expr>,
-        query: &str,
-    ) -> anyhow::Result<()> {
-        Err(AnonTargetsError::CantParseDuringCoerce(query.to_owned()).into())
-    }
-}
-
-impl AttrConfigurationContext for AnonAttrCtx {
-    fn matches<'a>(&'a self, _label: &TargetLabel) -> Option<&'a ConfigSettingData> {
-        None
-    }
-
-    fn cfg(&self) -> ConfigurationNoExec {
-        ConfigurationNoExec::new(self.cfg.dupe())
-    }
-
-    fn exec_cfg(&self) -> ConfigurationNoExec {
-        ConfigurationNoExec::new(self.cfg.dupe())
-    }
-
-    fn toolchain_cfg(&self) -> ConfigurationWithExec {
-        ConfigurationWithExec::new(self.cfg.dupe(), self.cfg.dupe())
-    }
-
-    fn platform_cfg(&self, _label: &TargetLabel) -> anyhow::Result<ConfigurationData> {
-        Ok(self.cfg.dupe())
-    }
-
-    fn resolved_transitions(&self) -> &OrderedMap<Arc<TransitionId>, Arc<TransitionApplied>> {
-        &self.transitions
     }
 }
 
@@ -573,8 +524,8 @@ pub(crate) fn init_get_promised_artifact() {
 
 pub(crate) async fn get_artifact_from_anon_target_analysis<'v>(
     promise_id: &'v PromiseArtifactId,
-    ctx: &'v DiceComputations,
-) -> anyhow::Result<Artifact> {
+    ctx: &mut DiceComputations<'_>,
+) -> buck2_error::Result<Artifact> {
     let owner = promise_id.owner();
     let analysis_result = match owner {
         BaseDeferredKey::AnonTarget(anon_target) => {
@@ -591,13 +542,13 @@ pub(crate) async fn get_artifact_from_anon_target_analysis<'v>(
         }
     };
 
-    analysis_result
+    Ok(analysis_result
         .promise_artifact_map()
         .get(promise_id)
-        .context(PromiseArtifactResolveError::NotFoundInAnalysis(
+        .buck_error_context(PromiseArtifactResolveError::NotFoundInAnalysis(
             promise_id.clone(),
-        ))
-        .cloned()
+        ))?
+        .clone())
 }
 
 pub(crate) fn init_anon_target_registry_new() {
@@ -613,11 +564,11 @@ pub(crate) fn init_anon_target_registry_new() {
 impl<'v> AnonTargetsRegistry<'v> {
     pub(crate) fn downcast_mut(
         registry: &mut dyn AnonTargetsRegistryDyn<'v>,
-    ) -> anyhow::Result<&'v mut AnonTargetsRegistry<'v>> {
+    ) -> buck2_error::Result<&'v mut AnonTargetsRegistry<'v>> {
         let registry: &mut AnonTargetsRegistry = registry
             .as_any_mut()
             .downcast_mut::<AnonTargetsRegistry>()
-            .context("AnonTargetsRegistryDyn is not an AnonTargetsRegistry (internal error)")?;
+            .internal_error("AnonTargetsRegistryDyn is not an AnonTargetsRegistry")?;
         unsafe {
             // It is hard or impossible to express this safely with the borrow checker.
             // Has something to do with 'v being invariant.
@@ -631,16 +582,17 @@ impl<'v> AnonTargetsRegistry<'v> {
     pub(crate) fn anon_target_key(
         &self,
         rule: ValueTyped<'v, FrozenRuleCallable>,
-        attributes: DictOf<'v, &'v str, Value<'v>>,
-    ) -> anyhow::Result<AnonTargetKey> {
-        AnonTargetKey::new(&self.execution_platform, rule, attributes)
+        attributes: UnpackDictEntries<&'v str, Value<'v>>,
+        owner_key: &BaseDeferredKey,
+    ) -> buck2_error::Result<AnonTargetKey> {
+        AnonTargetKey::new(&self.execution_platform, rule, attributes, owner_key)
     }
 
     pub(crate) fn register_one(
         &mut self,
         promise: ValueTyped<'v, StarlarkPromise<'v>>,
         key: AnonTargetKey,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         self.promises.push_one(promise, key);
 
         Ok(())
@@ -651,7 +603,7 @@ impl<'v> AnonTargetsRegistry<'v> {
         location: Option<FileSpan>,
         anon_target_key: AnonTargetKey,
         id: usize,
-    ) -> anyhow::Result<PromiseArtifact> {
+    ) -> buck2_error::Result<PromiseArtifact> {
         let anon_target_key = BaseDeferredKey::AnonTarget(anon_target_key.0.dupe());
         let id = PromiseArtifactId::new(anon_target_key, id);
         self.promise_artifact_registry.register(location, id)
@@ -687,7 +639,7 @@ impl<'v> AnonTargetsRegistryDyn<'v> for AnonTargetsRegistry<'v> {
     }
     */
 
-    fn assert_no_promises(&self) -> anyhow::Result<()> {
+    fn assert_no_promises(&self) -> buck2_error::Result<()> {
         if self.promises.is_empty() {
             Ok(())
         } else {
@@ -697,7 +649,7 @@ impl<'v> AnonTargetsRegistryDyn<'v> for AnonTargetsRegistry<'v> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]

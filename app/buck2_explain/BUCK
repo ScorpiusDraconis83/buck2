@@ -1,0 +1,57 @@
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule")
+load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
+
+oncall("build_infra")
+
+rust_library(
+    name = "buck2_explain",
+    srcs = glob(
+        ["src/*"],
+    ),
+    mapped_srcs = {
+        "//buck2/app/buck2_explain/js:html": "src/explain.html",
+        "//buck2/app/buck2_explain/output_format_js:html": "src/output_format.html",
+        ":output_format_schema_rust[output_format_generated.rs]": "src/output_format_generated.rs",
+        ":schema_rust[explain_generated.rs]": "src/explain_generated.rs",
+    },
+    test_deps = [
+        "//buck2/app/buck2_interpreter_for_build:buck2_interpreter_for_build",
+        "//buck2/app/buck2_util:buck2_util",
+        "//buck2/gazebo/dupe:dupe",
+        "//buck2/starlark-rust/starlark:starlark",
+    ],
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:base64",
+        "fbsource//third-party/rust:flatbuffers",
+        "//buck2/app/buck2_common:buck2_common",
+        "//buck2/app/buck2_core:buck2_core",
+        "//buck2/app/buck2_error:buck2_error",
+        "//buck2/app/buck2_node:buck2_node",
+        "//buck2/app/buck2_query:buck2_query",
+    ],
+)
+
+buck_genrule(
+    name = "output_format_schema_rust",
+    srcs = [
+        "output_format_js/output_format.fbs",
+    ],
+    outs = {
+        "output_format_generated.rs": ["output_format_generated.rs"],
+    },
+    cmd = "$(exe fbsource//third-party/flatbuffers-23.5.26:flatc) --rust -o ${OUT} ${SRCS}",
+    default_outs = ["."],
+)
+
+buck_genrule(
+    name = "schema_rust",
+    srcs = [
+        "js/explain.fbs",
+    ],
+    outs = {
+        "explain_generated.rs": ["explain_generated.rs"],
+    },
+    cmd = "$(exe fbsource//third-party/flatbuffers-23.5.26:flatc) --rust -o ${OUT} ${SRCS}",
+    default_outs = ["."],
+)

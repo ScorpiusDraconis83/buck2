@@ -79,7 +79,7 @@ pub fn test_console() -> SuperConsole {
         width: 80,
         height: 80,
     };
-    SuperConsole::new_internal(
+    SuperConsole::new_with_output(
         Some(size),
         Box::new(TestOutput {
             should_render: true,
@@ -97,4 +97,15 @@ pub fn frame_contains(frame: &[u8], needle: impl AsRef<[u8]>) -> bool {
         }
     }
     false
+}
+
+#[track_caller]
+pub fn assert_frame_contains(frame: &[u8], needle: impl AsRef<[u8]>) {
+    if !frame_contains(frame, needle.as_ref()) {
+        panic!(
+            "Expected frame to contain `{}`, but was:\n{}",
+            String::from_utf8_lossy(needle.as_ref()),
+            String::from_utf8_lossy(frame)
+        );
+    }
 }

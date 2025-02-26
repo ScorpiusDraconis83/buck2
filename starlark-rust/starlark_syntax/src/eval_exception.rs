@@ -15,10 +15,13 @@
  * limitations under the License.
  */
 
+use std::fmt::Display;
+
 use crate::call_stack::CallStack;
 use crate::codemap::CodeMap;
 use crate::codemap::Span;
 use crate::diagnostic::WithDiagnostic;
+use crate::internal_error;
 
 /// Error with location.
 #[derive(Debug, derive_more::Display)]
@@ -34,8 +37,21 @@ impl EvalException {
     }
 
     #[cold]
+    pub fn into_internal_error(self) -> Self {
+        EvalException(self.0.into_internal_error())
+    }
+
+    #[cold]
     pub fn new(mut error: crate::Error, span: Span, codemap: &CodeMap) -> EvalException {
         error.set_span(span, codemap);
+        EvalException(error)
+    }
+
+    /// `EvalException` is meant to provide type-safe guard against missing span.
+    /// Sometimes we need to construct `EvalException`, but span is not available,
+    /// so this function can be used. Avoid this function if possible.
+    #[cold]
+    pub fn new_unknown_span(error: crate::Error) -> EvalException {
         EvalException(error)
     }
 
@@ -55,6 +71,24 @@ impl EvalException {
     pub fn new_anyhow(error: anyhow::Error, span: Span, codemap: &CodeMap) -> EvalException {
         EvalException(crate::Error::new_spanned(
             crate::ErrorKind::Other(error),
+            span,
+            codemap,
+        ))
+    }
+
+    #[cold]
+    pub fn internal_error(error: impl Display, span: Span, codemap: &CodeMap) -> EvalException {
+        Self::new(internal_error!("{}", error), span, codemap)
+    }
+
+    #[cold]
+    pub(crate) fn parser_error(
+        error: impl Display,
+        span: Span,
+        codemap: &CodeMap,
+    ) -> EvalException {
+        EvalException(crate::Error::new_spanned(
+            crate::ErrorKind::Parser(anyhow::anyhow!("{error}")),
             span,
             codemap,
         ))

@@ -10,6 +10,7 @@
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
@@ -18,7 +19,6 @@ use std::marker::PhantomData;
 
 use allocative::Allocative;
 use buck2_core::fs::paths::RelativePathBuf;
-use buck2_util::thin_box::ThinBoxSlice;
 use display_container::display_pair;
 use display_container::fmt_container;
 use display_container::iter_display_chain;
@@ -26,41 +26,45 @@ use dupe::Dupe;
 use either::Either;
 use gazebo::prelude::*;
 use indexmap::IndexSet;
-use regex::Regex;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
 use starlark::coerce::coerce;
-use starlark::docs::StarlarkDocs;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
+use starlark::eval::Arguments;
 use starlark::typing::Ty;
 use starlark::values::list::ListRef;
+use starlark::values::list::UnpackList;
 use starlark::values::starlark_value;
 use starlark::values::tuple::UnpackTuple;
 use starlark::values::type_repr::StarlarkTypeRepr;
+use starlark::values::AllocStaticSimple;
 use starlark::values::AllocValue;
 use starlark::values::Demand;
 use starlark::values::Freeze;
+use starlark::values::FreezeResult;
 use starlark::values::Freezer;
+use starlark::values::FrozenValue;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
 use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
+use starlark::values::ThinBoxSliceFrozenValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueError;
 use starlark::values::ValueLike;
 use starlark::values::ValueOf;
 use static_assertions::assert_eq_size;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
-use crate::interpreter::rule_defs::artifact::StarlarkDeclaredArtifact;
-use crate::interpreter::rule_defs::artifact::StarlarkOutputArtifact;
+use crate::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
+use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
+use crate::interpreter::rule_defs::cmd_args::command_line_arg_like_type::command_line_arg_like_impl;
 use crate::interpreter::rule_defs::cmd_args::options::CommandLineOptions;
 use crate::interpreter::rule_defs::cmd_args::options::CommandLineOptionsRef;
 use crate::interpreter::rule_defs::cmd_args::options::CommandLineOptionsTrait;
@@ -87,12 +91,21 @@ trait Fields<'v> {
 /// Wrapper because we cannot implement traits for traits.
 struct FieldsRef<'v, F: Fields<'v>>(F, PhantomData<Value<'v>>);
 
+/// There's no good reason for a user to write `cmd_args` as JSON in analysis or BXL.
+///
+/// This implementation exists for operations such as:
+///
+/// ```ignore
+/// buck2 cquery :buck2 --providers
+/// ```
+///
+/// which must not fail if a provider contains `cmd_args` (D34887765).
 impl<'v, F: Fields<'v>> Serialize for FieldsRef<'v, F> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        /// Make sure mutable mutable and frozen `cmd_args` are serialized identically
+        /// Make sure mutable and frozen `cmd_args` are serialized identically
         /// by routing through this struct.
         #[derive(Serialize)]
         struct Mirror<'v, 'a> {
@@ -169,7 +182,7 @@ impl<'v, F: Fields<'v>> FieldsRef<'v, F> {
         }
     }
 
-    fn relative_to_path<C>(&self, ctx: &C) -> anyhow::Result<Option<RelativePathBuf>>
+    fn relative_to_path<C>(&self, ctx: &C) -> buck2_error::Result<Option<RelativePathBuf>>
     where
         C: CommandLineContext + ?Sized,
     {
@@ -181,11 +194,15 @@ impl<'v, F: Fields<'v>> FieldsRef<'v, F> {
 }
 
 impl<'v, F: Fields<'v>> CommandLineArgLike for FieldsRef<'v, F> {
+    fn register_me(&self) {
+        command_line_arg_like_impl!(StarlarkCmdArgs::starlark_type_repr());
+    }
+
     fn add_to_command_line(
         &self,
         cli: &mut dyn CommandLineBuilder,
         context: &mut dyn CommandLineContext,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         match self.0.options() {
             None => {
                 for item in self.0.items() {
@@ -208,7 +225,10 @@ impl<'v, F: Fields<'v>> CommandLineArgLike for FieldsRef<'v, F> {
         }
     }
 
-    fn visit_artifacts(&self, visitor: &mut dyn CommandLineArtifactVisitor) -> anyhow::Result<()> {
+    fn visit_artifacts(
+        &self,
+        visitor: &mut dyn CommandLineArtifactVisitor,
+    ) -> buck2_error::Result<()> {
         if !self.ignore_artifacts() {
             for item in self.0.items().iter().chain(self.0.hidden().iter()) {
                 visitor.push_frame()?;
@@ -234,7 +254,7 @@ impl<'v, F: Fields<'v>> CommandLineArgLike for FieldsRef<'v, F> {
     fn visit_write_to_file_macros(
         &self,
         visitor: &mut dyn WriteToFileMacroVisitor,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         visitor.set_current_relative_to_path(&|ctx| self.relative_to_path(ctx))?;
 
         for item in self.0.items() {
@@ -267,15 +287,7 @@ pub struct StarlarkCommandLineData<'v> {
     options: Option<Box<CommandLineOptions<'v>>>,
 }
 
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    Trace,
-    ProvidesStaticType,
-    StarlarkDocs,
-    Allocative
-)]
+#[derive(Debug, Default, Clone, Trace, ProvidesStaticType, Allocative)]
 pub struct StarlarkCmdArgs<'v>(RefCell<StarlarkCommandLineData<'v>>);
 
 impl<'v> Serialize for StarlarkCmdArgs<'v> {
@@ -289,8 +301,9 @@ impl<'v> Serialize for StarlarkCmdArgs<'v> {
 
 #[derive(Debug, ProvidesStaticType, Allocative)]
 pub struct FrozenStarlarkCmdArgs {
-    items: ThinBoxSlice<FrozenCommandLineArg>,
-    hidden: ThinBoxSlice<FrozenCommandLineArg>,
+    // Elements are `FrozenCommandLineArg`s
+    items: ThinBoxSliceFrozenValue<'static>,
+    hidden: ThinBoxSliceFrozenValue<'static>,
     options: FrozenCommandLineOptions,
 }
 
@@ -322,11 +335,15 @@ impl<'a, 'v> Fields<'v> for Ref<'a, StarlarkCommandLineData<'v>> {
 
 impl<'v> Fields<'v> for FrozenStarlarkCmdArgs {
     fn items(&self) -> &[CommandLineArg<'v>] {
-        coerce(&*self.items)
+        coerce(FrozenCommandLineArg::slice_from_frozen_value_unchecked(
+            &self.items,
+        ))
     }
 
     fn hidden(&self) -> &[CommandLineArg<'v>] {
-        coerce(&*self.hidden)
+        coerce(FrozenCommandLineArg::slice_from_frozen_value_unchecked(
+            &self.hidden,
+        ))
     }
 
     fn options(&self) -> Option<&dyn CommandLineOptionsTrait<'v>> {
@@ -414,6 +431,10 @@ impl FrozenStarlarkCmdArgs {
     pub(crate) fn is_concat(&self) -> bool {
         FieldsRef(self, PhantomData).is_concat()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 impl<'v> StarlarkCmdArgs<'v> {
@@ -431,6 +452,25 @@ impl<'v> StarlarkValue<'v> for StarlarkCmdArgs<'v> {
 
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         demand.provide_value::<&dyn CommandLineArgLike>(self);
+    }
+
+    fn try_freeze_static(&self) -> Option<FrozenValue> {
+        let StarlarkCommandLineData {
+            items,
+            hidden,
+            options,
+        } = &*self.0.borrow();
+        if items.is_empty() && hidden.is_empty() && options.is_none() {
+            static EMPTY: AllocStaticSimple<FrozenStarlarkCmdArgs> =
+                AllocStaticSimple::alloc(FrozenStarlarkCmdArgs {
+                    items: ThinBoxSliceFrozenValue::empty(),
+                    hidden: ThinBoxSliceFrozenValue::empty(),
+                    options: FrozenCommandLineOptions::empty(),
+                });
+            Some(EMPTY.unpack().to_frozen_value())
+        } else {
+            None
+        }
     }
 }
 
@@ -457,15 +497,22 @@ impl<'v> AllocValue<'v> for StarlarkCmdArgs<'v> {
 }
 
 impl<'v> CommandLineArgLike for StarlarkCmdArgs<'v> {
+    fn register_me(&self) {
+        command_line_arg_like_impl!(StarlarkCmdArgs::starlark_type_repr());
+    }
+
     fn add_to_command_line(
         &self,
         cli: &mut dyn CommandLineBuilder,
         context: &mut dyn CommandLineContext,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         FieldsRef(self.0.borrow(), PhantomData).add_to_command_line(cli, context)
     }
 
-    fn visit_artifacts(&self, visitor: &mut dyn CommandLineArtifactVisitor) -> anyhow::Result<()> {
+    fn visit_artifacts(
+        &self,
+        visitor: &mut dyn CommandLineArtifactVisitor,
+    ) -> buck2_error::Result<()> {
         FieldsRef(self.0.borrow(), PhantomData).visit_artifacts(visitor)
     }
 
@@ -476,21 +523,28 @@ impl<'v> CommandLineArgLike for StarlarkCmdArgs<'v> {
     fn visit_write_to_file_macros(
         &self,
         visitor: &mut dyn WriteToFileMacroVisitor,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         FieldsRef(self.0.borrow(), PhantomData).visit_write_to_file_macros(visitor)
     }
 }
 
 impl CommandLineArgLike for FrozenStarlarkCmdArgs {
+    fn register_me(&self) {
+        command_line_arg_like_impl!(FrozenStarlarkCmdArgs::starlark_type_repr());
+    }
+
     fn add_to_command_line(
         &self,
         cli: &mut dyn CommandLineBuilder,
         context: &mut dyn CommandLineContext,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         FieldsRef(self, PhantomData).add_to_command_line(cli, context)
     }
 
-    fn visit_artifacts(&self, visitor: &mut dyn CommandLineArtifactVisitor) -> anyhow::Result<()> {
+    fn visit_artifacts(
+        &self,
+        visitor: &mut dyn CommandLineArtifactVisitor,
+    ) -> buck2_error::Result<()> {
         FieldsRef(self, PhantomData).visit_artifacts(visitor)
     }
 
@@ -501,22 +555,32 @@ impl CommandLineArgLike for FrozenStarlarkCmdArgs {
     fn visit_write_to_file_macros(
         &self,
         visitor: &mut dyn WriteToFileMacroVisitor,
-    ) -> anyhow::Result<()> {
+    ) -> buck2_error::Result<()> {
         FieldsRef(self, PhantomData).visit_write_to_file_macros(visitor)
     }
 }
 
 impl<'v> Freeze for StarlarkCmdArgs<'v> {
     type Frozen = FrozenStarlarkCmdArgs;
-    fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+    fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
         let StarlarkCommandLineData {
             items,
             hidden,
             options,
         } = self.0.into_inner();
 
-        let items = ThinBoxSlice::from_iter(items.freeze(freezer)?);
-        let hidden = ThinBoxSlice::from_iter(hidden.freeze(freezer)?);
+        let items = ThinBoxSliceFrozenValue::from_iter(
+            items
+                .freeze(freezer)?
+                .into_iter()
+                .map(|a| a.to_frozen_value()),
+        );
+        let hidden = ThinBoxSliceFrozenValue::from_iter(
+            hidden
+                .freeze(freezer)?
+                .into_iter()
+                .map(|a| a.to_frozen_value()),
+        );
         let options = options
             .try_map(|options| (*options).freeze(freezer))?
             .unwrap_or_default();
@@ -534,40 +598,38 @@ impl<'v> StarlarkCmdArgs<'v> {
         Self::default()
     }
 
-    pub fn try_from_value(value: Value<'v>) -> anyhow::Result<Self> {
-        let mut builder = Self::new();
-        builder.0.get_mut().add_value(value)?;
-        Ok(builder)
+    pub fn try_from_value(value: Value<'v>) -> buck2_error::Result<Self> {
+        Self::try_from_value_typed(StarlarkCommandLineValueUnpack::unpack_value_err(value)?)
     }
 
-    fn try_from_values_with_options(
-        value: &[Value<'v>],
-        delimiter: Option<StringValue<'v>>,
-        format: Option<StringValue<'v>>,
-        prepend: Option<StringValue<'v>>,
-        quote: Option<QuoteStyle>,
-    ) -> anyhow::Result<Self> {
-        let mut builder = StarlarkCommandLineData::default();
-        if delimiter.is_some() || format.is_some() || prepend.is_some() || quote.is_some() {
-            let opts = builder.options_mut();
-            opts.delimiter = delimiter;
-            opts.format = format;
-            opts.prepend = prepend;
-            opts.quote = quote;
-        }
-        for v in value {
-            builder.add_value(*v)?;
-        }
-        Ok(Self(RefCell::new(builder)))
+    pub fn try_from_value_typed(
+        value: StarlarkCommandLineValueUnpack<'v>,
+    ) -> buck2_error::Result<Self> {
+        let mut builder = Self::new();
+        builder.0.get_mut().add_value_typed(value)?;
+        Ok(builder)
     }
 }
 
+#[derive(UnpackValue, StarlarkTypeRepr)]
+pub enum StarlarkCommandLineValueUnpack<'v> {
+    // This should be `list[Self]`, but we cannot express it.
+    List(&'v ListRef<'v>),
+    CommandLineArg(CommandLineArg<'v>),
+}
+
 impl<'v> StarlarkCommandLineData<'v> {
-    fn add_value(&mut self, value: Value<'v>) -> anyhow::Result<()> {
-        if let Some(values) = ListRef::from_value(value) {
-            self.add_values(values.content())?;
-        } else {
-            self.items.push(CommandLineArg::try_from_value(value)?);
+    fn add_value(&mut self, value: Value<'v>) -> buck2_error::Result<()> {
+        self.add_value_typed(StarlarkCommandLineValueUnpack::unpack_value_err(value)?)
+    }
+
+    fn add_value_typed(
+        &mut self,
+        value: StarlarkCommandLineValueUnpack<'v>,
+    ) -> buck2_error::Result<()> {
+        match value {
+            StarlarkCommandLineValueUnpack::List(values) => self.add_values(values.content())?,
+            StarlarkCommandLineValueUnpack::CommandLineArg(value) => self.items.push(value),
         }
         Ok(())
     }
@@ -575,7 +637,7 @@ impl<'v> StarlarkCommandLineData<'v> {
     /// Check the types of a list of values, and modify `data` accordingly
     ///
     /// The values must be one of: CommandLineArgLike or a list thereof.
-    fn add_values(&mut self, values: &[Value<'v>]) -> anyhow::Result<()> {
+    fn add_values(&mut self, values: &[Value<'v>]) -> buck2_error::Result<()> {
         self.items.reserve(values.len());
         for value in values {
             self.add_value(*value)?
@@ -583,13 +645,28 @@ impl<'v> StarlarkCommandLineData<'v> {
         Ok(())
     }
 
+    fn add_from_iterator(
+        &mut self,
+        values: impl Iterator<Item = Value<'v>>,
+    ) -> buck2_error::Result<()> {
+        let (lower, upper) = values.size_hint();
+        self.items.reserve(upper.unwrap_or(lower));
+        values
+            .into_iter()
+            .try_for_each(|value| self.add_value(value))?;
+        Ok(())
+    }
+
     /// Add values to the artifact that don't show up on the command line, but do for dependency
-    fn add_hidden(&mut self, values: &[Value<'v>]) -> anyhow::Result<()> {
-        for value in values {
-            if let Some(values) = ListRef::from_value(*value) {
-                self.add_hidden(values.content())?;
-            } else {
-                self.hidden.push(CommandLineArg::try_from_value(*value)?);
+    fn add_hidden(&mut self, value: StarlarkCommandLineValueUnpack<'v>) -> buck2_error::Result<()> {
+        match value {
+            StarlarkCommandLineValueUnpack::List(values) => {
+                for value in values.content() {
+                    self.add_hidden(StarlarkCommandLineValueUnpack::unpack_value_err(*value)?)?
+                }
+            }
+            StarlarkCommandLineValueUnpack::CommandLineArg(arg) => {
+                self.hidden.push(arg);
             }
         }
         Ok(())
@@ -602,21 +679,21 @@ struct StarlarkCommandLineMut<'v> {
 }
 
 impl<'v> StarlarkTypeRepr for StarlarkCommandLineMut<'v> {
+    type Canonical = <StarlarkCmdArgs<'v> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
         StarlarkCmdArgs::starlark_type_repr()
     }
 }
 
 impl<'v> UnpackValue<'v> for StarlarkCommandLineMut<'v> {
-    fn expected() -> String {
-        "command line builder; frozen command line cannot be mutated".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<Self> {
-        value.downcast_ref::<StarlarkCmdArgs>().map(|v| Self {
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        Ok(value.downcast_ref::<StarlarkCmdArgs>().map(|v| Self {
             value,
             borrow: v.0.borrow_mut(),
-        })
+        }))
     }
 }
 
@@ -649,50 +726,22 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
     /// Note that this operation mutates the input `cmd_args`.
     fn add<'v>(
         mut this: StarlarkCommandLineMut<'v>,
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.add_values(&args.items)?;
-        Ok(this)
-    }
-
-    /// Things to add to the command line which do not show up but are added as dependencies.
-    /// The values can be anything normally permissible to pass to `add`.
-    ///
-    /// Typically used if the command you are running implicitly depends on files that are not
-    /// passed on the command line, e.g. headers in the case of a C compilation.
-    fn hidden<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.add_hidden(&args.items)?;
-        Ok(this)
-    }
-
-    /// Causes this `cmd_args` to have no declared dependencies. Allows you to reference the path of an artifact _without_
-    /// introducing dependencies on it.
-    ///
-    /// As an example where this can be useful, consider passing a dependency that is only accessed at runtime, but whose path
-    /// must be baked into the binary. As an example:
-    ///
-    /// ```python
-    /// resources = cmd_args(resource_file, format = "-DFOO={}").ignore_artifacts()
-    /// ctx.actions.run(cmd_args("gcc", "-c", source_file, resources))
-    /// ```
-    ///
-    /// Note that `ignore_artifacts` sets all artifacts referenced by this `cmd_args` to be ignored, including those added afterwards,
-    /// so generally create a special `cmd_args` and scope it quite tightly.
-    ///
-    /// If you actually do use the inputs referenced by this command, you will either error out due to missing dependencies (if running actions remotely)
-    /// or have untracked dependencies that will fail to rebuild when it should.
-    fn ignore_artifacts<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.options_mut().ignore_artifacts = true;
+        heap: &'v Heap,
+        args: &Arguments<'v, '_>,
+    ) -> starlark::Result<StarlarkCommandLineMut<'v>> {
+        args.no_named_args()?;
+        let values = args.positions(heap)?;
+        this.borrow.add_from_iterator(values)?;
         Ok(this)
     }
 
     /// Make all artifact paths relative to a given location. Typically used when the command
     /// you are running changes directory.
+    ///
+    /// By default, the paths are relative to the artifacts themselves (equivalent to
+    /// `parent = 0`). Use `parent` to make the paths relative to an ancestor directory.
+    /// For example `parent = 1` would make all paths relative to the containing dirs
+    /// of any artifacts in the `cmd_args`.
     ///
     /// ```python
     /// dir = symlinked_dir(...)
@@ -704,81 +753,15 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
     fn relative_to<'v>(
         mut this: StarlarkCommandLineMut<'v>,
         #[starlark(require = pos)] directory: ValueOf<'v, RelativeOrigin<'v>>,
-        #[starlark(require = named, default = 0i32)] parent: i32,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        if parent < 0 {
-            return Err(ValueError::IncorrectParameterTypeNamed("parent".to_owned()).into());
-        }
-        this.borrow.options_mut().relative_to = Some((directory.value, parent as usize));
-        Ok(this)
-    }
-
-    /// Adds a prefix to the end of start artifact. Often used if you have a `$ROOT` variable
-    /// in a shell script and want to use it to make files absolute.
-    ///
-    /// ```python
-    /// cmd_args(script).absolute_prefix("$ROOT/")
-    /// ```
-    fn absolute_prefix<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-        prefix: StringValue<'v>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.options_mut().absolute_prefix = Some(prefix);
-        Ok(this)
-    }
-
-    /// Adds a suffix to the end of every artifact. Useful in conjunction with `absolute_prefix` to wrap
-    /// artifacts in function calls.
-    ///
-    /// ```python
-    /// cmd_args(script).absolute_prefix("call(").absolute_suffix(")")
-    /// ```
-    fn absolute_suffix<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-        suffix: StringValue<'v>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.options_mut().absolute_suffix = Some(suffix);
-        Ok(this)
-    }
-
-    /// For all the artifacts listed in this `cmd_args`, use their parent directory.
-    ///
-    /// Typically used when the file name is passed one way, and the directory another,
-    /// e.g. `cmd_args(artifact, format="-L{}").parent()`.
-    fn parent<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-        #[starlark(require = pos, default = 1u32)] count: u32,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        this.borrow.options_mut().parent += count;
-        Ok(this)
-    }
-
-    /// Replaces all parts matching pattern regular expression in each argument with replacement string.
-    /// Several replacements can be added by multiple replace_regex calls.
-    fn replace_regex<'v>(
-        mut this: StarlarkCommandLineMut<'v>,
-        #[starlark(require = pos)] pattern: CmdArgsRegex<'v>,
-        #[starlark(require = pos)] replacement: StringValue<'v>,
-    ) -> anyhow::Result<StarlarkCommandLineMut<'v>> {
-        let options = this.borrow.options_mut();
-        match &pattern {
-            CmdArgsRegex::Str(pattern) => {
-                // Validate that regex is valid
-                Regex::new(pattern.as_str())?;
-            }
-            CmdArgsRegex::Regex(_) => {}
-        }
-        if let Some(replacements) = &mut options.replacements {
-            replacements.push((pattern, replacement));
-        } else {
-            options.replacements = Some(Box::new(vec![(pattern, replacement)]));
-        }
+        #[starlark(require = named, default = 0u32)] parent: u32,
+    ) -> starlark::Result<StarlarkCommandLineMut<'v>> {
+        this.borrow.options_mut().relative_to = Some((directory.as_unchecked(), parent));
         Ok(this)
     }
 
     /// Returns a copy of the `cmd_args` such that any modifications to the original or the returned value will not impact each other.
     /// Note that this is a shallow copy, so any inner `cmd_args` can still be modified.
-    fn copy<'v>(this: Value<'v>) -> anyhow::Result<StarlarkCmdArgs<'v>> {
+    fn copy<'v>(this: Value<'v>) -> starlark::Result<StarlarkCmdArgs<'v>> {
         Ok(cmd_args(this).copy())
     }
 
@@ -786,7 +769,7 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
     /// The output can be compared for equality and have its `len` requested to see whether
     /// there are any inputs, but is otherwise mostly opaque.
     #[starlark(attribute)]
-    fn inputs<'v>(this: Value<'v>) -> anyhow::Result<StarlarkCommandLineInputs> {
+    fn inputs<'v>(this: Value<'v>) -> starlark::Result<StarlarkCommandLineInputs> {
         let mut visitor = SimpleCommandLineArtifactVisitor::new();
         cmd_args(this).visit_artifacts(&mut visitor)?;
         Ok(StarlarkCommandLineInputs {
@@ -799,7 +782,7 @@ fn cmd_args_methods(builder: &mut MethodsBuilder) {
     fn outputs<'v>(
         this: Value<'v>,
         heap: &Heap,
-    ) -> anyhow::Result<Vec<StarlarkOutputArtifact<'v>>> {
+    ) -> starlark::Result<Vec<StarlarkOutputArtifact<'v>>> {
         let mut visitor = SimpleCommandLineArtifactVisitor::new();
         cmd_args(this).visit_artifacts(&mut visitor)?;
         let mut outputs = Vec::with_capacity(visitor.outputs.len());
@@ -829,20 +812,146 @@ pub fn register_cmd_args(builder: &mut GlobalsBuilder) {
     /// * `delimiter` - added between arguments to join them together. For example, `cmd_args(["--args=",x], delimiter="")` would produce a single argument to the underlying tool.
     /// * `prepend` - added as a separate argument before each argument.
     /// * `quote` - indicates whether quoting is to be applied to each argument. The only current valid value is `"shell"`.
+    /// * `ignore_artifacts` - if `True`, artifacts paths are used, but artifacts are not pulled.
+    /// * `hidden` - artifacts not present on the command line, but added as dependencies.
+    /// * `absolute_prefix` and `absolute_suffix` - added to the start and end of each artifact.
+    /// * `parent` - for all the artifacts use their `parent`th directory (e.g. `parent = 1` for the directory the artifact is located, `parent = 2` for that directory's parent, etc.).
+    /// * `relative_to` - make all artifact paths relative to a given location.
+    /// * `replace_regex` - replaces arguments with a regular expression.
+    ///
+    /// ### `ignore_artifacts`
+    ///
+    /// `ignore_artifacts=True` makes `cmd_args` to have no declared dependencies.
+    /// Allows you to reference the path of an artifact _without_ introducing dependencies on it.
+    ///
+    /// As an example where this can be useful, consider passing a dependency that is only accessed at runtime, but whose path
+    /// must be baked into the binary. As an example:
+    ///
+    /// ```python
+    /// resources = cmd_args(resource_file, format = "-DFOO={}").ignore_artifacts()
+    /// ctx.actions.run(cmd_args("gcc", "-c", source_file, resources))
+    /// ```
+    ///
+    /// Note that `ignore_artifacts` sets all artifacts referenced by this `cmd_args` to be ignored, including those added afterwards,
+    /// so generally create a special `cmd_args` and scope it quite tightly.
+    ///
+    /// If you actually do use the inputs referenced by this command,
+    /// you will either error out due to missing dependencies (if running actions remotely)
+    /// or have untracked dependencies that will fail to rebuild when it should.
+    ///
+    /// ### `hidden`
+    ///
+    /// Things to add to the command line which do not show up but are added as dependencies.
+    /// The values can be anything normally permissible to pass to `add`.
+    ///
+    /// Typically used if the command you are running implicitly depends on files that are not
+    /// passed on the command line, e.g. headers in the case of a C compilation.
+    ///
+    /// ### `absolute_prefix` and `absolute_suffix`
+    ///
+    /// Adds a prefix to the start or end of every artifact.
+    ///
+    /// Prefix is often used if you have a `$ROOT` variable
+    /// in a shell script and want to use it to make files absolute.
+    ///
+    /// Suffix is often used in conjunction with `absolute_prefix`
+    /// to wrap artifacts in function calls.
+    ///
+    /// ```python
+    /// cmd_args(script, absolute_prefix = "$ROOT/")
+    /// cmd_args(script, absolute_prefix = "call", absolute_suffix = ")")
+    /// ```
+    ///
+    /// ### `parent`
+    ///
+    /// For all the artifacts use their parent directory.
+    ///
+    /// Typically used when the file name is passed one way, and the directory another,
+    /// e.g. `cmd_args(artifact, format="-L{}", parent=1)`.
+    ///
+    /// ### `relative_to=dir` or `relative_to=(dir, parent)`
+    ///
+    /// Make all artifact paths relative to a given location. Typically used when the command
+    /// you are running changes directory.
+    ///
+    /// By default, the paths are relative to the artifacts themselves (equivalent to
+    /// parent equals to `0`). Use `parent` to make the paths relative to an ancestor directory.
+    /// For example parent equals to `1` would make all paths relative to the containing dirs
+    /// of any artifacts in the `cmd_args`.
+    ///
+    /// ```python
+    /// dir = symlinked_dir(...)
+    /// script = [
+    ///     cmd_args(dir, format = "cd {}", relative_to=dir),
+    /// ]
+    /// ```
+    ///
+    /// ### `replace_regex`
+    ///
+    /// Replaces all parts matching pattern regular expression (or regular expressions)
+    /// in each argument with replacement strings.
     fn cmd_args<'v>(
-        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(args)] args: UnpackTuple<StarlarkCommandLineValueUnpack<'v>>,
+        hidden: Option<StarlarkCommandLineValueUnpack<'v>>,
         delimiter: Option<StringValue<'v>>,
         format: Option<StringValue<'v>>,
         prepend: Option<StringValue<'v>>,
         quote: Option<&str>,
-    ) -> anyhow::Result<StarlarkCmdArgs<'v>> {
-        StarlarkCmdArgs::try_from_values_with_options(
-            &args.items,
-            delimiter,
-            format,
-            prepend,
-            quote.try_map(QuoteStyle::parse)?,
-        )
+        #[starlark(default = false)] ignore_artifacts: bool,
+        absolute_prefix: Option<StringValue<'v>>,
+        absolute_suffix: Option<StringValue<'v>>,
+        #[starlark(default = 0)] parent: u32,
+        relative_to: Option<
+            Either<ValueOf<'v, RelativeOrigin<'v>>, (ValueOf<'v, RelativeOrigin<'v>>, u32)>,
+        >,
+        #[starlark(default = Either::Right(UnpackList::default()))] replace_regex: Either<
+            (CmdArgsRegex<'v>, StringValue<'v>),
+            UnpackList<(CmdArgsRegex<'v>, StringValue<'v>)>,
+        >,
+    ) -> starlark::Result<StarlarkCmdArgs<'v>> {
+        let quote = quote.try_map(QuoteStyle::parse)?;
+        let mut builder = StarlarkCommandLineData::default();
+        if delimiter.is_some()
+            || format.is_some()
+            || prepend.is_some()
+            || quote.is_some()
+            || ignore_artifacts
+            || absolute_prefix.is_some()
+            || absolute_suffix.is_some()
+            || parent != 0
+            || relative_to.is_some()
+        {
+            let opts = builder.options_mut();
+            opts.delimiter = delimiter;
+            opts.format = format;
+            opts.prepend = prepend;
+            opts.quote = quote;
+            opts.ignore_artifacts = ignore_artifacts;
+            opts.absolute_prefix = absolute_prefix;
+            opts.absolute_suffix = absolute_suffix;
+            opts.parent = parent;
+            opts.relative_to = relative_to.map(|either| {
+                let (relative_to, parent) = either.map_left(|o| (o, 0)).into_inner();
+                (relative_to.as_unchecked(), parent)
+            });
+        }
+        let replace_regex: Vec<(CmdArgsRegex, StringValue)> = replace_regex
+            .map_left(|x| vec![x])
+            .map_right(|x| x.items)
+            .into_inner();
+        if !replace_regex.is_empty() {
+            for (pattern, _replacement) in &replace_regex {
+                pattern.validate()?;
+            }
+            builder.options_mut().replacements = Some(Box::new(replace_regex));
+        }
+        for v in args.items {
+            builder.add_value_typed(v)?;
+        }
+        if let Some(hidden) = hidden {
+            builder.add_hidden(hidden)?;
+        }
+        Ok(StarlarkCmdArgs(RefCell::new(builder)))
     }
 }
 

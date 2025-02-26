@@ -42,6 +42,7 @@ use crate::values::none::NoneType;
 use crate::values::types::exported_name::ExportedName;
 use crate::values::types::exported_name::MutableExportedName;
 use crate::values::Freeze;
+use crate::values::FreezeResult;
 use crate::values::NoSerialize;
 use crate::values::StarlarkValue;
 use crate::values::Value;
@@ -84,7 +85,7 @@ fn test_export_as() {
         fn export_as(
             &self,
             variable_name: &str,
-            _eval: &mut Evaluator<'v, '_>,
+            _eval: &mut Evaluator<'v, '_, '_>,
         ) -> crate::Result<()> {
             self.named.try_export_as(variable_name);
             Ok(())
@@ -135,7 +136,7 @@ fn test_load_symbols() {
         fn load_symbol<'v>(
             name: &str,
             value: Value<'v>,
-            eval: &mut Evaluator<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
         ) -> starlark::Result<NoneType> {
             eval.set_module_variable_at_some_point(name, value)?;
             Ok(NoneType)
@@ -149,7 +150,7 @@ fn test_load_symbols() {
 }
 
 #[test]
-fn test_load_public_symbols_does_not_reexport() -> anyhow::Result<()> {
+fn test_load_public_symbols_does_not_reexport() -> starlark::Result<()> {
     let mut a = Assert::new();
 
     let module_b = a.module("b", "x = 5");
@@ -170,7 +171,7 @@ fn test_load_symbols_extra() -> crate::Result<()> {
         fn load_symbol<'v>(
             name: &str,
             value: Value<'v>,
-            eval: &mut Evaluator<'v, '_>,
+            eval: &mut Evaluator<'v, '_, '_>,
         ) -> anyhow::Result<NoneType> {
             let extra = eval
                 .module()
@@ -192,7 +193,7 @@ fn test_load_symbols_extra() -> crate::Result<()> {
         NoSerialize,
         Allocative
     )]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct Extra<'v>(Arc<Mutex<SmallMap<String, Value<'v>>>>);
 
     #[starlark_value(type = "Extra")]
@@ -204,7 +205,11 @@ fn test_load_symbols_extra() -> crate::Result<()> {
         let mut eval = Evaluator::new(&modu);
         modu.set_extra_value(eval.heap().alloc_complex_no_freeze(Extra::default()));
         eval.eval_module(
-            AstModule::parse("a", "load_symbol('x', 6*7)".to_owned(), &Dialect::Extended)?,
+            AstModule::parse(
+                "a",
+                "load_symbol('x', 6*7)".to_owned(),
+                &Dialect::AllOptionsInternal,
+            )?,
             &globals,
         )?;
     }
@@ -224,7 +229,7 @@ fn test_load_symbols_extra() -> crate::Result<()> {
 #[test]
 fn test_repr_str() {
     #[derive(ProvidesStaticType, Debug, Display)]
-    #[display(fmt = "{:?}", self)]
+    #[display("{:?}", self)]
     struct Foo(Option<usize>);
 
     #[starlark_module]

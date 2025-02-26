@@ -8,22 +8,24 @@
  */
 
 use async_trait::async_trait;
-use buck2_common::global_cfg_options::GlobalCfgOptions;
+use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::ProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
 use buck2_util::late_binding::LateBinding;
 use dice::DiceComputations;
+
+use crate::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 
 #[async_trait]
 pub trait ConfiguredTargetCalculationImpl: Send + Sync + 'static {
     async fn get_configured_target(
         &self,
-        ctx: &DiceComputations,
+        ctx: &mut DiceComputations<'_>,
         target: &TargetLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredTargetLabel>;
+    ) -> buck2_error::Result<ConfiguredTargetLabel>;
 }
 
 pub static CONFIGURED_TARGET_CALCULATION: LateBinding<
@@ -44,41 +46,62 @@ pub trait ConfiguredTargetCalculation {
     /// a mix of the global Configuration, the target's `default_target_platform` and
     /// (potentially) self-transitions on that node.
     async fn get_configured_target(
-        &self,
+        &mut self,
         target: &TargetLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredTargetLabel>;
+    ) -> buck2_error::Result<ConfiguredTargetLabel>;
+
+    async fn get_configured_target_post_transition(
+        &mut self,
+        target: &TargetLabel,
+        global_cfg_options: &GlobalCfgOptions,
+    ) -> buck2_error::Result<ConfiguredTargetLabel>;
 
     async fn get_configured_provider_label(
-        &self,
+        &mut self,
         target: &ProvidersLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredProvidersLabel>;
+    ) -> buck2_error::Result<ConfiguredProvidersLabel>;
 
     async fn get_default_configured_target(
-        &self,
+        &mut self,
         target: &TargetLabel,
-    ) -> anyhow::Result<ConfiguredTargetLabel>;
+    ) -> buck2_error::Result<ConfiguredTargetLabel>;
 }
 
 #[async_trait]
-impl ConfiguredTargetCalculation for DiceComputations {
+impl ConfiguredTargetCalculation for DiceComputations<'_> {
     async fn get_configured_target(
-        &self,
+        &mut self,
         target: &TargetLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredTargetLabel> {
+    ) -> buck2_error::Result<ConfiguredTargetLabel> {
         CONFIGURED_TARGET_CALCULATION
             .get()?
             .get_configured_target(self, target, global_cfg_options)
             .await
     }
 
+    async fn get_configured_target_post_transition(
+        &mut self,
+        target: &TargetLabel,
+        global_cfg_options: &GlobalCfgOptions,
+    ) -> buck2_error::Result<ConfiguredTargetLabel> {
+        let configured = self
+            .get_configured_target(target, global_cfg_options)
+            .await?;
+        let configured_target_node = self
+            .get_internal_configured_target_node(&configured)
+            .await?
+            .require_compatible()?;
+        Ok(configured_target_node.unwrap_forward().label().clone())
+    }
+
     async fn get_configured_provider_label(
-        &self,
+        &mut self,
         target: &ProvidersLabel,
         global_cfg_options: &GlobalCfgOptions,
-    ) -> anyhow::Result<ConfiguredProvidersLabel> {
+    ) -> buck2_error::Result<ConfiguredProvidersLabel> {
         let configured_target_label = CONFIGURED_TARGET_CALCULATION
             .get()?
             .get_configured_target(self, target.target(), global_cfg_options)
@@ -90,9 +113,9 @@ impl ConfiguredTargetCalculation for DiceComputations {
     }
 
     async fn get_default_configured_target(
-        &self,
+        &mut self,
         target: &TargetLabel,
-    ) -> anyhow::Result<ConfiguredTargetLabel> {
+    ) -> buck2_error::Result<ConfiguredTargetLabel> {
         CONFIGURED_TARGET_CALCULATION
             .get()?
             .get_configured_target(self, target, &GlobalCfgOptions::default())

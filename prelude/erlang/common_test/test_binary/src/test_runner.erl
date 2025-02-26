@@ -22,7 +22,7 @@
 -spec run_tests([string()], #test_info{}, string(), [#test_spec_test_case{}]) -> ok.
 run_tests(Tests, #test_info{} = TestInfo, OutputDir, Listing) ->
     check_ct_opts(TestInfo#test_info.ct_opts),
-    Suite = list_to_atom(filename:basename(TestInfo#test_info.test_suite, ".beam")),
+    Suite = binary_to_atom(filename:basename(TestInfo#test_info.test_suite, ".beam")),
     StructuredTests = lists:map(fun(Test) -> parse_test_name(Test, Suite) end, Tests),
     case StructuredTests of
         [] ->
@@ -62,10 +62,8 @@ execute_test_suite(
         Suite, Tests, filename:absname(filename:dirname(SuitePath)), OutputDir, CtOpts
     ),
     TestSpecFile = filename:join(OutputDir, "test_spec.spec"),
-    lists:foreach(
-        fun(Spec) -> file:write_file(TestSpecFile, io_lib:format("~tp.~n", [Spec]), [append]) end,
-        TestSpec
-    ),
+    FormattedSpec = [io_lib:format("~tp.~n", [Entry]) || Entry <- TestSpec],
+    file:write_file(TestSpecFile, FormattedSpec),
     NewTestEnv = TestEnv#test_env{test_spec_file = TestSpecFile, ct_opts = CtOpts},
     try run_test(NewTestEnv) of
         ok -> ok
@@ -102,15 +100,13 @@ run_test(
                         )
                     );
                 {run_succeed, Result} ->
+                    ensure_test_exec_stopped(),
                     test_run_succeed(TestEnv, Result);
                 {run_failed, Result} ->
+                    ensure_test_exec_stopped(),
                     test_run_fail(TestEnv, Result)
             after max_timeout(TestEnv) ->
-                {Pid, Monitor} = erlang:spawn_monitor(fun() -> application:stop(test_exec) end),
-                receive
-                    {'DOWN', Monitor, process, Pid, _} -> ok
-                after 5000 -> ok
-                end,
+                ensure_test_exec_stopped(),
                 ErrorMsg =
                     "\n***************************************************************\n"
                     "* the suite timed out, all tests will be reported as failure. *\n"
@@ -125,6 +121,14 @@ run_test(
             test_run_fail(
                 TestEnv, ErrorMsg
             )
+    end.
+
+-spec ensure_test_exec_stopped() -> ok.
+ensure_test_exec_stopped() ->
+    {Pid, Monitor} = erlang:spawn_monitor(fun() -> application:stop(test_exec) end),
+    receive
+        {'DOWN', Monitor, process, Pid, _} -> ok
+    after 5000 -> ok
     end.
 
 %% @doc Provides xml result as specified by the tpx protocol when test failed to ran.
@@ -169,10 +173,12 @@ provide_output_file(
         case Status of
             failed ->
                 collect_results_broken_run(
-                    Tests, Suite, "test binary internal crash", ResultExec, OutLog
+                    Tests, Suite, "internal crash", ResultExec, OutLog
                 );
-            Other when Other =:= passed orelse Other =:= timeout ->
-                % Here we either pased or timeout.
+            timeout ->
+                collect_results_broken_run(Tests, Suite, "", ResultExec, StdOut);
+            passed ->
+                % Here we either passed or timeout.
                 case file:read_file(ResultsFile) of
                     {ok, JsonFile} ->
                         TreeResults = binary_to_term(JsonFile),
@@ -193,31 +199,12 @@ provide_output_file(
                                     Tests, Suite, ErrorMsg, ResultExec, OutLog
                                 );
                             _ ->
-                                case Status of
-                                    timeout ->
-                                        % The ct node crashed after having produced results:
-                                        % some post-processing functionalities might be missing.
-                                        % We create a .timeout file at the root of the exec dir
-                                        % To alert tpx on the situation.
-                                        {ok, FileHandle} = file:open(
-                                            filename:join(OutputDir, ".timeout"), [write]
-                                        ),
-                                        io:format(FileHandle, "~p", [Suite]);
-                                    _ ->
-                                        ok
-                                end,
                                 collect_results_fine_run(TreeResults, Tests)
                         end;
                     {error, _Reason} ->
-                        ErrorMsg =
-                            case Status of
-                                timeout ->
-                                    undefined;
-                                _ ->
-                                    io_lib:format("ct failed to produced results file ~p", [
-                                        ResultsFile
-                                    ])
-                            end,
+                        ErrorMsg = io_lib:format("ct failed to produced results file ~p", [
+                            ResultsFile
+                        ]),
                         collect_results_broken_run(Tests, Suite, ErrorMsg, ResultExec, OutLog)
                 end
         end,
@@ -228,8 +215,6 @@ provide_output_file(
             json ->
                 json_interfacer:write_json_output(OutputDir, Results)
         end,
-    JsonLogs = execution_logs:create_dir_summary(OutputDir),
-    file:write_file(filename:join(OutputDir, "logs.json"), jsone:encode(JsonLogs)),
     test_artifact_directory:link_to_artifact_dir(test_logger:get_std_out(OutputDir, ct_executor), OutputDir, TestEnv),
     test_artifact_directory:link_to_artifact_dir(test_logger:get_std_out(OutputDir, test_runner), OutputDir, TestEnv),
     test_artifact_directory:prepare(OutputDir, TestEnv).
@@ -254,7 +239,7 @@ trimmed_content_file(File) ->
     end.
 
 %% @doc Provide tpx with a result when CT failed to provide results for tests.
--spec collect_results_broken_run([atom()], atom(), string() | undefined, term(), binary()) ->
+-spec collect_results_broken_run([#ct_test{}], atom(), string() | undefined, term(), binary()) ->
     [cth_tpx_test_tree:case_result()].
 
 collect_results_broken_run(Tests, _Suite, ErrorMsg, ResultExec, StdOut) ->
@@ -335,7 +320,8 @@ add_or_append(List, {Key, Value}) ->
 %% @doc Built the test_spec selecting the requested tests and
 %% specifying the result output.
 -spec build_test_spec(atom(), [atom()], string(), string(), [term()]) -> [term()].
-build_test_spec(Suite, Tests, TestDir, OutputDir, CtOpts) ->
+build_test_spec(Suite, Tests, TestDir0, OutputDir, CtOpts) ->
+    TestDir = unicode:characters_to_list(TestDir0),
     ListGroupTest = get_requested_tests(Tests),
     SpecTests = lists:map(
         fun
@@ -422,7 +408,7 @@ reorder_tests(Tests, #test_spec_test_case{testcases = TestCases}) ->
 %% Make sure it exists and returns it.
 set_up_log_dir(OutputDir) ->
     LogDir = filename:join(OutputDir, "log_dir"),
-    filelib:ensure_path(LogDir),
+    ok = filelib:ensure_path(LogDir),
     LogDir.
 
 %% @doc Informs the test runner of a successful test run.

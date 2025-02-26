@@ -6,13 +6,22 @@
 # of this source tree.
 
 load(
+    "@prelude//cxx:preprocessor.bzl",
+    "cxx_inherited_preprocessor_infos",
+    "cxx_merge_cpreprocessors",
+)
+load(
     "@prelude//linking:link_groups.bzl",
-    "LinkGroupLibInfo",
+    "merge_link_group_lib_info",
 )
 load(
     "@prelude//linking:link_info.bzl",
     "MergedLinkInfo",
     "create_merged_link_info_for_propagation",
+)
+load(
+    "@prelude//linking:linkable_graph.bzl",
+    "create_linkable_graph",
 )
 load(
     "@prelude//linking:shared_libraries.bzl",
@@ -23,71 +32,51 @@ load(
     "@prelude//utils:utils.bzl",
     "map_idx",
 )
-load(":compile.bzl", "GoPkgCompileInfo", "GoTestInfo", "compile", "get_filtered_srcs", "get_inherited_compile_pkgs")
-load(":coverage.bzl", "GoCoverageMode", "cover_srcs")
+load(":compile.bzl", "GoPkgCompileInfo", "GoTestInfo")
+load(":coverage.bzl", "GoCoverageMode")
 load(":link.bzl", "GoPkgLinkInfo", "get_inherited_link_pkgs")
-load(":packages.bzl", "GoPkg", "go_attr_pkg_name", "merge_pkgs")
+load(":package_builder.bzl", "build_package")
+load(":packages.bzl", "cgo_exported_preprocessor", "go_attr_pkg_name", "merge_pkgs")
 load(":toolchain.bzl", "GoToolchainInfo", "evaluate_cgo_enabled")
-
-def _compile_with_coverage(ctx: AnalysisContext, pkg_name: str, srcs: cmd_args, coverage_mode: GoCoverageMode, cgo_enabled: bool, shared: bool = False) -> (Artifact, cmd_args):
-    cov_res = cover_srcs(ctx, pkg_name, coverage_mode, srcs, shared)
-    srcs = cov_res.srcs
-    coverage_vars = cov_res.variables
-    coverage_pkg = compile(
-        ctx,
-        pkg_name,
-        srcs = srcs,
-        cgo_enabled = cgo_enabled,
-        deps = ctx.attrs.deps + ctx.attrs.exported_deps,
-        compile_flags = ctx.attrs.compiler_flags,
-        coverage_mode = coverage_mode,
-        shared = shared,
-    )
-    return (coverage_pkg, coverage_vars)
 
 def go_library_impl(ctx: AnalysisContext) -> list[Provider]:
     go_toolchain = ctx.attrs._go_toolchain[GoToolchainInfo]
+    pkg_name = go_attr_pkg_name(ctx)
 
-    pkgs = {}
-    default_output = None
-    pkg_name = None
-    if ctx.attrs.srcs:
-        pkg_name = go_attr_pkg_name(ctx)
+    race = ctx.attrs._race
+    asan = ctx.attrs._asan
+    coverage_mode = GoCoverageMode(ctx.attrs._coverage_mode) if ctx.attrs._coverage_mode else None
 
-        # We need to set CGO_DESABLED for "pure" Go libraries, otherwise CGo files may be selected for compilation.
-        srcs = get_filtered_srcs(ctx, ctx.attrs.srcs, force_disable_cgo = True)
-        cgo_enabled = evaluate_cgo_enabled(go_toolchain, ctx.attrs._cgo_enabled)
-        shared = ctx.attrs._compile_shared
+    pkg, pkg_info = build_package(
+        ctx = ctx,
+        pkg_name = pkg_name,
+        main = False,
+        srcs = ctx.attrs.srcs + ctx.attrs.headers,
+        package_root = ctx.attrs.package_root,
+        deps = ctx.attrs.deps,
+        compiler_flags = ctx.attrs.compiler_flags,
+        assembler_flags = ctx.attrs.assembler_flags,
+        build_tags = ctx.attrs._build_tags,
+        race = race,
+        asan = asan,
+        coverage_mode = coverage_mode,
+        embedcfg = ctx.attrs.embedcfg,
+        cgo_enabled = evaluate_cgo_enabled(go_toolchain, ctx.attrs._cgo_enabled, ctx.attrs.override_cgo_enabled),
+    )
 
-        compiled_pkg = compile(
-            ctx,
-            pkg_name,
-            srcs = srcs,
-            cgo_enabled = cgo_enabled,
-            deps = ctx.attrs.deps + ctx.attrs.exported_deps,
-            compile_flags = ctx.attrs.compiler_flags,
-            assemble_flags = ctx.attrs.assembler_flags,
-            shared = shared,
-        )
+    default_output = pkg.pkg
+    pkgs = {
+        pkg_name: pkg,
+    }
 
-        pkg_with_coverage = {mode: _compile_with_coverage(ctx, pkg_name, srcs, mode, cgo_enabled, shared) for mode in GoCoverageMode}
-
-        default_output = compiled_pkg
-        pkgs[pkg_name] = GoPkg(
-            pkg = compiled_pkg,
-            pkg_with_coverage = pkg_with_coverage,
-        )
+    own_exported_preprocessors = [cgo_exported_preprocessor(ctx, pkg_info)] if ctx.attrs.generate_exported_header else []
 
     return [
         DefaultInfo(default_output = default_output),
-        LinkGroupLibInfo(libs = {}),
-        GoPkgCompileInfo(pkgs = merge_pkgs([
-            pkgs,
-            get_inherited_compile_pkgs(ctx.attrs.exported_deps),
-        ])),
+        GoPkgCompileInfo(pkgs = pkgs),
         GoPkgLinkInfo(pkgs = merge_pkgs([
             pkgs,
-            get_inherited_link_pkgs(ctx.attrs.deps + ctx.attrs.exported_deps),
+            get_inherited_link_pkgs(ctx.attrs.deps),
         ])),
         GoTestInfo(
             deps = ctx.attrs.deps,
@@ -99,4 +88,11 @@ def go_library_impl(ctx: AnalysisContext) -> list[Provider]:
             ctx.actions,
             deps = filter(None, map_idx(SharedLibraryInfo, ctx.attrs.deps)),
         ),
+        merge_link_group_lib_info(deps = ctx.attrs.deps),
+        create_linkable_graph(
+            ctx,
+            deps = ctx.attrs.deps,
+        ),
+        cxx_merge_cpreprocessors(ctx, own_exported_preprocessors, cxx_inherited_preprocessor_infos(ctx.attrs.deps)),
+        pkg_info,
     ]

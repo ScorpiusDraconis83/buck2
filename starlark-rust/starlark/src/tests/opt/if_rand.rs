@@ -19,7 +19,6 @@
 
 use std::cell::Cell;
 use std::fmt;
-use std::fmt::Display;
 
 use derive_more::Display;
 use dupe::Dupe;
@@ -76,9 +75,9 @@ fn bool_fns(globals: &mut GlobalsBuilder) {
 
 #[derive(Display, Debug, Copy, Clone, Dupe)]
 enum TestBinOp {
-    #[display(fmt = "and")]
+    #[display("and")]
     And,
-    #[display(fmt = "or")]
+    #[display("or")]
     Or,
 }
 
@@ -148,7 +147,7 @@ impl Display for TestExpr {
 /// * Count side effects.
 fn eval_program(program: &str) -> (bool, CountCalls) {
     let module = Module::new();
-    let ast = AstModule::parse("t.star", program.to_owned(), &Dialect::Extended).unwrap();
+    let ast = AstModule::parse("t.star", program.to_owned(), &Dialect::AllOptionsInternal).unwrap();
 
     let mut globals = GlobalsBuilder::standard();
     bool_fns(&mut globals);

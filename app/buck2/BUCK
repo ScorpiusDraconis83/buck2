@@ -1,8 +1,11 @@
 load("@fbcode//buck2:buck_rust_binary.bzl", "buck_rust_binary")
+# @oss-disable[end= ]: load("@fbcode_macros//build_defs:platform_utils.bzl", "platform_utils")
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
+load(":transition.bzl", "buck2_client_transition_alias")
 
 oncall("build_infra")
+
+prelude = native
 
 rust_library(
     name = "buck2",
@@ -12,6 +15,7 @@ rust_library(
             "linux",
             [
                 "fbsource//third-party/rust:dirs",
+                "fbsource//third-party/rust:libc",
                 "fbsource//third-party/rust:nix",
                 "//buck2/app/buck2_forkserver:buck2_forkserver",
             ],
@@ -20,6 +24,7 @@ rust_library(
             "macos",
             [
                 "fbsource//third-party/rust:dirs",
+                "fbsource//third-party/rust:libc",
                 "fbsource//third-party/rust:nix",
                 "//buck2/app/buck2_forkserver:buck2_forkserver",
             ],
@@ -31,49 +36,46 @@ rust_library(
             ],
         ),
     ],
+    rustc_flags = select({
+        ":buck2_client_only_build": ["--cfg=client_only"],
+        "DEFAULT": [],
+    }),
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:backtrace",
-        "fbsource//third-party/rust:clap-3",
-        "fbsource//third-party/rust:futures",
-        "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:rand",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:termimad",
+        "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:tokio-stream",
         "fbsource//third-party/rust:tracing",
-        "//buck2/allocative/allocative:allocative",
         "//buck2/app/buck2_audit:buck2_audit",
-        "//buck2/app/buck2_audit_server:buck2_audit_server",
-        "//buck2/app/buck2_cli_proto:buck2_cli_proto",
         "//buck2/app/buck2_client:buck2_client",
         "//buck2/app/buck2_client_ctx:buck2_client_ctx",
+        "//buck2/app/buck2_cmd_completion_client:buck2_cmd_completion_client",
+        "//buck2/app/buck2_cmd_docs:buck2_cmd_docs",
+        "//buck2/app/buck2_cmd_starlark_client:buck2_cmd_starlark_client",
         "//buck2/app/buck2_common:buck2_common",
         "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_data:buck2_data",
         "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_event_observer:buck2_event_observer",
         "//buck2/app/buck2_events:buck2_events",
-        "//buck2/app/buck2_query:buck2_query",
-        "//buck2/app/buck2_server:buck2_server",
-        "//buck2/app/buck2_server_ctx:buck2_server_ctx",
-        "//buck2/app/buck2_starlark:buck2_starlark",
-        "//buck2/app/buck2_test_runner:buck2_test_runner",
         "//buck2/app/buck2_util:buck2_util",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
-        "//buck2/dice/dice:dice",
         "//buck2/gazebo/dupe:dupe",
-        # @oss-disable: "//common/rust/gflags:gflags", 
         "//common/rust/shed/fbinit:fbinit",
-    ],
+    ] + select({
+        ":buck2_client_only_build": [],
+        "DEFAULT": [
+            "//buck2/app/buck2_daemon:buck2_daemon",
+            "//buck2/app/buck2_server:buck2_server",
+            "//buck2/app/buck2_test_runner:buck2_test_runner",
+        ],
+    }),
 )
 
 buck_rust_binary(
     name = "buck2-bin",
     srcs = ["bin/buck2.rs"],
+    allow_cache_upload = True,
     crate = "buck2",
     crate_root = "bin/buck2.rs",
     env = {
@@ -86,34 +88,64 @@ buck_rust_binary(
         # This config value is set by the upload script, and controls the output of `--internal-version` on windows
         "BUCK2_WIN_INTERNAL_VERSION": read_config("buck", "win_internal_version", ""),
     },
+    rustc_flags = select({
+        ":buck2_client_only_build": ["--cfg=client_only"],
+        "DEFAULT": [],
+    }),
     unittests = False,
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:tracing",
         "//buck2/app/buck2:buck2",
-        "//buck2/app/buck2_action_impl:buck2_action_impl",
-        "//buck2/app/buck2_analysis:buck2_analysis",
-        "//buck2/app/buck2_anon_target:buck2_anon_target",
-        "//buck2/app/buck2_audit_server:buck2_audit_server",
-        "//buck2/app/buck2_build_api:buck2_build_api",
         "//buck2/app/buck2_build_info:buck2_build_info",
-        "//buck2/app/buck2_build_signals_impl:buck2_build_signals_impl",
-        "//buck2/app/buck2_bxl:buck2_bxl",
-        "//buck2/app/buck2_cfg_constructor:buck2_cfg_constructor",
         "//buck2/app/buck2_client_ctx:buck2_client_ctx",
-        "//buck2/app/buck2_configured:buck2_configured",
         "//buck2/app/buck2_core:buck2_core",
+        "//buck2/app/buck2_error:buck2_error",
         "//buck2/app/buck2_event_log:buck2_event_log",
         "//buck2/app/buck2_events:buck2_events",
-        "//buck2/app/buck2_interpreter_for_build:buck2_interpreter_for_build",
-        "//buck2/app/buck2_query_impls:buck2_query_impls",
-        "//buck2/app/buck2_server_commands:buck2_server_commands",
-        "//buck2/app/buck2_test:buck2_test",
-        "//buck2/app/buck2_transition:buck2_transition",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
         "//buck2/gazebo/dupe:dupe",
-        # @oss-disable: "//common/rust/folly/logging:logging", 
-        # @oss-disable: "//common/rust/gflags:gflags", 
-        "//common/rust/shed/fbinit:fbinit",
-    ],
+    ] + select({
+        ":buck2_client_only_build": [],
+        "DEFAULT": [
+            "//buck2/app/buck2_action_impl:buck2_action_impl",
+            "//buck2/app/buck2_analysis:buck2_analysis",
+            "//buck2/app/buck2_anon_target:buck2_anon_target",
+            "//buck2/app/buck2_audit_server:buck2_audit_server",
+            "//buck2/app/buck2_build_api:buck2_build_api",
+            "//buck2/app/buck2_build_signals_impl:buck2_build_signals_impl",
+            "//buck2/app/buck2_bxl:buck2_bxl",
+            "//buck2/app/buck2_cfg_constructor:buck2_cfg_constructor",
+            "//buck2/app/buck2_cmd_docs_server:buck2_cmd_docs_server",
+            "//buck2/app/buck2_cmd_starlark_server:buck2_cmd_starlark_server",
+            "//buck2/app/buck2_configured:buck2_configured",
+            "//buck2/app/buck2_external_cells:buck2_external_cells",
+            "//buck2/app/buck2_interpreter_for_build:buck2_interpreter_for_build",
+            "//buck2/app/buck2_query_impls:buck2_query_impls",
+            "//buck2/app/buck2_server_commands:buck2_server_commands",
+            "//buck2/app/buck2_test:buck2_test",
+            "//buck2/app/buck2_transition:buck2_transition",
+            "//buck2/app/buck2_validation:buck2_validation",
+        ],
+    }),
+)
+
+platform_utils = None # @oss-enable
+
+_dtp = platform_utils.get_cxx_platform_for_base_path(prelude.package_name()).target_platform if platform_utils else None
+
+prelude.constraint_setting(
+    name = "buck2_client_only_setting",
+)
+
+prelude.constraint_value(
+    name = "buck2_client_only_build",
+    constraint_setting = ":buck2_client_only_setting",
+)
+
+buck2_client_transition_alias(
+    name = "buck2_client-bin",
+    actual = ":buck2-bin",
+    default_target_platform = _dtp,
+    visibility = ["PUBLIC"],
 )

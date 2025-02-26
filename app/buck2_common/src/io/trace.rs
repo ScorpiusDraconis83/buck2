@@ -7,8 +7,6 @@
  * of this source tree.
  */
 
-use std::borrow::Cow;
-
 use allocative::Allocative;
 use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_core::fs::paths::forward_rel_path::ForwardRelativePath;
@@ -102,19 +100,6 @@ impl TracingIoProvider {
         self.trace.symlinks.insert(link);
     }
 
-    pub fn add_config_paths<I>(&self, project_root: &ProjectRoot, paths: I)
-    where
-        I: IntoIterator<Item = AbsNormPathBuf>,
-    {
-        for abspath in paths.into_iter() {
-            if let Ok(project_path) = project_root.relativize(&abspath).map(Cow::into_owned) {
-                self.add_project_path(project_path);
-            } else {
-                self.add_external_path(abspath);
-            }
-        }
-    }
-
     pub fn trace(&self) -> &Trace {
         &self.trace
     }
@@ -128,12 +113,15 @@ impl IoProvider for TracingIoProvider {
     ///
     /// This makes code working with the exported I/O manifest much easier to
     /// work with at the expense of some additional I/O during tracing builds.
-    async fn read_file_if_exists(
+    async fn read_file_if_exists_impl(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<String>> {
-        self.add_project_path(path.clone());
-        self.io.read_file_if_exists(path).await
+    ) -> buck2_error::Result<Option<String>> {
+        let res = self.io.read_file_if_exists_impl(path.clone()).await?;
+        if res.is_some() {
+            self.add_project_path(path);
+        }
+        Ok(res)
     }
 
     /// Combination of read_file_if_exists from underlying fs struct and reading
@@ -142,8 +130,11 @@ impl IoProvider for TracingIoProvider {
     ///
     /// This makes code working with the exported I/O manifest much easier to
     /// work with at the expense of some additional I/O during tracing builds.
-    async fn read_dir(&self, path: ProjectRelativePathBuf) -> anyhow::Result<Vec<RawDirEntry>> {
-        let entries = self.io.read_dir(path.clone()).await?;
+    async fn read_dir_impl(
+        &self,
+        path: ProjectRelativePathBuf,
+    ) -> buck2_error::Result<Vec<RawDirEntry>> {
+        let entries = self.io.read_dir_impl(path.clone()).await?;
         self.add_project_path(path.clone());
         for entry in entries.iter() {
             self.add_project_path(path.join(ForwardRelativePath::unchecked_new(&entry.file_name)));
@@ -152,11 +143,14 @@ impl IoProvider for TracingIoProvider {
         Ok(entries)
     }
 
-    async fn read_path_metadata_if_exists(
+    async fn read_path_metadata_if_exists_impl(
         &self,
         path: ProjectRelativePathBuf,
-    ) -> anyhow::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
-        let res = self.io.read_path_metadata_if_exists(path.clone()).await?;
+    ) -> buck2_error::Result<Option<RawPathMetadata<ProjectRelativePathBuf>>> {
+        let res = self
+            .io
+            .read_path_metadata_if_exists_impl(path.clone())
+            .await?;
         match &res {
             Some(RawPathMetadata::File(_)) | Some(RawPathMetadata::Directory) => {
                 self.add_project_path(path);
@@ -173,7 +167,7 @@ impl IoProvider for TracingIoProvider {
         Ok(res)
     }
 
-    async fn settle(&self) -> anyhow::Result<()> {
+    async fn settle(&self) -> buck2_error::Result<()> {
         self.io.settle().await
     }
 
@@ -181,7 +175,7 @@ impl IoProvider for TracingIoProvider {
         self.io.name()
     }
 
-    async fn eden_version(&self) -> anyhow::Result<Option<String>> {
+    async fn eden_version(&self) -> buck2_error::Result<Option<String>> {
         self.io.eden_version().await
     }
 

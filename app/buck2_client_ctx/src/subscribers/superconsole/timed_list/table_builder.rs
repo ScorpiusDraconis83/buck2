@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use buck2_error::conversion::from_any_with_tag;
 use buck2_event_observer::display;
 use buck2_event_observer::display::TargetDisplayOptions;
 use buck2_event_observer::fmt_duration;
@@ -106,7 +107,7 @@ impl TimedRow {
         time_speed: f64,
         cutoffs: &Cutoffs,
         display_platform: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         let event = display::display_event(
             &span.event,
             TargetDisplayOptions::for_console(display_platform),
@@ -122,7 +123,7 @@ impl TimedRow {
         time: String,
         age: Duration,
         cutoffs: &Cutoffs,
-    ) -> anyhow::Result<Self> {
+    ) -> buck2_error::Result<Self> {
         Self::styled(padding, style(event), style(time), age, cutoffs)
     }
 
@@ -132,8 +133,9 @@ impl TimedRow {
         time: StyledContent<String>,
         age: Duration,
         cutoffs: &Cutoffs,
-    ) -> anyhow::Result<Self> {
-        let event = Span::new_styled(styled_for_delay(event, age, cutoffs))?;
+    ) -> buck2_error::Result<Self> {
+        let event = Span::new_styled(styled_for_delay(event, age, cutoffs))
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
 
         let line = if padding > 0 {
             Line::from_iter([Span::padding(padding), event])
@@ -141,13 +143,15 @@ impl TimedRow {
             Line::from_iter([event])
         };
 
-        let time = Line::from_iter([Span::new_styled(styled_for_delay(time, age, cutoffs))?]);
+        let time = Line::from_iter([Span::new_styled(styled_for_delay(time, age, cutoffs))
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?]);
         Ok(Self { event: line, time })
     }
 }
 
 /// This component echoes the `Lines` that have been stored in it.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct LinesComponent(Lines);
 
 impl Component for LinesComponent {

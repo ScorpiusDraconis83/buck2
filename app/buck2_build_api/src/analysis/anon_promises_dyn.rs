@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use dice::DiceComputations;
 use starlark::eval::Evaluator;
 
@@ -15,8 +16,8 @@ use starlark::eval::Evaluator;
 pub trait AnonPromisesDyn<'v>: 'v {
     async fn run_promises(
         self: Box<Self>,
-        dice: &DiceComputations,
-        eval: &mut Evaluator<'v, '_>,
-        description: String,
-    ) -> anyhow::Result<()>;
+        dice: &mut DiceComputations,
+        eval: &mut Evaluator<'v, '_, '_>,
+        eval_kind: &StarlarkEvalKind,
+    ) -> buck2_error::Result<()>;
 }

@@ -7,6 +7,8 @@
  * of this source tree.
  */
 
+use std::sync::Arc;
+
 use buck2_common::package_listing::listing::testing::PackageListingExt;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::cells::name::CellName;
@@ -14,7 +16,7 @@ use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::package::package_relative_path::PackageRelativePathBuf;
 use buck2_core::package::PackageLabel;
 use buck2_core::plugins::PluginKindSet;
-use buck2_interpreter_for_build::attrs::attrs_global::register_attrs;
+use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
 use buck2_interpreter_for_build::attrs::coerce::attr_type::AttrTypeExt;
 use buck2_interpreter_for_build::attrs::coerce::ctx::BuildAttrCoercionContext;
 use buck2_interpreter_for_build::interpreter::testing::cells;
@@ -28,15 +30,9 @@ use dupe::Dupe;
 use indoc::indoc;
 use starlark::values::Heap;
 
-fn tester() -> Tester {
-    let mut tester = Tester::new().unwrap();
-    tester.additional_globals(register_attrs);
-    tester
-}
-
 #[test]
 fn string_works() -> buck2_error::Result<()> {
-    let mut tester = tester();
+    let mut tester = Tester::new().unwrap();
     tester.run_starlark_bzl_test(indoc!(
         r#"
         frozen = attrs.string(default="something", doc = "foo")
@@ -49,7 +45,7 @@ fn string_works() -> buck2_error::Result<()> {
 
 #[test]
 fn boolean_works() -> buck2_error::Result<()> {
-    let mut tester = tester();
+    let mut tester = Tester::new().unwrap();
     tester.run_starlark_bzl_test(indoc!(
         r#"
         frozen = attrs.bool(default=False)
@@ -62,7 +58,7 @@ fn boolean_works() -> buck2_error::Result<()> {
 
 #[test]
 fn test_attr_module_registered() -> buck2_error::Result<()> {
-    let mut tester = tester();
+    let mut tester = Tester::new().unwrap();
     tester.run_starlark_bzl_test(indoc!(
         r#"
         def test():
@@ -73,7 +69,7 @@ fn test_attr_module_registered() -> buck2_error::Result<()> {
 
 #[test]
 fn list_works() -> buck2_error::Result<()> {
-    let mut tester = tester();
+    let mut tester = Tester::new().unwrap();
     tester.run_starlark_bzl_test(indoc!(
         r#"
         frozen = attrs.list(
@@ -89,14 +85,14 @@ fn list_works() -> buck2_error::Result<()> {
             )
 
             assert_eq('attrs.list(attrs.string(), default=[])', repr(not_frozen))
-            assert_eq('attrs.list(attrs.string(), default=["1","2"])', repr(frozen))
+            assert_eq('attrs.list(attrs.string(), default=["1", "2"])', repr(frozen))
         "#
     ))
 }
 
 #[test]
 fn enum_works() -> buck2_error::Result<()> {
-    let mut tester = tester();
+    let mut tester = Tester::new().unwrap();
     tester.run_starlark_bzl_test(indoc!(
         r#"
         frozen = attrs.enum(["red", "green", "blue"])
@@ -109,17 +105,23 @@ fn enum_works() -> buck2_error::Result<()> {
 }
 
 #[test]
-fn attr_coercer_coerces() -> anyhow::Result<()> {
+fn attr_coercer_coerces() -> buck2_error::Result<()> {
     let heap = Heap::new();
     let some_cells = cells(None)?;
     let cell_resolver = some_cells.1;
+    let cell_alias_resolver = some_cells.0;
     let package = PackageLabel::new(
         CellName::testing_new("root"),
         CellRelativePath::unchecked_new("foo"),
     );
     let enclosing_package = (package.dupe(), PackageListing::testing_empty());
-    let coercer_ctx =
-        BuildAttrCoercionContext::new_with_package(cell_resolver, enclosing_package, false);
+    let coercer_ctx = BuildAttrCoercionContext::new_with_package(
+        cell_resolver,
+        cell_alias_resolver,
+        enclosing_package,
+        false,
+        Arc::new(ConcurrentTargetLabelInterner::default()),
+    );
     let label_coercer = AttrType::dep(ProviderIdSet::EMPTY, PluginKindSet::EMPTY);
     let string_coercer = AttrType::string();
     let enum_coercer = AttrType::enumeration(vec![
@@ -212,7 +214,7 @@ fn attr_coercer_coerces() -> anyhow::Result<()> {
 
 #[test]
 fn dep_works() -> buck2_error::Result<()> {
-    let mut t = tester();
+    let mut t = Tester::new().unwrap();
     t.run_starlark_bzl_test(indoc!(
         r#"
         frozen1 = attrs.dep(default="root//foo:bar")
@@ -224,7 +226,7 @@ fn dep_works() -> buck2_error::Result<()> {
         "#
     ))?;
 
-    let mut t = tester();
+    let mut t = Tester::new().unwrap();
     t.run_starlark_bzl_test_expecting_error(
         indoc!(
             r#"
@@ -232,11 +234,11 @@ fn dep_works() -> buck2_error::Result<()> {
             attrs.dep(default="notatarget")
         "#
         ),
-        "Invalid absolute target",
+        "Invalid target pattern",
     );
 
     // Relative targets are disallowed; there is no build file for them to be relative to
-    let mut t = tester();
+    let mut t = Tester::new().unwrap();
     t.run_starlark_bzl_test_expecting_error(
         indoc!(
             r#"
@@ -244,14 +246,14 @@ fn dep_works() -> buck2_error::Result<()> {
             attrs.dep(default=":reltarget")
         "#
         ),
-        "Use a fully qualified",
+        "Must be absolute",
     );
     Ok(())
 }
 
 #[test]
 fn source_works() -> buck2_error::Result<()> {
-    let mut t = tester();
+    let mut t = Tester::new().unwrap();
     t.run_starlark_bzl_test(indoc!(
         r#"
         frozen1 = attrs.source(default="root//foo:bar")
@@ -264,7 +266,7 @@ fn source_works() -> buck2_error::Result<()> {
     ))?;
 
     // Relative targets are disallowed; there is no build file for them to be relative to
-    let mut t = tester();
+    let mut t = Tester::new().unwrap();
     t.run_starlark_bzl_test_expecting_error(
         indoc!(
             r#"
@@ -272,28 +274,35 @@ fn source_works() -> buck2_error::Result<()> {
             attrs.source(default=":reltarget")
         "#
         ),
-        "Use a fully qualified",
+        "Must be absolute",
     );
     Ok(())
 }
 
 #[test]
-fn coercing_src_to_path_works() -> anyhow::Result<()> {
+fn coercing_src_to_path_works() -> buck2_error::Result<()> {
     let cell_resolver = cells(None).unwrap().1;
+    let cell_alias_resolver = cells(None).unwrap().0;
     let package = PackageLabel::new(
         CellName::testing_new("root"),
         CellRelativePath::unchecked_new("foo/bar"),
     );
     let package_ctx = BuildAttrCoercionContext::new_with_package(
         cell_resolver.dupe(),
+        cell_alias_resolver.dupe(),
         (
             package.dupe(),
             PackageListing::testing_files(&["baz/quz.cpp"]),
         ),
         false,
+        Arc::new(ConcurrentTargetLabelInterner::default()),
     );
-    let no_package_ctx =
-        BuildAttrCoercionContext::new_no_package(cell_resolver, CellName::testing_new("root"));
+    let no_package_ctx = BuildAttrCoercionContext::new_no_package(
+        cell_resolver,
+        CellName::testing_new("root"),
+        cell_alias_resolver,
+        Arc::new(ConcurrentTargetLabelInterner::default()),
+    );
 
     let err = no_package_ctx
         .coerce_path("baz/quz.cpp", false)

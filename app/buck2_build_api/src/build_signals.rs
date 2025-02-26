@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
-use buck2_build_signals::DeferredBuildSignals;
-use buck2_build_signals::NodeDuration;
+use buck2_build_signals::env::DeferredBuildSignals;
+use buck2_build_signals::env::NodeDuration;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_events::span::SpanId;
 use buck2_util::late_binding::LateBinding;
@@ -63,14 +63,11 @@ impl SetBuildSignals for UserComputationData {
 }
 
 pub trait HasBuildSignals {
-    fn get_build_signals(&self) -> Option<&dyn BuildSignals>;
+    fn get_build_signals(&self) -> Option<&Arc<dyn BuildSignals>>;
 }
 
 impl HasBuildSignals for UserComputationData {
-    fn get_build_signals(&self) -> Option<&dyn BuildSignals> {
-        self.data
-            .get::<Arc<dyn BuildSignals>>()
-            .ok()
-            .map(|build_signals| build_signals.as_ref())
+    fn get_build_signals(&self) -> Option<&Arc<dyn BuildSignals>> {
+        self.data.get::<Arc<dyn BuildSignals>>().ok()
     }
 }

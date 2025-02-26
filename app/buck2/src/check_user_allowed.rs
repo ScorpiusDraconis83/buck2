@@ -8,17 +8,15 @@
  */
 
 #[cfg(windows)]
-pub(crate) fn check_user_allowed() -> anyhow::Result<()> {
-    use std::env;
-    use std::ffi::OsStr;
+pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
     use std::io;
     use std::mem;
     use std::mem::MaybeUninit;
     use std::ptr;
 
-    use anyhow::Context;
-    use buck2_core::sandcastle::is_sandcastle;
-    use buck2_wrapper_common::winapi_handle::WinapiHandle;
+    use buck2_core::ci::is_ci;
+    use buck2_error::BuckErrorContext;
+    use buck2_wrapper_common::win::winapi_handle::WinapiHandle;
     use winapi::ctypes::c_void;
     use winapi::shared::minwindef::DWORD;
     use winapi::um::processthreadsapi::GetCurrentProcess;
@@ -28,22 +26,15 @@ pub(crate) fn check_user_allowed() -> anyhow::Result<()> {
     use winapi::um::winnt::TOKEN_ELEVATION;
     use winapi::um::winnt::TOKEN_QUERY;
 
-    #[derive(Debug, buck2_error::Error)]
-    enum CheckUserAllowedError {
-        #[error("OpenProcessToken returned null token handle (unreachable)")]
-        NullTokenHandle,
-    }
-
     let mut handle = ptr::null_mut();
     let token_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) };
     if token_ok == 0 {
-        return Err(io::Error::last_os_error()).context("OpenProcessToken failed");
-    }
-    if handle.is_null() {
-        return Err(CheckUserAllowedError::NullTokenHandle.into());
+        return Err(io::Error::last_os_error()).buck_error_context("OpenProcessToken failed");
     }
 
-    let handle = unsafe { WinapiHandle::new(handle) };
+    let handle = unsafe {
+        WinapiHandle::new_check_last_os_error(handle).buck_error_context("OpenProcessToken")?
+    };
     let size = mem::size_of::<TOKEN_ELEVATION>();
     let elevation: MaybeUninit<TOKEN_ELEVATION> = MaybeUninit::zeroed();
     let mut ret_size = 0;
@@ -58,26 +49,15 @@ pub(crate) fn check_user_allowed() -> anyhow::Result<()> {
         )
     };
     if success_get == 0 {
-        return Err(io::Error::last_os_error()).context("GetTokenInformation failed");
+        return Err(io::Error::last_os_error()).buck_error_context("GetTokenInformation failed");
     }
 
     let elevation_struct: TOKEN_ELEVATION = unsafe { elevation.assume_init() };
     if elevation_struct.TokenIsElevated == 1 {
-        // The CI environment variable is consistently set by CI providers.
-        //
-        // - GitHub Actions: https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
-        // - GitLab CI/CD: https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
-        // - CircleCI: https://circleci.com/docs/variables/#built-in-environment-variables
-        // - many others
-        //
         // In CI, if buck2 got run from an admin shell, we need not worry that a
         // subsequent invocation might come from a non-admin shell. It almost
         // certainly will not.
-        //
-        // Internally, CI should be setting SANDCASTLE env var.
-        let is_ci = env::var_os("CI").as_deref() == Some(OsStr::new("true")) || is_sandcastle()?;
-
-        if !is_ci {
+        if !is_ci()? {
             tracing::warn!(
                 "You're running buck2 from an admin shell. Invocations from non-admin shells will likely fail going forward. To remediate, run `buck2 clean` in this admin shell, then switch to a non-admin shell."
             );
@@ -87,20 +67,21 @@ pub(crate) fn check_user_allowed() -> anyhow::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn check_user_allowed() -> anyhow::Result<()> {
+pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    use anyhow::Context;
     use buck2_core::fs::fs_util;
     use buck2_core::fs::paths::abs_path::AbsPath;
     use buck2_core::soft_error;
+    use buck2_error::BuckErrorContext;
 
     #[derive(Debug, buck2_error::Error)]
     #[error("buck2 is not allowed to run as root (unless home dir is owned by root)")]
+    #[buck2(tag = Input)]
     struct RootError;
 
     if nix::unistd::geteuid().is_root() {
-        let home_dir = dirs::home_dir().context("home dir not found")?;
+        let home_dir = dirs::home_dir().buck_error_context("home dir not found")?;
         if let Ok(home_dir) = AbsPath::new(&home_dir) {
             let home_dir_metadata = fs_util::metadata(home_dir)?;
             if home_dir_metadata.uid() != 0 {

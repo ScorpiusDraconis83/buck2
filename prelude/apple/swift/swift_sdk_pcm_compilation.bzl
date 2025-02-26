@@ -12,6 +12,7 @@ load(
     ":swift_debug_info_utils.bzl",
     "extract_and_merge_clang_debug_infos",
 )
+load(":swift_sdk_flags.bzl", "get_sdk_flags")
 load(":swift_toolchain_types.bzl", "SdkUncompiledModuleInfo", "SwiftCompiledModuleInfo", "SwiftCompiledModuleTset", "WrappedSdkCompiledModuleInfo")
 
 def get_shared_pcm_compilation_args(module_name: str) -> cmd_args:
@@ -44,6 +45,15 @@ def get_shared_pcm_compilation_args(module_name: str) -> cmd_args:
         # to avoid serializing it as an absolute path.
         "-Xcc",
         "-working-directory=",
+        # AssetsLibrary is shipping with a #warning, which we shouldn't error on when compiling
+        # the SDK module. I don't think this is actually avoidable or removable until the next xcode major version
+        "-Xcc",
+        "-Wno-error=#warnings",
+        # When compiling PCMs with the new Swift driver, we need to manually set -file-compilation-dir.
+        # If not defined, the driver will append this path automatically,
+        # resulting in the emission of absolute paths in the PCMs.
+        "-file-compilation-dir",
+        ".",
     ])
 
     cmd.add(get_disable_pch_validation_flags())
@@ -86,6 +96,7 @@ def _add_sdk_module_search_path(cmd, uncompiled_sdk_module_info, apple_toolchain
 
 def get_swift_sdk_pcm_anon_targets(
         ctx: AnalysisContext,
+        enable_cxx_interop: bool,
         uncompiled_sdk_deps: list[Dependency],
         swift_cxx_args: list[str]):
     # We include the Swift deps here too as we need
@@ -93,6 +104,7 @@ def get_swift_sdk_pcm_anon_targets(
     return [
         (_swift_sdk_pcm_compilation, {
             "dep": module_dep,
+            "enable_cxx_interop": enable_cxx_interop,
             "name": module_dep.label,
             "swift_cxx_args": swift_cxx_args,
             "_apple_toolchain": ctx.attrs._apple_toolchain,
@@ -122,7 +134,7 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
         swift_toolchain = apple_toolchain.swift_toolchain_info
         cmd = cmd_args(swift_toolchain.compiler)
         cmd.add(uncompiled_sdk_module_info.partial_cmd)
-        cmd.add(["-sdk", swift_toolchain.sdk_path])
+        cmd.add(get_sdk_flags(ctx))
         cmd.add(swift_toolchain.compiler_flags)
 
         if swift_toolchain.resource_dir:
@@ -139,7 +151,7 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
                 "-I.",
             ])
 
-        cmd.add(sdk_deps_tset.project_as_args("clang_deps"))
+        cmd.add(sdk_deps_tset.project_as_args("clang_module_file_flags"))
 
         expanded_modulemap_path_cmd = expand_relative_prefixed_sdk_path(
             cmd_args(swift_toolchain.sdk_path),
@@ -168,6 +180,29 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
 
         cmd.add(ctx.attrs.swift_cxx_args)
 
+        if ctx.attrs.enable_cxx_interop:
+            # The stdlib headers have deprecation warnings set when targeting
+            # more recent versions. These warnings get serialized in the
+            # modules and make it impossible to import the std module, so
+            # suppress them during compilation instead.
+            cmd.add([
+                "-Xcc",
+                "-D_LIBCPP_DISABLE_DEPRECATION_WARNINGS",
+            ])
+
+            if module_name == "Darwin":
+                # The Darwin module requires special handling with cxx interop
+                # to ensure that it does not include the c++ headers. The module
+                # is marked with [no_undeclared_includes] which will prevent
+                # including headers declared in other modulemaps. So that the
+                # cxx modules are visible we need to pass the module map path
+                # without the corresponding module file, which we cannot build
+                # until the Darwin module is available.
+                cmd.add([
+                    "-Xcc",
+                    cmd_args(swift_toolchain.sdk_path, format = "-fmodule-map-file={}/usr/include/c++/v1/module.modulemap"),
+                ])
+
         _add_sdk_module_search_path(cmd, uncompiled_sdk_module_info, apple_toolchain)
 
         ctx.actions.run(
@@ -179,9 +214,9 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
         )
 
         # Construct the args needed to be passed to the clang importer
-        clang_importer_args = cmd_args()
-        clang_importer_args.add("-Xcc")
-        clang_importer_args.add(
+        clang_deps_args = cmd_args()
+        clang_deps_args.add("-Xcc")
+        clang_deps_args.add(
             cmd_args(
                 [
                     "-fmodule-file=",
@@ -192,8 +227,8 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
                 delimiter = "",
             ),
         )
-        clang_importer_args.add("-Xcc")
-        clang_importer_args.add(
+        clang_deps_args.add("-Xcc")
+        clang_deps_args.add(
             cmd_args(
                 [
                     "-fmodule-map-file=",
@@ -204,11 +239,13 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
         )
 
         compiled_sdk = SwiftCompiledModuleInfo(
-            clang_importer_args = clang_importer_args,
+            clang_module_file_args = clang_deps_args,
             is_framework = uncompiled_sdk_module_info.is_framework,
+            is_sdk_module = True,
             is_swiftmodule = False,
             module_name = module_name,
             output_artifact = pcm_output,
+            clang_modulemap = expanded_modulemap_path_cmd,
         )
 
         return [
@@ -220,9 +257,11 @@ def _swift_sdk_pcm_compilation_impl(ctx: AnalysisContext) -> [Promise, list[Prov
         ]
 
     # Compile the transitive clang module deps of this target.
+    deps = ctx.attrs.dep[SdkUncompiledModuleInfo].cxx_deps if ctx.attrs.enable_cxx_interop else ctx.attrs.dep[SdkUncompiledModuleInfo].deps
     clang_module_deps = get_swift_sdk_pcm_anon_targets(
         ctx,
-        ctx.attrs.dep[SdkUncompiledModuleInfo].deps,
+        ctx.attrs.enable_cxx_interop,
+        deps,
         ctx.attrs.swift_cxx_args,
     )
 
@@ -232,6 +271,7 @@ _swift_sdk_pcm_compilation = rule(
     impl = _swift_sdk_pcm_compilation_impl,
     attrs = {
         "dep": attrs.dep(),
+        "enable_cxx_interop": attrs.bool(),
         "swift_cxx_args": attrs.list(attrs.string(), default = []),
         "_apple_toolchain": attrs.dep(),
     },

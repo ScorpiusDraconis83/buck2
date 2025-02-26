@@ -31,8 +31,7 @@ use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::action_identity::ReActionIdentity;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
-use buck2_execute::re::remote_action_result::RemoteActionResult;
-use buck2_execute::re::remote_action_result::RemoteDepFileResult;
+use buck2_execute::re::remote_action_result::ActionCacheResult;
 use buck2_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use prost::Message;
@@ -79,7 +78,7 @@ async fn query_action_cache_and_download_result(
     action_digest: &ActionDigest,
     command: &PreparedCommand<'_, '_>,
     manager: CommandExecutionManager,
-    cancellations: &CancellationContext<'_>,
+    cancellations: &CancellationContext,
     upload_all_actions: bool,
     log_action_keys: bool,
     details: RemoteCommandExecutionDetails,
@@ -102,6 +101,7 @@ async fn query_action_cache_and_download_result(
     )
     .await;
 
+    let identity = None; // TODO(#503): implement this
     if upload_all_actions {
         match re_client
             .upload(
@@ -111,6 +111,7 @@ async fn query_action_cache_and_download_result(
                 ProjectRelativePath::empty(),
                 request.paths().input_directory(),
                 re_use_case,
+                identity,
                 digest_config,
             )
             .await
@@ -132,47 +133,37 @@ async fn query_action_cache_and_download_result(
 
     let action_exit_code = response.action_result.exit_code;
 
-    // Select the RemoteActionResult type so that we set the CommandExecutionKind properly.
-    let (response, dep_file_metadata): (Box<dyn RemoteActionResult>, Option<RemoteDepFile>) =
-        match &cache_type {
-            CacheType::ActionCache => (Box::new(response) as _, None),
-            CacheType::RemoteDepFileCache(_) => {
-                let metadata = response
-                    .action_result
-                    .execution_metadata
-                    .auxiliary_metadata
-                    .iter()
-                    .find(|k| k.type_url == REMOTE_DEP_FILE_KEY);
+    let dep_file_metadata: Option<RemoteDepFile> = match &cache_type {
+        CacheType::ActionCache => None,
+        CacheType::RemoteDepFileCache(_) => {
+            let metadata = response
+                .action_result
+                .execution_metadata
+                .auxiliary_metadata
+                .iter()
+                .find(|k| k.type_url == REMOTE_DEP_FILE_KEY);
 
-                if metadata.is_none() {
-                    // No entry found
-                    return ControlFlow::Continue(manager);
-                }
-                let dep_file_entry = match RemoteDepFile::decode(metadata.unwrap().value.as_slice())
-                {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        return ControlFlow::Break(manager.error("remote_dep_file", e));
-                    }
-                };
-                (
-                    Box::new(RemoteDepFileResult(response)) as _,
-                    Some(dep_file_entry),
-                )
+            if metadata.is_none() {
+                // No entry found
+                return ControlFlow::Continue(manager);
             }
-        };
-
-    let action_key = if log_action_keys {
-        let identity = ReActionIdentity::new(
-            command.target,
-            re_action_key.as_deref(),
-            command.request.paths(),
-        );
-        Some(identity.action_key)
-    } else {
-        None
+            let dep_file_entry = match RemoteDepFile::decode(metadata.unwrap().value.as_slice()) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return ControlFlow::Break(manager.error("remote_dep_file", e));
+                }
+            };
+            Some(dep_file_entry)
+        }
     };
 
+    let identity = ReActionIdentity::new(
+        command.target,
+        re_action_key.as_deref(),
+        command.request.paths(),
+    );
+
+    let response = ActionCacheResult(response, cache_type.to_proto());
     let res = download_action_results(
         request,
         materializer.as_ref(),
@@ -180,9 +171,15 @@ async fn query_action_cache_and_download_result(
         re_use_case,
         digest_config,
         manager,
+        &identity,
         buck2_data::CacheHit {
             action_digest: digest.to_string(),
-            action_key,
+            action_key: if log_action_keys {
+                Some(identity.action_key.clone())
+            } else {
+                None
+            },
+            cache_type: cache_type.to_proto().into(),
         }
         .into(),
         request.paths(),
@@ -194,6 +191,8 @@ async fn query_action_cache_and_download_result(
         action_exit_code,
         artifact_fs,
         false,
+        None,
+        None,
     )
     .await;
 
@@ -212,6 +211,7 @@ async fn query_action_cache_and_download_result(
                 command.request.all_args_str(),
                 action_digest,
             );
+            res.action_result = Some(response.0.action_result);
         }
     }
 
@@ -227,13 +227,13 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
         cancellations: &CancellationContext,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
         let action_digest = &command.prepared_action.action_and_blobs.action;
-        let details = RemoteCommandExecutionDetails {
-            action_digest: action_digest.dupe(),
-            session_id: self.re_client.get_session_id().await.ok(),
-            use_case: self.re_use_case,
-            platform: command.prepared_action.platform.clone(),
-            remote_dep_file_key: *command.request.remote_dep_file_key(),
-        };
+        let details = RemoteCommandExecutionDetails::new(
+            action_digest.dupe(),
+            *command.request.remote_dep_file_key(),
+            self.re_client.get_session_id().await.ok(),
+            self.re_use_case,
+            &command.prepared_action.platform,
+        );
         let cache_type = CacheType::ActionCache;
         let manager = manager.with_execution_kind(command_execution_kind_for_cache_type(
             &cache_type,
@@ -298,13 +298,13 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
 
         let cache_type = CacheType::RemoteDepFileCache(remote_dep_file_key);
         let action_digest = remote_dep_file_key.dupe().coerce::<ActionDigestKind>();
-        let details = RemoteCommandExecutionDetails {
-            action_digest: action_digest.dupe(),
-            session_id: self.re_client.get_session_id().await.ok(),
-            use_case: self.re_use_case,
-            platform: command.prepared_action.platform.clone(),
-            remote_dep_file_key: Some(remote_dep_file_key.dupe()),
-        };
+        let details = RemoteCommandExecutionDetails::new(
+            action_digest.dupe(),
+            Some(remote_dep_file_key.dupe()),
+            self.re_client.get_session_id().await.ok(),
+            self.re_use_case,
+            &command.prepared_action.platform,
+        );
         let manager = manager.with_execution_kind(command_execution_kind_for_cache_type(
             &cache_type,
             details.clone(),

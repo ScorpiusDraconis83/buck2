@@ -10,53 +10,102 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use anyhow::Context;
 use buck2_cli_proto::daemon_api_client::*;
 use buck2_cli_proto::*;
+use buck2_data::error::ErrorTag;
+use buck2_error::buck2_error;
 use buck2_wrapper_common::kill;
-use sysinfo::Pid;
-use sysinfo::PidExt;
-use sysinfo::ProcessExt;
+use buck2_wrapper_common::pid::Pid;
 use sysinfo::ProcessRefreshKind;
 use sysinfo::System;
-use sysinfo::SystemExt;
 use tonic::codegen::InterceptedService;
 use tonic::transport::Channel;
 use tonic::Request;
 
+use crate::daemon::client::connect::buckd_startup_timeout;
 use crate::daemon::client::connect::BuckAddAuthTokenInterceptor;
-
-#[derive(Debug, thiserror::Error)]
-enum KillError {
-    #[error("Daemon pid {} did not die after kill within {:.1}s (status: {})", _0, _1.as_secs_f32(), _2)]
-    DidNotDie(u32, Duration, String),
-}
+use crate::daemon::client::connect::BuckdProcessInfo;
+use crate::daemon::client::BuckdLifecycleLock;
 
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 /// Kill request does not wait for the process to exit.
 const KILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const FORCE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub struct KillResponse {
-    pid: u32,
-}
+pub async fn kill_command_impl(
+    lifecycle_lock: &BuckdLifecycleLock,
+    reason: &str,
+) -> buck2_error::Result<()> {
+    let process = match BuckdProcessInfo::load(lifecycle_lock.daemon_dir()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("No BuckdProcessInfo: {:#}", e);
+            crate::eprintln!("no buckd server running")?;
+            return Ok(());
+        }
+    };
 
-impl KillResponse {
-    pub fn log(&self) -> anyhow::Result<()> {
-        crate::eprintln!("Buck2 daemon pid {} has exited", self.pid)?;
-        Ok(())
+    let buckd = tokio::time::timeout(buckd_startup_timeout()?, async {
+        process.create_channel().await?.upgrade().await
+    })
+    .await;
+
+    let pid = match buckd {
+        Ok(Ok(mut buckd)) => {
+            crate::eprintln!("killing buckd server")?;
+            Some(buckd.kill(reason).await?)
+        }
+        Ok(Err(e)) => {
+            // No time out: we just errored out. This is likely indicative that there is no
+            // buckd (i.e. our connection got rejected), so let's check for this and then
+            // provide some information.
+            let e: buck2_error::Error = e.into();
+
+            // TODO(minglunli): Look into checking for explicit 'Connection Refused' or something more
+            // concretely pointing to `no server running` instead of all transport errors
+            if e.has_tag(ErrorTag::ServerTransportError) {
+                // OK, looks like the server
+                tracing::debug!("Connect failed with a Tonic error: {:#}", e);
+                crate::eprintln!("no buckd server running")?;
+            } else {
+                crate::eprintln!(
+                    "unexpected error connecting to Buck2: {:#} \
+                            (no buckd server running?)",
+                    e
+                )?;
+            }
+
+            None
+        }
+        Err(e) => {
+            tracing::debug!("Connect timed out: {:#}", e);
+
+            // If we timeout, then considering the generous timeout we give ourselves, then
+            // that must mean we're not getting a reply back from Buck, but that we did
+            // succeed in opening a connection to it (because if we didn't, we'd have
+            // errored out).
+            //
+            // This means the socket is probably open. We can reasonably got and kill this
+            // process if both the PID and the port exist.
+            crate::eprintln!("killing unresponsive buckd server")?;
+            process.hard_kill().await?;
+            Some(process.pid()?)
+        }
+    };
+
+    if let Some(pid) = pid {
+        crate::eprintln!("Buck2 daemon pid {} has exited", pid)?;
     }
+
+    Ok(())
 }
 
-pub async fn kill(
+pub(crate) async fn kill(
     client: &mut DaemonApiClient<InterceptedService<Channel, BuckAddAuthTokenInterceptor>>,
     info: &DaemonProcessInfo,
     reason: &str,
-) -> anyhow::Result<KillResponse> {
-    let pid = info.pid;
-    let pid: u32 = pid
-        .try_into()
-        .with_context(|| format!("Integer overflow converting pid {}", pid))?;
+) -> buck2_error::Result<()> {
+    let pid = Pid::from_i64(info.pid)?;
     let callers = get_callers_for_kill();
 
     tracing::debug!("Killing daemon with PID {}", pid);
@@ -74,7 +123,7 @@ pub async fn kill(
             match inner_result {
                 Ok(_) => loop {
                     if !kill::process_exists(pid)? {
-                        return Ok(KillResponse { pid });
+                        return Ok(());
                     }
                     if time_req_sent.elapsed() > GRACEFUL_SHUTDOWN_TIMEOUT {
                         crate::eprintln!(
@@ -108,82 +157,69 @@ pub async fn kill(
     hard_kill_impl(pid, time_req_sent, time_to_kill).await
 }
 
-pub async fn hard_kill(info: &DaemonProcessInfo) -> anyhow::Result<KillResponse> {
-    let pid = info
-        .pid
-        .try_into()
-        .with_context(|| format!("Integer overflow converting pid {}", info.pid))?;
+pub(crate) async fn hard_kill(info: &DaemonProcessInfo) -> buck2_error::Result<()> {
+    let pid = Pid::from_i64(info.pid)?;
 
     hard_kill_impl(pid, Instant::now(), FORCE_SHUTDOWN_TIMEOUT).await
 }
 
+pub(crate) async fn hard_kill_until(
+    info: &DaemonProcessInfo,
+    deadline: Instant,
+) -> buck2_error::Result<()> {
+    let pid = Pid::from_i64(info.pid)?;
+
+    let now = Instant::now();
+    hard_kill_impl(pid, now, deadline.saturating_duration_since(now)).await
+}
+
 async fn hard_kill_impl(
-    pid: u32,
+    pid: Pid,
     start_at: Instant,
     deadline: Duration,
-) -> anyhow::Result<KillResponse> {
+) -> buck2_error::Result<()> {
     tracing::info!(
         "Killing PID {} with status {}",
         pid,
         kill::get_sysinfo_status(pid)
+            .map(|s| s.to_string())
             .as_deref()
             .unwrap_or("<unknown>")
     );
 
-    let handle = kill::kill(pid)?;
+    let Some(handle) = kill::kill(pid)? else {
+        return Ok(());
+    };
     let timestamp_after_kill = Instant::now();
     while start_at.elapsed() < deadline {
         if handle.has_exited()? {
-            return Ok(KillResponse { pid });
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Last chance: we do logging this time.
-    let status = kill::get_sysinfo_status(pid);
+    let status = kill::get_sysinfo_status(pid).map(|s| s.to_string());
     let status = status.unwrap_or_else(|| "<unknown>".to_owned());
     if handle.has_exited()? {
-        return Ok(KillResponse { pid });
+        return Ok(());
     }
 
-    Err(KillError::DidNotDie(pid, timestamp_after_kill.elapsed(), status).into())
-}
-
-#[cfg(unix)]
-mod os_specific {
-
-    use std::time::Duration;
-
-    use sysinfo::Process;
-    use sysinfo::ProcessExt;
-
-    pub(super) fn process_creation_time(process: &Process) -> Option<Duration> {
-        // Returns process creation time with 1 second precision.
-        Some(Duration::from_secs(process.start_time()))
-    }
-}
-
-#[cfg(windows)]
-mod os_specific {
-    use std::time::Duration;
-
-    use sysinfo::PidExt;
-    use sysinfo::Process;
-    use sysinfo::ProcessExt;
-
-    pub(super) fn process_creation_time(process: &Process) -> Option<Duration> {
-        buck2_wrapper_common::kill::os_specific::process_creation_time(process.pid().as_u32())
-    }
+    let elapsed_s = timestamp_after_kill.elapsed().as_secs_f32();
+    Err(buck2_error!(
+        ErrorTag::DaemonWontDieFromKill,
+        "Daemon pid {pid} did not die after kill within {elapsed_s:.1}s (status: {status})"
+    ))
 }
 
 fn get_callers_for_kill() -> Vec<String> {
     /// Add a process to our parts and return its parent PID.
     fn push_process(
-        pid: Pid,
+        pid: sysinfo::Pid,
         creation_time: Duration,
         system: &mut System,
         process_tree: &mut Vec<String>,
-    ) -> Option<(Pid, Duration)> {
+    ) -> Option<(sysinfo::Pid, Duration)> {
         // Specifics about this process need to be refreshed by this time.
         let proc = system.process(pid)?;
         let title =
@@ -192,7 +228,7 @@ fn get_callers_for_kill() -> Vec<String> {
         let parent_pid = proc.parent()?;
         system.refresh_process_specifics(parent_pid, ProcessRefreshKind::new());
         let parent_proc = system.process(parent_pid)?;
-        let parent_creation_time = os_specific::process_creation_time(parent_proc)?;
+        let parent_creation_time = kill::process_creation_time(parent_proc)?;
         if parent_creation_time <= creation_time {
             Some((parent_pid, parent_creation_time))
         } else {
@@ -203,11 +239,11 @@ fn get_callers_for_kill() -> Vec<String> {
     let mut system = System::new();
     let mut process_tree = Vec::new();
 
-    let pid = Pid::from_u32(std::process::id());
+    let pid = sysinfo::Pid::from_u32(std::process::id());
     system.refresh_process_specifics(pid, ProcessRefreshKind::new());
     let mut curr = system
         .process(pid)
-        .and_then(|proc| Some((pid, os_specific::process_creation_time(proc)?)));
+        .and_then(|proc| Some((pid, kill::process_creation_time(proc)?)));
     while let Some((pid, creation_time)) = curr {
         curr = push_process(pid, creation_time, &mut system, &mut process_tree);
     }

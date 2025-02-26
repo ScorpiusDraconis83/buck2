@@ -99,9 +99,34 @@ fn do_render(
     let mut parts = Vec::new();
     if let Some(buck2_rss) = snapshot.buck2_rss {
         parts.push(format!("RSS = {}", HumanizedBytes::new(buck2_rss)));
+    } else {
+        // buck2_rss is only available on Linux. On other platforms, buck2 keeps track of buck2_max_rss so show that instead.
+        parts.push(format!(
+            "Max RSS = {}",
+            HumanizedBytes::new(snapshot.buck2_max_rss)
+        ));
     }
-    if let Some(cpu) = two_snapshots.cpu_percents() {
-        parts.push(format!("CPU = {}%", cpu));
+
+    // We prefer to display malloc_bytes_active instead of malloc_bytes_allocated
+    // because it represents active pages which is more than allocated and better reflects actual memory use of buck2.
+    if let Some(malloc_bytes_active) = snapshot.malloc_bytes_active {
+        parts.push(format!(
+            "Malloc active = {}",
+            HumanizedBytes::new(malloc_bytes_active)
+        ));
+    }
+    let user_cpu_percents = two_snapshots.user_cpu_percents();
+    let system_cpu_percents = two_snapshots.system_cpu_percents();
+    if user_cpu_percents.is_some() || system_cpu_percents.is_some() {
+        let mut cpu_str_parts = vec!["buckd CPU".to_owned()];
+        if let Some(p) = user_cpu_percents {
+            cpu_str_parts.push(format!("user = {}%", p));
+        }
+        if let Some(p) = system_cpu_percents {
+            cpu_str_parts.push(format!("system = {}%", p));
+        }
+        let cpu_str = cpu_str_parts.join("  ");
+        parts.push(cpu_str);
     }
     if snapshot.deferred_materializer_queue_size > 0 {
         parts.push(format!(
@@ -155,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_words_to_lines() {
-        assert_eq!(vec![String::new(); 0], words_to_lines(vec![], 5));
+        assert_eq!(Vec::<String>::new(), words_to_lines(vec![], 5));
         assert_eq!(
             vec!["ab".to_owned()],
             words_to_lines(vec!["ab".to_owned()], 5)

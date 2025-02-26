@@ -7,12 +7,17 @@
  * of this source tree.
  */
 
-use anyhow::Context;
+use buck2_error::BuckErrorContext;
+use buck2_util::tokio_runtime::new_tokio_runtime;
 
 /// Tokio runtime used by the client commands.
-pub fn client_tokio_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
+pub fn client_tokio_runtime() -> buck2_error::Result<tokio::runtime::Runtime> {
+    // Do not use current thread because current thread may have too low thread size.
+    new_tokio_runtime("buck2-cli")
+        // Tokio creates this number of threads,
+        // and creating too many threads for short commands is expensive.
+        .worker_threads(1)
         .enable_all()
         .build()
-        .context("Building tokio runtime")
+        .buck_error_context("Building tokio runtime")
 }

@@ -5,15 +5,44 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@prelude//:artifacts.bzl", "ArtifactGroupInfo")
+load("@prelude//cxx:headers.bzl", "prepare_headers")
+load(
+    "@prelude//cxx:preprocessor.bzl",
+    "CPreprocessor",
+    "CPreprocessorArgs",
+)
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
 load("@prelude//utils:utils.bzl", "value_or")
-load(":coverage.bzl", "GoCoverageMode")
+
+# Information about a package for GOPACKAGESDRIVER
+GoPackageInfo = provider(
+    fields = {
+        "build_out": provider_field(Artifact),
+        "cgo_gen_dir": provider_field(Artifact),
+        "go_list_out": provider_field(Artifact),
+        "package_name": provider_field(str),
+        "package_root": provider_field(str),
+        # Full list of package source files
+        # including generated and files of the package under test
+        "srcs": provider_field(list[Artifact]),
+    },
+)
 
 GoPkg = record(
-    cgo = field(bool, default = False),
+    # We have to produce allways shared (PIC) and non-shared (non-PIC) archives
     pkg = field(Artifact),
-    pkg_with_coverage = field(dict[GoCoverageMode, (Artifact, cmd_args)]),
+    pkg_shared = field(Artifact),
+    coverage_vars = field(cmd_args),
+    test_go_files = field(cmd_args),
+)
+
+GoStdlib = provider(
+    fields = {
+        "importcfg": provider_field(Artifact),
+        "importcfg_shared": provider_field(Artifact),
+        "pkgdir": provider_field(Artifact),
+        "pkgdir_shared": provider_field(Artifact),
+    },
 )
 
 def go_attr_pkg_name(ctx: AnalysisContext) -> str:
@@ -22,7 +51,7 @@ def go_attr_pkg_name(ctx: AnalysisContext) -> str:
     """
     return value_or(ctx.attrs.package_name, ctx.label.package)
 
-def merge_pkgs(pkgss: list[dict[str, typing.Any]]) -> dict[str, typing.Any]:
+def merge_pkgs(pkgss: list[dict[str, GoPkg]]) -> dict[str, GoPkg]:
     """
     Merge mappings of packages into a single mapping, throwing an error on
     conflicts.
@@ -31,65 +60,62 @@ def merge_pkgs(pkgss: list[dict[str, typing.Any]]) -> dict[str, typing.Any]:
     all_pkgs = {}
 
     for pkgs in pkgss:
-        for name, path in pkgs.items():
-            if name in pkgs and pkgs[name] != path:
-                fail("conflict for package {!r}: {} and {}".format(name, path, all_pkgs[name]))
-            all_pkgs[name] = path
+        for name, pkg in pkgs.items():
+            if name in all_pkgs and all_pkgs[name] != pkg:
+                fail("conflict for package {!r}: {} and {}".format(name, pkg, all_pkgs[name]))
+            all_pkgs[name] = pkg
 
     return all_pkgs
 
-def pkg_artifact(pkg: GoPkg, coverage_mode: [GoCoverageMode, None]) -> Artifact:
-    if coverage_mode:
-        artifact = pkg.pkg_with_coverage
-        return artifact[coverage_mode][0]
-    return pkg.pkg
-
-def pkg_coverage_vars(name: str, pkg: GoPkg, coverage_mode: [GoCoverageMode, None]) -> [cmd_args, None]:
-    if coverage_mode:
-        artifact = pkg.pkg_with_coverage
-        if coverage_mode not in artifact:
-            fail("coverage variables don't exist for {}".format(name))
-        return artifact[coverage_mode][1]
-    fail("coverage variables were requested but coverage_mode is None")
-
-def pkg_artifacts(pkgs: dict[str, GoPkg], coverage_mode: [GoCoverageMode, None] = None) -> dict[str, Artifact]:
+def pkg_artifacts(pkgs: dict[str, GoPkg], shared: bool) -> dict[str, Artifact]:
     """
     Return a map package name to a `shared` or `static` package artifact.
     """
     return {
-        name: pkg_artifact(pkg, coverage_mode)
+        name: pkg.pkg_shared if shared else pkg.pkg
         for name, pkg in pkgs.items()
     }
 
-def stdlib_pkg_artifacts(toolchain: GoToolchainInfo, shared: bool = False, non_cgo: bool = False) -> dict[str, Artifact]:
-    """
-    Return a map package name to a `shared` or `static` package artifact of stdlib.
-    """
+def make_importcfg(
+        ctx: AnalysisContext,
+        prefix_name: str,
+        own_pkgs: dict[str, GoPkg],
+        shared: bool) -> cmd_args:
+    go_toolchain = ctx.attrs._go_toolchain[GoToolchainInfo]
+    stdlib = ctx.attrs._go_stdlib[GoStdlib]
+    suffix = "__shared" if shared else ""  # suffix to make artifacts unique
 
-    # shared == True && non_cgo == True is not supported yet,
-    # we'll temporarily use non_cgo if both flags are true, this will be wixed with on-demand building of stdlib.
+    content = []
+    pkg_artifacts_map = pkg_artifacts(own_pkgs, shared)
+    for name_, pkg_ in pkg_artifacts_map.items():
+        # Hack: we use cmd_args get "artifact" valid path and write it to a file.
+        content.append(cmd_args("packagefile ", name_, "=", pkg_, delimiter = ""))
 
-    if non_cgo:
-        prebuilt_stdlib = toolchain.prebuilt_stdlib_noncgo
-    elif shared:
-        prebuilt_stdlib = toolchain.prebuilt_stdlib_shared
-    else:
-        prebuilt_stdlib = toolchain.prebuilt_stdlib
+    own_importcfg = ctx.actions.declare_output("{}{}.importcfg".format(prefix_name, suffix))
+    ctx.actions.write(own_importcfg, content)
 
-    stdlib_pkgs = prebuilt_stdlib[ArtifactGroupInfo].artifacts
+    final_importcfg = ctx.actions.declare_output("{}{}.final.importcfg".format(prefix_name, suffix))
+    ctx.actions.run(
+        [
+            go_toolchain.concat_files,
+            "--output",
+            final_importcfg.as_output(),
+            stdlib.importcfg_shared if shared else stdlib.importcfg,
+            own_importcfg,
+        ],
+        category = "concat_importcfgs",
+        identifier = prefix_name + suffix,
+    )
 
-    if len(stdlib_pkgs) == 0:
-        fail("Stdlib for current platfrom is missing from toolchain.")
+    return cmd_args(final_importcfg, hidden = [stdlib.pkgdir_shared if shared else stdlib.pkgdir, pkg_artifacts_map.values()])
 
-    pkgs = {}
-    for pkg in stdlib_pkgs:
-        # remove first directory like `pgk`
-        _, _, temp_path = pkg.short_path.partition("/")
-
-        # remove second directory like `darwin_amd64`
-        # now we have name like `net/http.a`
-        _, _, pkg_relpath = temp_path.partition("/")
-        name = pkg_relpath.removesuffix(".a")  # like `net/http`
-        pkgs[name] = pkg
-
-    return pkgs
+# Return "_cgo_export.h" to expose exported C declarations to non-Go rules
+def cgo_exported_preprocessor(ctx: AnalysisContext, pkg_info: GoPackageInfo) -> CPreprocessor:
+    return CPreprocessor(args = CPreprocessorArgs(args = [
+        "-I",
+        prepare_headers(
+            ctx,
+            {"{}/{}.h".format(ctx.label.package, ctx.label.name): pkg_info.cgo_gen_dir.project("_cgo_export.h")},
+            "cgo-exported-headers",
+        ).include_path,
+    ]))

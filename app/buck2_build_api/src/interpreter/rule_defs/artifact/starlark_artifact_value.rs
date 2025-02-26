@@ -13,11 +13,11 @@ use std::fs::File;
 use std::io::BufReader;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_core::fs::fs_util;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_error::BuckErrorContext;
 use gazebo::prelude::*;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
@@ -66,6 +66,7 @@ impl<'v> StarlarkValue<'v> for StarlarkArtifactValue {
 }
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum JsonError {
     #[error("JSON number is outside the bounds that Starlark supports, `{0}`")]
     NumberOutOfBounds(String),
@@ -81,8 +82,8 @@ fn json_convert<'v>(v: serde_json::Value, heap: &'v Heap) -> starlark::Result<Va
             } else if let Some(x) = x.as_f64() {
                 Ok(heap.alloc(x))
             } else {
-                Err(starlark::Error::new_other(JsonError::NumberOutOfBounds(
-                    x.to_string(),
+                Err(starlark::Error::new_other(buck2_error::Error::from(
+                    JsonError::NumberOutOfBounds(x.to_string()),
                 )))
             }
         }
@@ -100,17 +101,18 @@ fn json_convert<'v>(v: serde_json::Value, heap: &'v Heap) -> starlark::Result<Va
 
 #[starlark_module]
 fn artifact_value_methods(builder: &mut MethodsBuilder) {
-    fn read_string(this: &StarlarkArtifactValue) -> anyhow::Result<String> {
+    fn read_string(this: &StarlarkArtifactValue) -> starlark::Result<String> {
         let path = this.fs.resolve(&this.path);
-        fs_util::read_to_string(path)
+        Ok(fs_util::read_to_string(path).map_err(buck2_error::Error::from)?)
     }
 
     fn read_json<'v>(this: &StarlarkArtifactValue, heap: &'v Heap) -> starlark::Result<Value<'v>> {
         let path = this.fs.resolve(&this.path);
-        let file = File::open(&path).with_context(|| format!("Error opening file `{}`", path))?;
+        let file = File::open(&path)
+            .with_buck_error_context(|| format!("Error opening file `{}`", path))?;
         let reader = BufReader::new(file);
         let value: serde_json::Value = serde_json::from_reader(reader)
-            .with_context(|| format!("Error parsing JSON file `{}`", path))?;
+            .with_buck_error_context(|| format!("Error parsing JSON file `{}`", path))?;
         json_convert(value, heap)
     }
 }
@@ -122,7 +124,6 @@ pub(crate) fn register_artifact_value(globals: &mut GlobalsBuilder) {
 
 #[cfg(test)]
 mod tests {
-    use starlark::values::Heap;
 
     use super::*;
 

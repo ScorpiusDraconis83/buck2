@@ -5,6 +5,7 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//decls:test_common.bzl", "test_common")
 load(":common.bzl", "buck", "prelude_rule")
 load(":re_test_common.bzl", "re_test_common")
 
@@ -160,6 +161,7 @@ sh_test = prelude_rule(
     further = None,
     attrs = (
         # @unsorted-dict-items
+        buck.inject_test_env_arg() |
         {
             "test": attrs.option(attrs.one_of(attrs.dep(), attrs.source()), default = None, doc = """
                 Either the path to the script (relative to the build file), or a `build target`.
@@ -192,7 +194,9 @@ sh_test = prelude_rule(
             "run_env": attrs.dict(key = attrs.string(), value = attrs.string(), sorted = False, default = {}),
             "run_test_separately": attrs.bool(default = False),
             "test_rule_timeout_ms": attrs.option(attrs.int(), default = None),
-        } | re_test_common.test_args()
+        } | test_common.attributes() |
+        re_test_common.test_args() |
+        test_common.attributes()
     ),
 )
 

@@ -7,13 +7,11 @@
  * of this source tree.
  */
 
-use std::sync::Arc;
-
-use buck2_core::buck_path::path::BuckPathRef;
-use buck2_core::configuration::transition::id::TransitionId;
+use buck2_core::package::source_path::SourcePathRef;
 use buck2_core::package::PackageLabel;
-use buck2_core::plugins::PluginKind;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::provider::label::ProvidersLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_node::attrs::attr_type::configuration_dep::ConfigurationDepKind;
 use buck2_node::attrs::attr_type::AttrType;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::traversal::CoercedAttrTraversal;
@@ -36,13 +34,14 @@ fn indented_within_view(spec: &WithinViewSpecification) -> String {
 }
 
 #[derive(Debug, buck2_error::Error)]
-#[buck2(user)]
+#[buck2(input)]
 enum CheckWithinViewError {
     #[error(
-        "Dependency `{}` is not within view (as specified by `within_view` attribute):\n{}",
+        "Target's `within_view` attribute does not allow dependency `{}`. Allowed dependencies:\n{}",
         _0,
         indented_within_view(_1)
     )]
+    #[buck2(tag = Visibility)]
     DepNotWithinView(TargetLabel, WithinViewSpecification),
 }
 
@@ -52,7 +51,7 @@ pub(crate) fn check_within_view(
     pkg: PackageLabel,
     attr_type: &AttrType,
     within_view: &WithinViewSpecification,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     if within_view == &WithinViewSpecification::PUBLIC {
         // Shortcut.
         return Ok(());
@@ -64,7 +63,7 @@ pub(crate) fn check_within_view(
     }
 
     impl<'x> WithinViewCheckTraversal<'x> {
-        fn check_dep_within_view(&self, dep: &TargetLabel) -> anyhow::Result<()> {
+        fn check_dep_within_view(&self, dep: &TargetLabel) -> buck2_error::Result<()> {
             if self.pkg == dep.pkg() || self.within_view.0.matches_target(dep) {
                 Ok(())
             } else {
@@ -77,48 +76,27 @@ pub(crate) fn check_within_view(
     }
 
     impl<'a, 'x> CoercedAttrTraversal<'a> for WithinViewCheckTraversal<'x> {
-        fn dep(&mut self, dep: &'a TargetLabel) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
+        fn dep(&mut self, dep: &ProvidersLabel) -> buck2_error::Result<()> {
+            self.check_dep_within_view(dep.target())
         }
 
-        fn plugin_dep(&mut self, dep: &'a TargetLabel, _kind: &PluginKind) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn exec_dep(&mut self, dep: &'a TargetLabel) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn toolchain_dep(&mut self, dep: &'a TargetLabel) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn transition_dep(
+        fn configuration_dep(
             &mut self,
-            dep: &'a TargetLabel,
-            _tr: &Arc<TransitionId>,
-        ) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn split_transition_dep(
-            &mut self,
-            dep: &'a TargetLabel,
-            _tr: &Arc<TransitionId>,
-        ) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn configuration_dep(&mut self, _dep: &'a TargetLabel) -> anyhow::Result<()> {
-            // Skip configuration deps.
+            dep: &ProvidersLabel,
+            t: ConfigurationDepKind,
+        ) -> buck2_error::Result<()> {
+            match t {
+                // Skip some configuration deps
+                ConfigurationDepKind::CompatibilityAttribute => (),
+                ConfigurationDepKind::SelectKey => (),
+                ConfigurationDepKind::ConfiguredDepPlatform => {
+                    self.check_dep_within_view(dep.target())?
+                }
+            }
             Ok(())
         }
 
-        fn platform_dep(&mut self, dep: &'a TargetLabel) -> anyhow::Result<()> {
-            self.check_dep_within_view(dep)
-        }
-
-        fn input(&mut self, _input: BuckPathRef) -> anyhow::Result<()> {
+        fn input(&mut self, _input: SourcePathRef) -> buck2_error::Result<()> {
             Ok(())
         }
     }

@@ -8,12 +8,14 @@
  */
 
 use buck2_client_ctx::client_ctx::ClientCommandContext;
+use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::exit_result::ExitResult;
 use buck2_core::soft_error;
 
 use crate::commands::log::replay::ReplayCommand;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Input)]
 enum DebugReplayCommandError {
     #[error("`buck2 debug replay` is deprecated. Use `buck2 log replay` instead.")]
     Deprecated,
@@ -28,10 +30,14 @@ pub struct DebugReplayCommand {
 impl DebugReplayCommand {
     pub(crate) fn exec(
         self,
-        matches: &clap::ArgMatches,
+        matches: BuckArgMatches<'_>,
         ctx: ClientCommandContext<'_>,
     ) -> ExitResult {
-        soft_error!("debug_replay", DebugReplayCommandError::Deprecated.into())?;
+        soft_error!(
+            "debug_replay",
+            DebugReplayCommandError::Deprecated.into(),
+            deprecation: true
+        )?;
         self.replay.exec(matches, ctx)
     }
 }

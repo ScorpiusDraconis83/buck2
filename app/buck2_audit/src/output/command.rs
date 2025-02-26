@@ -8,6 +8,7 @@
  */
 
 use async_trait::async_trait;
+use buck2_client_ctx::common::target_cfg::TargetCfgOptions;
 use buck2_client_ctx::common::CommonCommandOptions;
 use buck2_client_ctx::query_args::CommonAttributeArgs;
 
@@ -19,9 +20,6 @@ use crate::AuditSubcommand;
     about = "Query the action that produced the output artifact. Does not support BXL, test, scratch, or anon artifacts. If the configuration hash of the output path does not match the current platform configuration, the unconfigured target label will be returned."
 )]
 pub struct AuditOutputCommand {
-    #[clap(flatten)]
-    common_opts: CommonCommandOptions,
-
     #[clap(
         name = "OUTPUT_PATH",
         help = "The buck-out path to the build artifact, starting with `buck-out` and including the configuration platform."
@@ -33,6 +31,12 @@ pub struct AuditOutputCommand {
 
     #[clap(flatten)]
     pub query_attributes: CommonAttributeArgs,
+
+    #[clap(flatten)]
+    pub target_cfg: TargetCfgOptions,
+
+    #[clap(flatten)]
+    pub common_opts: CommonCommandOptions,
 }
 
 #[async_trait]

@@ -3,23 +3,27 @@ id: writing_rules
 title: Writing Rules
 ---
 
+import { FbInternalOnly } from 'docusaurus-plugin-internaldocs-fb/internal';
+
 This page describes how to write rules for Buck2 and explains the flow for
 implementing rules that are already defined in Buck1.
 
 For a list of the API functions available, see the
-[Build APIs](../../api/build/globals).
+[Build APIs](../../api/build).
 
-<!-- prettier-ignore -->
 :::note
-Rules such as `@fbcode_macros//build_defs:native_rules.bzl buck_genrule` are not actually rules, they are _macros_ (Starlark functions that eventually call out the underlying `genrule` _rule_). Macros in Buck2 are mostly compatible with Buck1 and should be written in the same way.
 
-<!-- prettier-ignore -->
+Rules such as `@fbcode_macros//build_defs:native_rules.bzl buck_genrule` are not
+actually rules, they are _macros_ (Starlark functions that eventually call out
+the underlying `genrule` _rule_). Macros in Buck2 are mostly compatible with
+Buck1 and should be written in the same way.
+
 :::
 
 ## Workflow by example
 
-The built-in Buck2 rules are stored in `fbsource` in `fbcode/buck2/prelude`. To
-add a rule for a language, say `pascal`:
+The built-in Buck2 rules are stored in the `prelude` folder in the buck2 repo.
+To add a rule for a language, say `pascal`:
 
 1. Look at
    [prelude/decls](https://github.com/facebook/buck2/blob/main/prelude/decls/)
@@ -45,11 +49,14 @@ add a rule for a language, say `pascal`:
 
 5. Now implement the rules (see the rest of this page).
 
-<!-- prettier-ignore -->
 :::note
-Before merging a diff, it's important that all your Starlark is warning free (if you don't want to set up Buck2 for local development, test it in CI). <FbInternalOnly>If you do set it up locally, see the `README.md` in the root of `fbcode/buck2`. Running `./test.py --lint-only` will confirm your Starlark code is warning free.</FbInternalOnly>
 
-<!-- prettier-ignore -->
+Before merging a diff, it's important that all your Starlark is warning free (if
+you don't want to set up Buck2 for local development, test it in CI).
+<FbInternalOnly>If you do set it up locally, see the `README.md` in the root of
+`fbcode/buck2`. Running `./test.py --lint-only` will confirm your Starlark code
+is warning free.</FbInternalOnly>
+
 :::
 
 ## Concepts and design
@@ -158,7 +165,7 @@ In many cases, it becomes apparent you need the transitive closure of all
 libraries (for example, the libraries and everything they depend upon), in which
 case, the standard pattern is to move to a provider of a list of `record` (see
 the
-[types.md](https://github.com/facebookexperimental/starlark-rust/blob/main/docs/types.md)
+[types.md](https://github.com/facebook/starlark-rust/blob/main/docs/types.md)
 document in GitHub) and the `flatten/dedupe` functions, defining it as:
 
 ```python
@@ -227,8 +234,7 @@ the rule is changed to write the command to a shell script first:
 
 ```python
 sh = ctx.actions.write("test.sh", ["cp", input, output])
-cmd = cmd_args(["sh",sh])
-cmd.hidden([input, output.as_output()])
+cmd = cmd_args(["sh",sh],hidden=[input, output.as_output()])
 ctx.actions.run(cmd)
 ```
 

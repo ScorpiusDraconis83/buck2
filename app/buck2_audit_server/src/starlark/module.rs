@@ -27,19 +27,19 @@ pub(crate) async fn server_execute(
     server_ctx: &dyn ServerCommandContextTrait,
     mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
     _client_ctx: ClientContext,
-) -> anyhow::Result<()> {
+) -> buck2_error::Result<()> {
     server_ctx
-        .with_dice_ctx(async move |server_ctx, dice_ctx| {
+        .with_dice_ctx(|server_ctx, mut dice_ctx| async move {
             let cell_resolver = dice_ctx.get_cell_resolver().await?;
-            let current_cell_path = cell_resolver.get_cell_path(server_ctx.working_dir())?;
+            let cwd = server_ctx.working_dir();
+            let current_cell_path = cell_resolver.get_cell_path(cwd)?;
             let current_cell = BuildFileCell::new(current_cell_path.cell());
-
-            let cell_alias_resolver = cell_resolver
-                .get(current_cell_path.cell())?
-                .cell_alias_resolver();
+            let cell_alias_resolver = dice_ctx
+                .get_cell_alias_resolver(current_cell_path.cell())
+                .await?;
 
             let import_path = parse_bzl_path_with_config(
-                cell_alias_resolver,
+                &cell_alias_resolver,
                 &command.import_path,
                 &ParseImportOptions {
                     relative_import_option: RelativeImports::Allow {

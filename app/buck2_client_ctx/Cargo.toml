@@ -16,6 +16,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }
+csv = { workspace = true }
 derivative = { workspace = true }
 derive_more = { workspace = true }
 dupe = { workspace = true }
@@ -25,7 +26,7 @@ futures = { workspace = true }
 gazebo = { workspace = true }
 hex = { workspace = true }
 httparse = { workspace = true }
-hyper = { workspace = true }
+humantime = { workspace = true }
 itertools = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
@@ -38,10 +39,10 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shlex = { workspace = true }
+strum = { workspace = true }
 sysinfo = { workspace = true }
 take_mut = { workspace = true }
 termwiz = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -60,7 +61,7 @@ buck2_error = { workspace = true }
 buck2_event_log = { workspace = true }
 buck2_event_observer = { workspace = true }
 buck2_events = { workspace = true }
-buck2_http = { workspace = true }
+buck2_health_check = { workspace = true }
 buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
 
@@ -73,7 +74,11 @@ winapi = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+indoc = { workspace = true }
 lsp-server = { workspace = true }
 maplit = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

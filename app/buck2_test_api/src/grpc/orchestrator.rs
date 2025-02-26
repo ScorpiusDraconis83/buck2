@@ -19,6 +19,7 @@ use buck2_downward_api_proto::downward_api_server;
 use buck2_downward_api_proto::ConsoleRequest;
 use buck2_downward_api_proto::ExternalEventRequest;
 use buck2_downward_api_proto::LogRequest;
+use buck2_error::BuckErrorContext;
 use buck2_events::dispatch::with_dispatcher_async;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_grpc::make_channel;
@@ -39,6 +40,7 @@ use buck2_test_proto::Testing;
 use dupe::Dupe;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
+use gazebo::prelude::VecExt;
 use host_sharing::HostSharingRequirements;
 use sorted_vector_map::SortedVectorMap;
 use tokio::io::AsyncRead;
@@ -50,7 +52,6 @@ use tracing::Level;
 use crate::data::ArgValue;
 use crate::data::ConfiguredTargetHandle;
 use crate::data::DeclaredOutput;
-use crate::data::DisplayMetadata;
 use crate::data::ExecuteRequest2;
 use crate::data::ExecuteResponse;
 use crate::data::ExecutorConfigOverride;
@@ -58,6 +59,7 @@ use crate::data::PrepareForLocalExecutionResult;
 use crate::data::RequiredLocalResources;
 use crate::data::TestExecutable;
 use crate::data::TestResult;
+use crate::data::TestStage;
 use crate::protocol::TestOrchestrator;
 
 /// Test runner client to buck2 test orchestrator.
@@ -91,8 +93,8 @@ impl TestOrchestratorClient {
 
 #[async_trait::async_trait]
 impl DownwardApi for TestOrchestratorClient {
-    async fn console(&self, level: Level, message: String) -> anyhow::Result<()> {
-        let level = level.try_into().context("Invalid `level`")?;
+    async fn console(&self, level: Level, message: String) -> buck2_error::Result<()> {
+        let level = level.try_into().buck_error_context("Invalid `level`")?;
 
         self.downward_api_client
             .clone()
@@ -105,8 +107,8 @@ impl DownwardApi for TestOrchestratorClient {
         Ok(())
     }
 
-    async fn log(&self, level: Level, message: String) -> anyhow::Result<()> {
-        let level = level.try_into().context("Invalid `level`")?;
+    async fn log(&self, level: Level, message: String) -> buck2_error::Result<()> {
+        let level = level.try_into().buck_error_context("Invalid `level`")?;
 
         self.downward_api_client
             .clone()
@@ -119,7 +121,7 @@ impl DownwardApi for TestOrchestratorClient {
         Ok(())
     }
 
-    async fn external(&self, data: HashMap<String, String>) -> anyhow::Result<()> {
+    async fn external(&self, data: HashMap<String, String>) -> buck2_error::Result<()> {
         let event = data.into();
 
         self.downward_api_client
@@ -134,7 +136,7 @@ impl DownwardApi for TestOrchestratorClient {
 impl TestOrchestratorClient {
     pub async fn execute2(
         &self,
-        ui_prints: DisplayMetadata,
+        ui_prints: TestStage,
         target: ConfiguredTargetHandle,
         cmd: Vec<ArgValue>,
         env: SortedVectorMap<String, ArgValue>,
@@ -145,7 +147,7 @@ impl TestOrchestratorClient {
         required_local_resources: RequiredLocalResources,
     ) -> anyhow::Result<ExecuteResponse> {
         let test_executable = TestExecutable {
-            ui_prints,
+            stage: ui_prints,
             target,
             cmd,
             env,
@@ -237,14 +239,15 @@ impl TestOrchestratorClient {
 
     pub async fn prepare_for_local_execution(
         &self,
-        ui_prints: DisplayMetadata,
+        stage: TestStage,
         target: ConfiguredTargetHandle,
         cmd: Vec<ArgValue>,
         env: SortedVectorMap<String, ArgValue>,
         pre_create_dirs: Vec<DeclaredOutput>,
+        required_local_resources: RequiredLocalResources,
     ) -> anyhow::Result<PrepareForLocalExecutionResult> {
         let executable = TestExecutable {
-            ui_prints,
+            stage,
             target,
             cmd,
             env,
@@ -257,20 +260,15 @@ impl TestOrchestratorClient {
 
         let request = buck2_test_proto::PrepareForLocalExecutionRequest {
             test_executable: Some(executable),
+            required_local_resources: required_local_resources.resources.into_map(|r| r.into()),
         };
-        let PrepareForLocalExecutionResponse { result } = self
-            .test_orchestrator_client
+        self.test_orchestrator_client
             .clone()
             .prepare_for_local_execution(request)
             .await?
-            .into_inner();
-
-        let result = result
-            .context("Missing `result`")?
+            .into_inner()
             .try_into()
-            .context("Invalid `result`")?;
-
-        Ok(result)
+            .context("Invalid `result`")
     }
 
     pub async fn attach_info_message(&self, message: String) -> anyhow::Result<()> {
@@ -308,7 +306,7 @@ where
                 .context("Invalid execute2 request")?;
 
             let TestExecutable {
-                ui_prints,
+                stage,
                 target,
                 cmd,
                 env,
@@ -318,7 +316,7 @@ where
             let response = self
                 .inner
                 .execute2(
-                    ui_prints,
+                    stage,
                     target,
                     cmd,
                     env,
@@ -436,11 +434,16 @@ where
         request: tonic::Request<buck2_test_proto::PrepareForLocalExecutionRequest>,
     ) -> Result<tonic::Response<PrepareForLocalExecutionResponse>, tonic::Status> {
         to_tonic(async move {
-            let buck2_test_proto::PrepareForLocalExecutionRequest { test_executable } =
-                request.into_inner();
+            let buck2_test_proto::PrepareForLocalExecutionRequest {
+                test_executable,
+                required_local_resources,
+            } = request.into_inner();
+            let resources = RequiredLocalResources {
+                resources: required_local_resources.into_map(|r| r.into()),
+            };
 
             let TestExecutable {
-                ui_prints,
+                stage,
                 target,
                 cmd,
                 env,
@@ -453,15 +456,11 @@ where
 
             let result = self
                 .inner
-                .prepare_for_local_execution(ui_prints, target, cmd, env, pre_create_dirs)
+                .prepare_for_local_execution(stage, target, cmd, env, pre_create_dirs, resources)
                 .await
                 .context("Prepare for local execution failed")?;
 
-            let result = result.try_into().context("Failed to serialize result")?;
-
-            Ok(PrepareForLocalExecutionResponse {
-                result: Some(result),
-            })
+            result.try_into().context("Failed to serialize result")
         })
         .await
     }
@@ -501,14 +500,14 @@ where
             let ConsoleRequest { level, message } = request.into_inner();
 
             let level = level
-                .context("Missing `level`")?
+                .buck_error_context("Missing `level`")?
                 .try_into()
-                .context("Invalid `level`")?;
+                .buck_error_context("Invalid `level`")?;
 
             self.inner
                 .console(level, message)
                 .await
-                .context("Failed to console")?;
+                .buck_error_context("Failed to console")?;
 
             Ok(buck2_downward_api_proto::Empty {})
         })
@@ -523,14 +522,14 @@ where
             let LogRequest { level, message } = request.into_inner();
 
             let level = level
-                .context("Missing `level`")?
+                .buck_error_context("Missing `level`")?
                 .try_into()
-                .context("Invalid `level`")?;
+                .buck_error_context("Invalid `level`")?;
 
             self.inner
                 .log(level, message)
                 .await
-                .context("Failed to log")?;
+                .buck_error_context("Failed to log")?;
 
             Ok(buck2_downward_api_proto::Empty {})
         })
@@ -545,14 +544,14 @@ where
             let ExternalEventRequest { event } = request.into_inner();
 
             let event = event
-                .context("Missing `event`")?
+                .buck_error_context("Missing `event`")?
                 .try_into()
-                .context("Invalid `event`")?;
+                .buck_error_context("Invalid `event`")?;
 
             self.inner
                 .external(event)
                 .await
-                .context("Failed to deliver event")?;
+                .buck_error_context("Failed to deliver event")?;
 
             Ok(buck2_downward_api_proto::Empty {})
         })

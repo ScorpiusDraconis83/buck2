@@ -14,7 +14,7 @@
 -module(ct_daemon).
 
 -export([
-    start/0, start/1,
+    start/1, start/2,
     stop/0,
     alive/0,
     run/1,
@@ -26,21 +26,25 @@
     discover/1,
     load_changed/0,
     setup_state/0,
-    output_dir/0
+    output_dir/0,
+    priv_dir/0
 ]).
 
 %% @doc start a test-node with random name and shortname
--spec start() -> ok.
-start() ->
-    ct_daemon_node:start().
+-spec start(ErlCommand) -> ok when
+    ErlCommand :: [binary()].
+start(ErlCommand) ->
+    ct_daemon_node:start(ErlCommand).
 
 %% @doc starts the test node with the given distribution mode and node name
--spec start(ct_daemon_node:config()) -> ok.
-start(NodeInfo) ->
-    ct_daemon_node:start(NodeInfo).
+-spec start(ErlCommand, Config) -> ok | {error, {crash_on_startup, integer()}} when
+    ErlCommand :: [binary()],
+    Config :: ct_daemon_node:config().
+start(ErlCommand, NodeInfo) ->
+    ct_daemon_node:start(ErlCommand, NodeInfo).
 
 %% @doc stops the test node
--spec stop() -> ok.
+-spec stop() -> node().
 stop() ->
     ct_daemon_node:stop().
 
@@ -56,7 +60,7 @@ alive() ->
         | non_neg_integer()
         | {discovered, [#{suite => module(), name => string()}]}
 ) ->
-    #{string() => ct_daemon_runner:run_result()} | ct_daemon_runner:discover_error().
+    #{string() => ct_daemon_core:run_result()} | ct_daemon_runner:discover_error().
 run(Test) ->
     do_call({run, Test}).
 
@@ -76,7 +80,7 @@ list() ->
     do_call(list).
 
 -spec list(RegEx :: string()) ->
-    [{module(), [{non_neg_integer(), string()}]}] | {invalid_regex, {string, non_neg_integer()}}.
+    [{module(), [{non_neg_integer(), string()}]}] | {invalid_regex, {string(), non_neg_integer()}}.
 list(RegEx) ->
     case re:compile(RegEx) of
         {ok, Pattern} ->
@@ -106,6 +110,10 @@ setup_state() ->
 -spec output_dir() -> file:filename_all() | undefined.
 output_dir() ->
     do_call(output_dir).
+
+-spec priv_dir() -> file:filename_all() | undefined.
+priv_dir() ->
+    do_call(priv_dir).
 
 -spec push_paths(Paths :: [file:filename_all()]) -> ok.
 push_paths(Paths) ->

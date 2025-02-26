@@ -25,6 +25,7 @@ indexmap = { workspace = true }
 itertools = { workspace = true }
 num_cpus = { workspace = true }
 once_cell = { workspace = true }
+pathdiff = { workspace = true }
 prost = { workspace = true }
 ref-cast = { workspace = true }
 serde = { workspace = true }
@@ -51,14 +52,19 @@ buck2_cli_proto = { workspace = true }
 buck2_common = { workspace = true }
 buck2_core = { workspace = true }
 buck2_data = { workspace = true }
+buck2_directory = { workspace = true }
 buck2_error = { workspace = true }
 buck2_events = { workspace = true }
 buck2_futures = { workspace = true }
 buck2_http = { workspace = true }
 buck2_miniperf_proto = { workspace = true }
 buck2_re_configuration = { workspace = true }
+buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
 prost-types = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

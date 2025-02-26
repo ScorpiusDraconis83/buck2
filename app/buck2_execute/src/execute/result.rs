@@ -14,10 +14,13 @@ use std::ops::FromResidual;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use allocative::Allocative;
 use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use derivative::Derivative;
 use dupe::Dupe;
 use indexmap::IndexMap;
+use remote_execution::TActionResult2;
 
 use crate::artifact_value::ArtifactValue;
 use crate::execute::claim::Claim;
@@ -28,6 +31,12 @@ use crate::execute::request::CommandExecutionOutput;
 use crate::execute::request::ResolvedCommandExecutionOutput;
 use crate::output_size::OutputSize;
 
+#[derive(Debug)]
+pub enum CommandExecutionErrorType {
+    StorageResourceExhausted,
+    Other,
+}
+
 /// "Status" of an action execution indicating how it finished. E.g. "built_remotely", "local_fallback", "action_cache".
 #[derive(Debug)]
 pub enum CommandExecutionStatus {
@@ -37,10 +46,14 @@ pub enum CommandExecutionStatus {
     Failure {
         execution_kind: CommandExecutionKind,
     },
+    WorkerFailure {
+        execution_kind: CommandExecutionKind,
+    },
     Error {
         stage: &'static str,
-        error: anyhow::Error,
+        error: buck2_error::Error,
         execution_kind: Option<CommandExecutionKind>,
+        typ: CommandExecutionErrorType,
     },
     TimedOut {
         execution_kind: CommandExecutionKind,
@@ -55,6 +68,7 @@ impl CommandExecutionStatus {
         match self {
             CommandExecutionStatus::Success { execution_kind, .. } => Some(execution_kind),
             CommandExecutionStatus::Failure { execution_kind } => Some(execution_kind),
+            CommandExecutionStatus::WorkerFailure { execution_kind } => Some(execution_kind),
             CommandExecutionStatus::Error { execution_kind, .. } => execution_kind.as_ref(),
             CommandExecutionStatus::TimedOut { execution_kind, .. } => Some(execution_kind),
             CommandExecutionStatus::Cancelled => None,
@@ -68,6 +82,9 @@ impl Display for CommandExecutionStatus {
             CommandExecutionStatus::Success { execution_kind, .. } => {
                 write!(f, "success {}", execution_kind,)
             }
+            CommandExecutionStatus::WorkerFailure { execution_kind } => {
+                write!(f, "worker failure {}", execution_kind,)
+            }
             CommandExecutionStatus::Failure { execution_kind } => {
                 write!(f, "failure {}", execution_kind,)
             }
@@ -75,6 +92,7 @@ impl Display for CommandExecutionStatus {
                 stage,
                 error,
                 execution_kind: Some(execution_kind),
+                ..
             } => {
                 write!(f, "error {}:{}\n{:#}", execution_kind, stage, error)
             }
@@ -82,6 +100,7 @@ impl Display for CommandExecutionStatus {
                 stage,
                 error,
                 execution_kind: None,
+                ..
             } => {
                 write!(f, "error:{}\n{:#}", stage, error)
             }
@@ -95,7 +114,7 @@ impl Display for CommandExecutionStatus {
 
 /// Unlike action where we only really have just 1 time, commands can have slightly richer timing
 /// data.
-#[derive(Debug, Copy, Clone, Dupe)]
+#[derive(Debug, Copy, Clone, Dupe, Allocative)]
 pub struct CommandExecutionMetadata {
     /// How long this build actually waited for this action to complete
     pub wall_time: Duration,
@@ -160,7 +179,8 @@ impl Default for CommandExecutionMetadata {
 }
 
 /// CommandExecutionResult is the result of an executor executing a command.
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct CommandExecutionResult {
     /// The outputs produced by this command
     pub outputs: IndexMap<CommandExecutionOutput, ArtifactValue>,
@@ -180,6 +200,10 @@ pub struct CommandExecutionResult {
     /// This is picked up from the action result's auxiliary metadata and
     /// is used to verify the dep file cache lookup result
     pub dep_file_metadata: Option<RemoteDepFile>,
+    /// If the action executed on RE, the original action result
+    /// to be re-used when uploading the remote dep file.
+    #[derivative(Debug = "ignore")]
+    pub action_result: Option<TActionResult2>,
 }
 
 impl CommandExecutionResult {
@@ -207,10 +231,31 @@ impl CommandExecutionResult {
         }
     }
 
+    pub fn was_remotely_executed(&self) -> bool {
+        match self.report.status {
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::Remote { .. },
+            } => true,
+            _ => false,
+        }
+    }
+
     pub fn was_locally_executed(&self) -> bool {
         match self.report.status {
             CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::Local { .. },
+            } => true,
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::LocalWorker { .. },
+            } => true,
+            _ => false,
+        }
+    }
+
+    pub fn was_action_cache_hit(&self) -> bool {
+        match self.report.status {
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::ActionCache { .. },
             } => true,
             _ => false,
         }
@@ -219,7 +264,7 @@ impl CommandExecutionResult {
     pub fn resolve_outputs<'a>(
         &'a self,
         fs: &'a ArtifactFs,
-    ) -> impl Iterator<Item = (ResolvedCommandExecutionOutput, &ArtifactValue)> + 'a {
+    ) -> impl Iterator<Item = (ResolvedCommandExecutionOutput, &'a ArtifactValue)> + 'a {
         self.outputs
             .iter()
             .map(|(output, value)| (output.as_ref().resolve(fs), value))
@@ -236,6 +281,9 @@ pub struct CommandExecutionReport {
     /// No exit_code means the command did not finish executing. Signals get mapped into this as
     /// 128 + SIGNUM, which is the convention shells follow.
     pub exit_code: Option<i32>,
+    /// Any additional message that a command's executor wants to be user vissible in case of a
+    /// failure. Provided by non-Meta RE server.
+    pub additional_message: Option<String>,
 }
 
 impl CommandExecutionReport {
@@ -256,6 +304,9 @@ impl CommandExecutionReport {
             CommandExecutionStatus::Cancelled => buck2_data::command_execution::Cancelled {}.into(),
             CommandExecutionStatus::Failure { .. } => {
                 buck2_data::command_execution::Failure {}.into()
+            }
+            CommandExecutionStatus::WorkerFailure { .. } => {
+                buck2_data::command_execution::WorkerFailure {}.into()
             }
             CommandExecutionStatus::TimedOut { duration, .. } => {
                 buck2_data::command_execution::Timeout {
@@ -315,6 +366,7 @@ impl CommandExecutionReport {
             command_kind,
             signed_exit_code,
             metadata: Some(self.timing.to_proto()),
+            additional_message: self.additional_message.clone(),
         }
     }
 }
@@ -325,7 +377,6 @@ impl FromResidual<ControlFlow<Self, Infallible>> for CommandExecutionResult {
     fn from_residual(residual: ControlFlow<Self, Infallible>) -> Self {
         match residual {
             ControlFlow::Break(v) => v,
-            ControlFlow::Continue(_) => unreachable!(),
         }
     }
 }
@@ -367,6 +418,7 @@ mod tests {
                     time_enabled: 50,
                     time_running: 100,
                 }),
+                memory_peak: None,
             }),
             input_materialization_duration: Duration::from_secs(6),
             hashing_duration: Duration::from_secs(7),
@@ -384,6 +436,7 @@ mod tests {
             timing,
             std_streams,
             exit_code: Some(456),
+            additional_message: None,
         }
     }
 
@@ -417,6 +470,7 @@ mod tests {
                 time_enabled: 50,
                 time_running: 100,
             }),
+            memory_peak: None,
         };
         let command_execution_metadata = buck2_data::CommandExecutionMetadata {
             wall_time: Some(Duration {
@@ -452,6 +506,7 @@ mod tests {
             stderr: "DEF".to_owned(),
             command_kind: Some(command_execution_kind),
             metadata: Some(command_execution_metadata),
+            additional_message: None,
         };
 
         buck2_data::CommandExecution {

@@ -18,9 +18,10 @@
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::convert::Infallible;
 use std::ops::Deref;
-use std::ops::DerefMut;
 
+use dupe::Dupe;
 use either::Either;
 
 use crate::coerce::coerce;
@@ -29,6 +30,7 @@ use crate::values::dict::value::DictGen;
 use crate::values::dict::value::FrozenDictData;
 use crate::values::dict::Dict;
 use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::types::dict::dict_type::DictType;
 use crate::values::FrozenValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
@@ -39,6 +41,21 @@ use crate::values::ValueLike;
 pub struct DictRef<'v> {
     pub(crate) aref: Either<Ref<'v, Dict<'v>>, &'v Dict<'v>>,
 }
+
+impl<'v> Clone for DictRef<'v> {
+    fn clone(&self) -> Self {
+        match &self.aref {
+            Either::Left(x) => DictRef {
+                aref: Either::Left(Ref::clone(x)),
+            },
+            Either::Right(x) => DictRef {
+                aref: Either::Right(*x),
+            },
+        }
+    }
+}
+
+impl<'v> Dupe for DictRef<'v> {}
 
 /// Mutably borrowed `Dict`.
 pub struct DictMut<'v> {
@@ -70,7 +87,7 @@ impl<'v> DictRef<'v> {
 impl<'v> DictMut<'v> {
     /// Downcast the value to a mutable dict reference.
     #[inline]
-    pub fn from_value(x: Value<'v>) -> anyhow::Result<DictMut> {
+    pub fn from_value(x: Value<'v>) -> anyhow::Result<DictMut<'v>> {
         #[derive(thiserror::Error, Debug)]
         #[error("Value is not dict, value type: `{0}`")]
         struct NotDictError(&'static str);
@@ -122,32 +139,18 @@ impl<'v> Deref for DictRef<'v> {
     }
 }
 
-impl<'v> Deref for DictMut<'v> {
-    type Target = Dict<'v>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.aref
-    }
-}
-
-impl<'v> DerefMut for DictMut<'v> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.aref
-    }
-}
-
 impl<'v> StarlarkTypeRepr for DictRef<'v> {
+    type Canonical = <DictType<FrozenValue, FrozenValue> as StarlarkTypeRepr>::Canonical;
+
     fn starlark_type_repr() -> Ty {
-        Dict::<'v>::starlark_type_repr()
+        DictType::<FrozenValue, FrozenValue>::starlark_type_repr()
     }
 }
 
 impl<'v> UnpackValue<'v> for DictRef<'v> {
-    fn expected() -> String {
-        "dict".to_owned()
-    }
+    type Error = Infallible;
 
-    fn unpack_value(value: Value<'v>) -> Option<DictRef<'v>> {
-        DictRef::from_value(value)
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<DictRef<'v>>, Infallible> {
+        Ok(DictRef::from_value(value))
     }
 }

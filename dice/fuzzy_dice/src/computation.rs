@@ -17,7 +17,6 @@ use crossbeam::queue::SegQueue;
 use derivative::Derivative;
 use derive_more::Display;
 use dice::DiceComputations;
-use dice::DiceComputationsParallel;
 use dice::DiceTransactionUpdater;
 use dice::InjectedKey;
 use dice::Key;
@@ -30,7 +29,7 @@ use serde::Serialize;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Display, Debug, Allocative)]
 #[derive(Serialize, Deserialize)]
-#[display(fmt = "key{}", _0)]
+#[display("key{}", _0)]
 #[serde(transparent)]
 pub struct Var(pub usize);
 
@@ -40,21 +39,21 @@ pub enum Unit {
     Literal(bool),
 }
 
-async fn resolve_units(
-    ctx: &mut DiceComputations,
+async fn resolve_units<'a>(
+    ctx: &'a mut DiceComputations<'_>,
     units: &[Unit],
     state: Arc<FuzzState>,
 ) -> anyhow::Result<Vec<bool>> {
     let futs = ctx.compute_many(units.iter().map(|unit| {
         let state = state.dupe();
-        higher_order_closure! {
-            for<'x> move |ctx: &'x mut DiceComputationsParallel<'_>| -> BoxFuture<'x, Result<bool, anyhow::Error>> {
+        DiceComputations::declare_closure(
+            move |ctx: &mut DiceComputations| -> BoxFuture<Result<bool, anyhow::Error>> {
                 match unit {
                     Unit::Variable(var) => ctx.eval(state, *var).boxed(),
                     Unit::Literal(lit) => futures::future::ready(Ok(*lit)).boxed(),
                 }
-            }
-        }
+            },
+        )
     }));
     future::join_all(futs).await.into_iter().collect()
 }
@@ -70,12 +69,12 @@ pub enum Expr {
     Xor(Vec<Unit>),
 }
 
-async fn lookup_unit(ctx: &mut DiceComputations, var: Var) -> anyhow::Result<Arc<Expr>> {
+async fn lookup_unit(ctx: &mut DiceComputations<'_>, var: Var) -> anyhow::Result<Arc<Expr>> {
     Ok(ctx.compute(&LookupVar(var)).await?)
 }
 
 #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
-#[display(fmt = "Lookup({})", _0)]
+#[display("Lookup({})", _0)]
 struct LookupVar(Var);
 impl InjectedKey for LookupVar {
     type Value = Arc<Expr>;
@@ -87,6 +86,7 @@ impl InjectedKey for LookupVar {
 
 pub trait FuzzEquations {
     fn set_equation(&mut self, var: Var, expr: Expr) -> anyhow::Result<()>;
+    #[allow(dead_code)]
     fn set_equations(&mut self, expr: impl IntoIterator<Item = (Var, Expr)>) -> anyhow::Result<()>;
 }
 
@@ -113,7 +113,7 @@ pub trait FuzzMath {
 }
 
 #[async_trait]
-impl FuzzMath for DiceComputations {
+impl FuzzMath for DiceComputations<'_> {
     async fn eval(&mut self, state: Arc<FuzzState>, var: Var) -> anyhow::Result<bool> {
         Ok(*self
             .compute(&state.eval_var(var))
@@ -159,7 +159,7 @@ impl FuzzState {
 
 #[derive(Derivative, Clone, Display, Allocative)]
 #[derivative(Hash, Debug)]
-#[display(fmt = "Eval({})", key)]
+#[display("Eval({})", key)]
 pub struct EvalVar {
     key: Var,
     #[derivative(Debug = "ignore", Hash = "ignore")]

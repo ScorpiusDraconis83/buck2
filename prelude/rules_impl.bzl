@@ -5,27 +5,68 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@prelude//:alias.bzl", "alias_impl", "configured_alias_impl", "toolchain_alias_impl", "versioned_alias_impl")
+load("@prelude//:command_alias.bzl", "command_alias_impl")
+load("@prelude//:export_file.bzl", "export_file_impl")
+load("@prelude//:filegroup.bzl", "filegroup_impl")
+load("@prelude//:genrule.bzl", "genrule_attributes", "genrule_impl")
+load("@prelude//:http_file.bzl", "http_file_impl")
+load("@prelude//:remote_file.bzl", "remote_file_impl")
+load("@prelude//:sh_binary.bzl", "sh_binary_impl")
+load("@prelude//:sh_test.bzl", "sh_test_impl")
+load("@prelude//:test_suite.bzl", "test_suite_impl")
+load("@prelude//:worker_tool.bzl", "worker_tool")
 load("@prelude//android:android.bzl", _android_extra_attributes = "extra_attributes", _android_implemented_rules = "implemented_rules")
 load("@prelude//android:configuration.bzl", "is_building_android_binary_attr")
 load("@prelude//apple:apple_rules_impl.bzl", _apple_extra_attributes = "extra_attributes", _apple_implemented_rules = "implemented_rules")
+load("@prelude//apple/user:apple_resource_transition.bzl", "apple_resource_transition")
+load("@prelude//apple/user:target_sdk_version_transition.bzl", "apple_test_target_sdk_version_transition", "target_sdk_version_transition")
 load("@prelude//configurations:rules.bzl", _config_extra_attributes = "extra_attributes", _config_implemented_rules = "implemented_rules")
 load("@prelude//csharp:csharp.bzl", "csharp_library_impl", "prebuilt_dotnet_library_impl")
 load("@prelude//cxx:bitcode.bzl", "llvm_link_bitcode_impl")
+load("@prelude//cxx:cuda.bzl", "CudaCompileStyle")
 load("@prelude//cxx:cxx.bzl", "cxx_binary_impl", "cxx_library_impl", "cxx_precompiled_header_impl", "cxx_test_impl", "prebuilt_cxx_library_impl")
 load("@prelude//cxx:cxx_toolchain.bzl", "cxx_toolchain_extra_attributes", "cxx_toolchain_impl")
 load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxPlatformInfo", "CxxToolchainInfo")
 load("@prelude//cxx:headers.bzl", "CPrecompiledHeaderInfo", "HeaderMode")
+load("@prelude//cxx:link_groups_types.bzl", "LINK_GROUP_MAP_ATTR")
 load("@prelude//cxx:prebuilt_cxx_library_group.bzl", "prebuilt_cxx_library_group_impl")
-load("@prelude//cxx/user:link_group_map.bzl", "link_group_map_attr")
+load("@prelude//cxx:windows_resource.bzl", "windows_resource_impl")
+load("@prelude//decls:android_rules.bzl", "android_rules")
+load("@prelude//decls:apple_rules.bzl", "ios_rules")
+load("@prelude//decls:common.bzl", "IncludeType", "LinkableDepType", "buck")
+load("@prelude//decls:core_rules.bzl", "core_rules")
+load("@prelude//decls:cxx_rules.bzl", "cxx_rules")
+load("@prelude//decls:d_rules.bzl", "d_rules")
+load("@prelude//decls:dotnet_rules.bzl", "dotnet_rules")
+load("@prelude//decls:erlang_rules.bzl", "erlang_rules")
+load("@prelude//decls:git_rules.bzl", "git_rules")
+load("@prelude//decls:go_rules.bzl", "go_rules")
+load("@prelude//decls:groovy_rules.bzl", "groovy_rules")
+load("@prelude//decls:halide_rules.bzl", "halide_rules")
+load("@prelude//decls:haskell_rules.bzl", "haskell_rules")
+load("@prelude//decls:java_rules.bzl", "java_rules")
+load("@prelude//decls:js_rules.bzl", "js_rules")
+load("@prelude//decls:kotlin_rules.bzl", "kotlin_rules")
+load("@prelude//decls:lua_rules.bzl", "lua_rules")
+load("@prelude//decls:ocaml_rules.bzl", "ocaml_rules")
+load("@prelude//decls:python_rules.bzl", "python_rules")
+load("@prelude//decls:re_test_common.bzl", "re_test_common")
+load("@prelude//decls:rust_rules.bzl", "rust_rules")
+load("@prelude//decls:scala_rules.bzl", "scala_rules")
+load("@prelude//decls:shell_rules.bzl", "shell_rules")
+load("@prelude//decls:toolchains_common.bzl", "toolchains_common")
+load("@prelude//decls:uncategorized_rules.bzl", "uncategorized_rules")
 load("@prelude//erlang:erlang.bzl", _erlang_implemented_rules = "implemented_rules")
 load("@prelude//git:git_fetch.bzl", "git_fetch_impl")
-load("@prelude//go:cgo_library.bzl", "cgo_library_impl")
 load("@prelude//go:coverage.bzl", "GoCoverageMode")
 load("@prelude//go:go_binary.bzl", "go_binary_impl")
 load("@prelude//go:go_exported_library.bzl", "go_exported_library_impl")
 load("@prelude//go:go_library.bzl", "go_library_impl")
+load("@prelude//go:go_stdlib.bzl", "go_stdlib_impl")
 load("@prelude//go:go_test.bzl", "go_test_impl")
-load("@prelude//go/transitions:defs.bzl", "cgo_enabled_attr", "compile_shared_attr", "go_binary_transition", "go_exported_library_transition", "go_test_transition")
+load("@prelude//go/transitions:defs.bzl", "asan_attr", "build_tags_attr", "cgo_enabled_attr", "coverage_mode_attr", "go_binary_transition", "go_exported_library_transition", "go_library_transition", "go_stdlib_transition", "go_test_transition", "race_attr")
+load("@prelude//go_bootstrap:go_bootstrap.bzl", "go_bootstrap_binary_impl")
 load("@prelude//haskell:haskell.bzl", "haskell_binary_impl", "haskell_library_impl", "haskell_prebuilt_library_impl")
 load("@prelude//haskell:haskell_ghci.bzl", "haskell_ghci_impl")
 load("@prelude//haskell:haskell_haddock.bzl", "haskell_haddock_impl")
@@ -38,57 +79,31 @@ load("@prelude//julia:julia.bzl", _julia_extra_attributes = "extra_attributes", 
 load("@prelude//kotlin:kotlin.bzl", _kotlin_extra_attributes = "extra_attributes", _kotlin_implemented_rules = "implemented_rules")
 load("@prelude//linking:execution_preference.bzl", "link_execution_preference_attr")
 load("@prelude//linking:link_info.bzl", "LinkOrdering")
+load("@prelude//linking:types.bzl", "Linkage")
 load("@prelude//lua:cxx_lua_extension.bzl", "cxx_lua_extension_impl")
 load("@prelude//lua:lua_binary.bzl", "lua_binary_impl")
 load("@prelude//lua:lua_library.bzl", "lua_library_impl")
+load("@prelude//matlab:matlab.bzl", _matlab_extra_attributes = "extra_attributes", _matlab_implemented_rules = "implemented_rules")
 load("@prelude//ocaml:attrs.bzl", _ocaml_extra_attributes = "ocaml_extra_attributes")
 load("@prelude//ocaml:ocaml.bzl", "ocaml_binary_impl", "ocaml_library_impl", "ocaml_object_impl", "ocaml_shared_impl", "prebuilt_ocaml_library_impl")
 load("@prelude//python:cxx_python_extension.bzl", "cxx_python_extension_impl")
 load("@prelude//python:prebuilt_python_library.bzl", "prebuilt_python_library_impl")
+load("@prelude//python:python.bzl", "PythonLibraryInfo")
 load("@prelude//python:python_binary.bzl", "python_binary_impl")
 load("@prelude//python:python_library.bzl", "python_library_impl")
 load("@prelude//python:python_needed_coverage_test.bzl", "python_needed_coverage_test_impl")
 load("@prelude//python:python_test.bzl", "python_test_impl")
 load("@prelude//python_bootstrap:python_bootstrap.bzl", "PythonBootstrapSources", "python_bootstrap_binary_impl", "python_bootstrap_library_impl")
+load("@prelude//transitions:constraint_overrides.bzl", "constraint_overrides")
 load("@prelude//zip_file:zip_file.bzl", _zip_file_extra_attributes = "extra_attributes", _zip_file_implemented_rules = "implemented_rules")
-load("@prelude//apple/user/apple_resource_transition.bzl", "apple_resource_transition")
-load("@prelude//decls/android_rules.bzl", "android_rules")
-load("@prelude//decls/common.bzl", "IncludeType", "LinkableDepType", "Linkage", "buck")
-load("@prelude//decls/core_rules.bzl", "core_rules")
-load("@prelude//decls/cxx_rules.bzl", "cxx_rules")
-load("@prelude//decls/d_rules.bzl", "d_rules")
-load("@prelude//decls/dotnet_rules.bzl", "dotnet_rules")
-load("@prelude//decls/erlang_rules.bzl", "erlang_rules")
-load("@prelude//decls/git_rules.bzl", "git_rules")
-load("@prelude//decls/go_rules.bzl", "go_rules")
-load("@prelude//decls/groovy_rules.bzl", "groovy_rules")
-load("@prelude//decls/halide_rules.bzl", "halide_rules")
-load("@prelude//decls/haskell_rules.bzl", "haskell_rules")
-load("@prelude//decls/ios_rules.bzl", "ios_rules")
-load("@prelude//decls/java_rules.bzl", "java_rules")
-load("@prelude//decls/js_rules.bzl", "js_rules")
-load("@prelude//decls/kotlin_rules.bzl", "kotlin_rules")
-load("@prelude//decls/lua_rules.bzl", "lua_rules")
-load("@prelude//decls/ocaml_rules.bzl", "ocaml_rules")
-load("@prelude//decls/python_rules.bzl", "python_rules")
-load("@prelude//decls/re_test_common.bzl", "re_test_common")
-load("@prelude//decls/rust_rules.bzl", "rust_rules")
-load("@prelude//decls/scala_rules.bzl", "scala_rules")
-load("@prelude//decls/shell_rules.bzl", "shell_rules")
-load("@prelude//decls/toolchains_common.bzl", "toolchains_common")
-load("@prelude//decls/uncategorized_rules.bzl", "uncategorized_rules")
-load("@prelude//transitions/constraint_overrides.bzl", "constraint_overrides_transition")
-load(":alias.bzl", "alias_impl", "configured_alias_impl", "toolchain_alias_impl", "versioned_alias_impl")
-load(":command_alias.bzl", "command_alias_impl")
-load(":export_file.bzl", "export_file_impl")
-load(":filegroup.bzl", "filegroup_impl")
-load(":genrule.bzl", "genrule_attributes", "genrule_impl")
-load(":http_file.bzl", "http_file_impl")
-load(":remote_file.bzl", "remote_file_impl")
-load(":sh_binary.bzl", "sh_binary_impl")
-load(":sh_test.bzl", "sh_test_impl")
-load(":test_suite.bzl", "test_suite_impl")
-load(":worker_tool.bzl", "worker_tool")
+
+BUILD_INFO_ATTR = attrs.dict(
+    key = attrs.string(),
+    value = attrs.option(attrs.any()),
+    sorted = False,
+    default = {},
+    doc = "Build info that is passed along here will be late-stamped into a fb_build_info section on the output binary",
+)
 
 rule_decl_records = [
     android_rules,
@@ -157,6 +172,7 @@ extra_implemented_rules = struct(
     cxx_python_extension = cxx_python_extension_impl,
     prebuilt_cxx_library = prebuilt_cxx_library_impl,
     prebuilt_cxx_library_group = prebuilt_cxx_library_group_impl,
+    windows_resource = windows_resource_impl,
 
     # C++ / LLVM
     llvm_link_bitcode = llvm_link_bitcode_impl,
@@ -165,11 +181,12 @@ extra_implemented_rules = struct(
     git_fetch = git_fetch_impl,
 
     #go
-    cgo_library = cgo_library_impl,
     go_binary = go_binary_impl,
+    go_bootstrap_binary = go_bootstrap_binary_impl,
     go_exported_library = go_exported_library_impl,
     go_library = go_library_impl,
     go_test = go_test_impl,
+    go_stdlib = go_stdlib_impl,
 
     #haskell
     haskell_library = haskell_library_impl,
@@ -212,6 +229,7 @@ extra_implemented_rules = struct(
         _js_implemented_rules,
         _julia_implemented_rules,
         _kotlin_implemented_rules,
+        _matlab_implemented_rules,
         _zip_file_implemented_rules,
     ])
 )
@@ -229,10 +247,18 @@ def _cxx_python_extension_attrs():
         "allow_suffixing": attrs.bool(default = True),
         # Copied from cxx_library.
         "auto_link_groups": attrs.bool(default = False),
+
+        # These flags will only be used to instrument a target
+        # when coverage for that target is enabled by `exported_needs_coverage_instrumentation`
+        # or by any of the target's dependencies.
+        "coverage_instrumentation_compiler_flags": attrs.list(attrs.string(), default = []),
+        "cuda_compile_style": attrs.enum(CudaCompileStyle.values(), default = "mono"),
+        "exported_needs_coverage_instrumentation": attrs.bool(default = False),
         "link_ordering": attrs.option(attrs.enum(LinkOrdering.values()), default = None),
         "link_whole": attrs.default_only(attrs.bool(default = True)),
         "precompiled_header": attrs.option(attrs.dep(providers = [CPrecompiledHeaderInfo]), default = None),
         "preferred_linkage": attrs.default_only(attrs.string(default = "any")),
+        "separate_debug_info": attrs.bool(default = False),
         "suffix_all": attrs.bool(default = True),
         "support_shlib_interfaces": attrs.bool(default = True),
         "_cxx_hacks": attrs.default_only(attrs.dep(default = "prelude//cxx/tools:cxx_hacks")),
@@ -256,6 +282,8 @@ def _python_executable_attrs():
         if key not in python_executable_attrs
     }
 
+    updated_attrs.update(constraint_overrides.attributes)
+
     # allow non-default value for the args below
     updated_attrs.update({
         "anonymous_link_groups": attrs.bool(default = False),
@@ -263,7 +291,6 @@ def _python_executable_attrs():
         "bolt_flags": attrs.list(attrs.arg(), default = []),
         "bolt_profile": attrs.option(attrs.source(), default = None),
         "compiler_flags": attrs.list(attrs.arg(), default = []),
-        "constraint_overrides": attrs.list(attrs.string(), default = []),
         "cxx_main": attrs.source(default = "prelude//python/tools:embedded_main.cpp"),
         "distributed_thinlto_partial_split_dwarf": attrs.bool(default = False),
         "enable_distributed_thinlto": attrs.bool(default = False),
@@ -271,7 +298,7 @@ def _python_executable_attrs():
         "executable_name": attrs.option(attrs.string(), default = None),
         "inplace_build_args": attrs.list(attrs.arg(), default = []),
         "link_group": attrs.option(attrs.string(), default = None),
-        "link_group_map": link_group_map_attr(),
+        "link_group_map": LINK_GROUP_MAP_ATTR,
         "link_group_min_binary_node_count": attrs.option(attrs.int(), default = None),
         "link_style": attrs.enum(LinkableDepType, default = "static"),
         "main_function": attrs.option(
@@ -288,23 +315,33 @@ def _python_executable_attrs():
         """,
         ),
         "make_py_package": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
-        # entries for the generated __manifest__ python module
-        "manifest_module_entries": attrs.option(attrs.dict(
-            key = attrs.string(),
-            value = attrs.one_of(
-                attrs.dict(key = attrs.string(), value = attrs.option(attrs.any())),
-                attrs.list(attrs.string()),
+        "manifest_module_entries": attrs.option(
+            attrs.dict(
+                key = attrs.string(),
+                value = attrs.one_of(
+                    attrs.dict(key = attrs.string(), value = attrs.option(attrs.any())),
+                    attrs.list(attrs.string()),
+                ),
             ),
-        ), default = None),
+            default = None,
+            doc = """If present, it should be a `string` -> `entry` mapping that
+            gets generated into a `__manifest__` module in the executable. Top
+            level string keys will be the names of variables in this module (so
+            they must be valid Python identifiers). An `entry` can be a list of
+            `string`s, or a further `string`-keyed dictionary.""",
+        ),
         "native_link_strategy": attrs.option(attrs.enum(NativeLinkStrategy), default = None),
         "package_split_dwarf_dwp": attrs.bool(default = False),
         "par_style": attrs.option(attrs.string(), default = None),
         "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)), sorted = True, default = []),
+        "run_with_inplace": attrs.bool(default = False),
         "runtime_env": attrs.option(attrs.dict(key = attrs.string(), value = attrs.string()), default = None),
         "standalone_build_args": attrs.list(attrs.arg(), default = []),
         "static_extension_finder": attrs.source(default = "prelude//python/tools:static_extension_finder.py"),
         "static_extension_utils": attrs.source(default = "prelude//python/tools:static_extension_utils.cpp"),
         "strip_libpar": attrs.enum(StripLibparStrategy, default = "none"),
+        "strip_stapsdt": attrs.bool(default = False),
+        "_build_info": BUILD_INFO_ATTR,
         "_create_manifest_for_source_dir": _create_manifest_for_source_dir(),
         "_cxx_hacks": attrs.default_only(attrs.dep(default = "prelude//cxx/tools:cxx_hacks")),
         "_cxx_toolchain": toolchains_common.cxx(),
@@ -318,11 +355,12 @@ def _python_executable_attrs():
 def _python_test_attrs():
     test_attrs = _python_executable_attrs()
     test_attrs["_test_main"] = attrs.source(default = "prelude//python/tools:__test_main__.py")
+    test_attrs["implicit_test_library"] = attrs.option(attrs.dep(providers = [PythonLibraryInfo]), default = None)
     test_attrs.update(re_test_common.test_args())
     return test_attrs
 
 def _cxx_binary_and_test_attrs():
-    return {
+    ret = {
         "anonymous_link_groups": attrs.bool(default = False),
         "auto_link_groups": attrs.bool(default = False),
         # Linker flags that only apply to the executable link, used for link
@@ -331,18 +369,29 @@ def _cxx_binary_and_test_attrs():
         "binary_linker_flags": attrs.list(attrs.arg(anon_target_compatible = True), default = []),
         "bolt_flags": attrs.list(attrs.arg(), default = []),
         "bolt_profile": attrs.option(attrs.source(), default = None),
+        # These flags will only be used to instrument a target
+        # when coverage for that target is enabled by a header
+        # selected for coverage either in the target or in one
+        # of the target's dependencies.
+        "coverage_instrumentation_compiler_flags": attrs.list(attrs.string(), default = []),
+        "cuda_compile_style": attrs.enum(CudaCompileStyle.values(), default = "mono"),
         "distributed_thinlto_partial_split_dwarf": attrs.bool(default = False),
         "enable_distributed_thinlto": attrs.bool(default = False),
+        "exported_needs_coverage_instrumentation": attrs.bool(default = False),
         "link_execution_preference": link_execution_preference_attr(),
-        "link_group_map": link_group_map_attr(),
+        "link_group_map": LINK_GROUP_MAP_ATTR,
         "link_group_min_binary_node_count": attrs.option(attrs.int(), default = None),
         "link_ordering": attrs.option(attrs.enum(LinkOrdering.values()), default = None),
         "link_whole": attrs.default_only(attrs.bool(default = False)),
         "precompiled_header": attrs.option(attrs.dep(providers = [CPrecompiledHeaderInfo]), default = None),
         "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)), sorted = True, default = []),
+        "separate_debug_info": attrs.bool(default = False),
+        "_build_info": BUILD_INFO_ATTR,
         "_cxx_hacks": attrs.dep(default = "prelude//cxx/tools:cxx_hacks"),
         "_cxx_toolchain": toolchains_common.cxx(),
     }
+    ret.update(constraint_overrides.attributes)
+    return ret
 
 NativeLinkStrategy = ["separate", "native", "merged"]
 StripLibparStrategy = ["full", "extract", "none"]
@@ -367,14 +416,6 @@ def _create_manifest_for_source_dir():
 
 inlined_extra_attributes = {
 
-    # go
-    "cgo_library": {
-        "embedcfg": attrs.option(attrs.source(allow_directory = False), default = None),
-        "_compile_shared": compile_shared_attr,
-        "_cxx_toolchain": toolchains_common.cxx(),
-        "_exec_os_type": buck.exec_os_type_arg(),
-        "_go_toolchain": toolchains_common.go(),
-    },
     # csharp
     "csharp_library": {
         "_csharp_toolchain": toolchains_common.csharp(),
@@ -388,20 +429,35 @@ inlined_extra_attributes = {
     },
     "cxx_library": {
         "auto_link_groups": attrs.bool(default = False),
+        # These flags will only be used to instrument a target
+        # when coverage for that target is enabled by `exported_needs_coverage_instrumentation`
+        # or by any of the target's dependencies.
+        "coverage_instrumentation_compiler_flags": attrs.list(attrs.string(), default = []),
+        "cuda_compile_style": attrs.enum(CudaCompileStyle.values(), default = "mono"),
         "deps_query": attrs.option(attrs.query(), default = None),
+        "exported_needs_coverage_instrumentation": attrs.bool(default = False),
         "extra_xcode_sources": attrs.list(attrs.source(allow_directory = True), default = []),
         "header_mode": attrs.option(attrs.enum(HeaderMode.values()), default = None),
         "link_deps_query_whole": attrs.bool(default = False),
         "link_execution_preference": link_execution_preference_attr(),
-        "link_group_map": link_group_map_attr(),
+        "link_group_map": LINK_GROUP_MAP_ATTR,
         "link_ordering": attrs.option(attrs.enum(LinkOrdering.values()), default = None),
         "precompiled_header": attrs.option(attrs.dep(providers = [CPrecompiledHeaderInfo]), default = None),
         "prefer_stripped_objects": attrs.bool(default = False),
-        "preferred_linkage": attrs.enum(Linkage, default = "any"),
+        "preferred_linkage": attrs.enum(
+            Linkage.values(),
+            default = "any",
+            doc = """
+            Determines what linkage is used when the library is depended on by another target. To
+            control how the dependencies of this library are linked, use `link_style` instead.
+            """,
+        ),
         "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)), sorted = True, default = []),
+        "separate_debug_info": attrs.bool(default = False),
         "supports_header_symlink_subtarget": attrs.bool(default = False),
         "supports_python_dlopen": attrs.option(attrs.bool(), default = None),
         "supports_shlib_interfaces": attrs.bool(default = True),
+        "_create_third_party_build_root": attrs.default_only(attrs.exec_dep(default = "prelude//third-party/tools:create_build")),
         "_cxx_hacks": attrs.default_only(attrs.dep(default = "prelude//cxx/tools:cxx_hacks")),
         "_cxx_toolchain": toolchains_common.cxx(),
         "_is_building_android_binary": is_building_android_binary_attr(),
@@ -417,27 +473,65 @@ inlined_extra_attributes = {
     "go_binary": {
         "embedcfg": attrs.option(attrs.source(allow_directory = False), default = None),
         "resources": attrs.list(attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)), default = []),
+        "_asan": asan_attr,
+        "_build_info": BUILD_INFO_ATTR,
+        "_build_tags": build_tags_attr,
+        "_cxx_toolchain": toolchains_common.cxx(),
         "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
         "_go_toolchain": toolchains_common.go(),
+        "_race": race_attr,
+    },
+    "go_bootstrap_binary": {
+        "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_bootstrap_toolchain": toolchains_common.go_bootstrap(),
     },
     "go_exported_library": {
         "embedcfg": attrs.option(attrs.source(allow_directory = False), default = None),
+        "_asan": asan_attr,
+        "_build_info": BUILD_INFO_ATTR,
+        "_build_tags": build_tags_attr,
+        "_cxx_toolchain": toolchains_common.cxx(),
         "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
         "_go_toolchain": toolchains_common.go(),
+        "_race": race_attr,
     },
     "go_library": {
         "embedcfg": attrs.option(attrs.source(allow_directory = False), default = None),
+        "_asan": asan_attr,
+        "_build_tags": build_tags_attr,
         "_cgo_enabled": cgo_enabled_attr,
-        "_compile_shared": compile_shared_attr,
+        "_coverage_mode": coverage_mode_attr,
+        "_cxx_toolchain": toolchains_common.cxx(),
+        "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
         "_go_toolchain": toolchains_common.go(),
+        "_race": race_attr,
+    },
+    "go_stdlib": {
+        "_asan": asan_attr,
+        "_build_tags": build_tags_attr,
+        "_cgo_enabled": cgo_enabled_attr,
+        "_cxx_toolchain": toolchains_common.cxx(),
+        "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_toolchain": toolchains_common.go(),
+        "_race": race_attr,
     },
     "go_test": {
         "coverage_mode": attrs.option(attrs.enum(GoCoverageMode.values()), default = None),
         "embedcfg": attrs.option(attrs.source(allow_directory = False), default = None),
         "resources": attrs.list(attrs.source(allow_directory = True), default = []),
+        "_asan": asan_attr,
+        "_build_info": BUILD_INFO_ATTR,
+        "_build_tags": build_tags_attr,
+        "_coverage_mode": coverage_mode_attr,
+        "_cxx_toolchain": toolchains_common.cxx(),
         "_exec_os_type": buck.exec_os_type_arg(),
+        "_go_stdlib": attrs.default_only(attrs.dep(default = "prelude//go/tools:stdlib")),
         "_go_toolchain": toolchains_common.go(),
-        "_testmaingen": attrs.default_only(attrs.exec_dep(default = "prelude//go/tools:testmaingen")),
+        "_race": race_attr,
+        "_testmaingen": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//go_bootstrap/tools:go_testmaingen")),
     },
 
     # groovy
@@ -449,7 +543,7 @@ inlined_extra_attributes = {
     },
     "haskell_binary": {
         "auto_link_groups": attrs.bool(default = False),
-        "link_group_map": link_group_map_attr(),
+        "link_group_map": LINK_GROUP_MAP_ATTR,
         "template_deps": attrs.list(attrs.exec_dep(providers = [HaskellLibraryProvider]), default = []),
         "_cxx_toolchain": toolchains_common.cxx(),
         "_haskell_toolchain": toolchains_common.haskell(),
@@ -468,7 +562,7 @@ inlined_extra_attributes = {
         "_haskell_toolchain": toolchains_common.haskell(),
     },
     "haskell_library": {
-        "preferred_linkage": attrs.enum(Linkage, default = "any"),
+        "preferred_linkage": attrs.enum(Linkage.values(), default = "any"),
         "template_deps": attrs.list(attrs.exec_dep(providers = [HaskellLibraryProvider]), default = []),
         "_cxx_toolchain": toolchains_common.cxx(),
         "_haskell_toolchain": toolchains_common.haskell(),
@@ -484,12 +578,22 @@ inlined_extra_attributes = {
         "header_dirs": attrs.option(attrs.list(attrs.source(allow_directory = True)), default = None),
         "linker_flags": attrs.list(attrs.arg(anon_target_compatible = True), default = []),
         "platform_header_dirs": attrs.option(attrs.list(attrs.tuple(attrs.regex(), attrs.list(attrs.source(allow_directory = True)))), default = None),
-        "preferred_linkage": attrs.enum(Linkage, default = "any"),
+        "post_linker_flags": attrs.list(attrs.arg(anon_target_compatible = True), default = []),
+        "preferred_linkage": attrs.enum(
+            Linkage.values(),
+            default = "any",
+            doc = """
+            Determines what linkage is used when the library is depended on by another target. To
+            control how the dependencies of this library are linked, use `link_style` instead.
+            """,
+        ),
         "public_include_directories": attrs.set(attrs.string(), sorted = True, default = []),
         "public_system_include_directories": attrs.set(attrs.string(), sorted = True, default = []),
         "raw_headers": attrs.set(attrs.source(), sorted = True, default = []),
+        "supports_lto": attrs.bool(default = False),
         "supports_python_dlopen": attrs.bool(default = True),
         "versioned_header_dirs": attrs.option(attrs.versioned(attrs.list(attrs.source(allow_directory = True))), default = None),
+        "_create_third_party_build_root": attrs.default_only(attrs.exec_dep(default = "prelude//third-party/tools:create_build")),
         "_cxx_toolchain": toolchains_common.cxx(),
         "_target_os_type": buck.target_os_type_arg(),
     },
@@ -500,6 +604,7 @@ inlined_extra_attributes = {
     #python
     "prebuilt_python_library": {
         "_create_manifest_for_source_dir": _create_manifest_for_source_dir(),
+        "_create_third_party_build_root": attrs.default_only(attrs.exec_dep(default = "prelude//third-party/tools:create_build")),
         "_extract": attrs.default_only(attrs.exec_dep(default = "prelude//python/tools:extract")),
         "_python_toolchain": toolchains_common.python(),
     },
@@ -527,6 +632,7 @@ inlined_extra_attributes = {
     "python_library": {
         "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source(allow_directory = True)), sorted = True, default = []),
         "_create_manifest_for_source_dir": _create_manifest_for_source_dir(),
+        "_create_third_party_build_root": attrs.default_only(attrs.exec_dep(default = "prelude//third-party/tools:create_build")),
         "_cxx_toolchain": toolchains_common.cxx(),
         "_python_toolchain": toolchains_common.python(),
     },
@@ -536,7 +642,7 @@ inlined_extra_attributes = {
         labels = attrs.list(attrs.string(), default = []),
         needed_coverage = attrs.list(attrs.tuple(attrs.int(), attrs.dep(), attrs.option(attrs.string())), default = []),
         test = attrs.dep(providers = [ExternalRunnerTestInfo]),
-        **re_test_common.test_args()
+        **(re_test_common.test_args() | buck.inject_test_env_arg())
     ),
     "python_test": _python_test_attrs(),
     "remote_file": {
@@ -545,7 +651,10 @@ inlined_extra_attributes = {
         "_unzip_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//zip_file/tools:unzip")),
     },
     "rust_test": {},
-    "sh_test": {},
+    "sh_test": constraint_overrides.attributes,
+    "windows_resource": {
+        "_cxx_toolchain": toolchains_common.cxx(),
+    },
 }
 
 all_extra_attributes = _merge_dictionaries([
@@ -557,49 +666,37 @@ all_extra_attributes = _merge_dictionaries([
     _js_extra_attributes,
     _julia_extra_attributes,
     _kotlin_extra_attributes,
+    _matlab_extra_attributes,
     _ocaml_extra_attributes,
     _zip_file_extra_attributes,
 ])
-
-# Inject test toolchain in all tests.
-
-for rule in [
-    "sh_test",
-    "rust_test",
-    "python_test",
-    "python_needed_coverage_test",
-    "java_test",
-    "go_test",
-    "cxx_test",
-    "apple_test",
-    "android_instrumentation_test",
-    "kotlin_test",
-    "robolectric_test",
-    "julia_test",
-]:
-    # NOTE: We make this a `dep` not an `exec_dep` even though we'll execute
-    # it, because it needs to execute in the same platform as the test itself
-    # (we run tests in the target platform not the exec platform, since the
-    # goal is to test the code that is being built!).
-    all_extra_attributes[rule] = _merge_dictionaries([all_extra_attributes[rule], {
-        "_inject_test_env": attrs.default_only(attrs.dep(default = "prelude//test/tools:inject_test_env")),
-    }])
 
 extra_attributes = struct(**all_extra_attributes)
 
 # Configuration transitions to pass `cfg` for builtin rules.
 transitions = {
-    "android_binary": constraint_overrides_transition,
+    "android_binary": constraint_overrides.transition,
+    "apple_asset_catalog": apple_resource_transition,
+    "apple_binary": target_sdk_version_transition,
+    "apple_bundle": target_sdk_version_transition,
+    "apple_library": target_sdk_version_transition,
     "apple_resource": apple_resource_transition,
+    "apple_test": apple_test_target_sdk_version_transition,
+    "cxx_binary": constraint_overrides.transition,
+    "cxx_test": constraint_overrides.transition,
     "go_binary": go_binary_transition,
     "go_exported_library": go_exported_library_transition,
+    "go_library": go_library_transition,
+    "go_stdlib": go_stdlib_transition,
     "go_test": go_test_transition,
-    "python_binary": constraint_overrides_transition,
-    "python_test": constraint_overrides_transition,
+    "python_binary": constraint_overrides.transition,
+    "python_test": constraint_overrides.transition,
+    "sh_test": constraint_overrides.transition,
 }
 
 toolchain_rule_names = [
     "apple_toolchain",
+    "swift_macro_toolchain",
     "swift_toolchain",
     "toolchain_alias",
 ]

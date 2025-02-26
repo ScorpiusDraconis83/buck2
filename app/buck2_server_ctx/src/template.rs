@@ -7,15 +7,17 @@
  * of this source tree.
  */
 
+use std::time::Instant;
+
 use async_trait::async_trait;
+use buck2_core::logging::log_file::TracingLogFile;
 use buck2_events::dispatch::span_async;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use dice::DiceTransaction;
 
-use crate::command_end::command_end_ext;
+use crate::commands::command_end_ext;
 use crate::ctx::ServerCommandContextTrait;
 use crate::ctx::ServerCommandDiceContext;
-use crate::logging::TracingLogFile;
 use crate::partial_result_dispatcher::PartialResultDispatcher;
 
 /// Typical server command with DICE and span.
@@ -66,7 +68,7 @@ pub trait ServerCommandTemplate: Send + Sync {
         server_ctx: &dyn ServerCommandContextTrait,
         partial_result_dispatcher: PartialResultDispatcher<Self::PartialResult>,
         ctx: DiceTransaction,
-    ) -> anyhow::Result<Self::Response>;
+    ) -> buck2_error::Result<Self::Response>;
 }
 
 /// Call this function to run the command template implementation.
@@ -74,12 +76,13 @@ pub async fn run_server_command<T: ServerCommandTemplate>(
     command: T,
     server_ctx: &dyn ServerCommandContextTrait,
     partial_result_dispatcher: PartialResultDispatcher<<T as ServerCommandTemplate>::PartialResult>,
-) -> anyhow::Result<T::Response> {
+) -> buck2_error::Result<T::Response> {
     let start_event = buck2_data::CommandStart {
         metadata: server_ctx.request_metadata().await?,
         data: Some(command.start_event().into()),
     };
 
+    let command_start = Instant::now();
     // refresh our tracing log per command
     TracingLogFile::refresh()?;
 
@@ -94,6 +97,7 @@ pub async fn run_server_command<T: ServerCommandTemplate>(
                     command.command(server_ctx, partial_result_dispatcher, ctx)
                 },
                 command.exclusive_command_name(),
+                Some(command_start),
             )
             .await
             .map_err(Into::into);

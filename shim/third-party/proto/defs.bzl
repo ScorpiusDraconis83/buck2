@@ -1,3 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
 load("@prelude//http_archive/exec_deps.bzl", "HttpArchiveExecDeps")
 load(":releases.bzl", "releases")
 
@@ -49,6 +56,7 @@ def _turn_http_archive_into_protoc_distribution(
 def _download_protoc_distribution_impl(ctx: AnalysisContext) -> Promise:
     protoc_filename = "bin/protoc" + ctx.attrs.exe_extension
 
+    # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
     return ctx.actions.anon_target(native.http_archive, {
         "exec_deps": ctx.attrs._http_archive_exec_deps,
         "sha256": ctx.attrs.sha256,

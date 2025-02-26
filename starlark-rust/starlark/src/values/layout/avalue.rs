@@ -24,8 +24,6 @@ use std::mem;
 
 use allocative::Allocative;
 use derive_more::Display;
-use serde::Serialize;
-use serde::Serializer;
 use starlark_syntax::slice_vec_ext::SliceExt;
 
 use crate as starlark;
@@ -44,8 +42,7 @@ use crate::values::layout::heap::repr::ForwardPtr;
 use crate::values::layout::value_alloc_size::ValueAllocSize;
 use crate::values::layout::vtable::AValueVTable;
 use crate::values::list::value::ListGen;
-use crate::values::list::value::VALUE_EMPTY_FROZEN_LIST;
-use crate::values::string::StarlarkStr;
+use crate::values::string::str_type::StarlarkStr;
 use crate::values::types::any_array::AnyArray;
 use crate::values::types::array::Array;
 use crate::values::types::list::value::FrozenListData;
@@ -53,6 +50,8 @@ use crate::values::types::list::value::ListData;
 use crate::values::types::tuple::value::FrozenTuple;
 use crate::values::types::tuple::value::Tuple;
 use crate::values::ComplexValue;
+use crate::values::FreezeError;
+use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenValue;
 use crate::values::StarlarkValue;
@@ -61,14 +60,12 @@ use crate::values::Tracer;
 use crate::values::Value;
 use crate::values::ValueTyped;
 
-pub(crate) const fn alloc_static<M, T>(mode: M, value: T) -> AValueRepr<AValueImpl<M, T>>
+pub(crate) const fn alloc_static<'v, A>(value: A::StarlarkValue) -> AValueRepr<AValueImpl<'v, A>>
 where
-    M: AValueMode,
-    AValueImpl<M, T>: AValue<'static>,
+    A: AValue<'v>,
 {
-    mem::forget(mode);
-    let payload = AValueImpl::<M, _>::new(value);
-    AValueRepr::with_metadata(AValueVTable::new::<AValueImpl<M, T>>(), payload)
+    let payload = AValueImpl::<A>::new(value);
+    AValueRepr::with_metadata(AValueVTable::new::<A>(), payload)
 }
 
 pub(crate) const VALUE_STR_A_VALUE_PTR: AValueHeader =
@@ -80,7 +77,7 @@ enum AValueError {
     CannotBeFrozen(&'static str),
 }
 
-/// Sized counterpart of [`AValueDyn`].
+/// Extended vtable methods (those not covered by `StarlarkValue`).
 pub(crate) trait AValue<'v>: Sized + 'v {
     /// Unwrapped type.
     type StarlarkValue: StarlarkValue<'v>;
@@ -90,7 +87,7 @@ pub(crate) trait AValue<'v>: Sized + 'v {
     type ExtraElem: 'v;
 
     /// Payload array length.
-    fn extra_len(&self) -> usize;
+    fn extra_len(value: &Self::StarlarkValue) -> usize;
 
     /// Offset of field holding content, in bytes.
     ///
@@ -120,152 +117,132 @@ pub(crate) trait AValue<'v>: Sized + 'v {
     }
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue>;
+    ) -> FreezeResult<FrozenValue>;
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v>;
+    unsafe fn heap_copy(me: *mut AValueRepr<Self::StarlarkValue>, tracer: &Tracer<'v>)
+    -> Value<'v>;
 }
 
 #[inline]
 pub(crate) fn starlark_str<'v>(
     len: usize,
     hash: StarlarkHashValue,
-) -> impl AValue<'v, ExtraElem = usize> + Send + Sync {
-    AValueImpl::<Direct, _>::new(unsafe { StarlarkStr::new(len, hash) })
+) -> AValueImpl<'v, impl AValue<'v, ExtraElem = usize> + Send + Sync> {
+    AValueImpl::<StarlarkStrAValue>::new(unsafe { StarlarkStr::new(len, hash) })
 }
 
-pub(crate) fn tuple_avalue<'v>(len: usize) -> impl AValue<'v, ExtraElem = Value<'v>> {
-    AValueImpl::<Direct, _>::new(unsafe { Tuple::new(len) })
+pub(crate) fn tuple_avalue<'v>(
+    len: usize,
+) -> AValueImpl<'v, impl AValue<'v, ExtraElem = Value<'v>>> {
+    AValueImpl::<AValueTuple>::new(unsafe { Tuple::new(len) })
 }
 
-pub(crate) fn frozen_tuple_avalue(len: usize) -> impl AValue<'static, ExtraElem = FrozenValue> {
-    AValueImpl::<Direct, _>::new(unsafe { FrozenTuple::new(len) })
+pub(crate) fn frozen_tuple_avalue(
+    len: usize,
+) -> AValueImpl<'static, impl AValue<'static, ExtraElem = FrozenValue>> {
+    AValueImpl::<AValueFrozenTuple>::new(unsafe { FrozenTuple::new(len) })
 }
 
 pub(crate) fn list_avalue<'v>(
     content: ValueTyped<'v, Array<'v>>,
-) -> impl AValue<'v, StarlarkValue = ListGen<ListData<'v>>, ExtraElem = ()> {
-    AValueImpl::<Direct, _>::new(ListGen(ListData::new(content)))
+) -> AValueImpl<'v, impl AValue<'v, StarlarkValue = ListGen<ListData<'v>>, ExtraElem = ()>> {
+    AValueImpl::<AValueList>::new(ListGen(ListData::new(content)))
 }
 
-pub(crate) fn frozen_list_avalue(len: usize) -> impl AValue<'static, ExtraElem = FrozenValue> {
-    AValueImpl::<Direct, _>::new(unsafe { ListGen(FrozenListData::new(len)) })
+pub(crate) fn frozen_list_avalue(
+    len: usize,
+) -> AValueImpl<'static, impl AValue<'static, ExtraElem = FrozenValue>> {
+    AValueImpl::<AValueFrozenList>::new(unsafe { ListGen(FrozenListData::new(len)) })
 }
 
 pub(crate) fn array_avalue<'v>(
     cap: u32,
-) -> impl AValue<'v, StarlarkValue = Array<'v>, ExtraElem = Value<'v>> {
-    AValueImpl::<Direct, _>::new(unsafe { Array::new(0, cap) })
+) -> AValueImpl<'v, impl AValue<'v, StarlarkValue = Array<'v>, ExtraElem = Value<'v>>> {
+    AValueImpl::<AValueArray>::new(unsafe { Array::new(0, cap) })
 }
 
 pub(crate) fn any_array_avalue<T: Debug + 'static>(
     cap: usize,
-) -> impl AValue<'static, StarlarkValue = AnyArray<T>, ExtraElem = T> {
-    AValueImpl::<Direct, _>::new(unsafe { AnyArray::new(cap) })
+) -> AValueImpl<'static, impl AValue<'static, StarlarkValue = AnyArray<T>, ExtraElem = T>> {
+    AValueImpl::<AValueAnyArray<T>>::new(unsafe { AnyArray::new(cap) })
 }
 
 pub(crate) fn simple<T: StarlarkValue<'static> + Send + Sync>(
     x: T,
-) -> impl AValue<'static, ExtraElem = ()> + Send + Sync {
+) -> AValueImpl<'static, impl AValue<'static, ExtraElem = ()> + Send + Sync> {
     assert!(!T::is_special(Private));
-    AValueImpl::<Simple, _>::new(x)
+    AValueImpl::<AValueSimple<T>>::new(x)
 }
 
-pub(crate) fn complex<'v, C>(x: C) -> impl AValue<'v, ExtraElem = ()>
+pub(crate) fn complex<'v, C>(x: C) -> AValueImpl<'v, impl AValue<'v, ExtraElem = ()>>
 where
     C: ComplexValue<'v>,
     C::Frozen: StarlarkValue<'static>,
 {
     assert!(!C::is_special(Private));
-    AValueImpl::<Complex, _>::new(x)
+    AValueImpl::<AValueComplex<C>>::new(x)
 }
 
-pub(crate) fn complex_no_freeze<'v, C>(x: C) -> impl AValue<'v, ExtraElem = ()>
+pub(crate) fn complex_no_freeze<'v, C>(x: C) -> AValueImpl<'v, impl AValue<'v, ExtraElem = ()>>
 where
     C: StarlarkValue<'v> + Trace<'v>,
 {
     assert!(!C::is_special(Private));
-    AValueImpl::<ComplexNoFreeze, _>::new(x)
+    AValueImpl::<AValueComplexNoFreeze<C>>::new(x)
 }
 
-pub(crate) trait AValueMode: Send + Sync + 'static {}
-
-// A type where the second element is in control of what instances are in scope
-pub(crate) struct Direct;
-impl AValueMode for Direct {}
-
-// A type that implements StarlarkValue but nothing else, so will never be stored
-// in the heap (e.g. bool, None)
-pub(crate) struct Basic;
-impl AValueMode for Basic {}
-
-// A non-special type with no references to other Starlark values.
-pub(crate) struct Simple;
-impl AValueMode for Simple {}
-
-// A type that implements ComplexValue.
-pub(crate) struct Complex;
-impl AValueMode for Complex {}
-
-// A value which can be traced, but cannot be frozen.
-pub(crate) struct ComplexNoFreeze;
-impl AValueMode for ComplexNoFreeze {}
-
-// We want to define several types (Simple, Complex) that wrap a StarlarkValue,
-// reimplement it, and do some things custom. The easiest way to avoid repeating
-// the StarlarkValue trait each time is to make them all share a single wrapper,
-// where Mode is one of Simple/Complex.
+/// A value with extended (`AValue`) vtable methods.
 #[repr(C)]
-pub(crate) struct AValueImpl<Mode: AValueMode, T>(PhantomData<Mode>, pub(crate) T);
+pub(crate) struct AValueImpl<'v, T: AValue<'v>>(PhantomData<T>, pub(crate) T::StarlarkValue);
 
-impl<Mode: AValueMode, T> AValueImpl<Mode, T> {
-    pub(crate) const fn new(value: T) -> Self {
+impl<'v, T: AValue<'v>> AValueImpl<'v, T> {
+    pub(crate) const fn new(value: T::StarlarkValue) -> Self {
         AValueImpl(PhantomData, value)
     }
 }
 
-/// The overwrite operation in the heap requires that the LSB not be set.
-/// For FrozenValue this is the case, but for Value the LSB is always set.
-/// Fortunately, the consumer of the overwritten value reapplies the
-/// FrozenValue/Value tags, so we can freely discard it here.
-fn clear_lsb(x: usize) -> usize {
-    x & !1
-}
+/// For types which are only allocated statically (never in heap).
+/// Technically we can use `AValueSimple` for these, but this is more explicit and safe.
+pub(crate) struct AValueBasic<T>(PhantomData<T>);
 
-impl<'v, T: StarlarkValue<'v>> AValue<'v> for AValueImpl<Basic, T> {
+impl<'v, T: StarlarkValue<'v>> AValue<'v> for AValueBasic<T> {
     type StarlarkValue = T;
 
     type ExtraElem = ();
 
-    fn extra_len(&self) -> usize {
-        0
+    fn extra_len(_value: &T) -> usize {
+        unreachable!("Basic types don't appear in the heap")
     }
 
     fn offset_of_extra() -> usize {
-        mem::size_of::<Self>()
+        unreachable!("Basic types don't appear in the heap")
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         unreachable!("Basic types don't appear in the heap")
     }
-    unsafe fn heap_copy(_me: *mut AValueRepr<Self>, _tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        _me: *mut AValueRepr<Self::StarlarkValue>,
+        _tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         unreachable!("Basic types don't appear in the heap")
     }
 }
 
-pub(crate) type StarlarkStrAValue = AValueImpl<Direct, StarlarkStr>;
+pub(crate) struct StarlarkStrAValue;
 
-impl<'v> AValue<'v> for AValueImpl<Direct, StarlarkStr> {
+impl<'v> AValue<'v> for StarlarkStrAValue {
     type StarlarkValue = StarlarkStr;
 
     type ExtraElem = usize;
 
-    fn extra_len(&self) -> usize {
-        StarlarkStr::payload_len_for_len(self.1.len())
+    fn extra_len(value: &StarlarkStr) -> usize {
+        StarlarkStr::payload_len_for_len(value.len())
     }
 
     fn offset_of_extra() -> usize {
@@ -275,45 +252,50 @@ impl<'v> AValue<'v> for AValueImpl<Direct, StarlarkStr> {
     const IS_STR: bool = true;
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         debug_assert!(
-            (*me).payload.1.len() > 1,
+            (*me).payload.len() > 1,
             "short strings are allocated statically"
         );
 
-        let s = (*me).payload.1.as_str();
+        let s = (*me).payload.as_str();
         let fv = freezer.alloc(s);
         debug_assert!(fv.is_str());
-        AValueHeader::overwrite_with_forward::<Self>(me, ForwardPtr::new(fv.0.raw().ptr_value()));
+        AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(me, ForwardPtr::new_frozen(fv));
         Ok(fv)
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         debug_assert!(
-            (*me).payload.1.len() > 1,
+            (*me).payload.len() > 1,
             "short strings are allocated statically"
         );
 
-        let s = (*me).payload.1.as_str();
+        let s = (*me).payload.as_str();
         let v = tracer.alloc_str(s);
         debug_assert!(v.is_str());
-        AValueHeader::overwrite_with_forward::<Self>(
+        AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(
             me,
-            ForwardPtr::new(v.0.raw().ptr_value() & !1),
+            ForwardPtr::new_unfrozen(v),
         );
         v
     }
 }
 
-impl<'v> AValue<'v> for AValueImpl<Direct, Tuple<'v>> {
+pub(crate) struct AValueTuple;
+
+impl<'v> AValue<'v> for AValueTuple {
     type StarlarkValue = Tuple<'v>;
 
     type ExtraElem = Value<'v>;
 
-    fn extra_len(&self) -> usize {
-        self.1.len()
+    fn extra_len(value: &Tuple<'v>) -> usize {
+        value.len()
     }
 
     fn offset_of_extra() -> usize {
@@ -321,65 +303,69 @@ impl<'v> AValue<'v> for AValueImpl<Direct, Tuple<'v>> {
     }
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         debug_assert!(
-            (*me).payload.1.len() != 0,
+            (*me).payload.len() != 0,
             "empty tuple is allocated statically"
         );
 
         AValueForward::assert_does_not_overwrite_extra::<Self>();
-        let content = (*me).payload.1.content();
+        let content = (*me).payload.content();
 
-        let (fv, r, extra) =
-            freezer.reserve_with_extra::<AValueImpl<Direct, FrozenTuple>>(content.len());
-        AValueHeader::overwrite_with_forward::<Self>(me, ForwardPtr::new(fv.0.raw().ptr_value()));
+        let (fv, r, extra) = freezer.reserve_with_extra::<AValueFrozenTuple>(content.len());
+        AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(me, ForwardPtr::new_frozen(fv));
 
         // TODO: this allocation is unnecessary
         let frozen_values = content.try_map(|v| freezer.freeze(*v))?;
-        r.fill(AValueImpl(
-            PhantomData::<Direct>,
-            FrozenTuple::new(content.len()),
-        ));
+        r.fill(FrozenTuple::new(content.len()));
+
+        let extra = &mut *extra;
         maybe_uninit_write_slice(extra, &frozen_values);
 
         Ok(fv)
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         debug_assert!(
-            (*me).payload.1.len() != 0,
+            (*me).payload.len() != 0,
             "empty tuple is allocated statically"
         );
 
         AValueForward::assert_does_not_overwrite_extra::<Self>();
-        let content = (*me).payload.1.content_mut();
+        let content = (*me).payload.content_mut();
 
         let (v, r, extra) = tracer.reserve_with_extra::<Self>(content.len());
-        let x = AValueHeader::overwrite_with_forward::<Self>(
+        let x = AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(
             me,
-            ForwardPtr::new(clear_lsb(v.0.raw().ptr_value())),
+            ForwardPtr::new_unfrozen(v),
         );
 
-        debug_assert_eq!(content.len(), x.1.len());
+        debug_assert_eq!(content.len(), x.len());
 
         for elem in content.iter_mut() {
             tracer.trace(elem);
         }
         r.fill(x);
+        let extra = unsafe { &mut *extra };
         maybe_uninit_write_slice(extra, content);
         v
     }
 }
 
-impl<'v> AValue<'v> for AValueImpl<Direct, FrozenTuple> {
+pub(crate) struct AValueFrozenTuple;
+
+impl<'v> AValue<'v> for AValueFrozenTuple {
     type StarlarkValue = FrozenTuple;
 
     type ExtraElem = FrozenValue;
 
-    fn extra_len(&self) -> usize {
-        self.1.len()
+    fn extra_len(value: &FrozenTuple) -> usize {
+        value.len()
     }
 
     fn offset_of_extra() -> usize {
@@ -387,23 +373,28 @@ impl<'v> AValue<'v> for AValueImpl<Direct, FrozenTuple> {
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         panic!("already frozen");
     }
 
-    unsafe fn heap_copy(_me: *mut AValueRepr<Self>, _tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        _me: *mut AValueRepr<Self::StarlarkValue>,
+        _tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         panic!("shouldn't be copying frozen values");
     }
 }
 
-impl<'v> AValue<'v> for AValueImpl<Direct, ListGen<ListData<'v>>> {
+pub(crate) struct AValueList;
+
+impl<'v> AValue<'v> for AValueList {
     type StarlarkValue = ListGen<ListData<'v>>;
 
     type ExtraElem = ();
 
-    fn extra_len(&self) -> usize {
+    fn extra_len(_value: &ListGen<ListData<'v>>) -> usize {
         0
     }
 
@@ -412,26 +403,24 @@ impl<'v> AValue<'v> for AValueImpl<Direct, ListGen<ListData<'v>>> {
     }
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
-        let content = (*me).payload.1.0.content();
+    ) -> FreezeResult<FrozenValue> {
+        let content = (*me).payload.0.content();
 
         if content.is_empty() {
-            let fv = FrozenValue::new_repr(&VALUE_EMPTY_FROZEN_LIST);
-            AValueHeader::overwrite_with_forward::<Self>(
+            let fv = FrozenValue::new_empty_list();
+            AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(
                 me,
-                ForwardPtr::new(fv.0.raw().ptr_value()),
+                ForwardPtr::new_frozen(fv),
             );
             return Ok(fv);
         }
 
-        let (fv, r, extra) = freezer
-            .reserve_with_extra::<AValueImpl<Direct, ListGen<FrozenListData>>>(content.len());
-        AValueHeader::overwrite_with_forward::<Self>(me, ForwardPtr::new(fv.0.raw().ptr_value()));
-        r.fill(AValueImpl::<Direct, _>::new(ListGen(FrozenListData::new(
-            content.len(),
-        ))));
+        let (fv, r, extra) = freezer.reserve_with_extra::<AValueFrozenList>(content.len());
+        AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(me, ForwardPtr::new_frozen(fv));
+        r.fill(ListGen(FrozenListData::new(content.len())));
+        let extra = unsafe { &mut *extra };
         assert_eq!(extra.len(), content.len());
         for (elem_place, elem) in extra.iter_mut().zip(content) {
             elem_place.write(freezer.freeze(*elem)?);
@@ -439,18 +428,23 @@ impl<'v> AValue<'v> for AValueImpl<Direct, ListGen<ListData<'v>>> {
         Ok(fv)
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
-        Self::heap_copy_impl(me, tracer, Trace::trace)
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
+        heap_copy_impl::<Self>(me, tracer, Trace::trace)
     }
 }
 
-impl<'v> AValue<'v> for AValueImpl<Direct, ListGen<FrozenListData>> {
+pub(crate) struct AValueFrozenList;
+
+impl<'v> AValue<'v> for AValueFrozenList {
     type StarlarkValue = ListGen<FrozenListData>;
 
     type ExtraElem = FrozenValue;
 
-    fn extra_len(&self) -> usize {
-        self.1.0.len()
+    fn extra_len(value: &ListGen<FrozenListData>) -> usize {
+        value.0.len()
     }
 
     fn offset_of_extra() -> usize {
@@ -458,25 +452,30 @@ impl<'v> AValue<'v> for AValueImpl<Direct, ListGen<FrozenListData>> {
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         panic!("already frozen");
     }
 
-    unsafe fn heap_copy(_me: *mut AValueRepr<Self>, _tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        _me: *mut AValueRepr<Self::StarlarkValue>,
+        _tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         panic!("shouldn't be copying frozen values");
     }
 }
 
-impl<'v> AValue<'v> for AValueImpl<Direct, Array<'v>> {
+pub(crate) struct AValueArray;
+
+impl<'v> AValue<'v> for AValueArray {
     type StarlarkValue = Array<'v>;
 
     type ExtraElem = Value<'v>;
 
-    fn extra_len(&self) -> usize {
+    fn extra_len(value: &Array<'v>) -> usize {
         // Note we return capacity, not length here.
-        self.1.capacity()
+        value.capacity()
     }
 
     fn offset_of_extra() -> usize {
@@ -484,51 +483,54 @@ impl<'v> AValue<'v> for AValueImpl<Direct, Array<'v>> {
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         panic!("arrays should not be frozen")
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         debug_assert!(
-            (*me).payload.1.capacity() != 0,
+            (*me).payload.capacity() != 0,
             "empty array is allocated statically"
         );
 
-        if (*me).payload.1.len() == 0 {
+        if (*me).payload.len() == 0 {
             return FrozenValue::new_repr(VALUE_EMPTY_ARRAY.repr()).to_value();
         }
 
         AValueForward::assert_does_not_overwrite_extra::<Self>();
-        let content = (*me).payload.1.content_mut();
+        let content = (*me).payload.content_mut();
 
         let (v, r, extra) = tracer.reserve_with_extra::<Self>(content.len());
-        let x = AValueHeader::overwrite_with_forward::<Self>(
+        let x = AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(
             me,
-            ForwardPtr::new(clear_lsb(v.0.raw().ptr_value())),
+            ForwardPtr::new_unfrozen(v),
         );
 
-        debug_assert_eq!(content.len(), x.1.len());
+        debug_assert_eq!(content.len(), x.len());
 
         content.trace(tracer);
 
         // Note when copying we are dropping extra capacity.
-        r.fill(AValueImpl::<Direct, _>::new(Array::new(
-            content.len() as u32,
-            content.len() as u32,
-        )));
+        r.fill(Array::new(content.len() as u32, content.len() as u32));
+        let extra = unsafe { &mut *extra };
         maybe_uninit_write_slice(extra, content);
         v
     }
 }
 
-impl<'v, T: Debug + 'static> AValue<'v> for AValueImpl<Direct, AnyArray<T>> {
+pub(crate) struct AValueAnyArray<T>(PhantomData<T>);
+
+impl<'v, T: Debug + 'static> AValue<'v> for AValueAnyArray<T> {
     type StarlarkValue = AnyArray<T>;
     type ExtraElem = T;
 
-    fn extra_len(&self) -> usize {
-        self.1.len
+    fn extra_len(value: &AnyArray<T>) -> usize {
+        value.len
     }
 
     fn offset_of_extra() -> usize {
@@ -536,43 +538,59 @@ impl<'v, T: Debug + 'static> AValue<'v> for AValueImpl<Direct, AnyArray<T>> {
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
+    ) -> FreezeResult<FrozenValue> {
         panic!("AnyArray for now can only be allocated in FrozenHeap");
     }
 
-    unsafe fn heap_copy(_me: *mut AValueRepr<Self>, _tracer: &Tracer<'v>) -> Value<'v> {
+    unsafe fn heap_copy(
+        _me: *mut AValueRepr<Self::StarlarkValue>,
+        _tracer: &Tracer<'v>,
+    ) -> Value<'v> {
         panic!("AnyArray for now can only be allocated in FrozenHeap");
     }
 }
 
-impl<Mode: AValueMode, C> AValueImpl<Mode, C> {
-    /// `heap_freeze` implementation for simple `StarlarkValue` and `StarlarkFloat`
-    /// (`StarlarkFloat` is logically a simple type, but it is not considered simple type).
-    unsafe fn heap_freeze_simple_impl<'v>(
-        me: *mut AValueRepr<Self>,
-        freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue>
-    where
-        Self: AValue<'v, ExtraElem = ()>,
-    {
-        let (fv, r) = freezer.reserve::<Self>();
-        let x = AValueHeader::overwrite_with_forward::<Self>(
-            me,
-            ForwardPtr::new(fv.0.raw().ptr_value()),
-        );
-        r.fill(x);
-        Ok(fv)
-    }
+/// If `A` provides a statically allocated frozen value,
+/// replace object with the forward to that frozen value instead of using default freeze.
+unsafe fn try_freeze_static<'v, A>(me: *mut AValueRepr<A::StarlarkValue>) -> Option<FrozenValue>
+where
+    A: AValue<'v>,
+{
+    let f = (*me).payload.try_freeze_static()?;
+
+    drop(AValueHeader::overwrite_with_forward::<A::StarlarkValue>(
+        me,
+        ForwardPtr::new_frozen(f),
+    ));
+    Some(f)
 }
 
-impl<T: StarlarkValue<'static>> AValue<'static> for AValueImpl<Simple, T> {
+/// `heap_freeze` implementation for simple `StarlarkValue` and `StarlarkFloat`
+/// (`StarlarkFloat` is logically a simple type, but it is not considered simple type).
+unsafe fn heap_freeze_simple_impl<'v, A>(
+    me: *mut AValueRepr<A::StarlarkValue>,
+    freezer: &Freezer,
+) -> FreezeResult<FrozenValue>
+where
+    A: AValue<'v, ExtraElem = ()>,
+{
+    let (fv, r) = freezer.reserve::<A>();
+    let x =
+        AValueHeader::overwrite_with_forward::<A::StarlarkValue>(me, ForwardPtr::new_frozen(fv));
+    r.fill(x);
+    Ok(fv)
+}
+
+pub(crate) struct AValueSimple<T>(PhantomData<T>);
+
+impl<T: StarlarkValue<'static>> AValue<'static> for AValueSimple<T> {
     type StarlarkValue = T;
 
     type ExtraElem = ();
 
-    fn extra_len(&self) -> usize {
+    fn extra_len(_value: &T) -> usize {
         0
     }
 
@@ -581,40 +599,45 @@ impl<T: StarlarkValue<'static>> AValue<'static> for AValueImpl<Simple, T> {
     }
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
-        Self::heap_freeze_simple_impl(me, freezer)
+    ) -> FreezeResult<FrozenValue> {
+        if let Some(f) = try_freeze_static::<Self>(me) {
+            return Ok(f);
+        }
+
+        heap_freeze_simple_impl::<Self>(me, freezer)
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'static>) -> Value<'static> {
-        Self::heap_copy_impl(me, tracer, |_v, _tracer| {})
-    }
-}
-
-impl<Mode: AValueMode, C> AValueImpl<Mode, C> {
-    /// Common `heap_copy` implementation for types without extra.
-    unsafe fn heap_copy_impl<'v>(
-        me: *mut AValueRepr<Self>,
-        tracer: &Tracer<'v>,
-        trace: impl FnOnce(&mut C, &Tracer<'v>),
-    ) -> Value<'v>
-    where
-        Self: AValue<'v, ExtraElem = ()>,
-    {
-        let (v, r) = tracer.reserve::<Self>();
-        let mut x = AValueHeader::overwrite_with_forward::<Self>(
-            me,
-            ForwardPtr::new(clear_lsb(v.0.raw().ptr_value())),
-        );
-        // We have to put the forwarding node in _before_ we trace in case there are cycles
-        trace(&mut x.1, tracer);
-        r.fill(x);
-        v
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'static>,
+    ) -> Value<'static> {
+        heap_copy_impl::<Self>(me, tracer, |_v, _tracer| {})
     }
 }
 
-impl<'v, T> AValue<'v> for AValueImpl<Complex, T>
+/// Common `heap_copy` implementation for types without extra.
+unsafe fn heap_copy_impl<'v, A>(
+    me: *mut AValueRepr<A::StarlarkValue>,
+    tracer: &Tracer<'v>,
+    trace: impl FnOnce(&mut A::StarlarkValue, &Tracer<'v>),
+) -> Value<'v>
+where
+    A: AValue<'v, ExtraElem = ()>,
+{
+    let (v, r) = tracer.reserve::<A>();
+    let mut x =
+        AValueHeader::overwrite_with_forward::<A::StarlarkValue>(me, ForwardPtr::new_unfrozen(v));
+    // We have to put the forwarding node in _before_ we trace in case there are cycles
+    trace(&mut x, tracer);
+    r.fill(x);
+    v
+}
+
+pub(crate) struct AValueComplex<T>(PhantomData<T>);
+
+impl<'v, T> AValue<'v> for AValueComplex<T>
 where
     T: ComplexValue<'v>,
     T::Frozen: StarlarkValue<'static>,
@@ -623,7 +646,7 @@ where
 
     type ExtraElem = ();
 
-    fn extra_len(&self) -> usize {
+    fn extra_len(_value: &T) -> usize {
         0
     }
 
@@ -632,16 +655,20 @@ where
     }
 
     unsafe fn heap_freeze(
-        me: *mut AValueRepr<Self>,
+        me: *mut AValueRepr<Self::StarlarkValue>,
         freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
-        let (fv, r) = freezer.reserve::<AValueImpl<Simple, T::Frozen>>();
-        let x = AValueHeader::overwrite_with_forward::<Self>(
+    ) -> FreezeResult<FrozenValue> {
+        if let Some(f) = try_freeze_static::<Self>(me) {
+            return Ok(f);
+        }
+
+        let (fv, r) = freezer.reserve::<AValueSimple<T::Frozen>>();
+        let x = AValueHeader::overwrite_with_forward::<Self::StarlarkValue>(
             me,
-            ForwardPtr::new(fv.0.raw().ptr_value()),
+            ForwardPtr::new_frozen(fv),
         );
-        let res = x.1.freeze(freezer)?;
-        r.fill(AValueImpl::<Simple, _>::new(res));
+        let res = x.freeze(freezer)?;
+        r.fill(res);
         if TypeId::of::<T::Frozen>() == TypeId::of::<FrozenDef>() {
             let frozen_def = fv.downcast_frozen_ref().unwrap();
             freezer.frozen_defs.borrow_mut().push(frozen_def);
@@ -649,12 +676,17 @@ where
         Ok(fv)
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
-        Self::heap_copy_impl(me, tracer, Trace::trace)
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
+        heap_copy_impl::<Self>(me, tracer, Trace::trace)
     }
 }
 
-impl<'v, T> AValue<'v> for AValueImpl<ComplexNoFreeze, T>
+pub(crate) struct AValueComplexNoFreeze<T>(PhantomData<T>);
+
+impl<'v, T> AValue<'v> for AValueComplexNoFreeze<T>
 where
     T: StarlarkValue<'v> + Trace<'v>,
 {
@@ -662,52 +694,42 @@ where
 
     type ExtraElem = ();
 
-    fn extra_len(&self) -> usize {
+    fn extra_len(_value: &T) -> usize {
         0
     }
 
     fn offset_of_extra() -> usize {
-        mem::size_of::<Self>()
+        mem::size_of::<Self::StarlarkValue>()
     }
 
     unsafe fn heap_freeze(
-        _me: *mut AValueRepr<Self>,
+        _me: *mut AValueRepr<Self::StarlarkValue>,
         _freezer: &Freezer,
-    ) -> anyhow::Result<FrozenValue> {
-        Err(AValueError::CannotBeFrozen(type_name::<T>()).into())
+    ) -> FreezeResult<FrozenValue> {
+        Err(FreezeError::new(
+            AValueError::CannotBeFrozen(type_name::<T>()).to_string(),
+        ))
     }
 
-    unsafe fn heap_copy(me: *mut AValueRepr<Self>, tracer: &Tracer<'v>) -> Value<'v> {
-        Self::heap_copy_impl(me, tracer, Trace::trace)
+    unsafe fn heap_copy(
+        me: *mut AValueRepr<Self::StarlarkValue>,
+        tracer: &Tracer<'v>,
+    ) -> Value<'v> {
+        heap_copy_impl::<Self>(me, tracer, Trace::trace)
     }
 }
 
 #[derive(Debug, Display, ProvidesStaticType, Allocative)]
-#[display(fmt = "BlackHole")]
+#[display("BlackHole")]
 pub(crate) struct BlackHole(pub(crate) ValueAllocSize);
-
-impl Serialize for BlackHole {
-    fn serialize<S>(&self, _s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        panic!()
-    }
-}
-
-impl<'v, Mode: AValueMode, T: StarlarkValue<'v>> Serialize for AValueImpl<Mode, T> {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        erased_serde::serialize(&self.1, s)
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use crate::environment::Module;
+    use crate::values::dict::AllocDict;
     use crate::values::types::list::value::ListData;
+    use crate::values::UnpackValue;
+    use crate::values::Value;
 
     #[test]
     fn tuple_cycle_freeze() {
@@ -719,5 +741,25 @@ mod tests {
             .push(tuple, module.heap());
         module.set("t", tuple);
         module.freeze().unwrap();
+    }
+
+    #[test]
+    fn test_try_freeze_static() {
+        // `try_freeze_static` is only implemented for `dict` at the moment of writing,
+        // so use it for the test.
+
+        let module = Module::new();
+        let d0 = module.heap().alloc(AllocDict::EMPTY);
+        let d1 = module.heap().alloc(AllocDict::EMPTY);
+        // Pointers are not equal.
+        assert_ne!(d0.0.raw(), d1.0.raw());
+
+        module.set_extra_value(module.heap().alloc((d0, d1)));
+
+        let module = module.freeze().unwrap();
+        let (d0, d1) =
+            <(Value, Value)>::unpack_value_err(module.extra_value().unwrap().to_value()).unwrap();
+        // Pointers are equal.
+        assert_eq!(d0.0.raw(), d1.0.raw());
     }
 }

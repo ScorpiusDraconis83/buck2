@@ -19,9 +19,9 @@ use crate::metadata::key::MetadataKey;
 pub trait PackageValuesCalculation: Send + Sync + 'static {
     async fn package_values(
         &self,
-        ctx: &DiceComputations,
+        ctx: &mut DiceComputations<'_>,
         package: PackageLabel,
-    ) -> anyhow::Result<SmallMap<MetadataKey, serde_json::Value>>;
+    ) -> buck2_error::Result<SmallMap<MetadataKey, serde_json::Value>>;
 }
 
 pub static PACKAGE_VALUES_CALCULATION: LateBinding<&'static dyn PackageValuesCalculation> =

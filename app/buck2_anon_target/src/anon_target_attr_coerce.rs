@@ -11,8 +11,9 @@ use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::iter;
 
+use buck2_build_api::artifact_groups::promise::PromiseArtifactAttr;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsArtifactLike;
-use buck2_build_api::interpreter::rule_defs::artifact::StarlarkPromiseArtifact;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_promise_artifact::StarlarkPromiseArtifact;
 use buck2_build_api::interpreter::rule_defs::provider::dependency::Dependency;
 use buck2_build_api::interpreter::rule_defs::resolved_macro::ResolvedStringWithMacros;
 use buck2_core::provider::label::ProvidersLabel;
@@ -32,7 +33,6 @@ use buck2_node::attrs::attr_type::tuple::TupleAttrType;
 use buck2_node::attrs::attr_type::tuple::TupleLiteral;
 use buck2_node::attrs::attr_type::AttrType;
 use buck2_node::attrs::attr_type::AttrTypeInner;
-use buck2_node::attrs::coercion_context::AttrCoercionContext;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use gazebo::prelude::SliceExt;
@@ -46,27 +46,22 @@ use starlark::values::Value;
 
 use crate::anon_target_attr::AnonTargetAttr;
 use crate::anon_targets::AnonAttrCtx;
-use crate::promise_artifacts::PromiseArtifactAttr;
 
 pub trait AnonTargetAttrTypeCoerce {
-    fn coerce_item(&self, ctx: &AnonAttrCtx, value: Value) -> anyhow::Result<AnonTargetAttr>;
+    fn coerce_item(&self, ctx: &AnonAttrCtx, value: Value) -> buck2_error::Result<AnonTargetAttr>;
 }
 
 impl AnonTargetAttrTypeCoerce for AttrType {
-    fn coerce_item(&self, ctx: &AnonAttrCtx, value: Value) -> anyhow::Result<AnonTargetAttr> {
+    fn coerce_item(&self, ctx: &AnonAttrCtx, value: Value) -> buck2_error::Result<AnonTargetAttr> {
         match &self.0.inner {
             AttrTypeInner::Any(_) => to_anon_target_any(value, ctx),
             AttrTypeInner::Bool(_) => match value.unpack_bool() {
                 Some(s) => Ok(AnonTargetAttr::Bool(BoolLiteral(s))),
-                None => Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-                    "bool", value
-                ))),
+                None => Err(AnonTargetCoercionError::type_error("bool", value).into()),
             },
-            AttrTypeInner::Int(_) => match i64::unpack_value(value) {
+            AttrTypeInner::Int(_) => match i64::unpack_value(value)? {
                 Some(x) => Ok(AnonTargetAttr::Int(x)),
-                None => Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-                    "int", value
-                ))),
+                None => Err(AnonTargetCoercionError::type_error("int", value).into()),
             },
             AttrTypeInner::Dict(x) => to_anon_target_dict(x, ctx, value),
             AttrTypeInner::List(x) => to_anon_target_list(x, ctx, value),
@@ -81,10 +76,7 @@ impl AnonTargetAttrTypeCoerce for AttrType {
             }
             AttrTypeInner::String(_) => match value.unpack_str() {
                 Some(s) => Ok(AnonTargetAttr::String(StringLiteral(ctx.intern_str(s)))),
-                None => Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-                    STRING_TYPE,
-                    value
-                ))),
+                None => Err(AnonTargetCoercionError::type_error(STRING_TYPE, value).into()),
             },
             AttrTypeInner::Enum(x) => match value.unpack_str() {
                 Some(s) => {
@@ -103,12 +95,12 @@ impl AnonTargetAttrTypeCoerce for AttrType {
             AttrTypeInner::Dep(x) => {
                 match Dependency::from_value(value) {
                     Some(dep) => {
-                        let label = dep.label().inner().clone();
+                        let label = dep.label().inner().dupe();
 
                         let attr_type = match x.transition {
                             DepAttrTransition::Identity(..) => x.clone(),
                             DepAttrTransition::Exec => {
-                                match dep.execution_platform() {
+                                match dep.execution_platform()? {
                                 Some(exec_dep_resolution) => {
                                     if !exec_dep_resolution.eq(&ctx.execution_platform_resolution) {
                                         return Err(AnonTargetCoercionError::ExecDepPlatformMismatch(exec_dep_resolution.platform()?.id(), ctx.execution_platform_resolution.platform()?.id()).into());
@@ -139,10 +131,15 @@ impl AnonTargetAttrTypeCoerce for AttrType {
                         id: promise_artifact.artifact.id.as_ref().clone(),
                         short_path: promise_artifact.short_path.clone(),
                     }))
-                } else if let Some(artifact_like) = ValueAsArtifactLike::unpack_value(value) {
+                } else if let Some(artifact_like) = ValueAsArtifactLike::unpack_value(value)? {
                     let artifact = artifact_like.0.get_bound_artifact()?;
                     Ok(AnonTargetAttr::Artifact(artifact))
                 } else {
+                    // TODO(nga): `EnsuredArtifact` gets here with unhelpful error message like:
+                    //    ```
+                    //    Expected value of type `artifact`, got value with type `ensured_artifact`
+                    //    (value was `<ensured <build artifact merged_cdb bound to ...
+                    //    ```
                     Err(AnonTargetCoercionError::type_error("artifact", value).into())
                 }
             }
@@ -155,10 +152,10 @@ impl AnonTargetAttrTypeCoerce for AttrType {
             },
             AttrTypeInner::Label(_) => {
                 if let Some(label) = StarlarkProvidersLabel::from_value(value) {
-                    Ok(AnonTargetAttr::Label(label.label().clone()))
+                    Ok(AnonTargetAttr::Label(label.label().dupe()))
                 } else if let Some(label) = StarlarkTargetLabel::from_value(value) {
                     Ok(AnonTargetAttr::Label(ProvidersLabel::default_for(
-                        label.label().clone(),
+                        label.label().dupe(),
                     )))
                 } else {
                     Err(AnonTargetCoercionError::type_error(
@@ -176,28 +173,38 @@ impl AnonTargetAttrTypeCoerce for AttrType {
 #[derive(Debug, buck2_error::Error)]
 pub(crate) enum AnonTargetCoercionError {
     #[error("Expected value of type `{0}`, got value with type `{1}` (value was `{2}`)")]
+    #[buck2(tag = Input)]
     TypeError(String, String, String),
     #[error("Used one_of with an empty list.")]
+    #[buck2(tag = Input)]
     OneOfEmpty,
     #[error("one_of fails, the errors against each alternative in turn were:\n{}", .0.map(|x| format!("{:#}", x)).join("\n"))]
-    OneOfMany(Vec<anyhow::Error>),
+    #[buck2(tag = Input)]
+    OneOfMany(Vec<buck2_error::Error>),
     #[error("enum called with `{0}`, only allowed: {}", .1.map(|x| format!("`{}`", x)).join(", "))]
+    #[buck2(tag = Input)]
     InvalidEnumVariant(String, Vec<String>),
     #[error("Cannot coerce value of type `{0}` to any: `{1}`")]
+    #[buck2(tag = Input)]
     CannotCoerceToAny(&'static str, String),
     #[error("Attr value of type `{0}` not supported")]
+    #[buck2(tag = Input)]
     AttrTypeNotSupported(String),
     #[error("Arg attribute must have `anon_target_compatible` set to `True`")]
+    #[buck2(tag = Input)]
     ArgNotAnonTargetCompatible,
     #[error("Internal error: exec dep is missing the execution platform resolution")]
+    #[buck2(tag = Tier0)]
     ExecDepMissingExecPlatformResolution,
     #[error(
         "Exec deps and the current anon target must have the same execution platform resolution. Exec dep's execution platform: ({0}), anon target's execution platform: ({1})"
     )]
+    #[buck2(tag = Input)]
     ExecDepPlatformMismatch(String, String),
     #[error(
         "`transition_dep`, and `toolchain_dep` are not supported. By design, anon targets do not support configurations/transitions."
     )]
+    #[buck2(tag = Input)]
     OnlyIdentityDepSupported,
 }
 
@@ -210,7 +217,7 @@ impl AnonTargetCoercionError {
         )
     }
 
-    pub fn one_of_many(mut errs: Vec<anyhow::Error>) -> anyhow::Error {
+    pub fn one_of_many(mut errs: Vec<buck2_error::Error>) -> buck2_error::Error {
         if errs.is_empty() {
             AnonTargetCoercionError::OneOfEmpty.into()
         } else if errs.len() == 1 {
@@ -221,25 +228,25 @@ impl AnonTargetCoercionError {
     }
 }
 
-fn to_anon_target_any(value: Value, ctx: &AnonAttrCtx) -> anyhow::Result<AnonTargetAttr> {
+fn to_anon_target_any(value: Value, ctx: &AnonAttrCtx) -> buck2_error::Result<AnonTargetAttr> {
     if value.is_none() {
         Ok(AnonTargetAttr::None)
     } else if let Some(x) = value.unpack_bool() {
         Ok(AnonTargetAttr::Bool(BoolLiteral(x)))
-    } else if let Some(x) = i64::unpack_value(value) {
+    } else if let Some(x) = i64::unpack_value(value)? {
         Ok(AnonTargetAttr::Int(x))
     } else if let Some(x) = DictRef::from_value(value) {
         Ok(AnonTargetAttr::Dict(
             x.iter()
                 .map(|(k, v)| Ok((to_anon_target_any(k, ctx)?, to_anon_target_any(v, ctx)?)))
-                .collect::<anyhow::Result<_>>()?,
+                .collect::<buck2_error::Result<_>>()?,
         ))
     } else if let Some(x) = TupleRef::from_value(value) {
         // TODO(wendyy) intern attr
         Ok(AnonTargetAttr::Tuple(TupleLiteral(
             x.iter()
                 .map(|v| to_anon_target_any(v, ctx))
-                .collect::<anyhow::Result<Vec<_>>>()?
+                .collect::<buck2_error::Result<Vec<_>>>()?
                 .into(),
         )))
     } else if let Some(x) = ListRef::from_value(value) {
@@ -247,7 +254,7 @@ fn to_anon_target_any(value: Value, ctx: &AnonAttrCtx) -> anyhow::Result<AnonTar
         Ok(AnonTargetAttr::List(ListLiteral(
             x.iter()
                 .map(|v| to_anon_target_any(v, ctx))
-                .collect::<anyhow::Result<Vec<_>>>()?
+                .collect::<buck2_error::Result<Vec<_>>>()?
                 .into(),
         )))
     } else if let Some(s) = value.unpack_str() {
@@ -268,7 +275,7 @@ fn to_anon_target_dict(
 
     ctx: &AnonAttrCtx,
     value: Value,
-) -> anyhow::Result<AnonTargetAttr> {
+) -> buck2_error::Result<AnonTargetAttr> {
     if let Some(dict) = DictRef::from_value(value) {
         let mut res = Vec::with_capacity(dict.len());
         if dict_attr_type.sorted {
@@ -293,10 +300,7 @@ fn to_anon_target_dict(
         }
         Ok(AnonTargetAttr::Dict(DictLiteral(res.into())))
     } else {
-        Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-            Dict::TYPE,
-            value,
-        )))
+        Err(AnonTargetCoercionError::type_error(Dict::TYPE, value).into())
     }
 }
 
@@ -305,7 +309,7 @@ fn to_anon_target_one_of(
 
     ctx: &AnonAttrCtx,
     value: Value,
-) -> anyhow::Result<AnonTargetAttr> {
+) -> buck2_error::Result<AnonTargetAttr> {
     let mut errs = Vec::new();
     // Bias towards the start of the list - try and use success/failure from first in preference
     for (i, x) in one_of_attr_type.xs.iter().enumerate() {
@@ -317,7 +321,7 @@ fn to_anon_target_one_of(
             }
         }
     }
-    Err(AnonTargetCoercionError::one_of_many(errs))
+    Err(AnonTargetCoercionError::one_of_many(errs).into())
 }
 
 fn to_anon_target_tuple(
@@ -325,7 +329,7 @@ fn to_anon_target_tuple(
 
     ctx: &AnonAttrCtx,
     value: Value,
-) -> anyhow::Result<AnonTargetAttr> {
+) -> buck2_error::Result<AnonTargetAttr> {
     let coerce = |value, items: &[Value]| {
         // Use comparison rather than equality below. If the tuple is too short,
         // it is implicitly extended using None.
@@ -341,10 +345,11 @@ fn to_anon_target_tuple(
             // TODO(wendyy) intern attr
             Ok(AnonTargetAttr::Tuple(TupleLiteral(res.into())))
         } else {
-            Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
+            Err(AnonTargetCoercionError::type_error(
                 &format!("Tuple of at most length {}", tuple_attr_type.xs.len()),
-                value
-            )))
+                value,
+            )
+            .into())
         }
     };
     if let Some(list) = TupleRef::from_value(value) {
@@ -352,10 +357,7 @@ fn to_anon_target_tuple(
     } else if let Some(list) = ListRef::from_value(value) {
         coerce(value, list.content())
     } else {
-        Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-            TupleRef::TYPE,
-            value,
-        )))
+        Err(AnonTargetCoercionError::type_error(TupleRef::TYPE, value).into())
     }
 }
 
@@ -364,7 +366,7 @@ fn to_anon_target_list(
 
     ctx: &AnonAttrCtx,
     value: Value,
-) -> anyhow::Result<AnonTargetAttr> {
+) -> buck2_error::Result<AnonTargetAttr> {
     if let Some(list) = ListRef::from_value(value) {
         Ok(AnonTargetAttr::List(ListLiteral(
             // TODO(wendyy) intern attr
@@ -380,9 +382,6 @@ fn to_anon_target_list(
                 .into(),
         )))
     } else {
-        Err(anyhow::anyhow!(AnonTargetCoercionError::type_error(
-            ListRef::TYPE,
-            value,
-        )))
+        Err(AnonTargetCoercionError::type_error(ListRef::TYPE, value).into())
     }
 }

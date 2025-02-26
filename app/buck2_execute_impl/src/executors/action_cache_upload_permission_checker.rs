@@ -10,14 +10,14 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
-use anyhow::Context;
 use buck2_core::async_once_cell::AsyncOnceCell;
 use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+use buck2_error::BuckErrorContext;
+use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use dashmap::DashMap;
 use dupe::Dupe;
-use remote_execution::REClientError;
 use remote_execution::TCode;
 
 use crate::executors::empty_action_result::empty_action_result;
@@ -36,7 +36,7 @@ struct CacheValue {
 /// Check permission to upload to action cache and cache result.
 pub struct ActionCacheUploadPermissionChecker {
     re_client: ManagedRemoteExecutionClient,
-    /// Permission check does not depend on RE use case or platform,
+    /// Permission check does not depend on RE use case,
     /// but since we use these to upload, it is safer to cache the result by them.
     has_permission_to_upload_to_cache: DashMap<CacheKey, Arc<CacheValue>>,
 }
@@ -53,8 +53,8 @@ impl ActionCacheUploadPermissionChecker {
         &self,
         re_use_case: RemoteExecutorUseCase,
         platform: &RePlatformFields,
-    ) -> anyhow::Result<Result<(), String>> {
-        let (action, action_result) = empty_action_result()?;
+    ) -> buck2_error::Result<Result<(), String>> {
+        let (action, action_result) = empty_action_result(platform)?;
 
         // This is CAS upload, if it fails, something is very broken.
         self.re_client
@@ -78,7 +78,7 @@ impl ActionCacheUploadPermissionChecker {
             .await;
         match result {
             Ok(_) => Ok(Ok(())),
-            Err(e) => match e.downcast_ref::<REClientError>() {
+            Err(e) => match e.find_typed_context::<RemoteExecutionError>() {
                 Some(e) if e.code == TCode::PERMISSION_DENIED => Ok(Err(e.message.clone())),
                 _ => Err(e),
             },
@@ -107,13 +107,13 @@ impl ActionCacheUploadPermissionChecker {
         &self,
         re_use_case: RemoteExecutorUseCase,
         platform: &RePlatformFields,
-    ) -> anyhow::Result<Result<(), String>> {
+    ) -> buck2_error::Result<Result<(), String>> {
         let cache_value = self.cache_value(re_use_case, platform);
         cache_value
             .has_permission_to_upload_to_cache
             .get_or_try_init(self.do_has_permission_to_upload_to_cache(re_use_case, platform))
             .await
-            .map(|result| result.clone())
-            .context("Upload for permission check")
+            .cloned()
+            .buck_error_context("Upload for permission check")
     }
 }

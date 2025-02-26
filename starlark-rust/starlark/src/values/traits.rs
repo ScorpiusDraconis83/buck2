@@ -43,6 +43,8 @@ use crate::any::ProvidesStaticType;
 use crate::collections::Hashed;
 use crate::collections::StarlarkHasher;
 use crate::docs::DocItem;
+use crate::docs::DocMember;
+use crate::docs::DocProperty;
 use crate::environment::Methods;
 use crate::eval::Arguments;
 use crate::eval::Evaluator;
@@ -55,13 +57,14 @@ use crate::values::error::ControlError;
 use crate::values::function::FUNCTION_TYPE;
 use crate::values::Freeze;
 use crate::values::FrozenStringValue;
+use crate::values::FrozenValue;
 use crate::values::Heap;
 use crate::values::Trace;
 use crate::values::Value;
 use crate::values::ValueError;
 
-/// A trait for values which are more complex - because they are either mutable,
-/// or contain references to other values.
+/// A trait for values which are more complex - because they are either mutable
+/// (e.g. using [`RefCell`](std::cell::RefCell)), or contain references to other values.
 ///
 /// For values that contain nested [`Value`] types (mutable or not) there are a bunch of helpers
 /// and macros.
@@ -82,6 +85,7 @@ use crate::values::ValueError;
 /// use starlark::values::Coerce;
 /// use starlark::values::ComplexValue;
 /// use starlark::values::Freeze;
+/// use starlark::values::FreezeResult;
 /// use starlark::values::Freezer;
 /// use starlark::values::FrozenValue;
 /// use starlark::values::NoSerialize;
@@ -107,7 +111,7 @@ use crate::values::ValueError;
 /// starlark_complex_value!(One);
 ///
 /// #[starlark_value(type = "one")]
-/// impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for OneGen<V>
+/// impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for OneGen<V>
 /// where
 ///     Self: ProvidesStaticType<'v>,
 /// {
@@ -117,7 +121,7 @@ use crate::values::ValueError;
 ///
 /// impl<'v> Freeze for One<'v> {
 ///     type Frozen = FrozenOne;
-///     fn freeze(self, freezer: &Freezer) -> anyhow::Result<Self::Frozen> {
+///     fn freeze(self, freezer: &Freezer) -> FreezeResult<Self::Frozen> {
 ///         Ok(OneGen(self.0.freeze(freezer)?))
 ///     }
 /// }
@@ -125,7 +129,6 @@ use crate::values::ValueError;
 ///
 /// The [`starlark_complex_value!`](crate::starlark_complex_value!) requires that
 /// the type have an instance for `Coerce`, then the macro defines two type aliases.
-///
 /// ```
 /// # use crate::starlark::values::*;
 /// # #[derive(Debug, Trace)]
@@ -142,7 +145,6 @@ use crate::values::ValueError;
 /// [`AllocFrozenValue`](crate::values::AllocFrozenValue) for the frozen one, and
 /// [`UnpackValue`](crate::values::UnpackValue) for the non-frozen one.
 /// It also defines the methods:
-///
 /// ```
 /// # use crate::starlark::values::*;
 /// # use std::cell::RefMut;
@@ -197,8 +199,9 @@ where
 /// Every Rust value stored in a [`Value`] must implement this trait.
 /// You _must_ also implement [`ComplexValue`] if:
 ///
-/// * A type is _mutable_, if you ever need to get a `&mut self` reference to it.
-/// * A type _contains_ nested Starlark [`Value`]s.
+/// * A type is not [`Send`] and [`Sync`], typically because it contains
+///   interior mutability such as a [`RefCell`](std::cell::RefCell).
+/// * A type contains nested Starlark [`Value`]s.
 ///
 /// There are only two required members of [`StarlarkValue`], namely
 /// [`TYPE`](StarlarkValue::TYPE)
@@ -216,7 +219,7 @@ where
 /// use starlark_derive::starlark_value;
 ///
 /// #[derive(Debug, Display, ProvidesStaticType, NoSerialize, Allocative)]
-/// #[display(fmt = "Foo")]
+/// #[display("Foo")]
 /// struct Foo;
 /// # starlark_simple_value!(Foo);
 /// #[starlark_value(type = "foo")]
@@ -288,12 +291,6 @@ pub trait StarlarkValue<'v>:
         false
     }
 
-    /// Is this value a match for a named type. Usually returns `true` for
-    /// values matching `get_type`, but might also work for subtypes it implements.
-    fn matches_type(&self, ty: &str) -> bool {
-        Self::TYPE == ty
-    }
-
     /// Function is implemented for types values.
     #[doc(hidden)]
     fn type_matches_value(&self, _value: Value<'v>, _private: Private) -> bool {
@@ -312,12 +309,22 @@ pub trait StarlarkValue<'v>:
         None
     }
 
-    /// Return structured documentation for self, if available.
-    fn documentation(&self) -> Option<DocItem>
+    /// Return the documentation for this value.
+    ///
+    /// This should be the doc-item that is expected to be generated when this value appears as a
+    /// global in a module. In other words, for normal types this should generally return a
+    /// `DocMember::Property`. In that case there is no need to override this method.
+    fn documentation(&self) -> DocItem
     where
         Self: Sized,
     {
-        Self::get_methods().map(|methods| DocItem::Object(methods.documentation()))
+        let ty = self
+            .typechecker_ty()
+            .unwrap_or_else(|| Self::get_type_starlark_repr());
+        DocItem::Member(DocMember::Property(DocProperty {
+            docs: None,
+            typ: ty,
+        }))
     }
 
     /// Type of this instance for typechecker.
@@ -433,28 +440,9 @@ pub trait StarlarkValue<'v>:
         &self,
         _me: Value<'v>,
         _args: &Arguments<'v, '_>,
-        _eval: &mut Evaluator<'v, '_>,
+        _eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
         ValueError::unsupported(self, "call()")
-    }
-
-    /// Invoke this object as a method (after getattr, so this object is unbound).
-    ///
-    /// This is an internal operation, it cannot be used or implemented
-    /// outside of the Starlark crate.
-    ///
-    /// # Parameters
-    ///
-    /// * `this` - the object to invoke the unbound method on
-    #[doc(hidden)]
-    fn invoke_method(
-        &self,
-        _this: Value<'v>,
-        _args: &Arguments<'v, '_>,
-        _eval: &mut Evaluator<'v, '_>,
-        _sealed: Private,
-    ) -> crate::Result<Value<'v>> {
-        unreachable!("invoke_method should only be invoked for method or attribute");
     }
 
     /// Return the result of `a[index]` if `a` is indexable.
@@ -677,14 +665,15 @@ pub trait StarlarkValue<'v>:
         ValueError::unsupported(self, "-")
     }
 
-    /// Add with the arguments the other way around. Should return [`None`]
-    /// to fall through to normal add.
+    /// Add with the arguments the other way around.
+    /// Normal `add` should return `None` in order for it to be evaluated.
     fn radd(&self, _lhs: Value<'v>, _heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
         None
     }
 
     /// Add `other` to the current value. Pass both self and
-    /// the Value form of self as original.
+    /// the Value form of self as original. Should return [`None`]
+    /// to fall through to `radd`.
     ///
     /// # Examples
     ///
@@ -855,7 +844,11 @@ pub trait StarlarkValue<'v>:
     }
 
     /// Called when exporting a value under a specific name,
-    fn export_as(&self, _variable_name: &str, _eval: &mut Evaluator<'v, '_>) -> crate::Result<()> {
+    fn export_as(
+        &self,
+        _variable_name: &str,
+        _eval: &mut Evaluator<'v, '_, '_>,
+    ) -> crate::Result<()> {
         // Most data types ignore how they are exported
         // but rules/providers like to use it as a helpful hint for users
         Ok(())
@@ -891,5 +884,13 @@ pub trait StarlarkValue<'v>:
     /// [std::any::Provider](https://doc.rust-lang.org/std/any/trait.Provider.html).
     fn provide(&'v self, demand: &mut Demand<'_, 'v>) {
         let _ = demand;
+    }
+
+    /// When freezing, this function is called on mutable value to return
+    /// statically allocated singleton value if possible.
+    ///
+    /// This function is used for optimization and rarely needed to be implemented.
+    fn try_freeze_static(&self) -> Option<FrozenValue> {
+        None
     }
 }

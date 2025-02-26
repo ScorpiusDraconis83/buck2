@@ -10,24 +10,18 @@
 use buck2_build_api::interpreter::rule_defs::provider::registration::register_builtin_providers;
 use buck2_build_api::interpreter::rule_defs::register_rule_defs;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
-use buck2_common::legacy_configs::testing::TestConfigParserFileOps;
+use buck2_common::legacy_configs::configs::testing::TestConfigParserFileOps;
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::package_listing::listing::testing::PackageListingExt;
 use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::bzl::ImportPath;
-use buck2_core::cells::name::CellName;
-use buck2_core::fs::paths::abs_norm_path::AbsNormPathBuf;
-use buck2_core::fs::project::ProjectRoot;
-use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_interpreter::file_loader::LoadedModules;
 use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
 use buck2_interpreter::paths::path::StarlarkPath;
-use buck2_interpreter_for_build::attrs::attrs_global::register_attrs;
-use buck2_interpreter_for_build::interpreter::natives::register_module_natives;
 use buck2_interpreter_for_build::interpreter::testing::run_simple_starlark_test;
 use buck2_interpreter_for_build::interpreter::testing::CellsData;
 use buck2_interpreter_for_build::interpreter::testing::Tester;
-use buck2_interpreter_for_build::rule::register_rule_function;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
 use buck2_node::nodes::unconfigured::testing::targets_to_json;
 use dupe::Dupe;
@@ -103,8 +97,6 @@ fn test_load() {
 #[test]
 fn test_eval_build_file() {
     let mut tester = Tester::new().unwrap();
-    tester.additional_globals(register_rule_function);
-    tester.additional_globals(register_attrs);
     tester.additional_globals(register_builtin_providers);
 
     tester
@@ -183,40 +175,28 @@ fn test_eval_build_file() {
 }
 
 fn cells() -> CellsData {
-    let repo_root = if cfg!(windows) { "C:/" } else { "/" };
-    let project_fs =
-        ProjectRoot::new_unchecked(AbsNormPathBuf::try_from(repo_root.to_owned()).unwrap());
-    let BuckConfigBasedCells {
-        cell_resolver,
-        configs_by_name,
-        config_paths: _,
-    } = BuckConfigBasedCells::parse_with_file_ops(
-        &project_fs,
-        &mut TestConfigParserFileOps::new(&[(
-            "/.buckconfig",
-            indoc!(
-                r#"
-                    [repositories]
+    let BuckConfigBasedCells { cell_resolver, .. } =
+        futures::executor::block_on(BuckConfigBasedCells::testing_parse_with_file_ops(
+            &mut TestConfigParserFileOps::new(&[(
+                ".buckconfig",
+                indoc!(
+                    r#"
+                    [cells]
                         root = .
                         cell1 = project/cell1
                         cell2 = project/cell2
                         xalias2 = project/cell2
                     "#
-            ),
-        )])
-        .unwrap(),
-        &[],
-        ProjectRelativePath::empty(),
-    )
-    .unwrap();
+                ),
+            )])
+            .unwrap(),
+            &[],
+        ))
+        .unwrap();
     (
-        cell_resolver
-            .get(CellName::testing_new("root"))
-            .unwrap()
-            .cell_alias_resolver()
-            .dupe(),
+        cell_resolver.root_cell_cell_alias_resolver().dupe(),
         cell_resolver,
-        configs_by_name,
+        LegacyBuckConfig::empty(),
     )
 }
 
@@ -277,8 +257,6 @@ fn test_root_import() {
     .unwrap();
 
     tester.additional_globals(register_builtin_providers);
-    tester.additional_globals(register_rule_function);
-    tester.additional_globals(register_attrs);
 
     let import_path = ImportPath::testing_new("root//:include.bzl");
     tester
@@ -330,7 +308,7 @@ fn test_root_import() {
 }
 
 #[test]
-fn prelude_is_included() -> anyhow::Result<()> {
+fn prelude_is_included() -> buck2_error::Result<()> {
     let mut tester = Tester::new()?;
     let prelude_path = ImportPath::testing_new("root//prelude:prelude.bzl");
     tester.set_prelude(prelude_path.clone());
@@ -376,7 +354,7 @@ fn prelude_is_included() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_package_import() -> anyhow::Result<()> {
+fn test_package_import() -> buck2_error::Result<()> {
     let mut tester = Tester::with_cells(buck2_interpreter_for_build::interpreter::testing::cells(
         Some(indoc!(
             r#"
@@ -385,8 +363,6 @@ fn test_package_import() -> anyhow::Result<()> {
         "#
         )),
     )?)?;
-    tester.additional_globals(register_rule_function);
-    tester.additional_globals(register_module_natives);
 
     let import_path = ImportPath::testing_new("root//:include.bzl");
     tester.add_import(
@@ -425,6 +401,7 @@ fn test_package_import() -> anyhow::Result<()> {
                     "exec_compatible_with": [],
                     "name": "DEFAULT",
                     "target_compatible_with": [],
+                    "modifiers": [],
                     "tests": [],
                     "visibility": [],
                     "within_view": ["PUBLIC"],
@@ -441,10 +418,8 @@ fn test_package_import() -> anyhow::Result<()> {
 }
 
 #[test]
-fn eval() -> anyhow::Result<()> {
+fn eval() -> buck2_error::Result<()> {
     let mut tester = Tester::new()?;
-    tester.additional_globals(register_module_natives);
-    tester.additional_globals(register_rule_function);
     let content = indoc!(
         r#"
             def _impl(ctx):
@@ -452,11 +427,11 @@ fn eval() -> anyhow::Result<()> {
             export_file = rule(impl=_impl, attrs = {})
 
             def test():
-                assert_eq("some/package", __internal__.package_name())
-                assert_eq("@root", __internal__.repository_name())
+                assert_eq("some/package", __buck2_builtins__.package_name())
+                assert_eq("@root", __buck2_builtins__.repository_name())
 
-                assert_eq(package_name(), __internal__.package_name())
-                assert_eq(repository_name(), __internal__.repository_name())
+                assert_eq(package_name(), __buck2_builtins__.package_name())
+                assert_eq(repository_name(), __buck2_builtins__.repository_name())
 
                 assert_eq(package_name(), get_base_path())
 
@@ -473,24 +448,33 @@ fn eval() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_internal() -> anyhow::Result<()> {
-    // Test that most things end up on __internal__
-    let mut tester = Tester::new().unwrap();
-    tester.additional_globals(register_rule_defs);
+fn test_builtins() -> buck2_error::Result<()> {
+    // Test that most things end up on __buck2_builtins__
     run_simple_starlark_test(indoc!(
         r#"
             def test():
-                assert_eq(__internal__.json.encode({}), "{}")
+                assert_eq(__buck2_builtins__.json.encode({}), "{}")
             "#
-    ))
+    ))?;
+
+    // But not internals
+    let mut tester = Tester::new().unwrap();
+    tester.run_starlark_test_expecting_error(
+        indoc!(
+            r#"
+            def test():
+                __buck2_builtins__.buck2_fail("message")
+            "#
+        ),
+        "The attribute `buck2_fail` is not available",
+    );
+    Ok(())
 }
 
 #[test]
-fn test_oncall() -> anyhow::Result<()> {
+fn test_oncall() -> buck2_error::Result<()> {
     let mut tester = Tester::new().unwrap();
-    tester.additional_globals(register_module_natives);
     tester.additional_globals(register_rule_defs);
-    tester.additional_globals(register_rule_function);
     tester.run_starlark_test(indoc!(
         r#"
             def _impl(ctx):
@@ -500,6 +484,32 @@ fn test_oncall() -> anyhow::Result<()> {
             def test():
                 oncall("valid")
                 export_file(name = "rule_name")
+            "#
+    ))?;
+    tester.run_starlark_test(indoc!(
+        r#"
+            def _impl(ctx):
+                pass
+            export_file = rule(impl=_impl, attrs = {})
+
+            def test():
+                oncall("valid")
+                if read_oncall() != "valid":
+                    fail("oncall should be set to valid")
+                export_file(name = "rule_name")
+                if read_oncall() != "valid":
+                    fail("oncall should be set to valid and targets set")
+            "#
+    ))?;
+    tester.run_starlark_test(indoc!(
+        r#"
+            def _impl(ctx):
+                pass
+            export_file = rule(impl=_impl, attrs = {})
+
+            def test():
+                if read_oncall() != None:
+                    fail("oncall should be None if never set")
             "#
     ))?;
     tester.run_starlark_test_expecting_error(
@@ -525,6 +535,16 @@ fn test_oncall() -> anyhow::Result<()> {
             "#
         ),
         "after one or more targets",
+    );
+    tester.run_starlark_test_expecting_error(
+        indoc!(
+            r#"
+            def test():
+                read_oncall()
+                oncall("valid")
+            "#
+        ),
+        "after calling `read_oncall`",
     );
     Ok(())
 }

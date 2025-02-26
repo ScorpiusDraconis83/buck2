@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("build_infra")
 
@@ -11,12 +10,11 @@ rust_binary(
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
-        "fbsource//third-party/rust:clap-3",
+        "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:crossbeam",
         "fbsource//third-party/rust:derivative",
         "fbsource//third-party/rust:derive_more",
         "fbsource//third-party/rust:futures",
-        "fbsource//third-party/rust:higher-order-closure",
         "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:quickcheck",

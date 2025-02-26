@@ -9,7 +9,7 @@
 
 use buck2_interpreter::types::provider::callable::ProviderCallableLike;
 use starlark::typing::Ty;
-use starlark::typing::TyFunction;
+use starlark::typing::TyCallable;
 use starlark::typing::TyStarlarkValue;
 use starlark::typing::TyUser;
 use starlark::typing::TyUserParams;
@@ -17,8 +17,8 @@ use starlark::values::typing::TypeInstanceId;
 use starlark::values::StarlarkValue;
 
 pub(crate) fn ty_provider_callable<'v, C: StarlarkValue<'v> + ProviderCallableLike>(
-    creator_func: TyFunction,
-) -> anyhow::Result<Ty> {
+    creator_func: TyCallable,
+) -> buck2_error::Result<Ty> {
     Ok(Ty::custom(TyUser::new(
         C::TYPE.to_owned(),
         TyStarlarkValue::new::<C>(),

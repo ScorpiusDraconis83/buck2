@@ -24,10 +24,11 @@ use dupe::Dupe;
 use num_traits::Signed;
 use thiserror::Error;
 
-use crate::values::float;
-use crate::values::num::value::NumRef;
+use crate::values::float::float;
+use crate::values::float::StarlarkFloat;
 use crate::values::string::dot_format::format_one;
-use crate::values::types::int_or_big::StarlarkIntRef;
+use crate::values::types::int::int_or_big::StarlarkIntRef;
+use crate::values::types::num::value::NumRef;
 use crate::values::types::tuple::value::Tuple;
 use crate::values::Heap;
 use crate::values::StringValue;
@@ -233,10 +234,12 @@ pub(crate) fn percent(format: &str, value: Value) -> crate::Result<String> {
                     Some(NumRef::Int(StarlarkIntRef::Big(v))) => {
                         write!(res, "{}", v.get()).unwrap()
                     }
-                    Some(NumRef::Float(v)) => match NumRef::Float(v.trunc()).as_int() {
-                        Some(v) => write!(res, "{}", v).unwrap(),
-                        None => ValueError::unsupported_type(value, "format(%d)")?,
-                    },
+                    Some(NumRef::Float(v)) => {
+                        match NumRef::Float(StarlarkFloat(v.0.trunc())).as_int() {
+                            Some(v) => write!(res, "{}", v).unwrap(),
+                            None => ValueError::unsupported_type(value, "format(%d)")?,
+                        }
+                    }
                     None => ValueError::unsupported_type(value, "format(%d)")?,
                 }
             }
@@ -386,15 +389,23 @@ pub(crate) fn percent_s_one<'v>(
     arg: Value<'v>,
     after: &str,
     heap: &'v Heap,
-) -> anyhow::Result<StringValue<'v>> {
+) -> crate::Result<StringValue<'v>> {
     Ok(match StringValue::new(arg) {
         Some(arg) => heap.alloc_str_concat3(before, &arg, after),
         None => {
             let one = match Tuple::from_value(arg) {
                 Some(tuple) => match tuple.content() {
-                    [] => return Err(StringInterpolationError::NotEnoughParameters.into()),
+                    [] => {
+                        return Err(crate::Error::new_other(
+                            StringInterpolationError::NotEnoughParameters,
+                        ));
+                    }
                     [value] => *value,
-                    [_, _, ..] => return Err(StringInterpolationError::TooManyParameters.into()),
+                    [_, _, ..] => {
+                        return Err(crate::Error::new_other(
+                            StringInterpolationError::TooManyParameters,
+                        ));
+                    }
                 },
                 None => arg,
             };
@@ -511,15 +522,15 @@ mod tests {
 
         assert::fail(
             "'%e' % (True,)",
-            "Type of parameters mismatch, expected `int or float`, actual `bool`",
+            "Type of parameters mismatch, expected `float | int`, actual `bool (repr: True)`",
         );
         assert::fail(
             "'%e' % ('abc',)",
-            "Type of parameters mismatch, expected `int or float`, actual `string`",
+            "Type of parameters mismatch, expected `float | int`, actual `string (repr:",
         );
         assert::fail(
             "'%e' % ([],)",
-            "Type of parameters mismatch, expected `int or float`, actual `list`",
+            "Type of parameters mismatch, expected `float | int`, actual `list (repr",
         );
     }
 

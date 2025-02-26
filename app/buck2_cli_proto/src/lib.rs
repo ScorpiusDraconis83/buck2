@@ -11,6 +11,12 @@
 #![feature(min_specialization)]
 #![allow(clippy::large_enum_variant)]
 
+use buck2_core::cells::cell_root_path::CellRootPath;
+use buck2_core::cells::cell_root_path::CellRootPathBuf;
+use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_error::internal_error;
+use buck2_error::BuckErrorContext;
+
 use crate::BuckDaemonProtoError::MissingClientContext;
 
 pub mod new_generic;
@@ -19,19 +25,57 @@ pub mod protobuf_util;
 tonic::include_proto!("buck.daemon");
 
 #[derive(Debug, buck2_error::Error)]
+#[buck2(tag = Tier0)]
 enum BuckDaemonProtoError {
     #[error("daemon request was missing client context")]
     MissingClientContext,
-    #[error("wrong gRPC request message type, expecting {0} (internal error)")]
-    WrongRequestType(&'static str),
+}
+
+#[track_caller]
+fn wrong_request_type(request_type: &'static str) -> buck2_error::Error {
+    internal_error!("wrong gRPC request message type, expecting {request_type}")
+}
+
+impl ConfigOverride {
+    /// Not `fbcode//config.key=value`
+    pub fn flag_no_cell(s: &str) -> Self {
+        Self::flag(s, None)
+    }
+
+    pub fn flag(s: &str, cell: Option<CellRootPathBuf>) -> Self {
+        Self {
+            cell: cell.map(|c| c.as_str().to_owned()),
+            config_override: s.to_owned(),
+            config_type: crate::config_override::ConfigType::Value.into(),
+        }
+    }
+
+    pub fn file(p: &str, cell: Option<CellRootPathBuf>) -> Self {
+        Self {
+            cell: cell.map(|c| c.as_str().to_owned()),
+            config_override: p.to_owned(),
+            config_type: crate::config_override::ConfigType::File.into(),
+        }
+    }
+
+    pub fn get_cell(&self) -> buck2_error::Result<Option<&CellRootPath>> {
+        self.cell
+            .as_ref()
+            .map(|p| {
+                ProjectRelativePath::new(p)
+                    .map(CellRootPath::new)
+                    .internal_error("Client should have sent a valid path")
+            })
+            .transpose()
+    }
 }
 
 pub trait HasClientContext {
-    fn client_context(&self) -> anyhow::Result<&ClientContext>;
+    fn client_context(&self) -> buck2_error::Result<&ClientContext>;
 }
 
 impl HasClientContext for StreamingRequest {
-    fn client_context(&self) -> anyhow::Result<&ClientContext> {
+    fn client_context(&self) -> buck2_error::Result<&ClientContext> {
         match self.request.as_ref() {
             Some(streaming_request::Request::Context(ctx)) => Ok(ctx),
             _ => Err(MissingClientContext.into()),
@@ -46,12 +90,12 @@ impl HasBuildOptions for StreamingRequest {
 }
 
 impl TryFrom<StreamingRequest> for LspRequest {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     fn try_from(value: StreamingRequest) -> Result<Self, Self::Error> {
         match value.request {
             Some(streaming_request::Request::Lsp(req)) => Ok(req),
-            _ => Err(BuckDaemonProtoError::WrongRequestType("LspRequest").into()),
+            _ => Err(wrong_request_type("LspRequest")),
         }
     }
 }
@@ -65,12 +109,12 @@ impl From<LspRequest> for StreamingRequest {
 }
 
 impl TryFrom<StreamingRequest> for SubscriptionRequestWrapper {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     fn try_from(value: StreamingRequest) -> Result<Self, Self::Error> {
         match value.request {
             Some(streaming_request::Request::Subscription(req)) => Ok(req),
-            _ => Err(BuckDaemonProtoError::WrongRequestType("SubscriptionRequestWrapper").into()),
+            _ => Err(wrong_request_type("SubscriptionRequestWrapper")),
         }
     }
 }
@@ -84,12 +128,12 @@ impl From<SubscriptionRequestWrapper> for StreamingRequest {
 }
 
 impl TryFrom<StreamingRequest> for DapRequest {
-    type Error = anyhow::Error;
+    type Error = buck2_error::Error;
 
     fn try_from(value: StreamingRequest) -> Result<Self, Self::Error> {
         match value.request {
             Some(streaming_request::Request::Dap(req)) => Ok(req),
-            _ => Err(BuckDaemonProtoError::WrongRequestType("DapRequest").into()),
+            _ => Err(wrong_request_type("DapRequest")),
         }
     }
 }
@@ -171,7 +215,7 @@ macro_rules! define_request {
 
     ( @has $name:ident $has_buildopts:ident context $($tail:ident)* ) => {
         impl HasClientContext for $name {
-            fn client_context(&self) -> anyhow::Result<&ClientContext> {
+            fn client_context(&self) -> buck2_error::Result<&ClientContext> {
                 // A request that has a client context field should always set the context.
                 match &self.context {
                     Some(v) => Ok(v),
@@ -254,7 +298,6 @@ result_convert!(TargetsResponse);
 result_convert!(TargetsShowOutputsResponse);
 result_convert!(ConfiguredTargetsResponse);
 result_convert!(GenericResponse);
-result_convert!(UnstableDocsResponse);
 result_convert!(ProfileResponse);
 result_convert!(InstallResponse);
 result_convert!(CleanStaleResponse);
@@ -283,7 +326,6 @@ define_request!(CqueryRequest, has(context));
 define_request!(UqueryRequest, has(context));
 define_request!(TestRequest, has(context, build_options));
 define_request!(GenericRequest, has(context));
-define_request!(UnstableDocsRequest, has(context));
 define_request!(ProfileRequest, has(context));
 define_request!(AllocativeRequest, has(context));
 define_request!(CleanStaleRequest, has(context));

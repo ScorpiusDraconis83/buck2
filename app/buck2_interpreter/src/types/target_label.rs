@@ -10,37 +10,38 @@
 use std::hash::Hash;
 
 use allocative::Allocative;
-use anyhow::Context;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::NonDefaultProvidersName;
 use buck2_core::provider::label::ProviderName;
 use buck2_core::provider::label::ProvidersLabel;
 use buck2_core::provider::label::ProvidersName;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-use buck2_core::target::label::TargetLabel;
+use buck2_core::target::label::label::TargetLabel;
+use buck2_error::BuckErrorContext;
 use derive_more::Display;
 use derive_more::From;
 use dupe::Dupe;
 use serde::Serialize;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::StarlarkHasher;
-use starlark::docs::StarlarkDocs;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::environment::MethodsStatic;
-use starlark::typing::Ty;
-use starlark::values::list::AllocList;
-use starlark::values::list::ListRef;
+use starlark::starlark_module;
+use starlark::starlark_simple_value;
+use starlark::values::list::UnpackList;
 use starlark::values::starlark_value;
 use starlark::values::starlark_value_as_type::StarlarkValueAsType;
+use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::Heap;
 use starlark::values::StarlarkValue;
+use starlark::values::StringValue;
+use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueError;
 use starlark::values::ValueLike;
 
-use crate::starlark::values::AllocValue;
 use crate::types::cell_path::StarlarkCellPath;
 use crate::types::configuration::StarlarkConfiguration;
 use crate::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
@@ -57,7 +58,6 @@ use crate::types::configured_providers_label::StarlarkProvidersLabel;
     From,
     ProvidesStaticType,
     Serialize,
-    StarlarkDocs,
     Allocative
 )]
 #[serde(transparent)]
@@ -104,27 +104,31 @@ impl<'v> StarlarkValue<'v> for StarlarkTargetLabel {
             ValueError::unsupported_with(self, "compare", other)
         }
     }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
-    }
 }
 
 #[starlark_module]
 fn label_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
-    fn package<'v>(this: &StarlarkTargetLabel) -> anyhow::Result<&'v str> {
-        Ok(this.label.pkg().cell_relative_path().as_str())
+    fn package<'v>(
+        this: &StarlarkTargetLabel,
+        heap: &'v Heap,
+    ) -> starlark::Result<StringValue<'v>> {
+        Ok(heap.alloc_str_intern(this.label.pkg().cell_relative_path().as_str()))
     }
 
     #[starlark(attribute)]
-    fn name<'v>(this: &StarlarkTargetLabel) -> anyhow::Result<&'v str> {
+    fn name<'v>(this: &'v StarlarkTargetLabel) -> starlark::Result<&'v str> {
         Ok(this.label.name().as_str())
     }
 
     #[starlark(attribute)]
-    fn cell<'v>(this: &'v StarlarkTargetLabel) -> anyhow::Result<&'v str> {
+    fn cell<'v>(this: &'v StarlarkTargetLabel) -> starlark::Result<&'v str> {
         Ok(this.label.pkg().cell_name().as_str())
+    }
+
+    #[starlark(attribute)]
+    fn path<'v>(this: &StarlarkTargetLabel) -> starlark::Result<StarlarkCellPath> {
+        Ok(StarlarkCellPath(this.label.pkg().to_cell_path()))
     }
 
     /// Converts a `TargetLabel` into its corresponding `ProvidersLabel` given the subtarget names,
@@ -142,8 +146,10 @@ fn label_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn with_sub_target<'v>(
         this: &StarlarkTargetLabel,
-        #[starlark(default = AllocList::EMPTY)] subtarget_name: Value<'v>,
-    ) -> anyhow::Result<StarlarkProvidersLabel> {
+        // TODO(nga): must be either positional or named.
+        #[starlark(default = SubtargetNameArg::List(UnpackList { items: Vec::new() }))]
+        subtarget_name: SubtargetNameArg<'v>,
+    ) -> starlark::Result<StarlarkProvidersLabel> {
         let providers_name = value_to_providers_name(subtarget_name)?;
 
         Ok(StarlarkProvidersLabel::new(ProvidersLabel::new(
@@ -164,7 +170,6 @@ fn label_methods(builder: &mut MethodsBuilder) {
     From,
     ProvidesStaticType,
     Serialize,
-    StarlarkDocs,
     Allocative
 )]
 #[serde(transparent)]
@@ -211,41 +216,39 @@ impl<'v> StarlarkValue<'v> for StarlarkConfiguredTargetLabel {
             ValueError::unsupported_with(self, "compare", other)
         }
     }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
-    }
 }
 
 #[starlark_module]
 fn configured_label_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
-    fn package<'v>(this: &StarlarkConfiguredTargetLabel) -> anyhow::Result<&'v str> {
-        Ok(this.label.pkg().cell_relative_path().as_str())
+    fn package<'v>(
+        this: &StarlarkConfiguredTargetLabel,
+        heap: &'v Heap,
+    ) -> starlark::Result<StringValue<'v>> {
+        Ok(heap.alloc_str_intern(this.label.pkg().cell_relative_path().as_str()))
     }
 
     #[starlark(attribute)]
-    fn name<'v>(this: &StarlarkConfiguredTargetLabel) -> anyhow::Result<&'v str> {
+    fn name<'v>(this: &'v StarlarkConfiguredTargetLabel) -> starlark::Result<&'v str> {
         Ok(this.label.name().as_str())
     }
 
     #[starlark(attribute)]
-    fn cell<'v>(this: &'v StarlarkConfiguredTargetLabel) -> anyhow::Result<&'v str> {
+    fn cell<'v>(this: &'v StarlarkConfiguredTargetLabel) -> starlark::Result<&'v str> {
         Ok(this.label.pkg().cell_name().as_str())
     }
 
     #[starlark(attribute)]
-    fn path<'v>(this: &StarlarkConfiguredTargetLabel, heap: &Heap) -> anyhow::Result<Value<'v>> {
-        let path = StarlarkCellPath(this.label.pkg().to_cell_path());
-        Ok(path.alloc_value(heap))
+    fn path<'v>(this: &StarlarkConfiguredTargetLabel) -> starlark::Result<StarlarkCellPath> {
+        Ok(StarlarkCellPath(this.label.pkg().to_cell_path()))
     }
 
-    fn config<'v>(this: &StarlarkConfiguredTargetLabel) -> anyhow::Result<StarlarkConfiguration> {
+    fn config<'v>(this: &StarlarkConfiguredTargetLabel) -> starlark::Result<StarlarkConfiguration> {
         Ok(StarlarkConfiguration((this.label.cfg()).dupe()))
     }
 
     /// Returns the unconfigured underlying target label.
-    fn raw_target(this: &StarlarkConfiguredTargetLabel) -> anyhow::Result<StarlarkTargetLabel> {
+    fn raw_target(this: &StarlarkConfiguredTargetLabel) -> starlark::Result<StarlarkTargetLabel> {
         Ok(StarlarkTargetLabel::new(
             (*this.label.unconfigured()).dupe(),
         ))
@@ -266,8 +269,10 @@ fn configured_label_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn with_sub_target<'v>(
         this: &'v StarlarkConfiguredTargetLabel,
-        #[starlark(default = AllocList::EMPTY)] subtarget_name: Value<'v>,
-    ) -> anyhow::Result<StarlarkConfiguredProvidersLabel> {
+        // TODO(nga): must be either positional or named.
+        #[starlark(default = SubtargetNameArg::List(UnpackList { items: Vec::new() }))]
+        subtarget_name: SubtargetNameArg<'v>,
+    ) -> starlark::Result<StarlarkConfiguredProvidersLabel> {
         let providers_name = value_to_providers_name(subtarget_name)?;
 
         Ok(StarlarkConfiguredProvidersLabel::new(
@@ -276,42 +281,34 @@ fn configured_label_methods(builder: &mut MethodsBuilder) {
     }
 }
 
-pub fn value_to_providers_name<'v>(subtarget_name: Value<'v>) -> anyhow::Result<ProvidersName> {
-    let subtarget = if let Some(list) = ListRef::from_value(subtarget_name) {
-        list.iter()
+#[derive(StarlarkTypeRepr, UnpackValue)]
+enum SubtargetNameArg<'v> {
+    List(UnpackList<String>),
+    Str(&'v str),
+}
+
+fn value_to_providers_name(subtarget_name: SubtargetNameArg) -> buck2_error::Result<ProvidersName> {
+    let subtarget = match subtarget_name {
+        SubtargetNameArg::List(list) => list
+            .items
+            .into_iter()
             .map(|name| {
-                name.unpack_str()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(ValueError::IncorrectParameterTypeNamedWithExpected(
-                            "subtarget_name".to_owned(),
-                            "list of str or str".to_owned(),
-                            name.get_type().to_owned(),
-                        ))
-                    })
-                    .and_then(|name| {
-                        ProviderName::new(name.to_owned())
-                            .context("for parameter `subtarget_name`")
-                            .map_err(|e| anyhow::anyhow!(e))
-                    })
+                ProviderName::new(name).buck_error_context("for parameter `subtarget_name`")
             })
-            .collect::<anyhow::Result<Vec<_>>>()?
-    } else if let Some(str) = subtarget_name.unpack_str() {
-        vec![ProviderName::new(str.to_owned()).context("for parameter `subtarget_name`")?]
-    } else {
-        return Err(anyhow::anyhow!(
-            ValueError::IncorrectParameterTypeNamedWithExpected(
-                "subtarget_name".to_owned(),
-                "list of str or str".to_owned(),
-                subtarget_name.get_type().to_owned()
-            )
-        ));
+            .collect::<buck2_error::Result<Vec<_>>>()?,
+        SubtargetNameArg::Str(str) => {
+            vec![
+                ProviderName::new(str.to_owned())
+                    .buck_error_context("for parameter `subtarget_name`")?,
+            ]
+        }
     };
 
     Ok(if subtarget.is_empty() {
         ProvidersName::Default
     } else {
-        ProvidersName::NonDefault(Box::new(NonDefaultProvidersName::Named(
-            subtarget.into_boxed_slice(),
+        ProvidersName::NonDefault(triomphe::Arc::new(NonDefaultProvidersName::Named(
+            buck2_util::arc_str::ArcSlice::from_iter(subtarget),
         )))
     })
 }

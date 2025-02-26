@@ -27,12 +27,10 @@
 //! item it replaced.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::slice;
-use std::time::Instant;
 
 use allocative::Allocative;
 use allocative::Visitor;
@@ -40,11 +38,12 @@ use bumpalo::Bump;
 use dupe::Dupe;
 use starlark_map::small_map::SmallMap;
 
-use crate::cast::transmute;
 use crate::collections::StarlarkHashValue;
+use crate::eval::runtime::profile::instant::ProfilerInstant;
 use crate::values::layout::aligned_size::AlignedSize;
 use crate::values::layout::avalue::starlark_str;
 use crate::values::layout::avalue::AValue;
+use crate::values::layout::avalue::AValueImpl;
 use crate::values::layout::avalue::BlackHole;
 use crate::values::layout::heap::allocator::api::ArenaAllocator;
 use crate::values::layout::heap::allocator::api::ChunkAllocationDirection;
@@ -61,7 +60,7 @@ use crate::values::layout::heap::repr::AValueOrForward;
 use crate::values::layout::heap::repr::AValueOrForwardUnpack;
 use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::layout::vtable::AValueVTable;
-use crate::values::string::StarlarkStr;
+use crate::values::string::str_type::StarlarkStr;
 use crate::values::Value;
 use crate::values::ValueLike;
 
@@ -89,13 +88,12 @@ pub(crate) struct Arena<A: ArenaAllocator> {
 /// Reservation is morally a Reservation<T>, but we treat is as an
 /// existential.
 /// Tied to the lifetime of the heap.
-pub(crate) struct Reservation<'v, 'v2, T: AValue<'v2>> {
-    pointer: *mut AValueRepr<T>, // Secretly AValueObject<T>
-    phantom: PhantomData<(&'v (), &'v2 T)>,
+pub(crate) struct Reservation<'v, T: AValue<'v>> {
+    pointer: *mut AValueRepr<T::StarlarkValue>,
 }
 
-impl<'v, 'v2, T: AValue<'v2>> Reservation<'v, 'v2, T> {
-    pub(crate) fn fill(self, x: T) {
+impl<'v, T: AValue<'v>> Reservation<'v, T> {
+    pub(crate) fn fill(self, x: T::StarlarkValue) {
         unsafe {
             ptr::write(
                 self.pointer,
@@ -113,9 +111,10 @@ impl<'v, 'v2, T: AValue<'v2>> Reservation<'v, 'v2, T> {
 }
 
 pub(crate) trait ArenaVisitor<'v> {
+    fn enter_bump(&mut self);
     fn regular_value(&mut self, value: &'v AValueOrForward);
-    fn call_enter(&mut self, function: Value<'v>, time: Instant);
-    fn call_exit(&mut self, time: Instant);
+    fn call_enter(&mut self, function: Value<'v>, time: ProfilerInstant);
+    fn call_exit(&mut self, time: ProfilerInstant);
 }
 
 /// Iterate over chunk contents.
@@ -141,6 +140,66 @@ impl<'c> Iterator for ChunkIter<'c> {
     }
 }
 
+/// Result of allocation. Both fields are uninitialized.
+pub(crate) struct ArenaUninit<'v, T: AValue<'v>> {
+    // We use `MaybeUninit` here to emphasize that the memory is uninitialized.
+    repr: *mut MaybeUninit<AValueRepr<T::StarlarkValue>>,
+    extra: *mut [MaybeUninit<T::ExtraElem>],
+}
+
+impl<'v, T: AValue<'v>> ArenaUninit<'v, T> {
+    pub(crate) unsafe fn write_black_hole(
+        self,
+        extra_len: usize,
+    ) -> (Reservation<'v, T>, *mut [MaybeUninit<T::ExtraElem>]) {
+        let p = self.repr as *mut AValueRepr<BlackHole>;
+        p.write(AValueRepr {
+            header: AValueHeader(AValueVTable::new_black_hole()),
+            payload: BlackHole(T::alloc_size_for_extra_len(extra_len)),
+        });
+        (
+            Reservation {
+                pointer: p as *mut _,
+            },
+            self.extra,
+        )
+    }
+
+    pub(crate) fn debug_assert_extra_is_empty(&self) {
+        let extra = unsafe { &*self.extra };
+        debug_assert!(extra.is_empty());
+    }
+
+    pub(crate) fn write(
+        self,
+        x: T::StarlarkValue,
+    ) -> (
+        *mut AValueRepr<AValueImpl<'v, T>>,
+        *mut [MaybeUninit<T::ExtraElem>],
+    ) {
+        unsafe {
+            let repr = self.repr as *mut AValueRepr<AValueImpl<'v, T>>;
+            repr.write(AValueRepr {
+                header: AValueHeader::new::<T>(),
+                payload: AValueImpl::new(x),
+            });
+            (repr, self.extra)
+        }
+    }
+
+    pub(crate) fn write_no_extra(self, x: T::StarlarkValue) -> *mut AValueRepr<AValueImpl<'v, T>> {
+        self.debug_assert_extra_is_empty();
+        self.write(x).0
+    }
+}
+
+enum ArenaVisitEvent<'a> {
+    /// Called when entering new bump.
+    EnterBump,
+    /// Visiting a value in the bump.
+    Value(&'a AValueOrForward),
+}
+
 impl<A: ArenaAllocator> Arena<A> {
     pub(crate) fn is_empty(&self) -> bool {
         self.allocated_bytes() == 0
@@ -164,13 +223,7 @@ impl<A: ArenaAllocator> Arena<A> {
         self.non_drop.finish();
     }
 
-    fn alloc_uninit<'v, 'v2: 'v, T: AValue<'v2>>(
-        bump: &'v A,
-        extra_len: usize,
-    ) -> (
-        &'v mut MaybeUninit<AValueRepr<T>>,
-        &'v mut [MaybeUninit<T::ExtraElem>],
-    ) {
+    fn alloc_uninit<'v, 'v2, T: AValue<'v2>>(bump: &'v A, extra_len: usize) -> ArenaUninit<'v2, T> {
         assert!(
             mem::align_of::<T>() <= AValueHeader::ALIGN,
             "Unexpected alignment in Starlark arena. Type {} has alignment {}, expected <= {}",
@@ -182,17 +235,17 @@ impl<A: ArenaAllocator> Arena<A> {
         let size = T::alloc_size_for_extra_len(extra_len);
         let p = bump.alloc(size).as_ptr();
         unsafe {
-            let repr = &mut *(p as *mut MaybeUninit<AValueRepr<T>>);
+            let repr = p as *mut MaybeUninit<AValueRepr<_>>;
             let extra = slice::from_raw_parts_mut(
                 p.add(AValueRepr::<T>::offset_of_extra()) as *mut _,
                 extra_len,
             );
-            (repr, extra)
+            ArenaUninit { repr, extra }
         }
     }
 
     fn bump_for_type<'v, T: AValue<'v>>(&self) -> &A {
-        if mem::needs_drop::<T>() {
+        if mem::needs_drop::<T::StarlarkValue>() {
             &self.drop
         } else {
             &self.non_drop
@@ -200,10 +253,10 @@ impl<A: ArenaAllocator> Arena<A> {
     }
 
     // Reservation should really be an incremental type
-    pub(crate) fn reserve_with_extra<'v, 'v2: 'v, T: AValue<'v2>>(
-        &'v self,
+    pub(crate) fn reserve_with_extra<'v2, T: AValue<'v2>>(
+        &self,
         extra_len: usize,
-    ) -> (Reservation<'v, 'v2, T>, &'v mut [MaybeUninit<T::ExtraElem>]) {
+    ) -> (Reservation<'v2, T>, *mut [MaybeUninit<T::ExtraElem>]) {
         // We don't create reservations for strings because we don't need to,
         // but also because we need to be able to reconstruct a `Pointer`
         // from `AValueHeader` (with `TAG_STR` when appropriate).
@@ -211,62 +264,40 @@ impl<A: ArenaAllocator> Arena<A> {
         // it returns `false` from `is_str`.
         assert!(!T::IS_STR);
 
-        let (p, extra) = Self::alloc_uninit::<T>(self.bump_for_type::<T>(), extra_len);
+        let arena_uninit = Self::alloc_uninit::<T>(self.bump_for_type::<T>(), extra_len);
         // If we don't have a vtable we can't skip over missing elements to drop,
         // so very important to put in a current vtable
         // We always alloc at least one pointer worth of space, so can write in a one-ST blackhole
 
-        let x = BlackHole(T::alloc_size_for_extra_len(extra_len));
-        let p = unsafe {
-            transmute!(
-                &mut MaybeUninit<AValueRepr<T>>,
-                &mut MaybeUninit<AValueRepr<BlackHole>>,
-                p
-            )
-        };
-        let p = p.write(AValueRepr {
-            header: AValueHeader(AValueVTable::new_black_hole()),
-            payload: x,
-        });
-        let p = unsafe { transmute!(&mut AValueRepr<BlackHole>, &mut AValueRepr<T>, p) };
-
-        (
-            Reservation {
-                pointer: p,
-                phantom: PhantomData,
-            },
-            extra,
-        )
+        unsafe { arena_uninit.write_black_hole(extra_len) }
     }
 
     /// Allocate a type `T`.
-    pub(crate) fn alloc<'v, 'v2: 'v, T: AValue<'v2, ExtraElem = ()>>(
+    pub(crate) fn alloc<'v, 'v2, T: AValue<'v2, ExtraElem = ()>>(
         &'v self,
-        x: T,
-    ) -> &'v AValueRepr<T> {
-        debug_assert!(x.extra_len() == 0);
+        x: AValueImpl<'v2, T>,
+    ) -> &'v AValueRepr<AValueImpl<'v2, T>> {
+        debug_assert!(T::extra_len(&x.1) == 0);
         let bump = self.bump_for_type::<T>();
-        let (p, extra) = Self::alloc_uninit::<T>(bump, 0);
-        debug_assert!(extra.is_empty());
-        p.write(AValueRepr {
-            header: AValueHeader::new::<T>(),
-            payload: x,
-        })
+        let arena_uninit = Self::alloc_uninit::<T>(bump, 0);
+        arena_uninit.debug_assert_extra_is_empty();
+        unsafe { &mut *arena_uninit.write_no_extra(x.1) }
     }
 
     /// Allocate a type `T` plus `extra` bytes.
     ///
     /// The type `T` will never be dropped, so had better not do any memory allocation.
-    pub(crate) fn alloc_extra<'v, 'v2: 'v, T: AValue<'v2>>(
-        &'v self,
-        x: T,
-    ) -> (*mut AValueRepr<T>, &'v mut [MaybeUninit<T::ExtraElem>]) {
+    pub(crate) fn alloc_extra<'v, T: AValue<'v>>(
+        &self,
+        x: AValueImpl<'v, T>,
+    ) -> (
+        *mut AValueRepr<AValueImpl<'v, T>>,
+        *mut [MaybeUninit<T::ExtraElem>],
+    ) {
         let bump = self.bump_for_type::<T>();
-        let (p, extra) = Self::alloc_uninit::<T>(bump, x.extra_len());
-        let p = p.write(AValueRepr {
-            header: AValueHeader::new::<T>(),
-            payload: x,
-        });
+        let extra_len = T::extra_len(&x.1);
+        let arena_uninit = Self::alloc_uninit::<T>(bump, extra_len);
+        let (p, extra) = arena_uninit.write(x.1);
         (p, extra)
     }
 
@@ -279,6 +310,7 @@ impl<A: ArenaAllocator> Arena<A> {
     ) -> *mut AValueHeader {
         assert!(len > 1);
         let (v, extra) = self.alloc_extra::<_>(starlark_str(len, hash));
+        let extra = unsafe { &mut *extra };
         debug_assert_eq!(StarlarkStr::payload_len_for_len(len), extra.len());
         unsafe {
             extra.last_mut().unwrap_unchecked().write(0usize);
@@ -300,11 +332,12 @@ impl<A: ArenaAllocator> Arena<A> {
 
     // Iterate over the values in the heap in the order they
     // were added.
-    pub(crate) fn for_each_ordered<'a>(&'a mut self, mut f: impl FnMut(&'a AValueOrForward)) {
+    fn for_each_ordered<'a>(&'a mut self, mut f: impl FnMut(ArenaVisitEvent<'a>)) {
         // We get the chunks from most newest to oldest as per the bumpalo spec.
         // And within each chunk, the values are filled newest to oldest.
         // So need to do two sets of reversing.
         for bump in [&mut self.drop, &mut self.non_drop] {
+            f(ArenaVisitEvent::EnterBump);
             let chunks = unsafe { bump.iter_allocated_chunks_rev().collect::<Vec<_>>() };
             // Use a single buffer to reduce allocations, but clear it after use
             let mut buffer = Vec::new();
@@ -313,13 +346,13 @@ impl<A: ArenaAllocator> Arena<A> {
                     ChunkAllocationDirection::Down => {
                         buffer.extend(Arena::<A>::iter_chunk(chunk));
                         for x in buffer.iter().rev() {
-                            f(x);
+                            f(ArenaVisitEvent::Value(x));
                         }
                         buffer.clear();
                     }
                     ChunkAllocationDirection::Up => {
                         for x in Arena::<A>::iter_chunk(chunk) {
-                            f(x);
+                            f(ArenaVisitEvent::Value(x));
                         }
                     }
                 }
@@ -351,30 +384,31 @@ impl<A: ArenaAllocator> Arena<A> {
             }
         }
 
-        self.for_each_ordered(|x| match x.unpack() {
-            AValueOrForwardUnpack::Header(header) => {
-                let value = header.unpack_value(heap_kind);
-                if let Some(call_enter) = value.downcast_ref::<CallEnter<NeedsDrop>>() {
-                    visitor.call_enter(
-                        fix_function(call_enter.function, forward_heap_kind),
-                        call_enter.time,
-                    );
-                } else if let Some(call_enter) = value.downcast_ref::<CallEnter<NoDrop>>() {
-                    visitor.call_enter(
-                        fix_function(call_enter.function, forward_heap_kind),
-                        call_enter.time,
-                    );
-                } else if let Some(call_exit) = value.downcast_ref::<CallExit<NeedsDrop>>() {
-                    visitor.call_exit(call_exit.time);
-                } else if let Some(call_exit) = value.downcast_ref::<CallExit<NoDrop>>() {
-                    visitor.call_exit(call_exit.time);
-                } else {
-                    visitor.regular_value(x);
+        self.for_each_ordered(|x| match x {
+            ArenaVisitEvent::EnterBump => visitor.enter_bump(),
+            ArenaVisitEvent::Value(x) => match x.unpack() {
+                AValueOrForwardUnpack::Header(header) => {
+                    let value = header.unpack_value(heap_kind);
+                    if let Some(call_enter) = value.downcast_ref::<CallEnter<NeedsDrop>>() {
+                        visitor.call_enter(
+                            fix_function(call_enter.function, forward_heap_kind),
+                            call_enter.time,
+                        );
+                    } else if let Some(call_enter) = value.downcast_ref::<CallEnter<NoDrop>>() {
+                        visitor.call_enter(
+                            fix_function(call_enter.function, forward_heap_kind),
+                            call_enter.time,
+                        );
+                    } else if let Some(call_exit) = value.downcast_ref::<CallExit<NeedsDrop>>() {
+                        visitor.call_exit(call_exit.time);
+                    } else if let Some(call_exit) = value.downcast_ref::<CallExit<NoDrop>>() {
+                        visitor.call_exit(call_exit.time);
+                    } else {
+                        visitor.regular_value(x);
+                    }
                 }
-            }
-            AValueOrForwardUnpack::Forward(_forward) => {
-                visitor.regular_value(x);
-            }
+                AValueOrForwardUnpack::Forward(_forward) => visitor.regular_value(x),
+            },
         });
     }
 
@@ -434,11 +468,6 @@ impl<A: ArenaAllocator> Arena<A> {
             *summary.entry(name).or_insert_with(AllocCounts::default) += counts;
         }
         HeapSummary { summary }
-    }
-
-    /// Memory allocated in the arena but not used for allocation in starlark.
-    pub(crate) fn unused_capacity(&self) -> usize {
-        self.drop.remaining_capacity() + self.non_drop.remaining_capacity()
     }
 }
 
@@ -507,14 +536,14 @@ mod tests {
         s
     }
 
-    fn mk_str(x: &str) -> impl AValue<'static, ExtraElem = ()> {
+    fn mk_str(x: &str) -> AValueImpl<'static, impl AValue<'static, ExtraElem = ()>> {
         simple(StarlarkAny::new(x.to_owned()))
     }
 
     fn reserve_str<'v, T: AValue<'static>>(
         arena: &'v Arena<Bump>,
-        _: &T,
-    ) -> Reservation<'v, 'static, T> {
+        _: &AValueImpl<'static, T>,
+    ) -> Reservation<'static, T> {
         arena.reserve_with_extra::<T>(0).0
     }
 
@@ -535,7 +564,7 @@ mod tests {
         }
         assert!(!reserved.is_empty());
         for (r, i) in reserved {
-            r.fill(mk_str(&i.to_string()));
+            r.fill(mk_str(&i.to_string()).1);
         }
 
         // Not a functional part of the test, just makes sure we go through
@@ -545,10 +574,13 @@ mod tests {
             "Didn't allocate enough to test properly"
         );
         let mut j = 0;
-        arena.for_each_ordered(|i| {
-            if let Some(i) = i.unpack_header() {
-                assert_eq!(to_repr(i), j.to_string());
-                j += 1;
+        arena.for_each_ordered(|i| match i {
+            ArenaVisitEvent::EnterBump => {}
+            ArenaVisitEvent::Value(i) => {
+                if let Some(i) = i.unpack_header() {
+                    assert_eq!(to_repr(i), format!("{:?}", j.to_string()));
+                    j += 1;
+                }
             }
         });
         assert_eq!(j, LIMIT);
@@ -566,14 +598,17 @@ mod tests {
         reserve_str(&arena, &mk_str(""));
         arena.alloc(mk_str("hello"));
         let mut res = Vec::new();
-        arena.for_each_ordered(|x| {
-            if let Some(x) = x.unpack_header() {
-                res.push(x);
+        arena.for_each_ordered(|x| match x {
+            ArenaVisitEvent::EnterBump => {}
+            ArenaVisitEvent::Value(x) => {
+                if let Some(x) = x.unpack_header() {
+                    res.push(x);
+                }
             }
         });
         assert_eq!(res.len(), 3);
-        assert_eq!(to_repr(res[0]), "test");
-        assert_eq!(to_repr(res[2]), "hello");
+        assert_eq!(to_repr(res[0]), "\"test\"");
+        assert_eq!(to_repr(res[2]), "\"hello\"");
     }
 
     #[test]

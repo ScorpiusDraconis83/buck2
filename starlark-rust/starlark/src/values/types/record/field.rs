@@ -24,7 +24,6 @@ use dupe::Dupe;
 use starlark_derive::starlark_value;
 use starlark_derive::Freeze;
 use starlark_derive::NoSerialize;
-use starlark_derive::StarlarkDocs;
 use starlark_derive::Trace;
 use starlark_map::StarlarkHasher;
 
@@ -34,7 +33,9 @@ use crate::coerce::Coerce;
 use crate::starlark_complex_value;
 use crate::typing::Ty;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
+use crate::values::FreezeResult;
 use crate::values::StarlarkValue;
+use crate::values::ValueLifetimeless;
 use crate::values::ValueLike;
 
 /// The result of `field()`.
@@ -46,11 +47,9 @@ use crate::values::ValueLike;
     Freeze,
     NoSerialize,
     ProvidesStaticType,
-    StarlarkDocs,
     Allocative
 )]
-#[starlark_docs(builtin = "extension")]
-pub struct FieldGen<V> {
+pub struct FieldGen<V: ValueLifetimeless> {
     pub(crate) typ: TypeCompiled<V>,
     pub(crate) default: Option<V>,
 }
@@ -68,11 +67,14 @@ impl<'v, V: ValueLike<'v>> Display for FieldGen<V> {
 }
 
 // Manual because no instance for Option<V>
-unsafe impl<From: Coerce<To>, To> Coerce<FieldGen<To>> for FieldGen<From> {}
+unsafe impl<From: Coerce<To> + ValueLifetimeless, To: ValueLifetimeless> Coerce<FieldGen<To>>
+    for FieldGen<From>
+{
+}
 
 starlark_complex_value!(pub(crate) Field);
 
-impl<V> FieldGen<V> {
+impl<V: ValueLifetimeless> FieldGen<V> {
     pub(crate) fn new(typ: TypeCompiled<V>, default: Option<V>) -> Self {
         Self { typ, default }
     }
@@ -85,7 +87,7 @@ impl<'v, V: ValueLike<'v>> FieldGen<V> {
 }
 
 #[starlark_value(type = "field")]
-impl<'v, V: ValueLike<'v> + 'v> StarlarkValue<'v> for FieldGen<V>
+impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for FieldGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
@@ -96,10 +98,6 @@ where
             d.write_hash(hasher)?;
         }
         Ok(())
-    }
-
-    fn get_type_starlark_repr() -> Ty {
-        Ty::starlark_value::<Self>()
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
